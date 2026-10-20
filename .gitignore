@@ -1,0 +1,26 @@
+# runtime data root (datasets, indexes, history, model links)
+data/
+
+# local env with real endpoints/keys
+.env
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# service state
+*.log
+*.pid
+
+# OS noise
+.DS_Store
+Thumbs.db
