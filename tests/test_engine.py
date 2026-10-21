@@ -122,6 +122,55 @@ class IndexStoreTests(unittest.TestCase):
             store.load()
             self.assertEqual(len(store.all()), 1)
 
+    def _synthetic_generation(self, datasets_dir):
+        """Write one minimal generation-atomic index without using the ingest path."""
+        space = Path(datasets_dir) / "cxl" / "index" / "link__model"
+        generation = space / "generations" / "abc123"
+        generation.mkdir(parents=True)
+        meta = [{"id": "chunk-a", "doc": "widget text", "text": "widget text",
+                 "page_start": 1, "page_end": 1, "heading_only": False}]
+        (generation / "info.json").write_text(json.dumps(
+            {"schema": 2, "dim": 2, "space": "link__model",
+             "embedding": {"dim": 2}, "n": 1}))
+        (generation / "meta.json").write_text(json.dumps(meta))
+        np.save(space / "generations" / "abc123" / "vectors.npy",
+                np.array([[1.0, 0.0]], dtype=np.float32))
+        (space / "CURRENT").write_text("abc123\n")
+        return space
+
+    def test_current_generation_is_loaded(self):
+        import tempfile
+        from peekseed.engine import IndexStore
+        with tempfile.TemporaryDirectory() as tmp:
+            datasets_dir = Path(tmp) / "datasets"
+            space = self._synthetic_generation(datasets_dir)
+            store = IndexStore(str(datasets_dir))
+            store.load()
+            index = store.get("cxl", "link__model")
+            self.assertIsNotNone(index)
+            self.assertEqual(index.info["n"], 1)
+
+            # A CURRENT that names a missing generation is unusable: the space
+            # must be reported as needing a rebuild, never served half-written.
+            (space / "CURRENT").write_text("gone\n")
+            store.load()
+            self.assertEqual(store.all(), {})
+
+    def test_legacy_space_without_current_still_loads(self):
+        import tempfile
+        from peekseed.engine import IndexStore
+        with tempfile.TemporaryDirectory() as tmp:
+            datasets_dir = Path(tmp) / "datasets"
+            space = self._synthetic_generation(datasets_dir)
+            generation = space / "generations" / "abc123"
+            for name in ("info.json", "meta.json", "vectors.npy"):
+                source = generation / name
+                source.replace(space / name)
+            (space / "CURRENT").unlink()
+            store = IndexStore(str(datasets_dir))
+            store.load()
+            self.assertIsNotNone(store.get("cxl", "link__model"))
+
 
 if __name__ == "__main__":
     unittest.main()

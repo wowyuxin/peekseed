@@ -355,11 +355,39 @@ class DatasetIndex:
         return [float(s) for s in scores]
 
 
+def _current_generation_dir(space_dir: str) -> Optional[str]:
+    """Resolve the directory holding an index space's live generation.
+
+    New indexes are written to ``<space>/generations/<uuid>/`` and a ``CURRENT``
+    file in the space directory names the live generation; it is written last,
+    so a crash leaves the previous generation serving. Schema-1 indexes (and
+    imported legacy data) kept ``vectors.npy``/``meta.json``/``info.json``
+    directly in the space directory and have no ``CURRENT`` file.
+
+    A present-but-dangling ``CURRENT`` means the index cannot be served: the
+    caller must report it as needing a rebuild rather than silently pretending
+    the space does not exist.
+    """
+    current = os.path.join(space_dir, "CURRENT")
+    if not os.path.isfile(current):
+        return space_dir
+    try:
+        with open(current, encoding="utf-8") as handle:
+            generation = handle.read().strip()
+    except OSError:
+        return None
+    if not generation:
+        return None
+    candidate = os.path.join(space_dir, "generations", generation)
+    return candidate if os.path.isdir(candidate) else None
+
+
 class IndexStore:
     """Every usable dataset index found under one ``datasets`` directory.
 
     ``datasets_dir`` is the data root's ``datasets/`` directory; the store scans
-    ``<datasets_dir>/<dataset>/index/<space>/{info.json,vectors.npy,meta.json}``.
+    ``<datasets_dir>/<dataset>/index/<space>/CURRENT`` and loads the generation it
+    names (legacy spaces without ``CURRENT`` load their files in place).
     One unreadable index is skipped with a warning: a half-written or corrupt
     directory must not take the whole service down, and every other dataset
     stays searchable.
@@ -394,7 +422,12 @@ class IndexStore:
                 space_dir = os.path.join(index_dir, space)
                 if not os.path.isdir(space_dir):
                     continue
-                index = self._load_index(dataset, space, space_dir)
+                generation_dir = _current_generation_dir(space_dir)
+                if generation_dir is None:
+                    LOG.warning("skipping index %s: CURRENT names a missing generation",
+                                space_dir)
+                    continue
+                index = self._load_index(dataset, space, generation_dir)
                 if index is not None:
                     found[(dataset, space)] = index
         self._indexes = found
