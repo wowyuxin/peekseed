@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Local-first AI research framework over your own documents"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [{name = "peekseed contributors"}]
 keywords = ["rag", "search", "pdf", "agent", "local-first"]
 classifiers = [
@@ -27,8 +27,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=8.0"]
+# Core formats are stdlib + pypdf only; every extra below is opt-in and never
+# imported at module load. See docs/formats.md for the license rationale.
+office = ["python-docx>=1.1", "python-pptx>=0.6.23"]
+tables = ["openpyxl>=3.1"]
+ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
+layout = ["pymupdf>=1.24"]
 pymupdf = ["pymupdf>=1.24"]
+test = ["pytest>=8.0"]
 
 [project.scripts]
 peekseed = "peekseed.__main__:main"

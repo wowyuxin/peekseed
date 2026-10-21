@@ -20,9 +20,19 @@ Heading-only chunks are intentionally not emitted (``heading_only`` is always
 False): a section heading with no body of its own is already represented by the
 breadcrumb of its first content chunk, and keeping the record set free of
 content-less rows keeps search results useful.
+
+When the caller knows the source's content hash (the normal case for the
+workspace scan) it passes ``source_sha256`` and every record gets a
+content-derived id from :func:`peekseed.contracts.chunk_id`: adding file B to a
+collection can never renumber file A's chunks, which is what makes incremental
+embedding safe. Without a hash the historical ``"<dataset>-<NNNNNN>"`` ids are
+kept, so callers that concatenate several sources with ``id_start`` behave
+exactly as before.
 """
 
 import re
+
+from ..contracts import CHUNKER_VERSION, chunk_id
 
 __all__ = ["chunk_pages"]
 
@@ -120,6 +130,20 @@ def _looks_title_case(text):
 def _dataset_slug(value):
     text = re.sub(r"[^a-z0-9._-]+", "-", _collapse(value).lower()).strip("-._")
     return text or "dataset"
+
+
+def _normalize_sha256(value):
+    """The lowercase 64-hex hash in ``value``; empty means "no content id".
+
+    A caller that passes a malformed hash gets a clear error instead of ids the
+    validator would later reject: the id is a data contract, not a guess.
+    """
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise ValueError("source_sha256 must be a 64-character hex sha256")
+    return text
 
 
 def _ordered_pages(pages):
@@ -247,10 +271,14 @@ def _pack_blocks(blocks, target_chars, max_chars):
     for block in blocks:
         text = block["text"]
         if len(text) <= max_chars:
-            pieces.append({"text": text, "page": block["page"]})
+            pieces.append(
+                {"text": text, "page": block["page"], "block": block["block"]}
+            )
         else:
             for part in _split_oversized(text, max_chars):
-                pieces.append({"text": part, "page": block["page"]})
+                pieces.append(
+                    {"text": part, "page": block["page"], "block": block["block"]}
+                )
 
     groups = []
     current = []
@@ -310,6 +338,31 @@ def _make_record(context, group, dataset, source, number):
     }
 
 
+def _make_content_record(
+    context, group, dataset, source, source_sha256, chunk_index
+):
+    """One record whose id is derived from the source content and position.
+
+    ``block_index`` is the 0-based index of the chunk's first constituent block
+    within the source (not within its section), and ``chunk_index`` the 0-based
+    index of the chunk within the same source, so the pair is stable when other
+    files are added or a later section grows.
+    """
+    record = _make_record(context, group, dataset, source, chunk_index + 1)
+    block_index = int(group[0]["block"])
+    record["id"] = chunk_id(source_sha256, block_index, chunk_index)
+    record.update(
+        {
+            "source_sha256": source_sha256,
+            "block_index": block_index,
+            "chunk_index": chunk_index,
+            "chunker_version": CHUNKER_VERSION,
+            "ordinal": chunk_index + 1,
+        }
+    )
+    return record
+
+
 def chunk_pages(
     pages,
     *,
@@ -317,7 +370,8 @@ def chunk_pages(
     max_chars=2000,
     dataset_id="",
     source="",
-    id_start=1
+    id_start=1,
+    source_sha256=""
 ):
     """Turn extracted pages into deterministic ``chunks.jsonl`` records.
 
@@ -331,6 +385,13 @@ def chunk_pages(
     lets a caller concatenate several PDFs into one dataset while keeping ids
     sequential and unique; ids are ``"<dataset_id>-<6 digits>"`` and
     ``dataset_id`` defaults to ``"dataset"`` when empty.
+
+    ``source_sha256`` switches to content-derived ids: pass the source file's
+    64-hex sha and each record also carries ``source_sha256``, ``block_index``,
+    ``chunk_index``, ``chunker_version`` and ``ordinal``, with ``id`` from
+    :func:`peekseed.contracts.chunk_id`. The ids of one source then never change
+    because another file was added to the collection. A malformed hash is a
+    ``ValueError``: inventing an id would silently break the content-id contract.
 
     The function does no file I/O and is deterministic: the same pages and
     arguments always produce the same records.
@@ -347,6 +408,7 @@ def chunk_pages(
         # An inconsistent pair must never produce a chunk larger than the bound.
         maximum = target
     first_id = max(1, first_id)
+    content_sha = _normalize_sha256(source_sha256)
 
     dataset = _dataset_slug(dataset_id)
     source_name = str(source or "")
@@ -356,6 +418,8 @@ def chunk_pages(
     stack = []
     blocks = []
     next_id = first_id
+    next_block = 0
+    next_chunk = 0
     paragraph = []
     paragraph_page = 1
     previous_top_heading = ""
@@ -379,23 +443,35 @@ def chunk_pages(
         }
 
     def flush_paragraph():
+        nonlocal next_block
         if not paragraph:
             return
         text = _paragraph_text(paragraph)
         paragraph.clear()
         if text:
-            blocks.append({"text": text, "page": paragraph_page})
+            blocks.append({"text": text, "page": paragraph_page, "block": next_block})
+            next_block += 1
 
     def flush_section():
-        nonlocal next_id
+        nonlocal next_id, next_chunk
         if not blocks:
             return
         current = context()
         groups = _pack_blocks(list(blocks), target, maximum)
         blocks.clear()
         for group in groups:
-            chunks.append(_make_record(current, group, dataset, source_name, next_id))
-            next_id += 1
+            if content_sha:
+                chunks.append(
+                    _make_content_record(
+                        current, group, dataset, source_name, content_sha, next_chunk
+                    )
+                )
+                next_chunk += 1
+            else:
+                chunks.append(
+                    _make_record(current, group, dataset, source_name, next_id)
+                )
+                next_id += 1
 
     for page_number, page_text in ordered:
         lines = page_text.split("\n")

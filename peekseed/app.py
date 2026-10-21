@@ -37,7 +37,8 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from . import __version__, answer as answer_mod, config, ingest, links, prompts
+from . import (__version__, answer as answer_mod, config, ingest, links, prompts,
+               security)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -45,7 +46,8 @@ LOG = logging.getLogger("peekseed.app")
 BASE = Path(__file__).resolve().parent
 WEB_DIR = BASE / "web"
 
-MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# Upload limits live in peekseed.security (per-file, file count and total size).
+MAX_UPLOAD_BYTES = security.MAX_UPLOAD_BYTES
 MAX_QUERY_CHARS = 4000
 DATASET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 RERANK_PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=120.0, write=60.0, pool=5.0)
@@ -193,6 +195,24 @@ def _join(base, path):
     return (base or "").rstrip("/") + path
 
 
+def _link_url_problem(payload):
+    """The SSRF rejection for a submitted ``base_url``, or None.
+
+    Model links are user-supplied URLs the server will call, so they get the
+    same guard as any outbound request: cloud metadata endpoints, link-local
+    addresses and non-http(s) schemes are refused. Loopback, RFC1918 and tailnet
+    addresses stay allowed (local-first model servers). A missing/invalid URL is
+    left to :func:`peekseed.links.create`/:func:`peekseed.links.update`, which
+    already report it precisely.
+    """
+    if not isinstance(payload, dict) or "base_url" not in payload:
+        return None
+    url = payload.get("base_url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    return security.validate_url(url)
+
+
 def _clip(text, limit):
     text = (text or "").strip()
     if len(text) <= limit:
@@ -321,6 +341,72 @@ def _all_datasets():
     return rows
 
 
+async def _store_uploads(name, note, files):
+    """Validate, stream and store uploaded PDFs, returning the new dataset dict.
+
+    Order matters for safety:
+
+    * the filename is sanitised *before* any path is built (a zip-slip name like
+      ``../../evil.pdf`` becomes ``evil.pdf`` and can never escape);
+    * the extension is checked before the body is read;
+    * each file is streamed to the uploads staging area in 64 KiB chunks with the
+      per-file and running-total limits enforced as bytes arrive, and its first
+      chunk must carry the ``%PDF-`` magic;
+    * the dataset directory is created only after *every* file passed validation,
+      so a rejected upload leaves no half-created dataset behind.
+
+    Staging is removed in all cases. ``UploadError`` maps to its own status and
+    ``IngestError`` to a short 400; no path or secret is echoed.
+    """
+    if not (name or "").strip():
+        raise HTTPException(400, "a dataset name is required")
+    if not files:
+        raise HTTPException(400, "at least one PDF is required")
+    if len(files) > security.MAX_UPLOAD_FILES:
+        raise HTTPException(413, "a dataset accepts at most %d files"
+                            % security.MAX_UPLOAD_FILES)
+    staging = config.ensure().uploads_dir / ("upload-" + uuid.uuid4().hex)
+    dataset = None
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+        security.harden_dir(staging)
+        prepared = []
+        total = 0
+        for number, upload in enumerate(files):
+            raw_name = getattr(upload, "filename", "") or ""
+            filename = ingest.sanitize_filename(raw_name)
+            if not filename.lower().endswith(".pdf"):
+                raise HTTPException(400, "%r is not a PDF" % filename)
+            part_dir = staging / ("%03d" % number)
+            part_dir.mkdir(parents=True, exist_ok=True)
+            security.harden_dir(part_dir)
+            temp = part_dir / filename
+            try:
+                written = await security.stream_upload(
+                    upload, temp, total_used=total, expect_prefix=b"%PDF-")
+            except security.UploadInvalid:
+                raise HTTPException(400, "%r is not a valid PDF" % filename)
+            except security.UploadLimitExceeded as exc:
+                raise HTTPException(exc.status, exc.detail)
+            total += written
+            prepared.append(temp)
+        dataset = ingest.create_dataset(config.paths(), name, note=note)
+        security.harden_dataset_dir(dataset.get("dir"))
+        for temp in prepared:
+            ingest.add_source(dataset, temp)
+        return dataset
+    except HTTPException:
+        if dataset is not None and dataset.get("dir"):
+            shutil.rmtree(dataset["dir"], ignore_errors=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 - ingestion errors are user-facing
+        if dataset is not None and dataset.get("dir"):
+            shutil.rmtree(dataset["dir"], ignore_errors=True)
+        raise HTTPException(400, _http_detail(exc))
+    finally:
+        shutil.rmtree(str(staging), ignore_errors=True)
+
+
 # ---------------------------------------------------------------------------
 # model links: probing
 # ---------------------------------------------------------------------------
@@ -346,9 +432,11 @@ def _probe_link(link):
                                            json={"model": link.get("model") or "",
                                                  "input": ["ping"]})
                 if response.status_code >= 400:
+                    # The provider's body is never echoed: it can carry keys or
+                    # account details, and the status is enough to act on.
                     return {"ok": False,
-                            "detail": "HTTP %d: %s" % (response.status_code,
-                                                       _clip(response.text, 200))}
+                            "detail": "the embed endpoint returned HTTP %d"
+                            % response.status_code}
                 data = response.json()
                 if link.get("protocol") == "custom":
                     vectors = data.get("embeddings") or []
@@ -366,15 +454,17 @@ def _probe_link(link):
                     "documents": [{"text": "a"}, {"text": "b"}]})
                 if response.status_code >= 400:
                     return {"ok": False,
-                            "detail": "HTTP %d: %s" % (response.status_code,
-                                                       _clip(response.text, 200))}
+                            "detail": "the rerank endpoint returned HTTP %d"
+                            % response.status_code}
                 scores = response.json().get("scores")
                 ok = isinstance(scores, list) and len(scores) == 2
                 return {"ok": ok, "detail": "2 scores" if ok else "unexpected response"}
         return {"ok": False, "detail": "unknown link role"}
     except Exception as exc:  # noqa: BLE001 - unreachable is a normal state
-        return {"ok": False, "detail": "%s: %s" % (type(exc).__name__,
-                                                   _clip(str(exc), 200))}
+        # Type only: a provider/HTTP client message could contain a response
+        # body, an API key or a machine path, and this is a UI status line.
+        return {"ok": False, "detail": "the link is not reachable (%s)"
+                % type(exc).__name__}
 
 
 def _links_status():
@@ -803,6 +893,7 @@ def create_app():
         # whole service from starting, because "no model configured" is a valid
         # state and the user needs the UI to fix it.
         config.ensure()
+        security.harden_data_root(config.paths())
         try:
             links.load()
         except links.LinkConfigError as exc:
@@ -856,41 +947,8 @@ def create_app():
     @app.post("/api/datasets", status_code=201)
     async def datasets_create(name: str = Form(...), note: str = Form(""),
                               files: List[UploadFile] = File(...)):
-        if not (name or "").strip():
-            raise HTTPException(400, "a dataset name is required")
-        if not files:
-            raise HTTPException(400, "at least one PDF is required")
-        dataset = None
-        staging = config.ensure().uploads_dir / ("upload-" + uuid.uuid4().hex)
-        staging.mkdir(parents=True, exist_ok=True)
-        try:
-            dataset = ingest.create_dataset(config.paths(), name, note=note)
-            for number, upload in enumerate(files):
-                filename = os.path.basename(upload.filename or "")
-                if not filename.lower().endswith(".pdf"):
-                    raise HTTPException(400, "%r is not a PDF" % filename)
-                data = await upload.read()
-                if len(data) > MAX_UPLOAD_BYTES:
-                    raise HTTPException(413, "%r is larger than %d MB"
-                                        % (filename, MAX_UPLOAD_BYTES // (1024 * 1024)))
-                if not data.startswith(b"%PDF-"):
-                    raise HTTPException(400, "%r is not a valid PDF" % filename)
-                temp_dir = staging / ("%03d" % number)
-                temp_dir.mkdir(parents=True, exist_ok=True)
-                temp = temp_dir / filename
-                temp.write_bytes(data)
-                ingest.add_source(dataset, temp)
-            return {"dataset": _dataset_public(dataset["id"])}
-        except HTTPException:
-            if dataset is not None and dataset.get("dir"):
-                shutil.rmtree(dataset["dir"], ignore_errors=True)
-            raise
-        except Exception as exc:  # noqa: BLE001
-            if dataset is not None and dataset.get("dir"):
-                shutil.rmtree(dataset["dir"], ignore_errors=True)
-            raise HTTPException(400, _http_detail(exc))
-        finally:
-            shutil.rmtree(str(staging), ignore_errors=True)
+        dataset = await _store_uploads(name, note, files)
+        return {"dataset": _dataset_public(dataset["id"])}
 
     @app.delete("/api/datasets/{dataset_id}")
     def datasets_delete(dataset_id: str):
@@ -960,18 +1018,29 @@ def create_app():
     def dataset_pdf(dataset_id: str, filename: str):
         directory = _dataset_dir(dataset_id)
         name = os.path.basename(filename)
-        if name != filename or not name:
+        if name != filename or not name or name in (".", ".."):
             raise HTTPException(400, "invalid file name")
-        path = directory / "original" / name
+        if "/" in name or "\\" in name or "\x00" in name:
+            raise HTTPException(400, "invalid file name")
+        original = (directory / "original").resolve()
+        candidate = original / name
         try:
-            resolved = path.resolve(strict=True)
+            resolved = candidate.resolve(strict=True)
         except OSError:
             raise HTTPException(404, "no such file")
-        original = (directory / "original").resolve()
-        if original not in resolved.parents:
+        # A symlink inside original/ that resolves outside the dataset (or any
+        # absolute traversal) must never be served, even though the name itself
+        # looks safe. Compare resolved paths, not just parent membership.
+        try:
+            resolved.relative_to(original)
+        except ValueError:
             raise HTTPException(400, "invalid file name")
+        if not resolved.is_file():
+            raise HTTPException(404, "no such file")
+        # Inline so a browser opens its PDF viewer directly; #page=N then jumps
+        # to the chunk's page.
         return FileResponse(str(resolved), media_type="application/pdf",
-                            filename=name)
+                            content_disposition_type="inline", filename=name)
 
     # --- model links ------------------------------------------------------
     @app.get("/api/links")
@@ -985,6 +1054,9 @@ def create_app():
 
     @app.post("/api/links", status_code=201)
     def links_create(payload: Optional[dict] = None):
+        problem = _link_url_problem(payload)
+        if problem:
+            raise HTTPException(400, problem)
         try:
             link = links.create(payload or {})
         except links.LinkValidationError as exc:
@@ -995,6 +1067,9 @@ def create_app():
 
     @app.put("/api/links/{link_id}")
     def links_update(link_id: str, payload: Optional[dict] = None):
+        problem = _link_url_problem(payload)
+        if problem:
+            raise HTTPException(400, problem)
         try:
             link = links.update(link_id, payload or {})
         except KeyError:
@@ -1341,6 +1416,7 @@ def create_app():
         data["version"] = __version__
         return data
 
+    security.install(app)
     return app
 
 

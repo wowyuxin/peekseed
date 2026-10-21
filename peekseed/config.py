@@ -5,14 +5,23 @@ path, host, model or document name is baked into the code. Everything the user
 creates at runtime -- model links, datasets, indexes, search history -- lives
 under ONE configurable root:
 
-    PEEKSEED_DATA   (default: ./data relative to the current working directory)
+    PEEKSEED_DATA   (default: <workspace>/.peekseed)
+
+The default is derived rather than relative: :mod:`peekseed.workspace` resolves
+the user's workspace directory (``./workspace`` by default) and the derived tree
+lives in its hidden ``.peekseed`` child, so one directory can be backed up. The
+environment variable still overrides the derived root on its own, which keeps
+older deployments and tests working unchanged.
 
 Layout under that root (created on first use):
 
+    <root>/manifest.json           scan state; schema 1
     <root>/config/links.json       model links; 0600; keys masked in responses
     <root>/config/settings.json    optional UI title/tagline/examples
     <root>/datasets/<id>/          uploaded sources, chunks.jsonl, index/<space>/
+    <root>/extracted/<sha256>.json extraction cache
     <root>/history/                search + dialog history
+    <root>/jobs/<id>.json          persisted job records
     <root>/uploads/                temporary staging for an upload in progress
 
 Keeping the data root separate from the code is what makes updates safe: a new
@@ -44,29 +53,49 @@ DEFAULT_SETTINGS = {
 
 
 class Paths(object):
-    """Resolved paths for one data root. Immutable for a given process."""
+    """Resolved paths for one data root. Immutable for a given process.
 
-    __slots__ = ("root", "config_dir", "links_file", "settings_file",
-                 "datasets_dir", "history_dir", "uploads_dir")
+    ``root`` is the derived tree (``<workspace>/.peekseed`` by default or the
+    ``PEEKSEED_DATA`` override). ``workspace_root``/``documents_dir`` name the
+    user-owned side so callers never have to re-derive them.
+    """
 
-    def __init__(self, root):
+    __slots__ = ("root", "workspace_root", "documents_dir", "config_dir",
+                 "links_file", "settings_file", "datasets_dir", "extracted_dir",
+                 "manifest_file", "history_dir", "jobs_dir", "uploads_dir")
+
+    def __init__(self, root, workspace_root=None, documents_dir=None):
         root = Path(root)
         self.root = root
+        self.workspace_root = Path(workspace_root) if workspace_root else root
+        self.documents_dir = (
+            Path(documents_dir)
+            if documents_dir
+            else self.workspace_root / "documents"
+        )
         self.config_dir = root / "config"
         self.links_file = self.config_dir / "links.json"
         self.settings_file = self.config_dir / "settings.json"
         self.datasets_dir = root / "datasets"
+        self.extracted_dir = root / "extracted"
+        self.manifest_file = root / "manifest.json"
         self.history_dir = root / "history"
+        self.jobs_dir = root / "jobs"
         self.uploads_dir = root / "uploads"
 
     def as_dict(self):
         return {
             "root": str(self.root),
+            "workspace_root": str(self.workspace_root),
+            "documents_dir": str(self.documents_dir),
             "config_dir": str(self.config_dir),
             "links_file": str(self.links_file),
             "settings_file": str(self.settings_file),
             "datasets_dir": str(self.datasets_dir),
+            "extracted_dir": str(self.extracted_dir),
+            "manifest_file": str(self.manifest_file),
             "history_dir": str(self.history_dir),
+            "jobs_dir": str(self.jobs_dir),
             "uploads_dir": str(self.uploads_dir),
         }
 
@@ -77,22 +106,39 @@ _CACHE_LOCK = threading.RLock()
 
 
 def data_root():
-    """The configured data root, resolved to an absolute path.
+    """The configured data root (the derived tree), resolved absolute.
 
-    A relative PEEKSEED_DATA is resolved against the current working directory,
-    which is what a user typing `PEEKSEED_DATA=./data peekseed serve` expects.
+    A relative ``PEEKSEED_DATA`` is resolved against the current working
+    directory, which is what a user typing ``PEEKSEED_DATA=./data peekseed
+    serve`` expects. Without it the root follows the resolved workspace.
     """
-    raw = os.environ.get(DATA_ENV) or "data"
-    return Path(raw).expanduser().resolve()
+    raw = os.environ.get(DATA_ENV)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    from . import workspace
+
+    return workspace.resolve().derived_dir
 
 
 def paths():
     """Paths for the current data root (cached until the root changes)."""
     global _CACHE, _CACHE_ROOT
-    root = data_root()
+    raw = os.environ.get(DATA_ENV)
+    if raw:
+        root = Path(raw).expanduser().resolve()
+        workspace_root = root
+        documents_dir = root / "documents"
+    else:
+        from . import workspace
+
+        resolved = workspace.resolve()
+        root = resolved.derived_dir
+        workspace_root = resolved.root
+        documents_dir = resolved.documents_dir
     with _CACHE_LOCK:
         if _CACHE is None or _CACHE_ROOT != root:
-            _CACHE = Paths(root)
+            _CACHE = Paths(root, workspace_root=workspace_root,
+                           documents_dir=documents_dir)
             _CACHE_ROOT = root
         return _CACHE
 
@@ -110,10 +156,12 @@ def ensure():
 
     Called by the server at startup and by every write path that might run
     before the server does (the CLI). mkdir is idempotent, so this is cheap.
+    ``documents/`` is user-owned and created by :func:`peekseed.workspace.init`,
+    not here.
     """
     p = paths()
     for directory in (p.config_dir, p.datasets_dir, p.history_dir,
-                      p.uploads_dir):
+                      p.extracted_dir, p.jobs_dir, p.uploads_dir):
         directory.mkdir(parents=True, exist_ok=True)
     return p
 
