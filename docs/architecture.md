@@ -19,14 +19,19 @@ endpoints the user configured.
         +---------+---------+----------+---------+----> httpx --> user models
                                 |
                                 v
-                         config.py -> <PEEKSEED_DATA>
+               config.py -> contracts.py -> <workspace>/.peekseed
+               workspace.py / scan.py / extract.py -> documents/
 ```
 
 ## Modules
 
 | Module | Responsibility |
 |---|---|
-| `config.py` | Resolve the data root and every path under it; settings; bind host/port. |
+| `contracts.py` | Versioned data contracts: manifest/dataset/info/job schemas, content-derived chunk ids, embedding-space identity, probe, atomic JSON, schema upgrades. |
+| `workspace.py` | Resolve and manage the document workspace: `init`, `doctor`, `status`, `move`, gitignore guard. |
+| `scan.py` | Reconcile `documents/` with the manifest: hashing, diffing, extraction cache, staleness, dirty-collection builds. |
+| `extract.py` | Format extraction (PDF, Markdown, HTML, TXT, EPUB, `.eml`; optional extras) with a versioned extractor identity. |
+| `config.py` | Resolve the workspace-derived root and every path under it; settings; bind host/port. |
 | `links.py` | Model-link config store: schema, validation, masking, atomic 0600 write. |
 | `engine.py` | Pure retrieval: tokenizer, BM25, cosine, reciprocal-rank fusion, optional rerank hook, `DatasetIndex`/`IndexStore`. |
 | `answer.py` | OpenAI-compatible streaming chat client and generic grounded-answer prompt builders. |
@@ -34,29 +39,40 @@ endpoints the user configured.
 | `agent.py` | Transport-free research loop: budgets, observation ledger, repetition guard, forced answer. |
 | `tools.py` | Dataset tools the agent calls: list, outline, search, grep, read chunk/section. |
 | `history.py` | Persistent search/dialog history (per-entry JSON + index). |
-| `ingest/` | PDF extraction, chunking, embedding and index writing. |
+| `ingest/` | Chunking, embedding and generation-atomic index writing. |
+| `security.py` | Token + Host/Origin checks for mutating routes, upload limits, URL validation. |
+| `migrate.py` | Explicit schema migration (`peekseed migrate`, dry-run default). |
 | `app.py` | The HTTP layer that wires all of the above together. |
 | `web/index.html` | The single-file UI. |
 
 The dependency direction is intentionally acyclic: `app.py` imports everything;
-`engine.py`, `agent.py`, `tools.py`, `history.py` and `ingest/` import no web
-framework and no config, so they can be tested with plain files and fakes.
-`links.py` and `config.py` are small stdlib-only stores.
+`engine.py`, `agent.py`, `tools.py`, `history.py`, `scan.py` and `ingest/` import
+no web framework and no config, so they can be tested with plain files and fakes.
+`links.py`, `config.py`, `contracts.py` and `migrate.py` are small stdlib-only
+stores.
 
-## One data root
+## One workspace
 
-`PEEKSEED_DATA` (default `./data`) owns every mutable path:
+`PEEKSEED_WORKSPACE` (default `./workspace`) owns the user's documents and every
+derived path; `PEEKSEED_DATA` overrides only the derived root
+(`<workspace>/.peekseed`) for advanced layouts:
 
 ```
-<root>/config/links.json       model endpoints + masked keys
-<root>/config/settings.json    optional UI copy
-<root>/datasets/<id>/          sources, chunks, indexes
-<root>/history/                history entries + index
-<root>/uploads/                upload staging
+<workspace>/documents/          user-owned sources; never written by peekseed
+<workspace>/.peekseed/
+    manifest.json               scan state
+    config/links.json           model endpoints + masked keys (0600)
+    config/settings.json        optional UI copy
+    datasets/<collection>/      dataset.json, chunks.jsonl, index/<space>/
+    extracted/<sha256>.json     extraction cache
+    history/                    history entries + index
+    jobs/<id>.json              persistent jobs
+    uploads/                    upload staging
 ```
 
-Nothing outside that root is written at runtime. Code updates, a new clone, or
-`pip install --upgrade` cannot touch user data.
+Nothing outside the workspace is written at runtime (except the `init` gitignore
+guard). Code updates, a new clone, or `pip install --upgrade` cannot touch user
+data. See [workspace](workspace.md) for resolution rules and invariants.
 
 ## Request lifecycle
 
@@ -78,11 +94,13 @@ ledger: numbers the model invents are reported, not rendered as links.
 search result set is the seed, not the ceiling. Every observation is numbered in
 one ledger and the answer cites those numbers.
 
-**Index build.** `POST /api/datasets/{id}/index` starts a background job. The
-worker extracts PDF text (or reuses `chunks.jsonl`), chunks it, embeds in
-batches through the enabled embed link, and atomically writes
-`vectors.npy`/`meta.json`/`info.json`. The index store is reloaded when the job
-finishes, so a new dataset becomes searchable without restarting the process.
+**Index build.** `POST /api/datasets/{id}/index` or `peekseed scan` starts a job.
+The worker extracts text (or reuses `chunks.jsonl`), chunks it with stable ids,
+embeds in batches with retry/backoff through the enabled embed link, writes into
+`index/<space>/generations/<uuid>/` and flips `CURRENT` last. The index store is
+reloaded when the job finishes, so a new dataset becomes searchable without
+restarting the process, and a failed or cancelled build leaves the previous
+generation serving.
 
 ## Index format
 
@@ -90,19 +108,30 @@ One index per embedding space, written directly (no Chroma, no SQLite):
 
 ```
 datasets/<id>/index/<space>/
-  vectors.npy   float32 [n, dim], unnormalised (normalised at load)
-  meta.json     array of chunk metadata, row-aligned with vectors
-  info.json     embedding-space identity + provenance
+  CURRENT                       one line: the live generation uuid (written last)
+  generations/<uuid>/
+    vectors.npy   float32 [n, dim], unnormalised (normalised at load)
+    meta.json     array of chunk metadata, row-aligned with vectors
+    info.json     schema 2: embedding space identity, provenance, probe, sources
+    probe.npy     stored probe vector for the query-time space check
 ```
 
 The `space` key is `"<link id>__<model id>"` (sanitised). The engine only
 compares vectors inside one index, so mixing model dimensions is structurally
 impossible; the UI shows a dataset as "needs index" when the active space has no
-index yet.
+index yet. A `CURRENT` that names a missing generation, or an index that fails
+row/dimension validation, is reported as `needs_reindex`, never served.
 
 ## Security
 
-- Loopback bind by default; no authentication.
-- Keys live only in `config/links.json`, mode 0600, masked in every response.
-- Uploads are size-capped, type-checked, and served with a path-traversal guard.
+- Loopback bind by default; single-user local-first threat model.
+- Per-install bearer token (`PEEKSEED_TOKEN`) and Host/Origin allowlist
+  (`PEEKSEED_ALLOWED_HOSTS`) required for mutating routes when enabled; reads
+  stay open on loopback.
+- Keys live only in `.peekseed/config/links.json`, mode 0600, masked in every
+  response; derived data is 0700.
+- Uploads stream to disk with per-file, file-count and total-size limits enforced
+  while reading; filenames are sanitized before any directory is created.
+- `/pdf` serves only the dataset's own `original/` copies, inline, with traversal
+  and symlink escapes rejected.
 - The server never executes shell scripts or starts model processes.
