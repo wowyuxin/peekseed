@@ -1553,15 +1553,17 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
     <p class="settings-msg" id="settingsMsg" role="status" aria-live="polite"></p>
     <div class="hist-body settings-body">
       <section class="settings-group" id="settingsTokenGroup">
-        <h3 class="settings-group-h">Service token</h3>
-        <p class="note">This service requires a token for search, ask, uploads and link changes.
-        Paste it once; it is kept only in this browser. You can also open the page as
-        <span class="mono">/#token=…</span> to store it in one step.</p>
+        <h3 class="settings-group-h">Service token (PEEKSEED_TOKEN)</h3>
+        <p class="note">This is the local service access token, generated in
+        <span class="mono">deploy/env/peekseed.env</span> — <b>not</b> a model-provider API key.
+        It is required for search, ask, uploads and link changes. Paste it once; it is kept only
+        in this browser. You can also open the page as <span class="mono">/#token=…</span> to
+        store it in one step.</p>
         <form id="tokenForm" class="settings-form" autocomplete="off" novalidate>
           <div class="settings-grid">
-            <label class="set-field set-wide"><span>Token</span>
+            <label class="set-field set-wide"><span>PEEKSEED_TOKEN value</span>
               <input id="tokenInput" type="password" autocomplete="new-password"
-                     placeholder="paste the service token"></label>
+                     placeholder="paste the PEEKSEED_TOKEN value (not a model API key)"></label>
           </div>
           <div class="settings-actions">
             <button id="tokenSave" type="submit">Save token</button>
