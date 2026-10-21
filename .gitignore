@@ -1,26 +1,17 @@
-# runtime data root (datasets, indexes, history, model links)
-data/
-
-# local env with real endpoints/keys
-.env
-
-# python
+# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
-.eggs/
 build/
 dist/
 .venv/
 venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# service state
+# peekseed runtime state (never commit documents or derived data)
+data/
+workspace/
 *.log
 *.pid
 
-# OS noise
+# OS / editor
 .DS_Store
-Thumbs.db
