@@ -184,10 +184,15 @@ Tests 1–6 and 9–11 are verified end-to-end by `tests/test_acceptance.py`
    incomplete generation; crash-left jobs are `interrupted`, not `failed`.
 5. Corrupt `vectors.npy` → collection `needs_reindex` with a reason.
 6. Change chunker version → collection `stale`; `reindex --dry-run` prints scope.
+7. Embedder swap → **409** with an actionable message when the live probe no longer
+   matches the stored one; a legacy space without `probe.npy` also 409s (rebuild).
 9. Zip-slip/symlink escape and `/pdf` traversal rejected; `/pdf` is `inline`.
 10. Hostile `Origin`/`Host` on mutating routes rejected; token required when set.
 11. A 10 GB upload is rejected without RAM growth; file-count/total limits hold.
 
-Not yet wired (next workstreams, not 0.1.0 gates 1–6/9–11): probe check at query
-time returning 409 (W6), persisted job API (`GET/DELETE /api/jobs`, cancel/resume
-buttons — W7), SSRF validation inside `links.py`, and the UI workspace panel.
+The query-time probe gate is wired: `/api/search`, `/api/search/stream`,
+`/api/ask/stream` and `/api/agent/stream` re-embed the fixed probe text and return
+**409** when the live embedder no longer reproduces `probe.npy` (cosine < 0.999),
+or when a legacy space has no stored probe. Not yet wired: persisted job API
+(`GET/DELETE /api/jobs`, cancel/resume buttons — W7), SSRF validation inside
+`links.py`, and the UI workspace panel.

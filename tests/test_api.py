@@ -232,5 +232,125 @@ class ApiTests(unittest.TestCase):
                                            % dataset["id"]).status_code, 404)
 
 
+class ProbeQueryGateTests(unittest.TestCase):
+    """Query-time probe gate: a swapped embedder must 409, never compare spaces.
+
+    Audit §6.10 gate 7. The gate is verified for search, ask and research; the
+    stored probe is what makes the check cheap enough to run on every query.
+    """
+
+    def setUp(self):
+        self._agent = os.environ.get("PEEKSEED_AGENT")
+
+    def tearDown(self):
+        if self._agent is None:
+            os.environ.pop("PEEKSEED_AGENT", None)
+        else:
+            os.environ["PEEKSEED_AGENT"] = self._agent
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from peekseed import app as app_module
+        app_module.reset_state()
+        return TestClient(app_module.create_app())
+
+    def _add_link(self, client, base_url):
+        response = client.post("/api/links", json={
+            "role": "embed", "label": "Fake embed", "protocol": "openai",
+            "base_url": base_url, "model": "test-embed", "enabled": True})
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["link"]
+
+    def _upload_and_index(self, client, root):
+        pdf = make_pdf(root / "manual.pdf", pages=[
+            "Widget installation. The widget is mounted with two screws.",
+            "Widget operation. Press the green button to start it."])
+        response = client.post(
+            "/api/datasets", data={"name": "Docs"},
+            files=[("files", ("manual.pdf", pdf.read_bytes(), "application/pdf"))])
+        self.assertEqual(response.status_code, 201, response.text)
+        dataset = response.json()["dataset"]
+        job = client.post("/api/datasets/%s/index" % dataset["id"],
+                          json={}).json()["job"]
+        for _ in range(100):
+            state = client.get("/api/jobs/%s" % job).json()
+            if state["status"] != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(state["status"], "done", state)
+        return dataset
+
+    def _stream_error(self, response):
+        """The error event of a streamed endpoint.
+
+        ``/api/search/stream`` reports failures as ``{"error": {...}}`` while
+        ask/research emit ``{"type": "error", ...}``; both are error events.
+        """
+        events = [json.loads(line) for line in response.text.strip().splitlines()]
+        for event in events:
+            if event.get("type") == "error":
+                return event
+            if isinstance(event.get("error"), dict):
+                return {"status": event["error"].get("status"),
+                        "detail": event["error"].get("detail")}
+        self.fail("no error event in %r" % (events,))
+
+    def test_swapped_embedder_409s_search_ask_and_research(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake, \
+                FakeModelServer(dim=16) as swapped:
+            os.environ["PEEKSEED_AGENT"] = "1"
+            client = self._client()
+            link = self._add_link(client, fake.openai_base)
+            dataset = self._upload_and_index(client, root)
+            payload = {"dataset": dataset["id"], "query": "green button"}
+            ok = client.post("/api/search", json=payload)
+            self.assertEqual(ok.status_code, 200, ok.text)
+            self.assertIn("probe_sec", ok.json()["timings"])
+
+            # Same link id and model string, different server/weights: only the
+            # probe can tell that this is a different embedding space.
+            updated = client.put("/api/links/%s" % link["id"],
+                                 json={"base_url": swapped.openai_base})
+            self.assertEqual(updated.status_code, 200, updated.text)
+            bad = client.post("/api/search", json=payload)
+            self.assertEqual(bad.status_code, 409, bad.text)
+            self.assertIn("embedding space", bad.json()["detail"])
+            self.assertIn("reindex", bad.json()["detail"].lower())
+
+            streamed = client.post("/api/search/stream", json=payload)
+            self.assertEqual(self._stream_error(streamed).get("status"), 409,
+                             streamed.text)
+
+            asked = client.post("/api/ask/stream", json={
+                "dataset": dataset["id"], "query": "green button",
+                "question": "How do I start it?"})
+            self.assertEqual(self._stream_error(asked).get("status"), 409,
+                             asked.text)
+
+            researched = client.post("/api/agent/stream", json={
+                "dataset": dataset["id"], "question": "How do I start it?"})
+            self.assertEqual(self._stream_error(researched).get("status"), 409,
+                             researched.text)
+
+    def test_index_without_a_probe_is_not_silently_compared(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            client = self._client()
+            self._add_link(client, fake.openai_base)
+            dataset = self._upload_and_index(client, root)
+            from pathlib import Path
+
+            from peekseed import config
+            space_dir = Path(config.paths().datasets_dir) / dataset["id"] / "index"
+            space = next(space_dir.iterdir())
+            generation = (space / "generations"
+                          / (space / "CURRENT").read_text().strip())
+            (generation / "probe.npy").unlink()
+            client = self._client()  # reload the store from disk
+            bad = client.post("/api/search", json={
+                "dataset": dataset["id"], "query": "green button"})
+            self.assertEqual(bad.status_code, 409, bad.text)
+            self.assertIn("no stored probe", bad.json()["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

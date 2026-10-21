@@ -538,6 +538,31 @@ def _rerank_callable():
     return rerank
 
 
+def _probe_check(link, index):
+    """Fail closed when the live embedder no longer matches this index space.
+
+    The probe vector was stored when the index was built. Re-embedding the same
+    fixed probe text and comparing (cosine >= 0.999) is what catches a server
+    that still reports the same model name but returns different vectors --
+    comparing the query vector against such an index would silently rank noise.
+    """
+    try:
+        if index.generation_dir:
+            cosine = ingest.verify_probe_for_generation(
+                link, index.generation_dir, index.space)
+        else:  # an index constructed directly has no recorded generation dir
+            cosine = ingest.verify_probe(
+                link, config.paths().datasets_dir / index.dataset, index.space)
+    except ingest.ProbeMismatch as exc:
+        raise HTTPException(409, str(exc)) from None
+    except ingest.NeedsReindex as exc:
+        raise HTTPException(
+            409,
+            "%s (rebuild the index before searching so the embedder can be "
+            "verified)" % exc) from None
+    return cosine
+
+
 def _resolve_index(dataset, link, space=None):
     index_store = store()
     candidate_space = space or links.embed_space_key(link)
@@ -552,6 +577,7 @@ def _resolve_index(dataset, link, space=None):
             "Build its index first. Indexed spaces: %s"
             % (dataset, link.get("label") or link.get("id"),
                link.get("model") or "default", ", ".join(available) or "none"))
+    _probe_check(link, index)
     return index
 
 
@@ -582,13 +608,18 @@ def _run_search(req, on_stage=None):
             on_stage({"stage": name, "status": status, "sec": sec})
 
     t_request = time.perf_counter()
+    # Resolve (and probe-verify) the space before embedding the query: a query
+    # must not be embedded through an embedder that no longer matches the index.
+    t_probe = time.perf_counter()
+    index = _resolve_index(dataset, link, req.space)
+    probe_sec = time.perf_counter() - t_probe
+
     stage("embed", "start")
     t_embed = time.perf_counter()
     qvec = _embed_query(link, query)
     embed_sec = time.perf_counter() - t_embed
     stage("embed", "done", embed_sec)
 
-    index = _resolve_index(dataset, link, req.space)
     topk = max(1, min(int(req.topk or 10), 50))
     try:
         order, reranked, scores, timings = index.search(
@@ -603,6 +634,7 @@ def _run_search(req, on_stage=None):
                for rank, (position, score) in enumerate(
                    zip(order[:topk], scores[:topk]), start=1)]
     timings = dict(timings or {})
+    timings["probe_sec"] = round(probe_sec, 4)
     timings["embed_sec"] = round(embed_sec, 4)
     timings["total_sec"] = round(time.perf_counter() - t_request, 4)
     result = {
@@ -835,6 +867,40 @@ def _ndjson_stream(worker):
 # ---------------------------------------------------------------------------
 # agent helpers
 # ---------------------------------------------------------------------------
+
+def _agent_probe_gate(req):
+    """409 before a research run if the embedder no longer matches its spaces.
+
+    The agent's search tool degrades to keyword ranking on any failure (a
+    mid-loop retrieval error must not end the session), so a probe mismatch
+    discovered lazily there would be silent. Verify up front instead, with one
+    probe embedding per dataset the active embed link has an index for.
+    """
+    try:
+        link = links.active("embed")
+    except links.LinkConfigError as exc:
+        _link_config_500(exc)
+    if not link:
+        return
+    index_store = store()
+    wanted_space = links.embed_space_key(link)
+    model = link.get("model") or ""
+    targets = []
+    if req.dataset:
+        index = (index_store.get(req.dataset, wanted_space) or
+                 index_store.find(req.dataset, link.get("id"), model))
+        if index is not None:
+            targets.append(index)
+    else:
+        for index in index_store.all().values():
+            info = index.info or {}
+            if (index.space == wanted_space or
+                    (info.get("link_id") == link.get("id") and
+                     (info.get("model") or "") == model)):
+                targets.append(index)
+    for index in targets:
+        _probe_check(link, index)
+
 
 def _agent_semantic(dataset, query, k):
     """The agent's ``search`` tool: a fast retrieval without reranking.
@@ -1275,6 +1341,7 @@ def create_app():
                 question = (req.question or req.query or "").strip()
                 if not question:
                     raise answer_mod.AnswerError(400, "empty question")
+                _agent_probe_gate(req)
                 _link, client = _answer_choice(req)
                 tools = DatasetTools(config.paths().datasets_dir,
                                      semantic=_agent_semantic)

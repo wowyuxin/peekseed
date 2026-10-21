@@ -156,12 +156,16 @@ class DatasetIndex:
 
     def __init__(self, dataset: str, space: str, info: Optional[Dict[str, Any]] = None,
                  vectors: Optional[Any] = None, meta: Optional[List[Dict[str, Any]]] = None,
-                 rerank_fn: Optional[Callable[[str, List[str]], Optional[List[float]]]] = None):
+                 rerank_fn: Optional[Callable[[str, List[str]], Optional[List[float]]]] = None,
+                 generation_dir: Optional[str] = None):
         self.dataset = str(dataset)
         self.space = str(space)
         self.info: Dict[str, Any] = dict(info or {})
         self.meta: List[Dict[str, Any]] = list(meta or [])
         self.rerank_fn = rerank_fn
+        # The directory the vectors were loaded from, so the query-time probe
+        # gate can read ``probe.npy`` without re-loading the whole matrix.
+        self.generation_dir = str(generation_dir) if generation_dir else None
 
         arr = np.zeros((0, 0), dtype=np.float32) if vectors is None else np.asarray(vectors)
         if arr.ndim == 1 and arr.size:
@@ -450,6 +454,7 @@ class IndexStore:
                 vectors=vectors,
                 meta=[m for m in meta if isinstance(m, dict)],
                 rerank_fn=self.rerank_fn,
+                generation_dir=path,
             )
         except Exception as exc:  # noqa: BLE001 - skip a bad index, keep the rest
             LOG.warning("skipping index %s (%s: %s)",

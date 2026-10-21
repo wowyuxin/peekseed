@@ -1202,16 +1202,8 @@ def _probe_path(generation_dir):
     return Path(generation_dir) / PROBE_FILE
 
 
-def probe_cosine(link, dataset_dir, space):
-    """Cosine between the stored probe vector and the live embedder's probe output.
-
-    Embeds the fixed probe text through ``link``, normalises both vectors and
-    returns their dot product (1.0 = identical space). Raises
-    :class:`NeedsReindex` when the space has no stored probe and
-    :class:`ProbeMismatch` when the live call fails to produce a vector.
-    """
-    loaded = load_index(dataset_dir, space)
-    probe_file = Path(loaded["dir"]) / PROBE_FILE
+def _load_probe(probe_file, space):
+    """The stored, normalised probe vector, or an actionable NeedsReindex."""
     if not probe_file.is_file():
         raise NeedsReindex(
             "the index of space '%s' has no stored probe vector; rebuild the index "
@@ -1224,27 +1216,54 @@ def probe_cosine(link, dataset_dir, space):
             "the stored probe vector of space '%s' is unreadable (%s)"
             % (space, type(exc).__name__)
         ) from None
+    return _normalise_vector(stored)
+
+
+def _live_probe(link):
     try:
-        live = embed_query(link, (_probe_text(link)), timeout=None)
+        return _normalise_vector(embed_query(link, _probe_text(link), timeout=None))
     except IngestError as exc:
         raise ProbeMismatch(
             "could not embed the probe text through the active link: %s" % exc
         ) from None
-    stored_n = _normalise_vector(stored)
-    live_n = _normalise_vector(live)
-    if stored_n.shape != live_n.shape:
+
+
+def _probe_cosine(stored, live):
+    if stored.shape != live.shape:
         raise ProbeMismatch(
             "the live embedder returned dimension %d but the index was built at "
             "dimension %d; the embedding space changed. Reindex the dataset into "
             "a new space, or restore the embedder that built it."
-            % (live_n.shape[0], stored_n.shape[0])
+            % (live.shape[0], stored.shape[0])
         )
-    return float(np.dot(stored_n, live_n))
+    return float(np.dot(stored, live))
 
 
-def verify_probe(link, dataset_dir, space):
-    """Refuse to search a space whose live embedder no longer matches it."""
-    cosine = probe_cosine(link, dataset_dir, space)
+def probe_cosine_for_generation(link, generation_dir, space):
+    """Cosine between a loaded generation's stored probe and the live embedder.
+
+    Same check as :func:`probe_cosine`, but it reads ``probe.npy`` directly from
+    the generation directory a caller already loaded. That keeps the query-time
+    gate cheap: a search must not reload ``vectors.npy`` just to verify the
+    embedding space.
+    """
+    stored = _load_probe(_probe_path(generation_dir), space)
+    return _probe_cosine(stored, _live_probe(link))
+
+
+def probe_cosine(link, dataset_dir, space):
+    """Cosine between the stored probe vector and the live embedder's probe output.
+
+    Embeds the fixed probe text through ``link``, normalises both vectors and
+    returns their dot product (1.0 = identical space). Raises
+    :class:`NeedsReindex` when the space has no stored probe and
+    :class:`ProbeMismatch` when the live call fails to produce a vector.
+    """
+    loaded = load_index(dataset_dir, space)
+    return probe_cosine_for_generation(link, loaded["dir"], space)
+
+
+def _check_cosine(cosine):
     if cosine < PROBE_MIN_COSINE:
         raise ProbeMismatch(
             "the embedder does not match the index's embedding space (probe "
@@ -1253,6 +1272,16 @@ def verify_probe(link, dataset_dir, space):
             % (cosine, PROBE_MIN_COSINE)
         )
     return cosine
+
+
+def verify_probe_for_generation(link, generation_dir, space):
+    """Refuse to search a loaded generation whose live embedder no longer matches it."""
+    return _check_cosine(probe_cosine_for_generation(link, generation_dir, space))
+
+
+def verify_probe(link, dataset_dir, space):
+    """Refuse to search a space whose live embedder no longer matches it."""
+    return _check_cosine(probe_cosine(link, dataset_dir, space))
 
 
 # --- jobs ------------------------------------------------------------------

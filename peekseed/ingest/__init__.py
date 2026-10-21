@@ -27,10 +27,12 @@ from .index import (
     load_index,
     mark_interrupted_jobs,
     probe_cosine,
+    probe_cosine_for_generation,
     read_chunks,
     reindex,
     sanitize_filename,
     verify_probe,
+    verify_probe_for_generation,
     write_chunks,
 )
 from .pdf import IngestError, available, backend_name, extract_pdf, page_count
@@ -58,9 +60,11 @@ __all__ = [
     "mark_interrupted_jobs",
     "page_count",
     "probe_cosine",
+    "probe_cosine_for_generation",
     "read_chunks",
     "reindex",
     "sanitize_filename",
     "verify_probe",
+    "verify_probe_for_generation",
     "write_chunks",
 ]

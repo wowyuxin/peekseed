@@ -319,6 +319,24 @@ class ProbeTests(unittest.TestCase):
                 self.assertIn("embedding space", message)
                 self.assertIn("reindex", message.lower())
 
+    def test_generation_probe_check_matches_without_reloading_vectors(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            dataset = build_dataset(root, fake)
+            link = embed_link(fake)
+            info = ingest.build_index(dataset["dir"], link)
+            generation = (Path(dataset["dir"]) / "index" / info["space"]
+                          / "generations" / info["generation"])
+            cosine = ingest.probe_cosine_for_generation(
+                link, generation, info["space"])
+            self.assertAlmostEqual(cosine, 1.0, places=5)
+            ingest.verify_probe_for_generation(link, generation, info["space"])
+            with FakeModelServer(dim=16) as other:
+                wrong = embed_link(other)
+                with self.assertRaises(ingest.ProbeMismatch) as raised:
+                    ingest.verify_probe_for_generation(
+                        wrong, generation, info["space"])
+                self.assertIn("dimension", str(raised.exception))
+
 
 class JobTests(unittest.TestCase):
     def test_job_record_lifecycle(self):

@@ -92,7 +92,10 @@ A fixed **probe text** is embedded once when the index is built and stored as
 probe: a cosine below **0.999** means the server is no longer the same embedding
 space as the index (a swapped model, different weights, changed prefixes) and the
 search returns **409** with an actionable message instead of silently comparing
-incompatible vectors.
+incompatible vectors. That check runs on every search/ask/research request; it is
+one extra short embed call, tiny next to the query embedding and the rerank. An
+index built before `probe.npy` existed (legacy flat layout) cannot be verified and
+also returns 409 asking for a rebuild.
 
 ## Index generations
 
