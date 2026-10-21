@@ -193,6 +193,12 @@ Tests 1–6 and 9–11 are verified end-to-end by `tests/test_acceptance.py`
 The query-time probe gate is wired: `/api/search`, `/api/search/stream`,
 `/api/ask/stream` and `/api/agent/stream` re-embed the fixed probe text and return
 **409** when the live embedder no longer reproduces `probe.npy` (cosine < 0.999),
-or when a legacy space has no stored probe. Not yet wired: persisted job API
-(`GET/DELETE /api/jobs`, cancel/resume buttons — W7), SSRF validation inside
-`links.py`, and the UI workspace panel.
+or when a legacy space has no stored probe. The persisted job API (W7) is wired
+too: `GET/DELETE /api/jobs`, `POST /api/jobs/{id}/resume`, and one writer per
+collection via `.peekseed/jobs/locks/<collection>.lock` (stale-holder detection);
+the API job is the record on disk, and startup marks crash-left `running` records
+`interrupted`. The workspace/collections surface (`GET /api/workspace`,
+`/api/collections`, `/api/datasets/{id}/sources`) and the UI Workspace panel are
+wired; `links.py` runs the same `security.validate_url` SSRF guard as the API and
+all streams emit `{"type": "error", "status", "detail"}`. Scanning (`POST
+/api/scan`, CLI scan UX, `--watch`) and OCR remain 0.2.0.

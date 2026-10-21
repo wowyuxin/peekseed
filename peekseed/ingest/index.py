@@ -62,6 +62,7 @@ __all__ = [
     "IndexState",
     "NeedsReindex",
     "ProbeMismatch",
+    "active_job_for",
     "add_source",
     "build_index",
     "create_dataset",
@@ -72,14 +73,20 @@ __all__ = [
     "embed_space_key",
     "embed_texts",
     "index_state",
+    "job_cancel_requested",
+    "job_path",
+    "list_jobs",
     "load_index",
     "mark_interrupted_jobs",
     "probe_cosine",
     "read_chunks",
+    "read_job",
     "reindex",
+    "request_cancel",
     "sanitize_filename",
     "verify_probe",
     "write_chunks",
+    "write_job",
 ]
 
 INFO_SCHEMA = contracts.INFO_SCHEMA
@@ -1298,13 +1305,137 @@ def _jobs_dir(dataset_dir):
 
 
 def _persist_job(jobs_dir, job):
-    """Write a job record atomically; returns False when the directory is unwritable."""
+    """Write a job record atomically; returns False when the directory is unwritable.
+
+    A ``cancel_requested`` flag set through the API while the builder is between
+    batches must survive the builder's next progress write: the flag is a
+    one-way latch, so it is re-read from disk and preserved here.
+    """
     try:
         data = contracts.validate_job(job)
-        contracts.write_json_atomic(Path(jobs_dir) / (job["id"] + ".json"), data)
+        path = Path(jobs_dir) / (job["id"] + ".json")
+        try:
+            existing = contracts.read_json(path)
+        except contracts.ContractError:
+            existing = None
+        if isinstance(existing, dict) and existing.get("cancel_requested"):
+            data["cancel_requested"] = True
+        contracts.write_json_atomic(path, data)
         return True
     except (OSError, contracts.ContractError):
         return False
+
+
+# --- job store (the API's source of truth is the record on disk) -----------
+
+JOB_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def job_path(jobs_dir, job_id):
+    """The record path for a validated job id (rejects path traversal)."""
+    identifier = str(job_id or "").strip()
+    if not JOB_ID_RE.match(identifier):
+        raise IngestError("invalid job id")
+    return Path(jobs_dir) / (identifier + ".json")
+
+
+def read_job(jobs_dir, job_id):
+    """One validated job record, or None when it does not exist."""
+    path = job_path(jobs_dir, job_id)
+    if not path.is_file():
+        return None
+    try:
+        raw = contracts.read_json(path)
+    except contracts.ContractError:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return contracts.validate_job(raw)
+    except contracts.ContractError:
+        return None
+
+
+def write_job(jobs_dir, job):
+    """Persist one validated job record and return the normalised copy."""
+    data = contracts.validate_job(job)
+    path = job_path(jobs_dir, data["id"])
+    contracts.write_json_atomic(path, data)
+    return data
+
+
+def list_jobs(jobs_dir, *, state=None, collection=None, limit=200):
+    """Every readable job record, newest first.
+
+    Corrupt or unreadable records are skipped rather than failing the list: one
+    bad file must not hide the jobs a user can still act on.
+    """
+    root = Path(jobs_dir)
+    rows = []
+    try:
+        names = sorted(root.glob("*.json"))
+    except OSError:
+        return rows
+    states = None
+    if state:
+        states = {part.strip() for part in str(state).split(",") if part.strip()}
+    for path in names:
+        try:
+            raw = contracts.read_json(path)
+            if not isinstance(raw, dict):
+                continue
+            job = contracts.validate_job(raw)
+        except (OSError, contracts.ContractError):
+            continue
+        if states and job["state"] not in states:
+            continue
+        if collection and job.get("collection") != collection:
+            continue
+        rows.append(job)
+    rows.sort(key=lambda job: (job.get("updated_at") or "",
+                               job.get("created_at") or "",
+                               job["id"]), reverse=True)
+    try:
+        return rows[:max(1, int(limit))]
+    except (TypeError, ValueError):
+        return rows[:200]
+
+
+def request_cancel(jobs_dir, job_id):
+    """Latch ``cancel_requested`` on a running job.
+
+    The builder checks the flag between batches, so this returns immediately and
+    the job's state becomes ``cancelled`` when the current batch is committed.
+    Terminal and interrupted jobs cannot be cancelled (resume is the action for
+    the latter), which is an :class:`IngestError` the API maps to 409.
+    """
+    job = read_job(jobs_dir, job_id)
+    if job is None:
+        raise IngestError("no such job")
+    if job["state"] in ("succeeded", "failed", "cancelled"):
+        raise IngestError("job '%s' is already %s" % (job["id"], job["state"]))
+    if job["state"] == "interrupted":
+        raise IngestError("job '%s' was interrupted; resume it instead"
+                          % job["id"])
+    job["cancel_requested"] = True
+    job["updated_at"] = _now()
+    return write_job(jobs_dir, job)
+
+
+def job_cancel_requested(jobs_dir, job_id):
+    """Whether a cancel was requested for this job (never raises)."""
+    try:
+        job = read_job(jobs_dir, job_id)
+    except IngestError:
+        return False
+    return bool(job and job.get("cancel_requested"))
+
+
+def active_job_for(jobs_dir, collection):
+    """The running job record for a collection, or None."""
+    for job in list_jobs(jobs_dir, state="running", collection=collection, limit=20):
+        return job
+    return None
 
 
 def _job_touch(job, jobs_dir, *, state=None, phase=None, done=None, total=None,
@@ -1635,6 +1766,7 @@ def build_index(
     batch_size=DEFAULT_BATCH_SIZE,
     job=None,
     cancel=None,
+    lock=None,
 ):
     """Build (or rebuild) one dataset's index for one embedding link.
 
@@ -1653,6 +1785,13 @@ def build_index(
     ``progress(frac, message)`` is called with a 0..1 fraction at each stage.
     ``cancel`` is a zero-argument callable checked between batches. Returns the
     ``info.json`` content.
+
+    ``job`` is either the persisted job record the caller wants this build to
+    own (the API creates the record and passes it, so the job id the client polls
+    is the record on disk) or a legacy in-memory dict kept for compatibility.
+    ``lock`` is an already-held :class:`peekseed.ingest.lock.CollectionLock`;
+    when omitted the builder takes the collection's writer lock itself, so CLI and
+    scan callers cannot race the server either.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.is_dir():
@@ -1671,17 +1810,39 @@ def build_index(
         raise IngestError("batch_size must be positive.")
 
     jobs_dir = _jobs_dir(dataset_dir)
-    job_record = contracts.new_job(
-        "index",
-        collection=dataset_dir.name,
-        job_id=(job or {}).get("id") if isinstance(job, dict) else None,
-    )
+    legacy_job = None
+    if (isinstance(job, dict) and job.get("schema") == contracts.JOB_SCHEMA
+            and job.get("kind")):
+        try:
+            job_record = contracts.validate_job(job)
+        except contracts.ContractError as exc:
+            raise IngestError("invalid job record: %s" % exc) from None
+    else:
+        if isinstance(job, dict):
+            legacy_job = job
+        job_record = contracts.new_job(
+            "index",
+            collection=dataset_dir.name,
+            job_id=(legacy_job or {}).get("id"),
+        )
+    if not job_record.get("collection"):
+        job_record["collection"] = dataset_dir.name
+
+    # The API acquires the lock before returning 202 and passes it here; CLI and
+    # scan callers let the builder take it, so no two writers overlap either way.
+    own_lock = None
+    if lock is None:
+        from .lock import CollectionLock
+
+        own_lock = CollectionLock(jobs_dir, dataset_dir.name)
+        own_lock.acquire(job_id=job_record["id"])
+
     _persist_job(jobs_dir, job_record)
     _job_touch(job_record, jobs_dir, state="running", phase="preparing",
                done=0, total=0, fraction=0.0, error=None)
-    if isinstance(job, dict):
-        job["status"] = "running"
-        job["message"] = "preparing"
+    if legacy_job is not None:
+        legacy_job["status"] = "running"
+        legacy_job["message"] = "preparing"
 
     try:
         notify(0.0, "Preparing dataset")
@@ -1751,15 +1912,15 @@ def build_index(
 
         _job_touch(job_record, jobs_dir, phase="embedding", total=total,
                    done=start_row, fraction=0.3 + 0.6 * (start_row / max(1, total)))
-        if isinstance(job, dict):
-            job["progress"] = max(0.0, min(1.0, 0.3 + 0.6 * (start_row / max(1, total))))
-            job["message"] = "embedding"
+        if legacy_job is not None:
+            legacy_job["progress"] = max(0.0, min(1.0, 0.3 + 0.6 * (start_row / max(1, total))))
+            legacy_job["message"] = "embedding"
 
         notify(0.3 + 0.6 * (start_row / max(1, total)),
                "Embedding %d/%d chunk(s)" % (start_row, total))
         row = start_row
         while row < total:
-            if _cancelled(cancel, job):
+            if _cancelled(cancel, legacy_job if legacy_job is not None else job_record):
                 _job_touch(job_record, jobs_dir, state="cancelled", phase="cancelled")
                 raise IndexCancelled(
                     "the index build was cancelled; the previous index is still "
@@ -1785,9 +1946,9 @@ def build_index(
             fraction = 0.3 + 0.6 * (row / max(1, total))
             notify(fraction, "Embedded %d/%d chunk(s)" % (row, total))
             _job_touch(job_record, jobs_dir, done=row, fraction=fraction)
-            if isinstance(job, dict):
-                job["progress"] = max(0.0, min(1.0, fraction))
-                job["message"] = "embedded %d/%d" % (row, total)
+            if legacy_job is not None:
+                legacy_job["progress"] = max(0.0, min(1.0, fraction))
+                legacy_job["message"] = "embedded %d/%d" % (row, total)
 
         notify(0.93, "Writing index files")
         info = _build_info(dataset, dataset_id, space, generation, dim, total,
@@ -1803,17 +1964,23 @@ def build_index(
             pass
         _job_touch(job_record, jobs_dir, state="succeeded", phase="done",
                    done=total, fraction=1.0)
-        if isinstance(job, dict):
-            job["progress"] = 1.0
-            job["message"] = "index ready: %d chunks, dimension %d" % (total, dim)
+        if legacy_job is not None:
+            legacy_job["progress"] = 1.0
+            legacy_job["message"] = "index ready: %d chunks, dimension %d" % (total, dim)
         notify(1.0, "Index ready: %d chunk(s), dimension %d" % (total, dim))
+        if own_lock is not None:
+            own_lock.release()
         return info
     except IndexCancelled:
+        if own_lock is not None:
+            own_lock.release()
         raise
     except BaseException as exc:
         _job_touch(job_record, jobs_dir, state="failed", error=str(exc))
-        if isinstance(job, dict):
-            job["error"] = str(exc)[:500]
+        if legacy_job is not None:
+            legacy_job["error"] = str(exc)[:500]
+        if own_lock is not None:
+            own_lock.release()
         raise
 
 

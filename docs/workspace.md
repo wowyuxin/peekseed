@@ -49,8 +49,15 @@ peekseed workspace path                     # print the resolved absolute root
 peekseed workspace move ~/new-research      # move the tree as one unit
 peekseed doctor                             # paths, gitignore/checkout check, links, schemas
 peekseed status                             # last scan, collections, stale/missing files
-peekseed scan                               # reconcile documents/ with the manifest
+peekseed scan                               # preview only: scan workflow ships in 0.2.0
 ```
+
+The workspace is also exposed over HTTP: `GET /api/workspace` returns the served
+absolute paths, last scan and per-collection state; `GET /api/collections` is the
+same collection rows; `GET /api/datasets/{id}/sources` lists per-source
+provenance. The UI has a Workspace panel that shows those paths with copy
+buttons, the collection states, Build/Rebuild, and the persisted job records with
+Cancel/Resume.
 
 `init` prints every resolved absolute path, writes an empty link store (0600),
 initialises `manifest.json`, and ensures an **anchored** entry for the workspace
@@ -71,8 +78,8 @@ These are enforced by tests, not just documented:
    next scan rebuilds the state.
 3. **Every chunk traces to `source_sha256`,** and every index records the source
    hashes plus extractor, chunker and embedding identity it was built from.
-4. **Scan is idempotent.** A second scan of unchanged documents makes zero embed
-   calls.
+4. **Scan is idempotent** (0.2.0 workflow; the engine already honours it). A second
+   scan of unchanged documents makes zero embed calls.
 5. **Paths are allowlisted.** Only `documents/` is scanned, served and watched;
    symlinks are resolved and rejected when they escape. `/pdf` serves only the
    dataset's own `original/` copies.

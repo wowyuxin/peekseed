@@ -86,21 +86,27 @@ vectors from two different spaces.
 **Ask.** The browser sends the question plus the result rows it is looking at
 (or none, in which case the server searches first). The server selects an answer
 link, builds a grounded prompt with numbered excerpts, streams the model's
-response, and records the run in history. Citations are validated against the
-ledger: numbers the model invents are reported, not rendered as links.
+response, and records the run in history. The prompt asks the model to cite
+excerpt numbers as `[n]`, but Ask mode does **not** validate those in-text
+citations; the numbered excerpt chips beside the answer are the authoritative
+references and link to the PDFs. (Research mode does validate citations against
+its ledger.)
 
 **Research.** The same model gets tools over the dataset (`search`, `grep`,
 `read_chunk`, `read_section`, `outline`, `list_datasets`). The deterministic
 search result set is the seed, not the ceiling. Every observation is numbered in
-one ledger and the answer cites those numbers.
+one ledger and the answer cites those numbers; invented numbers are reported as
+unknown, not rendered as links.
 
-**Index build.** `POST /api/datasets/{id}/index` or `peekseed scan` starts a job.
-The worker extracts text (or reuses `chunks.jsonl`), chunks it with stable ids,
-embeds in batches with retry/backoff through the enabled embed link, writes into
-`index/<space>/generations/<uuid>/` and flips `CURRENT` last. The index store is
-reloaded when the job finishes, so a new dataset becomes searchable without
-restarting the process, and a failed or cancelled build leaves the previous
-generation serving.
+**Index build.** `POST /api/datasets/{id}/index` starts a persisted background job
+(the folder `scan` workflow is a 0.2.0 feature). The worker extracts text (or
+reuses `chunks.jsonl`), chunks it with stable ids, embeds in batches with
+retry/backoff through the enabled embed link, writes into
+`index/<space>/generations/<uuid>/` and flips `CURRENT` last. The job record under
+`.peekseed/jobs/` is the API's source of truth (`GET /api/jobs`, `DELETE` to
+cancel between batches, `POST …/resume`); the index store is reloaded when the
+job finishes, so a new dataset becomes searchable without restarting the process,
+and a failed or cancelled build leaves the previous generation serving.
 
 ## Index format
 

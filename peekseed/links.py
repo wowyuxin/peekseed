@@ -42,7 +42,7 @@ import re
 import threading
 from urllib.parse import urlparse
 
-from . import config
+from . import config, security
 
 ROLES = ("embed", "rerank", "answer")
 STAGE_ROLES = ("embed", "rerank")
@@ -133,7 +133,13 @@ def _normalize_base(url):
 
 
 def _base_error(base):
-    """The validation message for one base_url, or None when it is usable."""
+    """The validation message for one base_url, or None when it is usable.
+
+    The syntax checks are local and precise; the SSRF checks are delegated to
+    :func:`peekseed.security.validate_url`, so every path that can create a link
+    (API, CLI, environment seeding, a hand-edited links.json) gets the same
+    metadata/link-local/non-http(s) guard.
+    """
     if not base:
         return "base_url is required"
     if not isinstance(base, str):
@@ -150,7 +156,7 @@ def _base_error(base):
         p.port
     except ValueError:
         return "base_url has an invalid port"
-    return None
+    return security.validate_url(base)
 
 
 def _blank_link(role, label=""):

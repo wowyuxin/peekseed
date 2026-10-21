@@ -17,10 +17,16 @@ documents/ ──scan──▶ manifest.json ──diff by sha256──▶ extra
                                                             ──▶ search
 ```
 
-## Scanning
+## Scanning (0.2.0)
 
-`peekseed scan` (or **Scan documents** in the UI, or `POST /api/scan`) walks
-`documents/`, hashes each file and compares it with `manifest.json`:
+The scan engine is implemented and tested, but the **scan workflow** — the CLI
+`scan`/`--watch`, `POST /api/scan`, and the UI Scan panel — is a **0.2.0**
+feature. 0.1.0's supported ingestion paths are the upload API/UI and
+`peekseed import`; there is no `POST /api/scan` route in 0.1.0. The contracts
+below (manifest, statuses, idempotency) are what the 0.2.0 workflow will expose.
+
+`peekseed scan` (preview) walks `documents/`, hashes each file and compares it
+with `manifest.json`:
 
 ```
 walk documents/ (skip hidden, *.part, ~$*, .DS_Store; resolve symlinks, reject escapes)

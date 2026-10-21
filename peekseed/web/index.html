@@ -1095,6 +1095,46 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   color:var(--text);background:var(--panel-2);border:1px solid var(--line);}
 .empty-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:13px;}
 .empty-actions button{padding:6px 12px;font-size:12px;border-radius:8px;font-weight:550;}
+
+/* ---- workspace dialog ----------------------------------------------------
+   Paths, collection state and job records come from GET /api/workspace,
+   /api/collections and /api/jobs. Model process control stays status-only:
+   launchd owns the embedder, the panel only shows which link is serving. */
+.ws-sec{border:1px solid var(--line);border-radius:12px;background:var(--panel-2);
+  padding:12px 14px;display:flex;flex-direction:column;gap:8px;min-width:0;}
+.ws-sec-h{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:0;}
+.ws-sec-h h3{margin:0;font-size:13px;font-weight:650;}
+.ws-path{display:flex;align-items:center;gap:8px;min-width:0;}
+.ws-path .ws-label{flex:0 0 92px;color:var(--faint);font-size:10.5px;
+  text-transform:uppercase;letter-spacing:.05em;}
+.ws-path code{flex:1 1 140px;min-width:0;overflow-wrap:anywhere;font:11px/1.45 var(--mono);
+  color:var(--text);background:var(--panel);border:1px solid var(--line);
+  border-radius:7px;padding:5px 8px;}
+.ws-path button{padding:4px 9px;font-size:11px;min-height:26px;border-radius:7px;}
+.ws-col{border:1px solid var(--line);border-radius:10px;background:var(--panel);
+  padding:9px 11px;display:flex;flex-wrap:wrap;gap:8px;align-items:flex-start;}
+.ws-col-main{flex:1 1 220px;min-width:0;display:flex;flex-direction:column;gap:4px;}
+.ws-col-title{display:flex;flex-wrap:wrap;align-items:center;gap:6px;min-width:0;}
+.ws-col-name{font-weight:650;font-size:13px;overflow-wrap:anywhere;}
+.ws-col-meta{color:var(--muted);font-size:11px;line-height:1.5;overflow-wrap:anywhere;}
+.ws-col button{padding:4px 9px;font-size:11px;min-height:26px;border-radius:7px;}
+.ws-job{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:7px 9px;
+  border:1px solid var(--line);border-radius:9px;background:var(--panel);font-size:11px;}
+.ws-job .ws-job-id{font:10.5px var(--mono);color:var(--muted);overflow-wrap:anywhere;}
+.ws-job .ws-job-progress{flex:1 1 140px;min-width:80px;height:5px;border-radius:4px;
+  background:var(--line);overflow:hidden;}
+.ws-job .ws-job-progress i{display:block;height:100%;background:var(--accent);}
+.ws-job button{padding:3px 8px;font-size:10.5px;min-height:24px;border-radius:6px;}
+.ws-badge{font:9.5px var(--mono);text-transform:uppercase;letter-spacing:.05em;
+  border:1px solid var(--line);border-radius:6px;padding:2px 6px;color:var(--muted);}
+.ws-badge.local{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.ws-badge.remote{color:var(--warn);border-color:rgba(251,191,36,.35);background:var(--warn-soft);}
+.ws-badge.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.ws-badge.warn{color:var(--warn);border-color:rgba(251,191,36,.35);background:var(--warn-soft);}
+.ws-badge.bad{color:var(--bad);border-color:rgba(251,113,133,.35);background:var(--bad-soft);}
+.ws-empty{color:var(--faint);font-size:11px;line-height:1.5;}
+.ws-steps{margin:0;padding-left:18px;color:var(--muted);font-size:11.5px;line-height:1.7;}
+.ws-steps a{color:var(--accent);}
 </style>
 </head>
 <body data-tab="search">
@@ -1135,6 +1175,15 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
         <path d="M4.8 11.8v6.2c0 1.6 3.2 2.9 7.2 2.9s7.2-1.3 7.2-2.9v-6.2"/>
       </svg>
       <span class="btn-label">Datasets</span>
+    </button>
+    <button class="pillbtn" id="workspaceBtn" type="button"
+            title="Workspace: paths, collection state and index jobs">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3.5 6.5h6l1.8 2.2h9.2v10.1H3.5z"/>
+        <path d="M3.5 6.5V4.9h5.2l1.5 1.6"/>
+      </svg>
+      <span class="btn-label">Workspace</span>
     </button>
     <button class="pillbtn" id="historyBtn" type="button" title="Search history (⌘K)">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -1444,6 +1493,30 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   </div>
 </div>
 
+<!-- Workspace: absolute paths, last scan, collection state, job controls and a
+     minimal first-run checklist. Read-mostly: Build/Rebuild starts an index job,
+     Cancel/Resume acts on one; model processes stay owned by launchd. -->
+<div class="hist-overlay" id="workspaceModal" hidden>
+  <div class="hist-dialog settings-dialog" role="dialog" aria-modal="true"
+       aria-label="Workspace">
+    <div class="hist-head">
+      <div>
+        <h2>Workspace</h2>
+        <p>Where your documents and derived data live, what is indexed, and which
+        background jobs are running. The workspace is the one directory to back up.</p>
+      </div>
+      <button class="secondary" id="workspaceRefreshBtn" type="button">Refresh</button>
+      <button class="hist-close" id="workspaceClose" type="button" aria-label="Close">&#215;</button>
+    </div>
+    <p class="settings-msg" id="workspaceMsg" role="status" aria-live="polite"></p>
+    <div class="hist-body settings-body">
+      <div class="settings-links" id="workspacePanel">
+        <span class="hist-empty">Loading workspace…</span>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="hist-overlay" id="histModal" hidden>
   <div class="hist-dialog" role="dialog" aria-modal="true" aria-label="Search history">
     <div class="hist-head">
@@ -1588,6 +1661,10 @@ let DATASETS=[];
 let LINKS=[];
 let LINK_STATUS={};
 let ASK_STATUS={configured:false,links:[],agent:false,max_chunks:8};
+/* Workspace panel state: the served paths, collection rows and recent jobs. */
+let WS=null;
+let COLS=[];
+let JOBS=[];
 
 /* ---- theme ---------------------------------------------------------------
    Dark is the default; the toggle is opt-in and remembered. */
@@ -4085,59 +4162,77 @@ async function deleteDataset(id){
     await loadDatasets();
   }catch(e){ datasetsMsg('Could not delete the dataset: '+(e.message||e),true); }
 }
-async function buildDataset(id,btn){
+async function buildDataset(id,btn,report){
+  report=report||datasetsMsg;
   const embed=embedLink();
   if(!embed){
-    datasetsMsg('Add or enable an embedding link in Settings, then build the index.',true);
+    report('Add or enable an embedding link in Settings, then build the index.',true);
     return;
   }
   if(btn){ btn.disabled=true; btn.textContent='Building…'; }
-  datasetsMsg('Building the index for "'+id+'"…');
+  report('Building the index for "'+id+'"…');
   try{
     const r=await callJSON('/api/datasets/'+encodeURIComponent(id)+'/index',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({link:embed.id})});
     const job=r&&(r.job||r.id);
     if(!job){
-      datasetsMsg('The server did not return a job id, so progress cannot be followed. '
+      report('The server did not return a job id, so progress cannot be followed. '
         +'Press Refresh in a moment to see whether the index appeared.',true);
       return;
     }
-    await pollJob(job,id);
+    await pollJob(job,id,report);
   }catch(e){
-    datasetsMsg('Could not start the index build: '+(e.message||e),true);
+    report('Could not start the index build: '+(e.message||e),true);
   }finally{
     if(btn){ btn.disabled=false; btn.textContent='Build index'; }
   }
 }
 function sleep(ms){ return new Promise(res=>setTimeout(res,ms)); }
-/* ~10 minutes at 1s. The job keeps running server-side if the page gives up, so
-   the message says to press Refresh rather than pretending it failed. */
-async function pollJob(jobId,datasetId){
+/* Jobs are persisted records: state (queued/running/interrupted/cancelled/
+   failed/succeeded) plus progress.{phase,done,total,fraction}. The server keeps
+   running if this page gives up, so the message says to press Refresh rather
+   than pretending it failed. */
+function jobPct(j){
+  const f=(j&&j.progress&&j.progress.fraction);
+  return f==null?null:Math.round(Math.max(0,Math.min(1,Number(f)))*100);
+}
+function jobPhase(j){ return (j&&j.progress&&j.progress.phase)||''; }
+async function pollJob(jobId,datasetId,report){
+  report=report||datasetsMsg;
   for(let i=0;i<600;i++){
     let j=null;
     try{ j=await getJSON('/api/jobs/'+encodeURIComponent(jobId)); }
     catch(e){
-      datasetsMsg('Lost the job status ('+(e.message||e)+'). Press Refresh to see the result.',true);
+      report('Lost the job status ('+(e.message||e)+'). Press Refresh to see the result.',true);
       return;
     }
-    const pct=(j&&j.progress!=null)?Math.round(Math.max(0,Math.min(1,Number(j.progress)))*100):null;
-    const msg=(j&&j.message)||'';
-    if(j&&j.status==='done'){
-      datasetsMsg('Index built for "'+datasetId+'"'+(msg?': '+msg:'')+'. It is now searchable.');
+    const pct=jobPct(j), phase=jobPhase(j);
+    if(j&&j.state==='succeeded'){
+      report('Index built for "'+datasetId+'": '+Number((j.progress||{}).done||0).toLocaleString()
+        +' chunk(s). It is now searchable.');
       await loadDatasets();
       return;
     }
-    if(j&&j.status==='error'){
-      datasetsMsg('Index build failed for "'+datasetId+'": '
-        +((j.error||msg)||'unknown error'),true);
+    if(j&&j.state==='failed'){
+      report('Index build failed for "'+datasetId+'": '+(j.error||phase||'unknown error'),true);
       await loadDatasets();
       return;
     }
-    datasetsMsg('Building "'+datasetId+'"… '+(pct!=null?pct+'% ':'')+msg);
+    if(j&&j.state==='cancelled'){
+      report('Index build cancelled for "'+datasetId+'". The previous index (if any) is still serving.');
+      await loadDatasets();
+      return;
+    }
+    if(j&&j.state==='interrupted'){
+      report('Index build for "'+datasetId+'" was interrupted by a restart. Open Workspace to resume it.');
+      await loadDatasets();
+      return;
+    }
+    report('Building "'+datasetId+'"… '+(pct!=null?pct+'% ':'')+phase);
     await sleep(1000);
   }
-  datasetsMsg('The index build is still running in the background. Press Refresh to see '
+  report('The index build is still running in the background. Press Refresh to see '
     +'whether the index appeared.',false);
 }
 async function addDataset(ev){
@@ -4210,6 +4305,223 @@ $('#datasetList').addEventListener('click',function(ev){
 });
 $('#datasetForm').addEventListener('submit',addDataset);
 
+/* ---- workspace dialog ----------------------------------------------------
+   Read-mostly: GET /api/workspace gives the served absolute paths, last scan and
+   per-collection state; GET /api/jobs gives the persisted job records. Build and
+   Rebuild start an index job, Cancel latches a between-batch cancel, Resume
+   continues an interrupted/cancelled/failed record. The model links themselves
+   stay in Settings and are status-only here (launchd owns the processes). */
+let WS_TIMER=null;
+function workspaceOpen(){ const m=$('#workspaceModal'); return !!(m&&!m.hidden); }
+function workspaceMsg(text,isError){
+  const el=$('#workspaceMsg'); if(!el) return;
+  el.innerHTML=isError?('<span class="err">'+esc(text)+'</span>'):esc(text||'');
+  el.classList.toggle('is-error',!!isError);
+}
+function wsStatusClass(status){
+  const s=String(status||'').toLowerCase();
+  if(s==='indexed'||s==='succeeded') return 'ok';
+  if(s==='stale'||s==='needs_reindex'||s==='interrupted'||s==='cancelled'
+     ||s==='chunked') return 'warn';
+  if(s==='missing'||s==='error'||s==='failed') return 'bad';
+  return '';
+}
+/* Local-first: loopback, link-local/tailnet and RFC1918 endpoints keep text on
+   the machine; anything else is badged remote so the user knows before asking. */
+function embeddingScope(link){
+  let host='';
+  try{ host=new URL((link&&link.base_url)||'').hostname.toLowerCase(); }catch(e){}
+  if(!host) return 'remote';
+  return (host==='127.0.0.1'||host==='localhost'||host==='::1'||host==='0.0.0.0'
+    ||host.endsWith('.local')||host.startsWith('10.')||host.startsWith('192.168.')
+    ||/^172\.(1[6-9]|2\d|3[01])\./.test(host)||host.startsWith('100.'))
+    ? 'local' : 'remote';
+}
+function wsSection(title,body){
+  return '<section class="ws-sec"><div class="ws-sec-h"><h3>'+esc(title)+'</h3></div>'
+    +body+'</section>';
+}
+function wsPathRow(label,value){
+  if(!value) return '';
+  return '<div class="ws-path"><span class="ws-label">'+esc(label)+'</span>'
+    +'<code>'+esc(value)+'</code>'
+    +'<button class="secondary" data-act="copy" data-copy="'+escAttr(value)+'"'
+    +' title="Copy path">Copy</button></div>';
+}
+function paintWorkspace(){
+  const box=$('#workspacePanel'); if(!box) return;
+  if(!WS){ box.innerHTML='<span class="ws-empty">Workspace not loaded.</span>'; return; }
+  const e=embedLink();
+  const paths=(WS&&WS.workspace)||{};
+  const cols=COLS||[], jobs=JOBS||[];
+  let html='';
+
+  let emb;
+  if(e){
+    const scope=embeddingScope(e);
+    emb=wsPathRow('embedding',linkLabel(e)+(linkModel(e)?' · '+linkModel(e):''))
+      +'<div><span class="ws-badge '+scope+'">'+scope+'</span> '
+      +'<span class="ws-empty">Status-only: launchd owns the model process; this panel never starts or stops it.</span></div>';
+  }else{
+    emb='<p class="ws-empty">No embedding link in use. Add one in Settings before building an index.</p>'
+      +'<div><button class="secondary" data-act="settings">Open Settings</button></div>';
+  }
+  html+=wsSection('Embedding', emb);
+
+  const pathRows=wsPathRow('workspace',paths.root)+wsPathRow('documents',paths.documents_dir)
+    +wsPathRow('derived',paths.derived_dir);
+  html+=wsSection('Paths', pathRows
+    +'<p class="ws-empty">Back up the workspace directory only; derived data is rebuildable. '
+    +'Scanning a documents/ folder is a 0.2.0 workflow.</p>');
+
+  let colHtml;
+  if(!cols.length){
+    colHtml='<span class="ws-empty">No collections yet. Upload PDFs in Datasets, or import a corpus.</span>';
+  }else{
+    colHtml=cols.map(c=>{
+      const running=jobs.find(j=>j.collection===c.id&&j.state==='running');
+      const idx=(c.indexes||[]).length;
+      const meta=[esc(c.status),Number(c.chunks||0).toLocaleString()+' chunk(s)',
+                  Number(c.sources||0)+' source(s)',idx?idx+' index(es)':'not indexed'];
+      return '<div class="ws-col"><div class="ws-col-main"><div class="ws-col-title">'
+        +'<span class="ws-col-name">'+esc(c.name||c.id)+'</span>'
+        +'<span class="set-badge">'+esc(c.id)+'</span>'
+        +'<span class="ws-badge '+wsStatusClass(c.status)+'">'+esc(c.status)+'</span></div>'
+        +'<div class="ws-col-meta">'+meta.join(' · ')+'</div>'
+        +(c.reasons&&c.reasons.length?'<div class="ws-col-meta">'+esc(c.reasons.join('; '))+'</div>':'')
+        +'</div><div class="ds-actions">'
+        +'<button class="secondary" data-act="build" data-id="'+escAttr(c.id)+'"'
+        +(e?'':' disabled')+'>'+(idx?'Rebuild':'Build')+' index</button>'
+        +(running?'<button class="secondary" data-act="cancel" data-job="'+escAttr(running.id)+'">Cancel build</button>':'')
+        +'</div></div>';
+    }).join('');
+  }
+  html+=wsSection('Collections', colHtml);
+
+  let jobHtml;
+  if(!jobs.length){
+    jobHtml='<span class="ws-empty">No index jobs yet. Build one from a collection above.</span>';
+  }else{
+    jobHtml=jobs.map(j=>{
+      const pct=jobPct(j)||0;
+      const canCancel=(j.state==='running'||j.state==='queued');
+      const canResume=(j.state==='interrupted'||j.state==='cancelled'||j.state==='failed');
+      return '<div class="ws-job">'
+        +'<span class="ws-job-id">'+esc(j.id)+'</span>'
+        +'<span class="ws-badge '+wsStatusClass(j.state)+'">'+esc(j.state)+'</span>'
+        +'<span>'+esc(j.collection||'')+'</span>'
+        +'<span class="ws-job-progress"><i style="width:'+pct+'%"></i></span>'
+        +'<span>'+pct+'% · '+esc(jobPhase(j))+'</span>'
+        +(canCancel?'<button class="secondary" data-act="cancel" data-job="'+escAttr(j.id)+'">Cancel</button>':'')
+        +(canResume?'<button class="secondary" data-act="resume" data-job="'+escAttr(j.id)+'"'
+          +' data-collection="'+escAttr(j.collection||'')+'">Resume</button>':'')
+        +'</div>';
+    }).join('');
+  }
+  html+=wsSection('Recent jobs', jobHtml);
+
+  const needs=[];
+  if(!e) needs.push('Add an embedding link in <a href="#" data-act="settings">Settings</a> (with a Test button).');
+  if(!DATASETS.length) needs.push('Upload one or more PDFs in <a href="#" data-act="datasets">Datasets</a>.');
+  if(!cols.length||cols.every(c=>c.status!=='indexed')) needs.push('Build an index for a collection.');
+  if(needs.length){
+    html+=wsSection('First run', '<ol class="ws-steps">'
+      +needs.map(step=>'<li>'+step+'</li>').join('')+'</ol>');
+  }
+  box.innerHTML=html;
+  workspaceMsg(WS.last_scan?('Last scan: '+WS.last_scan)
+    :'No scan recorded yet (scan is a 0.2.0 workflow; uploads and imports work in 0.1.0).');
+}
+async function loadWorkspace(){
+  const [ws,cols,jobs]=await Promise.all([
+    getJSON('/api/workspace'),
+    getJSON('/api/collections'),
+    getJSON('/api/jobs?limit=20')]);
+  WS=ws||{};
+  COLS=(cols&&Array.isArray(cols.collections))?cols.collections:[];
+  JOBS=(jobs&&Array.isArray(jobs.jobs))?jobs.jobs:[];
+  paintWorkspace();
+}
+async function openWorkspace(){
+  const m=$('#workspaceModal'); if(!m) return;
+  m.hidden=false;
+  try{ history.replaceState(null,'','#workspace'); }catch(e){}
+  workspaceMsg('');
+  try{
+    await loadLinks();
+    await loadWorkspace();
+  }catch(e){
+    workspaceMsg('Could not read the workspace: '+(e.message||e),true);
+  }
+  if(WS_TIMER) clearInterval(WS_TIMER);
+  WS_TIMER=setInterval(()=>{ if(workspaceOpen()) loadWorkspace().catch(()=>{}); },2500);
+  setTimeout(()=>{ const c=$('#workspaceClose'); if(c) c.focus(); },30);
+}
+function closeWorkspace(){
+  const m=$('#workspaceModal'); if(m) m.hidden=true;
+  if(WS_TIMER){ clearInterval(WS_TIMER); WS_TIMER=null; }
+  try{ history.replaceState(null,'','#search'); }catch(e){}
+}
+async function cancelWorkspaceJob(jobId){
+  workspaceMsg('Requesting cancellation of '+jobId+'…');
+  try{
+    await callJSON('/api/jobs/'+encodeURIComponent(jobId),{method:'DELETE'});
+    workspaceMsg('Cancellation requested; the build stops between batches and the previous index stays live.');
+  }catch(e){ workspaceMsg('Could not cancel: '+(e.message||e),true); }
+  await loadWorkspace();
+}
+async function resumeWorkspaceJob(jobId,collection,btn){
+  if(btn){ btn.disabled=true; btn.textContent='Resuming…'; }
+  workspaceMsg('Resuming job '+jobId+'…');
+  try{
+    await callJSON('/api/jobs/'+encodeURIComponent(jobId)+'/resume',{method:'POST'});
+    await pollJob(jobId,collection||'collection',workspaceMsg);
+  }catch(e){
+    workspaceMsg('Could not resume: '+(e.message||e),true);
+  }finally{
+    await loadWorkspace();
+  }
+}
+$('#workspaceBtn').onclick=()=>workspaceOpen()?closeWorkspace():openWorkspace();
+$('#workspaceClose').onclick=closeWorkspace;
+$('#workspaceModal').addEventListener('click',function(ev){
+  if(ev.target===this) closeWorkspace();
+});
+$('#workspaceRefreshBtn').onclick=async()=>{
+  try{
+    await loadLinks();
+    await loadWorkspace();
+    workspaceMsg('Refreshed.');
+  }catch(e){ workspaceMsg('Could not refresh: '+(e.message||e),true); }
+};
+$('#workspacePanel').addEventListener('click',async function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-act],a[data-act]'):null;
+  if(!btn) return;
+  const act=btn.getAttribute('data-act');
+  if(!act) return;
+  ev.preventDefault();
+  if(act==='copy'){
+    try{
+      await navigator.clipboard.writeText(btn.getAttribute('data-copy')||'');
+      workspaceMsg('Copied path to clipboard.');
+    }catch(e){ workspaceMsg('Could not copy; select the path manually.',true); }
+    return;
+  }
+  if(act==='settings'){ closeWorkspace(); openSettings(); return; }
+  if(act==='datasets'){ closeWorkspace(); openDatasets(); return; }
+  if(act==='build'){
+    await buildDataset(btn.getAttribute('data-id'),btn,workspaceMsg);
+    await loadWorkspace();
+    return;
+  }
+  if(act==='cancel'){ await cancelWorkspaceJob(btn.getAttribute('data-job')); return; }
+  if(act==='resume'){
+    await resumeWorkspaceJob(btn.getAttribute('data-job'),
+                             btn.getAttribute('data-collection'),btn);
+    return;
+  }
+});
+
 /* ---- keyboard -------------------------------------------------------------
    Esc backs out of the topmost layer; "/" jumps to the search box; Cmd/Ctrl+K is
    history; Cmd/Ctrl+Enter asks from anywhere in the panel. */
@@ -4221,6 +4533,7 @@ document.addEventListener('keydown',function(ev){
   }
   if(ev.key==='/'&&!typing&&!ev.ctrlKey&&!ev.metaKey&&!ev.altKey
      &&$('#histModal').hidden&&$('#settingsModal').hidden&&$('#datasetsModal').hidden
+     &&!workspaceOpen()
      &&!$('#askPanel').classList.contains('full')
      &&!pipelineOpen()){
     ev.preventDefault();
@@ -4234,6 +4547,7 @@ document.addEventListener('keydown',function(ev){
   if(ev.key!=='Escape') return;
   if(settingsOpen()){ closeSettings(); return; }
   if(datasetsOpen()){ closeDatasets(); return; }
+  if(workspaceOpen()){ closeWorkspace(); return; }
   if(!$('#histModal').hidden){ closeHistory(); return; }
   if(pipelineOpen()){ closePipeline(); return; }
   const panel=$('#askPanel');

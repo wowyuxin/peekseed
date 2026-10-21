@@ -1,4 +1,4 @@
-# peekseed maintenance notes
+# peekseed
 
 peekseed is a local-first framework for searching, asking about and researching
 a set of documents you provide. It has three moving parts:
@@ -18,7 +18,7 @@ cd peekseed
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e .
 
-python -m peekseed init          # create ./data
+python -m peekseed init          # create ./workspace (documents/ + .peekseed/)
 python -m peekseed serve         # http://127.0.0.1:8030
 ```
 
@@ -31,13 +31,14 @@ Then, in the browser:
 4. Search the dataset. Tick results and click **Ask about these**; switch to
    *Research* when the agent mode is enabled.
 
-## Data root
+## Workspace
 
-Every mutable path is derived from one root:
+Every mutable path is derived from one workspace root:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PEEKSEED_DATA` | `./data` | datasets, indexes, history, link config |
+| `PEEKSEED_WORKSPACE` | `./workspace` | documents/, derived `.peekseed/` data, history, link config |
+| `PEEKSEED_DATA` | `<workspace>/.peekseed` | advanced override for the derived root only |
 | `PEEKSEED_HOST` | `127.0.0.1` | bind address (loopback by default) |
 | `PEEKSEED_PORT` | `8030` | bind port |
 
@@ -46,13 +47,16 @@ A `.env` in the working directory or beside the project (template:
 defaults; a real environment variable always wins. Use `PEEKSEED_ENV_FILE` to
 point at a different file.
 
-The root is created on first use. A checkout can be replaced or upgraded
-without touching user data; back up or move the root as one directory.
+`init` prints the resolved absolute paths and refuses to treat a tracked
+workspace as safe. The workspace is the one directory to back up; `.peekseed/` is
+derived and rebuildable. See [workspace](docs/workspace.md) and
+[API](docs/api.md).
 
 ```
-<data>/config/links.json      model endpoints; API keys are 0600 and masked
-<data>/datasets/<id>/         original PDFs, chunks.jsonl, index/<space>/
-<data>/history/               search and dialog history
+<workspace>/documents/         user-owned; one top-level folder = one collection
+<workspace>/.peekseed/config/links.json    model endpoints; keys 0600 and masked
+<workspace>/.peekseed/datasets/<id>/       original PDFs, chunks.jsonl, index/<space>/
+<workspace>/.peekseed/jobs/                persisted, cancellable job records
 ```
 
 Model links may also be seeded headlessly with `PEEKSEED_EMBED_BASE` / `_MODEL`
@@ -90,20 +94,30 @@ Optional: install `pymupdf` (`pip install -e '.[pymupdf]'`) to use it as the
 extractor instead. PyMuPDF is AGPL-3.0 or commercial, so it is not a default
 dependency of this MIT-licensed project.
 
-The original PDF is served at `/pdf/<dataset>/<file>` so page citations open in
-the browser's own PDF viewer. No PDF.js is vendored.
+The original PDF is served at `/pdf/<dataset>/<file>` so search results and the
+numbered excerpt chips beside an answer open the browser's own PDF viewer at the
+right page. Ask answers cite excerpts as `[n]` in the text; those in-text numbers
+are the model's, not validated links — the excerpt chips are the authoritative
+references. No PDF.js is vendored.
+
+Scanning a `documents/` folder and OCR are **0.2.0** features; in 0.1.0 you add
+documents through the upload API/UI or `peekseed import`.
 
 ## API
 
-See `docs/architecture.md` and the `docs/` folder for the endpoint list. Every
-`/api/*` response is `Cache-Control: no-store`.
+The full route list, request/response shapes, stream events and the persisted job
+record are in [docs/api.md](docs/api.md). Every `/api/*` response is
+`Cache-Control: no-store`.
 
 ## Security posture
 
 peekseed is designed to run **locally, for one user**. It binds to loopback by
-default, has no authentication, and must not be exposed to an untrusted network
-as-is. API keys live only in `<data>/config/links.json` (mode 0600) and are
-never returned to the browser; the UI only learns `api_key_set`.
+default and must not be exposed to an untrusted network as-is. Optional guards:
+`PEEKSEED_TOKEN` requires a shared secret on mutating `/api/*` calls, and
+`PEEKSEED_ALLOWED_HOSTS` pins the Host/Origin names the service may answer. API
+keys live only in `<workspace>/.peekseed/config/links.json` (mode 0600) and are
+never returned to the browser; the UI only learns `api_key_set`. Model links are
+SSRF-checked when saved. See [security](docs/security.md).
 
 The server never starts or stops model processes. Local model servers (Ollama,
 LM Studio, llama.cpp, an OpenAI-compatible inference server, ...) are started by

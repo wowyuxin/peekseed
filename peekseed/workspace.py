@@ -767,7 +767,16 @@ def status(explicit=None):
     Collection state is delegated to ``.peekseed/datasets`` and the manifest,
     so status never needs the index module: it only reports what is on disk.
     """
-    ws = resolve(explicit)
+    return status_for(resolve(explicit))
+
+
+def status_for(ws):
+    """The same summary for an explicit :class:`Workspace` object.
+
+    The server uses this with the paths its process actually resolved, instead
+    of re-resolving from the current directory: ``GET /api/workspace`` must
+    describe the workspace being served, not the one under the server's cwd.
+    """
     manifest, manifest_error = _read_manifest(ws)
     entries = list(manifest.get("documents") or [])
     manifest_paths = {str(entry.get("path") or "") for entry in entries}

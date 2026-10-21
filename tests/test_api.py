@@ -49,12 +49,13 @@ class ApiTests(unittest.TestCase):
                                json={"link": link_id} if link_id else {})
         self.assertEqual(response.status_code, 202, response.text)
         job_id = response.json()["job"]
-        for _ in range(100):
+        job = {}
+        for _ in range(200):
             job = client.get("/api/jobs/%s" % job_id).json()
-            if job["status"] != "running":
+            if job["state"] not in ("queued", "running"):
                 break
             time.sleep(0.02)
-        self.assertEqual(job["status"], "done", job)
+        self.assertEqual(job["state"], "succeeded", job)
         return job
 
     def test_boot_health_ui_and_settings(self):
@@ -66,6 +67,10 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertIn(b"peekseed", page.content.lower())
             self.assertEqual(page.headers["cache-control"], "no-cache")
+            # The UI ships the workspace panel wired to the new endpoints.
+            for marker in (b'id="workspacePanel"', b"/api/workspace",
+                           b"/api/collections", b"/api/jobs"):
+                self.assertIn(marker, page.content)
             settings = client.get("/api/settings").json()
             self.assertEqual(settings["title"], "peekseed")
             updated = client.put("/api/settings",
@@ -272,27 +277,21 @@ class ProbeQueryGateTests(unittest.TestCase):
         dataset = response.json()["dataset"]
         job = client.post("/api/datasets/%s/index" % dataset["id"],
                           json={}).json()["job"]
-        for _ in range(100):
+        state = {}
+        for _ in range(200):
             state = client.get("/api/jobs/%s" % job).json()
-            if state["status"] != "running":
+            if state["state"] not in ("queued", "running"):
                 break
             time.sleep(0.02)
-        self.assertEqual(state["status"], "done", state)
+        self.assertEqual(state["state"], "succeeded", state)
         return dataset
 
     def _stream_error(self, response):
-        """The error event of a streamed endpoint.
-
-        ``/api/search/stream`` reports failures as ``{"error": {...}}`` while
-        ask/research emit ``{"type": "error", ...}``; both are error events.
-        """
+        """The error event of a streamed endpoint (one shape for all routes)."""
         events = [json.loads(line) for line in response.text.strip().splitlines()]
         for event in events:
             if event.get("type") == "error":
                 return event
-            if isinstance(event.get("error"), dict):
-                return {"status": event["error"].get("status"),
-                        "detail": event["error"].get("detail")}
         self.fail("no error event in %r" % (events,))
 
     def test_swapped_embedder_409s_search_ask_and_research(self):

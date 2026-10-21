@@ -37,8 +37,8 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from . import (__version__, answer as answer_mod, config, ingest, links, prompts,
-               security)
+from . import (__version__, answer as answer_mod, config, contracts, ingest,
+               links, prompts, security, workspace)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -105,8 +105,6 @@ _STORE = None
 _STORE_LOCK = threading.RLock()
 _HISTORY = None
 _HISTORY_LOCK = threading.RLock()
-_JOBS: Dict[str, Dict[str, Any]] = {}
-_JOBS_LOCK = threading.RLock()
 _UI_CACHE = {"bytes": None, "etag": None}
 
 
@@ -151,14 +149,16 @@ def history_store():
 
 
 def reset_state():
-    """Drop cached stores/jobs (tests point PEEKSEED_DATA at a temp dir)."""
+    """Drop cached stores (tests point PEEKSEED_DATA at a temp dir).
+
+    Job records deliberately survive this: they live on disk and are the API's
+    source of truth; only the in-process caches are dropped.
+    """
     global _STORE, _HISTORY
     with _STORE_LOCK:
         _STORE = None
     with _HISTORY_LOCK:
         _HISTORY = None
-    with _JOBS_LOCK:
-        _JOBS.clear()
     config.reset_cache()
     links.reset_cache()
 
@@ -338,6 +338,53 @@ def _all_datasets():
             rows.append(_dataset_public(name))
         except HTTPException:
             continue
+    return rows
+
+
+def _workspace_report():
+    """The workspace this server actually serves, with absolute paths.
+
+    Resolution is taken from :func:`peekseed.config.paths` (what the server
+    opened), never re-derived from the process cwd, so the API cannot describe a
+    different workspace than the one whose dataset directories just answered.
+    """
+    paths = config.ensure()
+    return workspace.status_for(workspace.Workspace(paths.workspace_root, paths.root))
+
+
+def _source_rows(dataset_dir):
+    """Per-source provenance rows from ``dataset.json`` plus file presence.
+
+    ``GET /api/datasets/{id}/sources`` is the honest counterpart of the upload
+    response: it says which files the index was built from, what hash/pages the
+    extractor saw, and whether the stored copy is still on disk.
+    """
+    try:
+        raw = contracts.read_json(Path(dataset_dir) / "dataset.json")
+    except contracts.ContractError as exc:
+        raise HTTPException(500, _http_detail(exc))
+    if not isinstance(raw, dict):
+        raise HTTPException(500, "dataset.json is not readable")
+    rows = []
+    for entry in raw.get("sources") or []:
+        if isinstance(entry, str):
+            entry = {"name": entry}
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "")
+        relative = str(entry.get("path") or "")
+        candidate = Path(dataset_dir) / relative if relative else \
+            Path(dataset_dir) / "original" / name
+        rows.append({
+            "name": name,
+            "path": str(candidate),
+            "sha256": str(entry.get("sha256") or ""),
+            "bytes": entry.get("bytes"),
+            "pages": entry.get("pages"),
+            "extractor": str(entry.get("extractor") or ""),
+            "status": str(entry.get("status") or ""),
+            "present": candidate.is_file(),
+        })
     return rows
 
 
@@ -960,6 +1007,16 @@ def create_app():
         # state and the user needs the UI to fix it.
         config.ensure()
         security.harden_data_root(config.paths())
+        # A process death leaves "running" job records behind; marking them
+        # "interrupted" at startup is what makes the Resume button honest. The
+        # records themselves are the API's source of truth (not memory).
+        try:
+            interrupted = ingest.mark_interrupted_jobs(config.paths().jobs_dir)
+            if interrupted:
+                LOG.warning("marked %d interrupted job(s): %s",
+                            len(interrupted), ", ".join(interrupted))
+        except OSError as exc:
+            LOG.warning("could not reconcile job records: %s", exc)
         try:
             links.load()
         except links.LinkConfigError as exc:
@@ -1005,10 +1062,33 @@ def create_app():
     def health():
         return {"ok": True, "datasets": len(_all_datasets())}
 
+    # --- workspace / collections -----------------------------------------
+    @app.get("/api/workspace")
+    def workspace_get():
+        """Absolute workspace paths, last scan and per-collection state."""
+        return _workspace_report()
+
+    @app.get("/api/collections")
+    def collections_get():
+        report = _workspace_report()
+        rows = []
+        for name in sorted(report["collections"]):
+            row = dict(report["collections"][name])
+            row["id"] = name
+            rows.append(row)
+        return {"collections": rows,
+                "last_scan": report.get("last_scan"),
+                "counts": report.get("counts")}
+
     # --- datasets ---------------------------------------------------------
     @app.get("/api/datasets")
     def datasets_list():
         return {"datasets": _all_datasets()}
+
+    @app.get("/api/datasets/{dataset_id}/sources")
+    def dataset_sources(dataset_id: str):
+        directory = _dataset_dir(dataset_id)
+        return {"dataset": dataset_id, "sources": _source_rows(directory)}
 
     @app.post("/api/datasets", status_code=201)
     async def datasets_create(name: str = Form(...), note: str = Form(""),
@@ -1024,10 +1104,7 @@ def create_app():
         return {"ok": True, "deleted": dataset_id}
 
     # --- index jobs -------------------------------------------------------
-    @app.post("/api/datasets/{dataset_id}/index", status_code=202)
-    def datasets_index(dataset_id: str, payload: Optional[dict] = None):
-        directory = _dataset_dir(dataset_id)
-        link_id = (payload or {}).get("link")
+    def _index_link(link_id):
         try:
             link = links.get(link_id) if link_id else links.active("embed")
         except links.LinkConfigError as exc:
@@ -1037,48 +1114,139 @@ def create_app():
         if link.get("role") != "embed" or not link.get("enabled"):
             raise HTTPException(409, "link '%s' is not an enabled embed link"
                                 % (link_id or ""))
-        job = {
-            "id": "job-" + uuid.uuid4().hex[:12],
-            "dataset": dataset_id,
-            "space": links.embed_space_key(link),
-            "status": "running",
-            "progress": 0.0,
-            "message": "queued",
-            "error": None,
-            "created_at": time.time(),
-        }
-        with _JOBS_LOCK:
-            _JOBS[job["id"]] = job
+        return link
+
+    def _start_index_job(directory, dataset_id, link, record, lock):
+        """Run one index build on a worker thread; the record is the truth.
+
+        The lock is already held by the route, so a second request fails fast
+        with 409 instead of queueing behind a thread the user cannot see. The
+        worker only releases it; every state change goes through the record.
+        """
+        jobs_dir = config.ensure().jobs_dir
 
         def work():
-            def progress(frac, message):
-                job["progress"] = max(0.0, min(1.0, float(frac)))
-                job["message"] = str(message)
-
             try:
-                info = ingest.build_index(directory, link, progress=progress)
-                job["progress"] = 1.0
-                job["message"] = "index ready: %d chunks, dimension %d" % (
-                    info.get("n", 0), info.get("dim", 0))
-                job["status"] = "done"
-                reload_store()
-            except Exception as exc:  # noqa: BLE001 - the job reports, never crashes
-                job["status"] = "error"
-                job["error"] = _http_detail(exc)
-                job["message"] = "index failed"
+                ingest.build_index(
+                    directory, link, job=record, lock=lock,
+                    cancel=lambda: ingest.job_cancel_requested(
+                        jobs_dir, record["id"]))
+            except ingest.IndexCancelled as exc:
+                # The builder already wrote state="cancelled" and kept the
+                # previous generation serving.
+                LOG.info("index job %s cancelled: %s", record["id"], exc)
+            except Exception as exc:  # noqa: BLE001 - the record reports, never crashes
+                LOG.warning("index job %s failed: %s", record["id"],
+                            _http_detail(exc))
             finally:
-                job["finished_at"] = time.time()
+                lock.release()
+                reload_store()
 
         threading.Thread(target=work, name="peekseed-index", daemon=True).start()
-        return {"job": job["id"]}
+
+    @app.post("/api/datasets/{dataset_id}/index", status_code=202)
+    def datasets_index(dataset_id: str, payload: Optional[dict] = None):
+        directory = _dataset_dir(dataset_id)
+        link = _index_link((payload or {}).get("link"))
+        jobs_dir = config.ensure().jobs_dir
+        lock = ingest.CollectionLock(jobs_dir, dataset_id)
+        try:
+            lock.acquire()
+        except ingest.CollectionBusy as exc:
+            raise HTTPException(409, str(exc))
+        try:
+            record = ingest.write_job(
+                jobs_dir, contracts.new_job("index", collection=dataset_id))
+        except Exception:
+            lock.release()
+            raise
+        _start_index_job(directory, dataset_id, link, record, lock)
+        return {"job": record["id"], "state": record["state"]}
+
+    @app.get("/api/jobs")
+    def jobs_list(state: str = "", collection: str = "", limit: int = 200):
+        """Every job record on disk, newest first (state=, collection= filters)."""
+        try:
+            limit = min(max(1, int(limit)), 500)
+        except (TypeError, ValueError):
+            limit = 200
+        return {"jobs": ingest.list_jobs(config.ensure().jobs_dir,
+                                         state=state or None,
+                                         collection=collection or None,
+                                         limit=limit)}
 
     @app.get("/api/jobs/{job_id}")
     def jobs_get(job_id: str):
-        with _JOBS_LOCK:
-            job = _JOBS.get(job_id)
-            if job is None:
-                raise HTTPException(404, "no such job")
-            return dict(job)
+        jobs_dir = config.ensure().jobs_dir
+        try:
+            job = ingest.read_job(jobs_dir, job_id)
+        except ingest.IngestError as exc:
+            raise HTTPException(400, str(exc))
+        if job is None:
+            raise HTTPException(404, "no such job")
+        return job
+
+    @app.delete("/api/jobs/{job_id}")
+    def jobs_cancel(job_id: str):
+        """Request cancellation; the builder stops between batches."""
+        jobs_dir = config.ensure().jobs_dir
+        try:
+            job = ingest.read_job(jobs_dir, job_id)
+        except ingest.IngestError as exc:
+            raise HTTPException(400, str(exc))
+        if job is None:
+            raise HTTPException(404, "no such job")
+        try:
+            cancelled = ingest.request_cancel(jobs_dir, job_id)
+        except ingest.IngestError as exc:
+            raise HTTPException(409, str(exc))
+        return {"job": cancelled, "cancelling": True}
+
+    @app.post("/api/jobs/{job_id}/resume", status_code=202)
+    def jobs_resume(job_id: str):
+        """Resume an interrupted/cancelled/failed index job from its checkpoint.
+
+        The build resumes from the generation's committed row range, so a
+        restarted service does not re-embed the corpus. The job id is reused so
+        the history of the work stays one record.
+        """
+        jobs_dir = config.ensure().jobs_dir
+        try:
+            job = ingest.read_job(jobs_dir, job_id)
+        except ingest.IngestError as exc:
+            raise HTTPException(400, str(exc))
+        if job is None:
+            raise HTTPException(404, "no such job")
+        if job["kind"] != "index":
+            raise HTTPException(409, "only index jobs can be resumed")
+        if job["state"] == "running":
+            raise HTTPException(409, "job '%s' is already running" % job["id"])
+        if job["state"] == "succeeded":
+            raise HTTPException(409, "job '%s' already succeeded" % job["id"])
+        collection = job.get("collection") or ""
+        if not collection:
+            raise HTTPException(409, "job '%s' has no collection to resume" % job["id"])
+        directory = _dataset_dir(collection)
+        link = _index_link(None)
+        lock = ingest.CollectionLock(jobs_dir, collection)
+        try:
+            lock.acquire(job_id=job["id"])
+        except ingest.CollectionBusy as exc:
+            raise HTTPException(409, str(exc))
+        try:
+            job.update({
+                "state": "queued",
+                "cancel_requested": False,
+                "error": None,
+                "finished_at": None,
+                "updated_at": contracts.utc_now(),
+            })
+            record = ingest.write_job(jobs_dir, job)
+        except Exception:
+            lock.release()
+            raise
+        _start_index_job(directory, collection, link, record, lock)
+        return {"job": record["id"], "resumed": True, "state": record["state"]}
 
     @app.get("/pdf/{dataset_id}/{filename}")
     def dataset_pdf(dataset_id: str, filename: str):
@@ -1202,11 +1370,15 @@ def create_app():
                 # already pushed by on_stage.
                 put({"result": result})
             except HTTPException as exc:
-                out["error"] = {"error": {"status": exc.status_code,
-                                          "detail": exc.detail}}
+                error = {"type": "error", "status": exc.status_code,
+                         "detail": exc.detail}
+                put(error)
+                out["error"] = error
             except Exception as exc:  # noqa: BLE001
-                out["error"] = {"error": {"status": 500,
-                                          "detail": _http_detail(exc)}}
+                error = {"type": "error", "status": 500,
+                         "detail": _http_detail(exc)}
+                put(error)
+                out["error"] = error
 
         return _ndjson_stream(worker)
 

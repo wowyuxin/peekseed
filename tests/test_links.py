@@ -42,6 +42,24 @@ class LinkStoreTests(unittest.TestCase):
                 with self.assertRaises(links.LinkValidationError, msg=case):
                     links.create(case)
 
+    def test_ssrf_guard_rejects_metadata_link_local_and_bad_schemes(self):
+        """links.validate() itself enforces the SSRF guard (not just the app)."""
+        with temp_data_root():
+            links = self._links()
+            cases = [
+                ("http://169.254.169.254/latest/meta-data", "metadata"),
+                ("http://169.254.1.1/v1", "link-local"),
+                ("http://[fd00:ec2::254]/", "metadata"),
+                ("file:///etc/passwd", "http"),
+                ("http://user:pass@127.0.0.1/v1", "credentials"),
+            ]
+            for url, expected in cases:
+                with self.assertRaises(links.LinkValidationError, msg=url) as raised:
+                    links.create(self._make(base_url=url))
+                self.assertIn(expected, str(raised.exception).lower())
+            # Loopback and RFC1918 stay allowed: local-first model servers.
+            links.create(self._make(label="Loopback", base_url="http://127.0.0.1:9/v1"))
+
     def test_create_mask_and_key_never_returned(self):
         with temp_data_root():
             links = self._links()
