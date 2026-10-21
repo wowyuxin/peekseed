@@ -1,0 +1,78 @@
+name: Feature request
+description: Propose a capability or improvement for peekseed
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        peekseed is deliberately small and local-first. Before proposing a
+        feature, check `README.md` (especially the 0.1.0 vs 0.2.0 scope) and
+        `docs/contracts.md`.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the user need, not just the proposed solution.
+      placeholder: "As a user with ... I want ... so that ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How should peekseed behave? Include API/UI shape if relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Workarounds, simpler options, or existing tools that cover this.
+    validations:
+      required: false
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Which release does this belong to?
+      options:
+        - 0.1.x (fix or documentation)
+        - 0.2.0 (folder scan / OCR / planned scope)
+        - later / undecided
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - ingestion and formats
+        - search, ask or research
+        - model links
+        - workspace and CLI
+        - HTTP API
+        - web UI
+        - packaging and release
+        - documentation
+        - other
+    validations:
+      required: true
+  - type: textarea
+    id: constraints
+    attributes:
+      label: Compatibility and licence constraints
+      description: |
+        Does it need a new dependency? Default dependencies must stay
+        permissively licensed (no AGPL/GPL); copyleft extras must be opt-in.
+        Does it change a documented contract or the workspace schema?
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I have searched existing issues and the documentation.
+          required: true
+        - label: This is a single-user, local-first feature (not a request to expose a multi-user service).
+          required: true

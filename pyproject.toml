@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=68"]
+# PEP 639 support (SPDX license expression + license-files) landed in
+# setuptools 77; keep the floor there so every build understands the metadata.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,13 +9,17 @@ name = "peekseed"
 version = "0.1.0rc1"
 description = "Local-first AI research framework over your own documents"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{name = "peekseed contributors"}]
 keywords = ["rag", "search", "pdf", "agent", "local-first"]
 classifiers = [
   "Programming Language :: Python :: 3",
-  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Operating System :: OS Independent",
 ]
 dependencies = [
@@ -43,4 +49,31 @@ peekseed = "peekseed.__main__:main"
 include = ["peekseed*"]
 
 [tool.setuptools.package-data]
+# The single-file web UI sits beside the Python package and must ship in both
+# the wheel and the sdist; tests/test_packaging.py and CI assert this.
 peekseed = ["web/*"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+# Keep generated/vendored trees and runtime state out of the lint run.
+extend-exclude = ["build", "dist", ".venv", "workspace", ".uv-cache"]
+
+[tool.ruff.lint]
+# Ruff's stable, low-noise defaults: real errors and suspicious code rather
+# than a full style rewrite of the existing codebase.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# Pre-existing, tracked style debt in the 0.1.0 codebase (owned by other
+# workstreams). Each entry names the exact codes already present, so new
+# findings still fail CI. New files must pass unmodified.
+"tests/*" = ["F401", "F841"]
+"peekseed/__main__.py" = ["F401"]
+"peekseed/agent.py" = ["F401", "E741"]
+"peekseed/answer.py" = ["F401"]
+"peekseed/app.py" = ["F401", "F841"]
+"peekseed/extract.py" = ["E731"]
+"peekseed/ingest/index.py" = ["F401", "F822", "F841"]
+"peekseed/links.py" = ["F841", "E741"]
+"peekseed/tools.py" = ["F841"]

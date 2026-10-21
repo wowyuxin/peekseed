@@ -1,0 +1,97 @@
+name: Bug report
+description: Report a defect in peekseed
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve peekseed. Please search existing issues first.
+
+        **Do not report security vulnerabilities here.** Follow `SECURITY.md`
+        instead.
+
+        Remove API keys, tokens, document contents and private paths from
+        everything you paste.
+  - type: input
+    id: version
+    attributes:
+      label: peekseed version
+      description: Output of `peekseed version` (or `python -m peekseed version`).
+      placeholder: "peekseed 0.1.0rc1"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python and OS
+      description: Python version, operating system and architecture.
+      placeholder: "Python 3.12.15 on macOS 15 (arm64)"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How was peekseed installed?
+      options:
+        - pip install peekseed
+        - editable checkout (`pip install -e .`)
+        - sdist/wheel built from source
+        - other (describe below)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands and UI steps. A minimal reproduction is ideal.
+      placeholder: |
+        1. `peekseed init`
+        2. `peekseed serve`
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behaviour
+      description: What happened instead, including error messages or stack traces.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / workspace state
+      description: |
+        Relevant logs plus `peekseed status` and `peekseed doctor` output,
+        with secrets and private paths redacted.
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: |
+        Non-secret `PEEKSEED_*` variables, model-link role/protocol/model
+        (never the API key), extras installed and whether the server was
+        loopback-only.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I have searched the existing issues and docs.
+          required: true
+        - label: I removed API keys, tokens, document contents and private paths.
+          required: true
+        - label: This is not a security vulnerability (those go to SECURITY.md).
+          required: true

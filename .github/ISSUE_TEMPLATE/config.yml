@@ -1,0 +1,11 @@
+# The public repository does not exist yet. When it is published, add
+# `contact_links` here for security reports and discussions, for example:
+#
+# contact_links:
+#   - name: Security report
+#     url: https://github.com/OWNER/peekseed/security/advisories/new
+#     about: Please report vulnerabilities privately; see SECURITY.md.
+#   - name: Usage questions
+#     url: https://github.com/OWNER/peekseed/discussions
+#     about: Ask questions and share workflows here.
+blank_issues_enabled: false
