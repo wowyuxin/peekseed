@@ -118,8 +118,15 @@ class IndexBuildTests(unittest.TestCase):
             self.assertEqual(info["model"], "test-embed")
             self.assertEqual(progress[-1], 1.0)
             space_dir = Path(dataset["dir"]) / "index" / info["space"]
-            self.assertTrue((space_dir / "vectors.npy").is_file())
-            meta = json.loads((space_dir / "meta.json").read_text())
+            generation_dir = space_dir / "generations" / info["generation"]
+            # The generation layout writes CURRENT last; the live generation holds
+            # the files, and the space root only points at it.
+            self.assertTrue((space_dir / "CURRENT").is_file())
+            self.assertEqual((space_dir / "CURRENT").read_text().strip(),
+                             info["generation"])
+            self.assertTrue((generation_dir / "vectors.npy").is_file())
+            self.assertTrue((generation_dir / "probe.npy").is_file())
+            meta = json.loads((generation_dir / "meta.json").read_text())
             self.assertEqual(len(meta), info["n"])
             for key in ("id", "section", "chapter", "numbering", "parent",
                         "path", "page_start", "page_end", "pdf_y", "doc"):

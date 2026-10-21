@@ -1,16 +1,30 @@
-"""Dataset storage and vector-index writing for peekseed.
+"""Dataset storage, generation-atomic vector indexes and job records.
 
 A dataset directory owns the uploaded files, the canonical ``chunks.jsonl`` and
-one compact index per embedding space::
+one index per embedding space::
 
     <dataset>/dataset.json
-    <dataset>/original/...
+    <dataset>/original/...                    uploaded copies served by /pdf
     <dataset>/chunks.jsonl
-    <dataset>/index/<space_key>/{vectors.npy, meta.json, info.json}
+    <dataset>/index/<space_key>/
+        CURRENT                               one line: the live generation uuid
+        generations/<uuid>/
+            vectors.npy  meta.json  info.json  probe.npy  progress.json
 
-The index is deliberately plain numpy: vectors are float32 ``[N, dim]`` in
-row-order with the chunk metadata, so loading needs no vector database and the
-files are atomically replaceable while a process keeps serving.
+The index is deliberately plain numpy: float32 ``[N, dim]`` in row order with the
+chunk metadata, so loading needs no vector database. A build writes into a new
+generation directory and flips ``CURRENT`` with a single atomic rename **last**:
+a crash mid-build leaves the previous generation serving, and the incomplete
+generation keeps a per-batch checkpoint so the next build resumes instead of
+re-embedding the whole corpus. Loading validates the schema, row alignment,
+unique ids and dimension; an invalid index is reported as needing a rebuild
+(:class:`NeedsReindex`) rather than silently skipped.
+
+Every index records the full identity of the embedding space it was built in
+(link id, model, protocol, dimension, normalization, prefixes) plus a stored
+**probe** vector. Re-embedding the fixed probe text at query time and comparing
+cosine proves the live server is still the same embedding space; a mismatch is
+an actionable error instead of a silent comparison of incompatible vectors.
 
 The only network dependency is the configured embed link. Both supported link
 protocols are implemented here -- OpenAI-compatible ``POST {base}/embeddings``
@@ -26,20 +40,28 @@ import hashlib
 import json
 import math
 import os
+import random
 import re
 import shutil
 import tempfile
+import time
 import unicodedata
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import httpx
 import numpy as np
 
+from .. import contracts
 from .chunk import chunk_pages
 from .pdf import IngestError, extract_pdf, page_count
 
 __all__ = [
+    "IndexCancelled",
+    "IndexState",
+    "NeedsReindex",
+    "ProbeMismatch",
     "add_source",
     "build_index",
     "create_dataset",
@@ -49,16 +71,40 @@ __all__ = [
     "embed_query",
     "embed_space_key",
     "embed_texts",
+    "index_state",
+    "load_index",
+    "mark_interrupted_jobs",
+    "probe_cosine",
     "read_chunks",
+    "reindex",
     "sanitize_filename",
+    "verify_probe",
     "write_chunks",
 ]
 
-INFO_SCHEMA = 1
+INFO_SCHEMA = contracts.INFO_SCHEMA
 DEFAULT_BATCH_SIZE = 32
 EMBED_TIMEOUT = 120.0
 MAX_DATASET_ID = 64
 MAX_FILENAME_LENGTH = 120
+
+#: Retry policy for transient embed failures (429/5xx/timeouts/connect errors).
+RETRY_ATTEMPTS = 3
+RETRY_BASE_DELAY = 0.5
+RETRY_MAX_DELAY = 4.0
+
+#: Layout names of one index space.
+CURRENT_FILE = "CURRENT"
+GENERATIONS_DIR = "generations"
+PROGRESS_FILE = "progress.json"
+PROBE_FILE = "probe.npy"
+
+#: The probe gate: a live embedder must reproduce the stored probe this closely.
+PROBE_MIN_COSINE = 0.999
+
+#: Rough throughput used only for cost estimates in ``reindex --dry-run``.
+ESTIMATE_SECONDS_PER_CHUNK = 0.06
+ESTIMATE_SECONDS_PER_REMOTE_BATCH = 1.5
 
 _META_FIELDS = (
     "id",
@@ -75,7 +121,30 @@ _META_FIELDS = (
     "heading_only",
     "source",
 )
+# Provenance fields added by content-derived chunking; copied when present so an
+# older chunks.jsonl keeps loading unchanged.
+_META_PROVENANCE_FIELDS = (
+    "source_sha256",
+    "block_index",
+    "chunk_index",
+    "chunker_version",
+    "ordinal",
+    "block_kind",
+)
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+_HTTP_STATUS = re.compile(r"HTTP (\d{3})")
+
+
+class NeedsReindex(IngestError):
+    """The index on disk is missing, unreadable or internally inconsistent."""
+
+
+class ProbeMismatch(IngestError):
+    """The live embedder does not reproduce the index's stored probe vector."""
+
+
+class IndexCancelled(IngestError):
+    """A cancelled build; the previous generation is still serving."""
 
 
 # --- small utilities -------------------------------------------------------
@@ -93,7 +162,7 @@ def _int(value, default=0):
 
 
 def _now():
-    return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    return contracts.utc_now()
 
 
 def _size(path):
@@ -171,15 +240,16 @@ def _write_lines_atomic(path, lines):
         raise
 
 
-def _save_vectors(path, vectors):
+def _save_npy_atomic(path, array):
+    """Write one ``.npy`` file atomically (temp file + fsync + os.replace)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".vectors.", suffix=".npy"
+        dir=str(path.parent), prefix="." + path.name + ".", suffix=".tmp"
     )
     try:
         with os.fdopen(handle, "wb") as stream:
-            np.save(stream, np.asarray(vectors, dtype=np.float32))
+            np.save(stream, np.asarray(array, dtype=np.float32))
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, 0o644)
@@ -187,6 +257,10 @@ def _save_vectors(path, vectors):
     except BaseException:
         _silent_unlink(temporary)
         raise
+
+
+def _save_vectors(path, vectors):
+    _save_npy_atomic(path, vectors)
 
 
 def _datasets_dir(paths):
@@ -294,7 +368,7 @@ def create_dataset(paths, name, note=""):
     dataset_dir = datasets_dir / dataset_id
     (dataset_dir / "original").mkdir(parents=True, exist_ok=True)
     dataset = {
-        "version": 1,
+        "schema": contracts.DATASET_SCHEMA,
         "id": dataset_id,
         "name": display,
         "created_at": _now(),
@@ -307,11 +381,12 @@ def create_dataset(paths, name, note=""):
     return result
 
 
-def dataset_indexes(dataset_dir):
-    """Return the ``info.json`` dictionaries of every index in a dataset.
+def _index_info_paths(dataset_dir):
+    """``[(space_name, info_path)]`` for every index in a dataset.
 
-    Directories without a readable ``info.json`` are skipped: one damaged index
-    must not hide the healthy ones from the datasets listing.
+    Supports both the historical flat ``index/<space>/info.json`` layout and the
+    generation layout ``index/<space>/CURRENT`` -> ``generations/<uuid>/info.json``.
+    ``CURRENT`` wins when present.
     """
     dataset_dir = Path(dataset_dir)
     index_root = dataset_dir / "index"
@@ -319,16 +394,48 @@ def dataset_indexes(dataset_dir):
         return []
     found = []
     for entry in sorted(index_root.iterdir()):
-        if not entry.is_dir():
+        if not entry.is_dir() or entry.name.startswith("."):
             continue
+        current = entry / CURRENT_FILE
+        candidate = None
+        if current.is_file():
+            try:
+                generation = current.read_text(encoding="utf-8").strip().splitlines()[0]
+            except (OSError, IndexError):
+                generation = ""
+            if generation:
+                candidate = entry / GENERATIONS_DIR / generation.strip() / "info.json"
+            if candidate is None or not candidate.is_file():
+                continue
+        else:
+            candidate = entry / "info.json"
+        if candidate.is_file():
+            found.append((entry.name, candidate))
+    return found
+
+
+def dataset_indexes(dataset_dir):
+    """Return the ``info.json`` dictionaries of every index in a dataset.
+
+    Directories without a readable ``info.json`` are skipped: one damaged index
+    must not hide the healthy ones from the datasets listing.
+    """
+    dataset_dir = Path(dataset_dir)
+    found = []
+    for space, info_path in _index_info_paths(dataset_dir):
         try:
-            info = _read_json(entry / "info.json", None)
+            raw = _read_json(info_path, None)
         except IngestError:
             continue
-        if not isinstance(info, dict):
+        if not isinstance(raw, dict):
             continue
-        info = dict(info)
-        info.setdefault("space", entry.name)
+        try:
+            info = contracts.ensure_current(raw, "info.json")
+        except contracts.ContractError:
+            # A schema-1 index still belongs in the listing; the UI shows it as
+            # needing an index in the active space rather than hiding the dataset.
+            info = dict(raw)
+        info.setdefault("space", space)
         info.setdefault("dataset", dataset_dir.name)
         found.append(info)
     found.sort(key=lambda item: str(item.get("space") or ""))
@@ -452,9 +559,9 @@ def add_source(dataset, source_path):
     (it must carry the dataset directory under ``dir``); a dataset directory path
     is also accepted. The filename is sanitised, an existing different file with
     the same name is never overwritten (a numbered suffix is used instead), and
-    the resulting ``{name, path, bytes, pages}`` entry is appended to
-    ``dataset.json`` ``sources`` and returned. Adding the same file twice is
-    idempotent and returns the existing entry.
+    the resulting ``{name, path, sha256, bytes, pages, extractor, status}`` entry
+    is appended to ``dataset.json`` ``sources`` and returned. Adding the same file
+    twice is idempotent and returns the existing entry.
     """
     dataset_dir_path = _dataset_root(dataset)
     source = Path(source_path)
@@ -482,6 +589,7 @@ def add_source(dataset, source_path):
             ) from None
 
     pages = 0
+    extractor = ""
     if target.suffix.lower() == ".pdf":
         try:
             pages = page_count(target)
@@ -490,22 +598,27 @@ def add_source(dataset, source_path):
     entry = {
         "name": name,
         "path": "original/" + name,
+        "sha256": _file_digest(target),
         "bytes": _size(target),
         "pages": pages,
+        "extractor": extractor,
+        "status": "new",
     }
 
     sources = _source_entries(metadata.get("sources"))
     for index, existing in enumerate(sources):
         if str(existing.get("name") or "") == name:
-            if not existing.get("bytes") or not existing.get("pages"):
-                sources[index] = entry
+            if not existing.get("bytes") or not existing.get("pages") or not existing.get("sha256"):
+                sources[index] = {**dict(existing), **entry}
                 metadata["sources"] = sources
                 _write_json_atomic(dataset_dir_path / "dataset.json", metadata, indent=2)
             if isinstance(dataset, dict):
                 dataset["sources"] = _source_entries(metadata.get("sources"))
             return entry
     sources.append(entry)
+    metadata["schema"] = contracts.DATASET_SCHEMA
     metadata["sources"] = sources
+    metadata.setdefault("updated_at", _now())
     _write_json_atomic(dataset_dir_path / "dataset.json", metadata, indent=2)
     if isinstance(dataset, dict):
         dataset["sources"] = [dict(item) for item in sources]
@@ -544,7 +657,7 @@ def dataset_info(dataset_dir):
     if not sources:
         sources = [path.name for path in _original_files(dataset_dir)]
     return {
-        "version": _int(dataset.get("version"), 1),
+        "version": contracts.DATASET_SCHEMA,
         "id": str(dataset.get("id") or dataset_dir.name),
         "name": str(dataset.get("name") or dataset.get("id") or dataset_dir.name),
         "created_at": str(dataset.get("created_at") or ""),
@@ -595,6 +708,39 @@ def write_chunks(dataset_dir, chunks):
     _write_lines_atomic(Path(dataset_dir) / "chunks.jsonl", lines)
 
 
+def _meta_record(chunk):
+    page_start = _int(chunk.get("page_start"), 0)
+    record = {
+        "id": str(chunk.get("id") or ""),
+        "section": str(chunk.get("section") or ""),
+        "chapter": str(chunk.get("chapter") or ""),
+        "numbering": str(chunk.get("numbering") or ""),
+        "parent": str(chunk.get("parent") or ""),
+        "path": str(chunk.get("path") or ""),
+        "page_start": page_start,
+        "page_end": _int(chunk.get("page_end"), page_start),
+        "pdf_y": _int(chunk.get("pdf_y"), 0),
+        "doc": str(chunk.get("doc") or ""),
+        "text": str(chunk.get("text") or chunk.get("doc") or ""),
+        "heading_only": bool(chunk.get("heading_only")),
+        "source": str(chunk.get("source") or ""),
+    }
+    for field in _META_PROVENANCE_FIELDS:
+        if chunk.get(field) is not None:
+            record[field] = chunk[field]
+    return {field: record[field] for field in _META_FIELDS if field in record} | {
+        field: record[field] for field in _META_PROVENANCE_FIELDS if field in record
+    }
+
+
+def _embedding_text(chunk):
+    text = str(chunk.get("doc") or chunk.get("text") or "").strip()
+    if text:
+        return text
+    fallback = str(chunk.get("section") or chunk.get("id") or "").strip()
+    return fallback or "document"
+
+
 # --- embedding link --------------------------------------------------------
 
 
@@ -614,22 +760,15 @@ def _links_space_key():
 def embed_space_key(link):
     """The ``index/<space_key>`` directory name for one embedding link.
 
-    The rule is owned by :mod:`peekseed.links` and imported from there when that
-    module is available. The local fallback is kept in sync with it so ingestion
-    still works headlessly: sanitized ``"<link_id>__<model>"``, or
-    ``"<link_id>__default"`` when the link has no model string.
+    The rule is owned by :mod:`peekseed.contracts.space_key` (and mirrored by
+    :mod:`peekseed.links`); the local fallback keeps ingestion usable headlessly.
     """
     if not isinstance(link, dict):
         raise IngestError("An embedding link dictionary is required.")
-    ready = _links_space_key()
-    if ready is not None:
-        try:
-            key = ready(link)
-        except Exception:
-            key = None
-        if isinstance(key, str) and key:
-            return key
-    return "%s__%s" % (_space_slug(link.get("id")), _space_slug(link.get("model")))
+    try:
+        return contracts.space_key(link)
+    except contracts.ContractError:
+        return "%s__%s" % (_space_slug(link.get("id")), _space_slug(link.get("model")))
 
 
 def _link_target(link):
@@ -824,46 +963,450 @@ def embed_query(link, text, *, timeout=None):
     return vectors[0]
 
 
-# --- index writing ---------------------------------------------------------
+def _retryable(exc):
+    """True for transient embed failures worth retrying (429/5xx/timeout/connect)."""
+    message = str(exc)
+    match = _HTTP_STATUS.search(message)
+    if match:
+        status = int(match.group(1))
+        return status == 429 or status >= 500
+    return "Could not reach" in message or "timed out" in message.lower()
+
+
+def _embed_with_retry(link, texts, *, batch_size, timeout=None, cancel=None):
+    """Embed one batch, retrying transient failures with backoff and jitter."""
+    attempt = 0
+    while True:
+        try:
+            return embed_texts(link, texts, batch_size=batch_size, timeout=timeout)
+        except IngestError as exc:
+            attempt += 1
+            if cancel is not None and cancel():
+                raise IndexCancelled(
+                    "the index build was cancelled; the previous index is still "
+                    "serving and this build can be resumed"
+                ) from None
+            if not _retryable(exc) or attempt >= RETRY_ATTEMPTS:
+                raise
+            delay = min(RETRY_MAX_DELAY, RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+            delay += random.uniform(0.0, delay * 0.25)
+            time.sleep(delay)
+
+
+# --- index layout ----------------------------------------------------------
+
+
+def _space_dir(dataset_dir, space):
+    return Path(dataset_dir) / "index" / str(space)
+
+
+def _read_current(space_dir):
+    """The live generation name written in ``CURRENT`` (or None if absent)."""
+    current = Path(space_dir) / CURRENT_FILE
+    if not current.is_file():
+        return None
+    try:
+        text = current.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    return text.splitlines()[0].strip() if text else None
+
+
+def _resolve_generation_dir(space_dir):
+    """The directory holding the live generation of an index space.
+
+    ``CURRENT`` names it; a legacy schema-1 space keeps its files directly in the
+    space directory, so it is used when no ``CURRENT`` file exists. A dangling
+    ``CURRENT`` returns ``None`` (the index needs a rebuild).
+    """
+    space_dir = Path(space_dir)
+    generation = _read_current(space_dir)
+    if generation is None:
+        return space_dir if (space_dir / "info.json").is_file() else None
+    candidate = space_dir / GENERATIONS_DIR / generation
+    return candidate if (candidate / "info.json").is_file() else None
+
+
+def _generations_dir(space_dir):
+    return Path(space_dir) / GENERATIONS_DIR
+
+
+def _generation_dirs(space_dir):
+    root = _generations_dir(space_dir)
+    if not root.is_dir():
+        return []
+    return sorted(path for path in root.iterdir() if path.is_dir())
+
+
+def _write_current(space_dir, generation):
+    """Flip an index space to a generation. Always the last write of a build."""
+    _write_text_atomic(Path(space_dir) / CURRENT_FILE, str(generation) + "\n")
+
+
+def _load_info(info_path):
+    raw = contracts.read_json(info_path)
+    if not isinstance(raw, dict):
+        raise NeedsReindex("index metadata is missing or not a JSON object")
+    try:
+        return contracts.ensure_current(raw, "info.json")
+    except contracts.SchemaTooNew as exc:
+        raise NeedsReindex(str(exc)) from None
+    except contracts.ContractError as exc:
+        raise NeedsReindex("index metadata is invalid: %s" % exc) from None
+
+
+def load_index(dataset_dir, space):
+    """Load one index space, validating it before use.
+
+    Returns ``{"info", "vectors", "meta", "dir", "space"}``. Raises
+    :class:`NeedsReindex` with a user-facing reason when the index is missing,
+    points at a missing generation, has unreadable files, or fails validation
+    (schema, row alignment, unique ids, dimension). A broken index must be
+    reported as needing a rebuild, never silently skipped or half-served.
+    """
+    dataset_dir = Path(dataset_dir)
+    space_dir = _space_dir(dataset_dir, space)
+    if not space_dir.is_dir():
+        raise NeedsReindex(
+            "there is no index for space '%s' in dataset '%s'; build it first"
+            % (space, dataset_dir.name)
+        )
+    generation_dir = _resolve_generation_dir(space_dir)
+    if generation_dir is None:
+        raise NeedsReindex(
+            "index space '%s' in dataset '%s' has no usable generation (CURRENT "
+            "is missing or dangling); rebuild the index" % (space, dataset_dir.name)
+        )
+    info = _load_info(generation_dir / "info.json")
+    try:
+        vectors = np.load(str(generation_dir / "vectors.npy"))
+    except Exception as exc:  # corrupt/truncated npy is a rebuild, not a crash
+        raise NeedsReindex(
+            "the index vectors of space '%s' are unreadable (%s); rebuild the index"
+            % (space, type(exc).__name__)
+        ) from None
+    meta = contracts.read_json(generation_dir / "meta.json")
+    if not isinstance(meta, list):
+        raise NeedsReindex("the index metadata rows of space '%s' are not a list" % space)
+    if not isinstance(vectors, np.ndarray) or vectors.ndim != 2:
+        raise NeedsReindex("the index vectors of space '%s' are not a 2-d array" % space)
+    rows, width = int(vectors.shape[0]), int(vectors.shape[1])
+    if rows != len(meta):
+        raise NeedsReindex(
+            "the index of space '%s' has %d vector(s) for %d metadata row(s)"
+            % (space, rows, len(meta))
+        )
+    if rows != int(info.get("n") or 0):
+        raise NeedsReindex(
+            "the index of space '%s' records %s chunk(s) but holds %d"
+            % (space, info.get("n"), rows)
+        )
+    if width != int(info.get("dim") or 0):
+        raise NeedsReindex(
+            "the index of space '%s' records dimension %s but holds %d"
+            % (space, info.get("dim"), width)
+        )
+    ids = {}
+    for position, row in enumerate(meta):
+        if not isinstance(row, dict):
+            raise NeedsReindex("index metadata row %d is not an object" % position)
+        identifier = str(row.get("id") or "")
+        if not identifier:
+            raise NeedsReindex("index metadata row %d has no chunk id" % position)
+        if identifier in ids:
+            raise NeedsReindex(
+                "duplicate chunk id '%s' in the index of space '%s'" % (identifier, space)
+            )
+        ids[identifier] = position
+    return {
+        "info": info,
+        "vectors": vectors,
+        "meta": meta,
+        "dir": str(generation_dir),
+        "space": str(space),
+    }
+
+
+def _dataset_sources_for_digest(dataset_dir):
+    """Current source rows (path+sha256) used to judge whether an index is stale."""
+    dataset_dir = Path(dataset_dir)
+    dataset = _read_dataset_json(dataset_dir)
+    rows = []
+    for entry in _source_entries(dataset.get("sources")):
+        sha = str(entry.get("sha256") or "").lower()
+        if not sha:
+            continue
+        rows.append({
+            "path": str(entry.get("path") or entry.get("name") or ""),
+            "sha256": sha,
+        })
+    return rows
+
+
+def index_state(dataset_dir, space, *, chunker=None, extractor=None):
+    """One space's state: ``indexed``, ``stale``, ``needs_reindex`` or ``not_indexed``.
+
+    ``stale`` means the index is readable but was built from different inputs
+    (source set, chunker version or extractor version changed). ``needs_reindex``
+    means it cannot be served at all. Both carry short human reasons.
+    """
+    dataset_dir = Path(dataset_dir)
+    space_dir = _space_dir(dataset_dir, space)
+    if not space_dir.is_dir():
+        return {"status": "not_indexed", "reasons": ["no index for this space"],
+                "generation": "", "space": str(space)}
+    try:
+        loaded = load_index(dataset_dir, space)
+    except NeedsReindex as exc:
+        return {"status": "needs_reindex", "reasons": [str(exc)],
+                "generation": "", "space": str(space)}
+    info = loaded["info"]
+    reasons = contracts.stale_reasons(
+        info, _dataset_sources_for_digest(dataset_dir),
+        chunker=chunker, extractor=extractor,
+    )
+    if not contracts.has_probe(info):
+        reasons.append("index has no stored embedding probe")
+    status = "stale" if reasons else "indexed"
+    return {
+        "status": status,
+        "reasons": reasons,
+        "generation": str(info.get("generation") or ""),
+        "space": str(space),
+        "n": int(info.get("n") or 0),
+        "dim": int(info.get("dim") or 0),
+    }
+
+
+# --- probe gate -----------------------------------------------------------
+
+
+def _probe_text(link):
+    prefix = str(link.get("doc_prefix") or "") if isinstance(link, dict) else ""
+    return prefix + contracts.PROBE_TEXT
+
+
+def _normalise_vector(vector):
+    array = np.asarray(vector, dtype=np.float32)
+    norm = float(np.linalg.norm(array))
+    if norm > 0:
+        array = array / norm
+    return array
+
+
+def _save_probe(path, vector):
+    _save_npy_atomic(path, _normalise_vector(vector))
+
+
+def _probe_path(generation_dir):
+    return Path(generation_dir) / PROBE_FILE
+
+
+def probe_cosine(link, dataset_dir, space):
+    """Cosine between the stored probe vector and the live embedder's probe output.
+
+    Embeds the fixed probe text through ``link``, normalises both vectors and
+    returns their dot product (1.0 = identical space). Raises
+    :class:`NeedsReindex` when the space has no stored probe and
+    :class:`ProbeMismatch` when the live call fails to produce a vector.
+    """
+    loaded = load_index(dataset_dir, space)
+    probe_file = Path(loaded["dir"]) / PROBE_FILE
+    if not probe_file.is_file():
+        raise NeedsReindex(
+            "the index of space '%s' has no stored probe vector; rebuild the index "
+            "(or run `peekseed migrate`) so a space mismatch can be detected" % space
+        )
+    try:
+        stored = np.load(str(probe_file))
+    except Exception as exc:
+        raise NeedsReindex(
+            "the stored probe vector of space '%s' is unreadable (%s)"
+            % (space, type(exc).__name__)
+        ) from None
+    try:
+        live = embed_query(link, (_probe_text(link)), timeout=None)
+    except IngestError as exc:
+        raise ProbeMismatch(
+            "could not embed the probe text through the active link: %s" % exc
+        ) from None
+    stored_n = _normalise_vector(stored)
+    live_n = _normalise_vector(live)
+    if stored_n.shape != live_n.shape:
+        raise ProbeMismatch(
+            "the live embedder returned dimension %d but the index was built at "
+            "dimension %d; the embedding space changed. Reindex the dataset into "
+            "a new space, or restore the embedder that built it."
+            % (live_n.shape[0], stored_n.shape[0])
+        )
+    return float(np.dot(stored_n, live_n))
+
+
+def verify_probe(link, dataset_dir, space):
+    """Refuse to search a space whose live embedder no longer matches it."""
+    cosine = probe_cosine(link, dataset_dir, space)
+    if cosine < PROBE_MIN_COSINE:
+        raise ProbeMismatch(
+            "the embedder does not match the index's embedding space (probe "
+            "cosine %.3f < %.3f). The model, weights or server changed: use the "
+            "link that built this index, or reindex into a new space."
+            % (cosine, PROBE_MIN_COSINE)
+        )
+    return cosine
+
+
+# --- jobs ------------------------------------------------------------------
+
+
+def _jobs_dir(dataset_dir):
+    """The persisted jobs directory for a dataset (``.peekseed/jobs``)."""
+    try:
+        from .. import config
+
+        return config.paths().jobs_dir
+    except Exception:
+        return Path(dataset_dir).parent.parent / "jobs"
+
+
+def _persist_job(jobs_dir, job):
+    """Write a job record atomically; returns False when the directory is unwritable."""
+    try:
+        data = contracts.validate_job(job)
+        contracts.write_json_atomic(Path(jobs_dir) / (job["id"] + ".json"), data)
+        return True
+    except (OSError, contracts.ContractError):
+        return False
+
+
+def _job_touch(job, jobs_dir, *, state=None, phase=None, done=None, total=None,
+               fraction=None, error=None):
+    """Update a job record and (optionally) its in-memory API counterpart."""
+    if state is not None:
+        job["state"] = state
+    if error is not None:
+        job["error"] = str(error)[:500]
+    if phase is not None:
+        job["progress"]["phase"] = str(phase)
+    if done is not None:
+        job["progress"]["done"] = int(done)
+    if total is not None:
+        job["progress"]["total"] = int(total)
+    if fraction is not None:
+        job["progress"]["fraction"] = float(fraction)
+    job["updated_at"] = _now()
+    if state == "running" and not job.get("started_at"):
+        job["started_at"] = job["updated_at"]
+    if state in ("succeeded", "failed", "cancelled"):
+        job["finished_at"] = job["updated_at"]
+    if jobs_dir is not None:
+        _persist_job(jobs_dir, job)
+
+
+def mark_interrupted_jobs(jobs_dir):
+    """Mark job records that were left ``running`` by a crash as ``interrupted``.
+
+    A process death leaves the record ``running``; treating that as ``failed``
+    would hide that the work can be resumed. Returns the ids that were updated.
+    """
+    jobs_dir = Path(jobs_dir)
+    if not jobs_dir.is_dir():
+        return []
+    interrupted = []
+    for path in sorted(jobs_dir.glob("*.json")):
+        try:
+            raw = contracts.read_json(path)
+            if not isinstance(raw, dict):
+                continue
+            job = contracts.validate_job(raw)
+        except contracts.ContractError:
+            continue
+        if job.get("state") != "running":
+            continue
+        job["state"] = "interrupted"
+        job["updated_at"] = _now()
+        job["finished_at"] = job["updated_at"]
+        try:
+            contracts.write_json_atomic(path, job)
+        except OSError:
+            continue
+        interrupted.append(job["id"])
+    return interrupted
+
+
+# --- source summaries -----------------------------------------------------
+
+
+def _source_file(dataset_dir, entry):
+    """The on-disk file for one source entry, if it can be found."""
+    dataset_dir = Path(dataset_dir)
+    name = str(entry.get("name") or "")
+    raw_path = str(entry.get("path") or "")
+    candidates = []
+    if raw_path:
+        candidates.append(dataset_dir / raw_path)
+    if name:
+        candidates.append(dataset_dir / "original" / name)
+    for candidate in candidates:
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _sources_summary(dataset_dir, dataset):
-    """Provenance rows for ``info.json``: name, page count and byte size."""
-    declared = {}
-    raw = dataset.get("sources") if isinstance(dataset, dict) else None
-    for entry in _source_entries(raw):
+    """Provenance rows for ``info.json``: name, path, sha256, pages and bytes.
+
+    Declared upload order wins over directory order. A hash is computed from the
+    file when ``dataset.json`` predates content hashing; when the file is gone the
+    entry is marked ``missing`` with no hash rather than inventing one.
+    """
+    dataset_dir = Path(dataset_dir)
+    declared = []
+    for entry in _source_entries((dataset or {}).get("sources")):
         name = str(entry.get("name") or "").strip()
         if name:
-            declared[name] = entry
-    files = _original_files(dataset_dir)
-    if not files:
-        return [
-            {
-                "name": name,
-                "pages": _int(meta.get("pages"), 0),
-                "bytes": _int(meta.get("bytes"), 0),
-            }
-            for name, meta in declared.items()
-        ]
-    # Declared order first (upload order), then any file the metadata missed.
-    by_name = {path.name: path for path in files}
-    ordered = []
-    for name, meta in declared.items():
-        path = by_name.pop(name, None)
-        if path is not None:
-            ordered.append((name, path, meta))
-    for name in sorted(by_name):
-        ordered.append((name, by_name[name], {}))
-    summaries = []
-    for name, path, meta in ordered:
-        pages = _int(meta.get("pages"), 0)
-        if pages <= 0 and path.suffix.lower() == ".pdf":
+            declared.append((name, entry))
+    paths = {path.name: path for path in _original_files(dataset_dir)}
+    rows = []
+    for name, entry in declared:
+        sha = str(entry.get("sha256") or "").lower()
+        path = str(entry.get("path") or ("original/" + name))
+        file_path = _source_file(dataset_dir, entry) if not sha else None
+        if not sha and file_path is not None:
+            sha = _file_digest(file_path)
+        pages = _int(entry.get("pages"), 0)
+        if pages <= 0 and file_path is not None and file_path.suffix.lower() == ".pdf":
             try:
-                pages = page_count(path)
+                pages = page_count(file_path)
             except IngestError:
                 pages = 0
-        summaries.append({"name": name, "pages": pages, "bytes": _size(path)})
-    return summaries
+        byte_size = _int(entry.get("bytes"), 0) or (
+            _size(file_path) if file_path is not None else 0
+        )
+        row = {
+            "name": name,
+            "path": path,
+            "sha256": sha,
+            "bytes": byte_size,
+            "pages": pages,
+        }
+        if not sha:
+            row["status"] = "missing"
+        rows.append(row)
+        paths.pop(name, None)
+    # A file the metadata missed (for example a hand-copied dataset).
+    for name in sorted(paths):
+        path = paths[name]
+        rows.append({
+            "name": name,
+            "path": "original/" + name,
+            "sha256": _file_digest(path),
+            "bytes": _size(path),
+            "pages": page_count(path) if path.suffix.lower() == ".pdf" else 0,
+        })
+    return rows
 
 
 def _chunks_from_pdfs(dataset_dir, dataset_id, target_chars, max_chars, notify):
@@ -901,6 +1444,7 @@ def _chunks_from_pdfs(dataset_dir, dataset_id, target_chars, max_chars, notify):
             max_chars=max_chars,
             dataset_id=dataset_id,
             source=path.name,
+            source_sha256=_file_digest(path),
             id_start=next_id,
         )
         chunks.extend(produced)
@@ -909,32 +1453,147 @@ def _chunks_from_pdfs(dataset_dir, dataset_id, target_chars, max_chars, notify):
     return chunks
 
 
-def _meta_record(chunk):
-    page_start = _int(chunk.get("page_start"), 0)
-    record = {
-        "id": str(chunk.get("id") or ""),
-        "section": str(chunk.get("section") or ""),
-        "chapter": str(chunk.get("chapter") or ""),
-        "numbering": str(chunk.get("numbering") or ""),
-        "parent": str(chunk.get("parent") or ""),
-        "path": str(chunk.get("path") or ""),
-        "page_start": page_start,
-        "page_end": _int(chunk.get("page_end"), page_start),
-        "pdf_y": _int(chunk.get("pdf_y"), 0),
-        "doc": str(chunk.get("doc") or ""),
-        "text": str(chunk.get("text") or chunk.get("doc") or ""),
-        "heading_only": bool(chunk.get("heading_only")),
-        "source": str(chunk.get("source") or ""),
+def _extractor_identity(dataset):
+    """The extractor that produced a dataset's chunks, from its provenance labels."""
+    label = str((dataset or {}).get("extractor") or "")
+    if "@" in label and label != "mixed":
+        name, _, version = label.partition("@")
+        return {"name": name, "version": version}
+    labels = set()
+    for entry in _source_entries((dataset or {}).get("sources")):
+        value = str(entry.get("extractor") or "")
+        if value:
+            labels.add(value)
+    labels.discard("mixed")
+    if len(labels) == 1:
+        value = labels.pop()
+        if "@" in value:
+            name, _, version = value.partition("@")
+            return {"name": name, "version": version}
+    return {"name": "", "version": ""}
+
+
+def _documents_digest(sources):
+    try:
+        return contracts.documents_digest(sources)
+    except contracts.ContractError:
+        return ""
+
+
+# --- resumable generations -------------------------------------------------
+
+
+def _find_resumable_generation(space_dir, *, space, digest, chunker, n):
+    """An interrupted generation that can continue from its checkpoint.
+
+    Compatibility is exact: same space, same documents digest, same chunker
+    version, same chunk count, a readable vector memmap of that row count and a
+    stored probe whose dimension matches the memmap width. Anything else starts a
+    fresh generation, because resuming into a changed corpus would write vectors
+    that do not belong to their rows.
+    """
+    for generation_dir in reversed(_generation_dirs(space_dir)):
+        progress = _read_json(generation_dir / PROGRESS_FILE, None)
+        vectors_path = generation_dir / "vectors.npy"
+        probe_file = generation_dir / PROBE_FILE
+        if not isinstance(progress, dict):
+            continue
+        if not vectors_path.is_file() or not probe_file.is_file():
+            continue
+        if str(progress.get("space") or "") != str(space):
+            continue
+        if str(progress.get("documents_digest") or "") != str(digest):
+            continue
+        recorded_chunker = progress.get("chunker") or {}
+        if (recorded_chunker.get("name"), recorded_chunker.get("version")) != (
+            chunker.get("name"), chunker.get("version")
+        ):
+            continue
+        if int(progress.get("n") or -1) != n:
+            continue
+        row = int(progress.get("row") or 0)
+        if row <= 0 or row >= n:
+            continue
+        try:
+            shape = np.load(str(vectors_path), mmap_mode="r").shape
+            probe_dim = int(np.load(str(probe_file)).shape[0])
+        except Exception:
+            continue
+        if len(shape) != 2 or int(shape[0]) != n or int(shape[1]) != probe_dim:
+            continue
+        return generation_dir, row
+    return None, 0
+
+
+def _open_vectors(generation_dir, n, dim):
+    """Open (or preallocate) the generation's row-aligned float32 memmap."""
+    path = Path(generation_dir) / "vectors.npy"
+    if path.is_file():
+        return np.lib.format.open_memmap(
+            str(path), mode="r+", dtype=np.float32, shape=(n, dim)
+        )
+    return np.lib.format.open_memmap(
+        str(path), mode="w+", dtype=np.float32, shape=(n, dim)
+    )
+
+
+def _write_progress(generation_dir, *, space, digest, chunker, n, dim, row):
+    _write_json_atomic(
+        Path(generation_dir) / PROGRESS_FILE,
+        {
+            "space": str(space),
+            "documents_digest": str(digest),
+            "chunker": dict(chunker),
+            "n": int(n),
+            "dim": int(dim),
+            "row": int(row),
+            "updated_at": _now(),
+        },
+    )
+
+
+# --- build -----------------------------------------------------------------
+
+
+def _cancelled(cancel, job):
+    if cancel is not None:
+        try:
+            if cancel():
+                return True
+        except Exception:
+            return False
+    if isinstance(job, dict) and job.get("cancel_requested"):
+        return True
+    return False
+
+
+def _build_info(dataset, dataset_id, space, generation, dim, n, link, sources,
+                chunker, extractor, digest):
+    target = _link_target(link)
+    embedding = contracts.space_identity(link, dim=dim)
+    embedding["probe"] = {
+        "text_sha256": contracts.probe_sha256(),
+        "file": PROBE_FILE,
     }
-    return {field: record[field] for field in _META_FIELDS}
-
-
-def _embedding_text(chunk):
-    text = str(chunk.get("doc") or chunk.get("text") or "").strip()
-    if text:
-        return text
-    fallback = str(chunk.get("section") or chunk.get("id") or "").strip()
-    return fallback or "document"
+    info = {
+        "schema": contracts.INFO_SCHEMA,
+        "dataset": dataset_id,
+        "name": str((dataset or {}).get("name") or dataset_id),
+        "space": str(space),
+        "generation": str(generation),
+        "n": int(n),
+        "dim": int(dim),
+        "link_id": str(link.get("id") or ""),
+        "model": target[2],
+        "protocol": target[0],
+        "created_at": _now(),
+        "embedding": embedding,
+        "chunker": dict(chunker),
+        "extractor": dict(extractor),
+        "documents_digest": str(digest),
+        "sources": sources,
+    }
+    return contracts.validate_info(info)
 
 
 def build_index(
@@ -944,18 +1603,27 @@ def build_index(
     target_chars=1200,
     max_chars=2000,
     progress=None,
-    batch_size=DEFAULT_BATCH_SIZE
+    batch_size=DEFAULT_BATCH_SIZE,
+    job=None,
+    cancel=None,
 ):
     """Build (or rebuild) one dataset's index for one embedding link.
 
     ``chunks.jsonl`` is the canonical input: when it exists it is used as-is;
     otherwise every PDF under ``original/`` is extracted and chunked first and the
-    result is written back. The embed link is then called in batches and the
-    vectors plus row-aligned metadata are written atomically to
-    ``index/<space_key>/``. Rebuilding one space never touches other spaces.
+    result is written back. Then:
 
-    ``progress(frac, message)`` is called with a 0..1 fraction at each stage. The
-    returned dictionary is the ``info.json`` content.
+    * the fixed probe text is embedded and stored (the space-mismatch gate);
+    * every chunk is embedded in batches into a **preallocated** memmap, with a
+      per-batch checkpoint (no ``vstack`` of the whole corpus in memory);
+    * transient failures (429/5xx/timeouts) are retried with backoff and jitter;
+    * the new generation's ``info.json`` is written, and ``CURRENT`` is flipped
+      **last**, so a crash or cancel leaves the previous generation serving;
+    * the job record (``.peekseed/jobs/<id>.json``) tracks the lifecycle.
+
+    ``progress(frac, message)`` is called with a 0..1 fraction at each stage.
+    ``cancel`` is a zero-argument callable checked between batches. Returns the
+    ``info.json`` content.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.is_dir():
@@ -966,28 +1634,6 @@ def build_index(
     space = embed_space_key(link)
     notify = _progress_function(progress)
 
-    notify(0.0, "Preparing dataset")
-    chunks = read_chunks(dataset_dir)
-    if chunks:
-        notify(0.08, "Loaded %d existing chunk(s)" % len(chunks))
-        sources = _sources_summary(dataset_dir, dataset)
-    else:
-        chunks = _chunks_from_pdfs(
-            dataset_dir, dataset_id, target_chars, max_chars, notify
-        )
-        if not chunks:
-            raise IngestError(
-                "No extractable text was found in the dataset's PDF files."
-            )
-        write_chunks(dataset_dir, chunks)
-        # Declared upload order (not directory order) is the provenance order.
-        sources = _sources_summary(dataset_dir, dataset)
-        notify(0.25, "Wrote %d chunk(s)" % len(chunks))
-    if not chunks:
-        raise IngestError("No chunks to index for dataset '%s'." % dataset_id)
-
-    total = len(chunks)
-    texts = [_embedding_text(chunk) for chunk in chunks]
     try:
         batch = int(batch_size)
     except (TypeError, ValueError):
@@ -995,65 +1641,210 @@ def build_index(
     if batch <= 0:
         raise IngestError("batch_size must be positive.")
 
-    notify(0.3, "Embedding %d chunk(s)" % total)
-    parts = []
-    dim = 0
-    for start in range(0, total, batch):
-        subset = texts[start : start + batch]
-        vectors = embed_texts(link, subset, batch_size=len(subset), timeout=None)
-        array = np.asarray(vectors, dtype=np.float32)
-        if (
-            array.ndim != 2
-            or array.shape[0] != len(subset)
-            or array.shape[1] <= 0
-        ):
-            raise IngestError(
-                "The embedding link returned an unusable vector array for %d chunk(s)."
-                % len(subset)
-            )
-        if dim == 0:
-            dim = int(array.shape[1])
-        elif array.shape[1] != dim:
-            raise IngestError(
-                "Embedding dimension changed from %d to %d between batches; check "
-                "the embedding link's model." % (dim, array.shape[1])
-            )
-        parts.append(array)
-        done = min(total, start + len(subset))
-        notify(
-            0.3 + 0.6 * (float(done) / total),
-            "Embedded %d/%d chunk(s)" % (done, total),
-        )
+    jobs_dir = _jobs_dir(dataset_dir)
+    job_record = contracts.new_job(
+        "index",
+        collection=dataset_dir.name,
+        job_id=(job or {}).get("id") if isinstance(job, dict) else None,
+    )
+    _persist_job(jobs_dir, job_record)
+    _job_touch(job_record, jobs_dir, state="running", phase="preparing",
+               done=0, total=0, fraction=0.0, error=None)
+    if isinstance(job, dict):
+        job["status"] = "running"
+        job["message"] = "preparing"
 
-    matrix = np.vstack(parts) if parts else np.zeros((0, dim), dtype=np.float32)
-    if matrix.shape[0] != total:
-        raise IngestError(
-            "The embedding link returned %d vector(s) for %d chunk(s)."
-            % (matrix.shape[0], total)
+    try:
+        notify(0.0, "Preparing dataset")
+        chunks = read_chunks(dataset_dir)
+        if chunks:
+            notify(0.05, "Loaded %d existing chunk(s)" % len(chunks))
+        else:
+            chunks = _chunks_from_pdfs(
+                dataset_dir, dataset_id, target_chars, max_chars, notify
+            )
+            if not chunks:
+                raise IngestError(
+                    "No extractable text was found in the dataset's PDF files."
+                )
+            write_chunks(dataset_dir, chunks)
+            notify(0.15, "Wrote %d chunk(s)" % len(chunks))
+        total = len(chunks)
+        if not total:
+            raise IngestError("No chunks to index for dataset '%s'." % dataset_id)
+
+        sources = _sources_summary(dataset_dir, dataset)
+        digest = _documents_digest(sources)
+        chunker = contracts.chunker_identity(target_chars, max_chars)
+        extractor = _extractor_identity(dataset)
+        texts = [_embedding_text(chunk) for chunk in chunks]
+
+        space_dir = _space_dir(dataset_dir, space)
+        space_dir.mkdir(parents=True, exist_ok=True)
+        generation_dirs = _generation_dirs(space_dir)
+
+        # The probe fixes the dimension before the memmap is preallocated, and
+        # resumes use the already-stored probe so no embed call is wasted.
+        resumable, start_row = (None, 0)
+        if generation_dirs:
+            resumable, start_row = _find_resumable_generation(
+                space_dir, space=space, digest=digest, chunker=chunker, n=total,
+            )
+        generation = uuid.uuid4().hex[:16]
+        generation_dir = space_dir / GENERATIONS_DIR / generation
+        resumed = False
+        if resumable is not None:
+            dim = int(np.load(str(resumable / PROBE_FILE)).shape[0])
+            generation_dir = resumable
+            generation = resumable.name
+            resumed = True
+
+        if not resumed:
+            notify(0.2, "Embedding the probe vector")
+            probe_vector = _normalise_vector(
+                embed_query(link, _probe_text(link), timeout=None)
+            )
+            dim = int(probe_vector.shape[0])
+            generation_dir.mkdir(parents=True, exist_ok=True)
+            _save_probe(generation_dir / PROBE_FILE, probe_vector)
+            _write_progress(generation_dir, space=space, digest=digest,
+                            chunker=chunker, n=total, dim=dim, row=0)
+        else:
+            notify(0.2, "Resuming generation %s at row %d/%d"
+                   % (generation, start_row, total))
+
+        notify(0.25, "Writing %d metadata row(s)" % total)
+        _write_json_atomic(
+            generation_dir / "meta.json",
+            [_meta_record(chunk) for chunk in chunks],
         )
-    info = {
-        "schema": INFO_SCHEMA,
-        "dataset": dataset_id,
-        "name": str(dataset.get("name") or dataset_id),
-        "space": space,
-        "link_id": str(link.get("id") or ""),
-        "model": target[2],
-        "protocol": target[0],
-        "dim": int(dim),
-        "n": int(total),
-        "created_at": _now(),
-        "chunker": {
-            "target_chars": _int(target_chars, 1200),
-            "max_chars": _int(max_chars, 2000),
-            "overlap": 0,
-        },
-        "sources": sources,
+        vectors = _open_vectors(generation_dir, total, dim)
+
+        _job_touch(job_record, jobs_dir, phase="embedding", total=total,
+                   done=start_row, fraction=0.3 + 0.6 * (start_row / max(1, total)))
+        if isinstance(job, dict):
+            job["progress"] = max(0.0, min(1.0, 0.3 + 0.6 * (start_row / max(1, total))))
+            job["message"] = "embedding"
+
+        notify(0.3 + 0.6 * (start_row / max(1, total)),
+               "Embedding %d/%d chunk(s)" % (start_row, total))
+        row = start_row
+        while row < total:
+            if _cancelled(cancel, job):
+                _job_touch(job_record, jobs_dir, state="cancelled", phase="cancelled")
+                raise IndexCancelled(
+                    "the index build was cancelled; the previous index is still "
+                    "serving and this build can be resumed"
+                )
+            subset = texts[row : row + batch]
+            vectors_batch = _embed_with_retry(
+                link, subset, batch_size=len(subset), cancel=cancel
+            )
+            array = np.asarray(vectors_batch, dtype=np.float32)
+            if array.ndim != 2 or array.shape[0] != len(subset) or array.shape[1] != dim:
+                raise IngestError(
+                    "The embedding link returned an unusable vector array for %d "
+                    "chunk(s) (expected dimension %d)." % (len(subset), dim)
+                )
+            norms = np.linalg.norm(array, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            vectors[row : row + len(subset)] = array / norms
+            vectors.flush()
+            row += len(subset)
+            _write_progress(generation_dir, space=space, digest=digest,
+                            chunker=chunker, n=total, dim=dim, row=row)
+            fraction = 0.3 + 0.6 * (row / max(1, total))
+            notify(fraction, "Embedded %d/%d chunk(s)" % (row, total))
+            _job_touch(job_record, jobs_dir, done=row, fraction=fraction)
+            if isinstance(job, dict):
+                job["progress"] = max(0.0, min(1.0, fraction))
+                job["message"] = "embedded %d/%d" % (row, total)
+
+        notify(0.93, "Writing index files")
+        info = _build_info(dataset, dataset_id, space, generation, dim, total,
+                           link, sources, chunker, extractor, digest)
+        _write_json_atomic(generation_dir / "info.json", info, indent=2)
+        # The atomic pointer flip is the commit point: before this line the
+        # previous generation is live, after it the new one is.
+        _write_current(space_dir, generation)
+        _silent_unlink(generation_dir / PROGRESS_FILE)
+        if generation_dir != space_dir and (space_dir / "vectors.npy").exists():
+            # A legacy in-place index is superseded; leave it alone on disk until
+            # `reindex --gc`, but CURRENT now selects the generation.
+            pass
+        _job_touch(job_record, jobs_dir, state="succeeded", phase="done",
+                   done=total, fraction=1.0)
+        if isinstance(job, dict):
+            job["progress"] = 1.0
+            job["message"] = "index ready: %d chunks, dimension %d" % (total, dim)
+        notify(1.0, "Index ready: %d chunk(s), dimension %d" % (total, dim))
+        return info
+    except IndexCancelled:
+        raise
+    except BaseException as exc:
+        _job_touch(job_record, jobs_dir, state="failed", error=str(exc))
+        if isinstance(job, dict):
+            job["error"] = str(exc)[:500]
+        raise
+
+
+# --- reindex / gc ----------------------------------------------------------
+
+
+def reindex(dataset_dir, link, *, dry_run=False, gc=False, progress=None):
+    """Rebuild a dataset's index in the link's embedding space, with a scope estimate.
+
+    ``dry_run`` prints (returns) exactly what would happen and writes nothing. A
+    real run rebuilds the target space generation-atomically and then, with
+    ``gc``, removes every non-``CURRENT`` generation of that space.
+    """
+    dataset_dir = Path(dataset_dir)
+    if not dataset_dir.is_dir():
+        raise IngestError("Dataset directory not found: '%s'." % dataset_dir.name)
+    chunks = read_chunks(dataset_dir)
+    total = len(chunks)
+    target_space = embed_space_key(link)
+    space_dir = _space_dir(dataset_dir, target_space)
+    generations = _generation_dirs(space_dir)
+    current = _read_current(space_dir)
+    batch = DEFAULT_BATCH_SIZE
+    embed_calls = (math.ceil(total / batch) if total else 0) + 1  # + the probe
+    remote = not str(link.get("base_url") or "").startswith(("http://127.0.0.1",
+                                                             "http://localhost",
+                                                             "http://[::1]"))
+    if remote:
+        estimate_seconds = embed_calls * ESTIMATE_SECONDS_PER_REMOTE_BATCH
+    else:
+        estimate_seconds = total * ESTIMATE_SECONDS_PER_CHUNK
+    gc_candidates = [path.name for path in generations
+                     if current is None or path.name != current]
+    report = {
+        "dataset": dataset_dir.name,
+        "chunks": total,
+        "target_space": target_space,
+        "current_space": target_space if current else "",
+        "generations": len(generations),
+        "gc_candidates": gc_candidates,
+        "embed_calls": embed_calls,
+        "estimate_seconds": round(estimate_seconds, 1),
+        "estimate": "%d embed call(s), about %s" % (
+            embed_calls,
+            ("%d min" % max(1, int(estimate_seconds / 60))) if estimate_seconds >= 60
+            else ("%d s" % max(1, int(estimate_seconds)))),
+        "dry_run": bool(dry_run),
     }
-    space_dir = dataset_dir / "index" / space
-    space_dir.mkdir(parents=True, exist_ok=True)
-    notify(0.93, "Writing index files")
-    _save_vectors(space_dir / "vectors.npy", matrix)
-    _write_json_atomic(space_dir / "meta.json", [_meta_record(chunk) for chunk in chunks])
-    _write_json_atomic(space_dir / "info.json", info, indent=2)
-    notify(1.0, "Index ready: %d chunk(s), dimension %d" % (total, dim))
-    return info
+    if dry_run:
+        return report
+
+    info = build_index(dataset_dir, link, progress=progress)
+    report["space"] = info.get("space")
+    report["n"] = info.get("n")
+    if gc:
+        removed = []
+        for generation_dir in _generation_dirs(space_dir):
+            if generation_dir.name == str(info.get("generation") or ""):
+                continue
+            shutil.rmtree(str(generation_dir), ignore_errors=True)
+            removed.append(generation_dir.name)
+        report["gc_removed"] = removed
+    return report

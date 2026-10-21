@@ -37,6 +37,7 @@ __all__ = [
     "DERIVED_DIRNAME",
     "GITIGNORE_ENTRY",
     "Workspace",
+    "dataset_dirs",
     "doctor",
     "guard_gitignore",
     "init",
@@ -427,6 +428,11 @@ def _dataset_dirs(ws):
     )
 
 
+def dataset_dirs(ws):
+    """The collection directories of a workspace, sorted by name (read-only)."""
+    return _dataset_dirs(ws)
+
+
 def _index_dirs(dataset_dir):
     index_root = Path(dataset_dir) / "index"
     if not index_root.is_dir():
@@ -645,25 +651,64 @@ def _dataset_sources(dataset):
     return sources
 
 
+def _extractor_from_label(label):
+    """The extractor identity recorded at dataset level, when it parses."""
+    label = str(label or "")
+    if "@" in label:
+        name, _, version = label.partition("@")
+        return contracts.extractor_identity(name, version)
+    return None
+
+
+def _module_index_state(dataset_dir, space, extractor=None):
+    """The index module's own loader/gate verdict for one index space.
+
+    ``ingest.index.index_state`` runs the same row/alignment/dim/unique-id
+    validation as ``load_index``, so a truncated ``vectors.npy`` is reported as
+    ``needs_reindex`` instead of looking healthy from ``info.json`` alone. The
+    import is lazy and any failure falls back to the metadata-only reader below,
+    so headless/older trees keep working.
+    """
+    try:
+        from .ingest.index import index_state
+    except Exception:
+        return None
+    try:
+        state = index_state(
+            dataset_dir, space, chunker=contracts.chunker_identity(),
+            extractor=extractor,
+        )
+    except Exception:
+        return None
+    return state if isinstance(state, dict) else None
+
+
 def _index_state(dataset_dir, dataset):
-    """One collection's index state: status + reasons (contracts only)."""
+    """One collection's index state: status + reasons.
+
+    The index module's validation is authoritative when available; otherwise
+    this falls back to a metadata-only check (schema/staleness/readability).
+    """
     sources = [
         {"path": str(entry.get("path") or entry.get("name") or ""),
          "sha256": str(entry.get("sha256") or "")}
         for entry in _dataset_sources(dataset)
         if str(entry.get("sha256") or "")
     ]
-    extractor = None
-    label = str(dataset.get("extractor") or "")
-    if "@" in label:
-        name, _, version = label.partition("@")
-        extractor = contracts.extractor_identity(name, version)
+    extractor = _extractor_from_label(dataset.get("extractor"))
     indexes = _index_dirs(dataset_dir)
     if not indexes:
         return "not_indexed", ["no index"]
     statuses = []
     reasons = []
     for space, info_path in index_info_files(dataset_dir):
+        verified = _module_index_state(dataset_dir, space, extractor)
+        if verified is not None:
+            status = str(verified.get("status") or "")
+            if status in ("needs_reindex", "stale", "not_indexed", "indexed"):
+                statuses.append(status)
+                reasons.extend(str(reason) for reason in verified.get("reasons") or [])
+                continue
         data, error = _read_json(info_path)
         if error or data is None:
             statuses.append("needs_reindex")
@@ -707,11 +752,20 @@ def status(explicit=None):
         chunks = _count_lines(dataset_dir / "chunks.jsonl")
         state, reasons = _index_state(dataset_dir, dataset)
         reported = str(dataset.get("status") or "")
-        if reported in contracts.COLLECTION_STATUSES and not error:
+        # The live index verdict (needs_reindex/stale) always wins: a corrupt
+        # generation must never hide behind a stale scan-time status. The
+        # dataset's own status only adds what the index cannot know (source
+        # errors or deleted documents).
+        if state == "indexed" and reported in ("error", "missing", "skipped"):
+            state = reported
+        elif state == "not_indexed" and reported in (
+            "chunked", "error", "missing", "skipped"
+        ):
             state = reported
         collections[dataset_dir.name] = {
             "name": str(dataset.get("name") or dataset_dir.name),
             "status": state,
+            "scan_status": reported if reported in contracts.COLLECTION_STATUSES else None,
             "sources": len(sources),
             "chunks": chunks,
             "indexes": [index_dir.name for index_dir in _index_dirs(dataset_dir)],

@@ -11,6 +11,9 @@ the on-disk index layout; the public functions below are the whole interface.
 
 from .chunk import chunk_pages
 from .index import (
+    IndexCancelled,
+    NeedsReindex,
+    ProbeMismatch,
     add_source,
     build_index,
     create_dataset,
@@ -20,14 +23,23 @@ from .index import (
     embed_query,
     embed_space_key,
     embed_texts,
+    index_state,
+    load_index,
+    mark_interrupted_jobs,
+    probe_cosine,
     read_chunks,
+    reindex,
     sanitize_filename,
+    verify_probe,
     write_chunks,
 )
 from .pdf import IngestError, available, backend_name, extract_pdf, page_count
 
 __all__ = [
+    "IndexCancelled",
     "IngestError",
+    "NeedsReindex",
+    "ProbeMismatch",
     "add_source",
     "available",
     "backend_name",
@@ -41,8 +53,14 @@ __all__ = [
     "embed_space_key",
     "embed_texts",
     "extract_pdf",
+    "index_state",
+    "load_index",
+    "mark_interrupted_jobs",
     "page_count",
+    "probe_cosine",
     "read_chunks",
+    "reindex",
     "sanitize_filename",
+    "verify_probe",
     "write_chunks",
 ]
