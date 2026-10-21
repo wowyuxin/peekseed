@@ -147,13 +147,13 @@ Mutating `/api/*` routes require the token when enabled and reject a hostile
 **before** reading. `/pdf` is served inline and only from the dataset's
 `original/` copies, with traversal and symlink escapes rejected.
 
-## CLI (Lead)
+## CLI
 
 `peekseed init [--workspace PATH]`, `scan [--prune] [--link ID]`, `status`,
 `doctor`, `workspace path|move PATH`, `reindex --all --link ID [--dry-run] [--gc]`,
-`migrate [--dry-run]`, `serve`, `version`, and the legacy `index`.
-CLI wiring lives in `peekseed/__main__.py` (Lead-owned) and calls the module
-functions above; teammates must not edit it.
+`import --manifest FILE [--dry-run]`, `migrate [--dry-run]`, `serve`, `version`,
+and the legacy `index`. CLI wiring lives in `peekseed/__main__.py` and calls the
+module functions above.
 
 ## Module map
 
@@ -165,6 +165,9 @@ functions above; teammates must not edit it.
 | `peekseed/extract.py` | Format extraction and versioned extractor identity (core + optional extras) |
 | `peekseed/ingest/chunk.py` | Heading-aware chunker with content-derived ids |
 | `peekseed/ingest/index.py` | Generation-atomic indexes, probe, jobs, `load_index`/`index_state`/`reindex` |
+| `peekseed/ingest/lock.py` | Per-collection writer lock with stale-holder detection |
+| `peekseed/importer.py` | Versioned corpus manifest import, zero-re-embed copy, Chroma export |
+| `peekseed/overlap.py` | Top-k ranking overlap for the cutover acceptance record |
 | `peekseed/security.py`, `app.py` | Token/Host/Origin gate, streaming upload limits, inline `/pdf` |
 | `peekseed/migrate.py` | Explicit schema migration (dry-run default) |
 | `peekseed/__main__.py` | CLI wiring for all of the above |
@@ -174,7 +177,8 @@ functions above; teammates must not edit it.
 Tests 1–6 and 9–11 are verified end-to-end by `tests/test_acceptance.py`
 (`GateOneTests` … `GateElevenTests`); each module also has its own unit suite
 (`test_workspace`, `test_scan`, `test_extract`, `test_index`, `test_security`,
-`test_contracts`, `test_migrate`, `test_chunk`, `test_engine`, `test_cli`).
+`test_contracts`, `test_migrate`, `test_chunk`, `test_engine`, `test_cli`,
+`test_jobs`, `test_import`, `test_overlap`, `test_packaging`).
 
 1. `init --workspace /tmp/ws` creates the tree + anchored gitignore entry;
    `documents/` hashes/mtimes unchanged after a scan.

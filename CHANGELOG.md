@@ -71,6 +71,18 @@ summarises the complete 0.1.0 surface.
 
 ## Unreleased
 
+### Added
+
+- **Corpus import contract.** `peekseed import --manifest corpus.json` reproduces
+  a workspace from a versioned manifest (schema 1). It is idempotent, uses
+  deterministic dataset ids, copies prebuilt indexes/chunks/vectors unchanged
+  (zero re-embed) or imports a portable Chroma JSONL export, verifies the stored
+  probe against the live embedder (cosine ≥ 0.999 before trusting a copied
+  space), and stages each collection so a failed import leaves the previous data
+  untouched. `--dry-run` prints the plan without writing or embedding. The P4
+  overlap harness lives in `peekseed.overlap` / `scripts/overlap_check.py`. See
+  [docs/import.md](docs/import.md).
+
 ### Planned for 0.2.0
 
 - The `documents/` folder scan workflow (`POST /api/scan`, staleness/diffing,

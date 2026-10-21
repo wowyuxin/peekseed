@@ -243,6 +243,8 @@ when no index exists for the active space.
 - [docs/contracts.md](docs/contracts.md), [docs/architecture.md](docs/architecture.md)
   — module boundaries and the invariants the tests enforce.
 - [docs/security.md](docs/security.md) — threat model and upload limits.
+- [docs/import.md](docs/import.md) — `peekseed import --manifest` (idempotent
+  corpus migration, zero re-embed, probe canary, overlap harness).
 - [docs/release.md](docs/release.md) — version/tag policy and release
   checklist.
 - [CHANGELOG.md](CHANGELOG.md), [CONTRIBUTING.md](CONTRIBUTING.md),

@@ -62,6 +62,7 @@ __all__ = [
     "IndexState",
     "NeedsReindex",
     "ProbeMismatch",
+    "PROBE_MIN_COSINE",
     "active_job_for",
     "add_source",
     "build_index",

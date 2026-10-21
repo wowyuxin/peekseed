@@ -13,6 +13,7 @@ from .chunk import chunk_pages
 from .index import (
     IndexCancelled,
     NeedsReindex,
+    PROBE_MIN_COSINE,
     ProbeMismatch,
     active_job_for,
     add_source,
@@ -51,6 +52,7 @@ __all__ = [
     "IndexCancelled",
     "IngestError",
     "NeedsReindex",
+    "PROBE_MIN_COSINE",
     "ProbeMismatch",
     "active_job_for",
     "add_source",

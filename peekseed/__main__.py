@@ -210,6 +210,37 @@ def cmd_reindex(args):
     return exit_code
 
 
+def cmd_import(args):
+    """Import a corpus described by a versioned manifest (idempotent)."""
+    from . import importer, workspace
+    _apply_workspace_argument(args)
+    try:
+        report = importer.import_corpus(args.manifest, workspace=args.workspace,
+                                        dry_run=args.dry_run)
+    except importer.CorpusImportError as exc:
+        print("import failed: %s" % exc, file=sys.stderr)
+        return 1
+    except (OSError, ValueError) as exc:
+        print("import failed: %s" % exc, file=sys.stderr)
+        return 1
+    if report.get("dry_run"):
+        print("dry run: workspace %s" % report["workspace"]["root"])
+        for row in report["collections"]:
+            suffix = "" if row["documents_exist"] else " (documents missing)"
+            print("  %-20s %-9s -> %s%s"
+                  % (row["id"], row["kind"], row["target"], suffix))
+        return 0
+    print("imported into %s" % report["workspace"]["root"])
+    for row in report["collections"]:
+        if row["status"] == "skipped":
+            print("  %-20s skipped (%s)" % (row["id"], row.get("reason", "")))
+            continue
+        print("  %-20s %-8s %s chunk(s), space %s, probe cosine %.6f"
+              % (row["id"], row["status"], row.get("chunks", 0),
+                 row.get("space"), row.get("probe_cosine", 0.0)))
+    return 0
+
+
 def cmd_migrate(args):
     from . import migrate as migrate_module, workspace
     _apply_workspace_argument(args)
@@ -309,6 +340,14 @@ def build_parser():
     move = actions.add_parser("move", help="move the whole workspace tree")
     move.add_argument("target", help="new workspace directory")
     p.set_defaults(func=cmd_workspace)
+
+    p = sub.add_parser("import", help="import a corpus from a versioned manifest")
+    _add_workspace_argument(p)
+    p.add_argument("--manifest", required=True, metavar="FILE",
+                   help="corpus manifest JSON (schema 1)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="print the plan without writing or embedding")
+    p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("reindex", help="rebuild an index in a new embedding space")
     _add_workspace_argument(p)
