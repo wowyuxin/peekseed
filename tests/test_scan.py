@@ -383,6 +383,27 @@ class FailureIsolationTests(unittest.TestCase):
             self.assertEqual(report["counts"]["errors"], 0)
             self.assertNotEqual(report["collections"]["cxl"]["status"], "error")
 
+    def test_rebuild_reports_the_final_state_not_pre_build_reasons(self):
+        with initialized_workspace() as ws:
+            make_pdf(ws.documents_dir / "cxl" / "a.pdf",
+                     pages=["CXL overview. The CXL protocol is coherent and "
+                            "device-attached."])
+            with FakeModelServer(dim=8) as fake:
+                scan.scan(link=_link(fake))
+                make_pdf(ws.documents_dir / "cxl" / "b.pdf",
+                         pages=["Torque wrench instructions: tighten the bolt "
+                                "to four newton metres."])
+                report = scan.scan(link=_link(fake))
+            collection = report["collections"]["cxl"]
+            self.assertEqual(collection["status"], "indexed")
+            self.assertGreater(collection["embed_calls"], 0)
+            # A successful rebuild replaces stale-index diagnostics: the final
+            # line a CLI prints must describe the rebuilt index only.
+            for reason in collection["reasons"]:
+                self.assertNotIn("source documents changed", reason)
+                self.assertNotIn("inputs changed since the index", reason)
+                self.assertNotIn("no index for this link", reason)
+
     def test_symlink_escape_is_rejected_without_reading(self):
         with initialized_workspace() as ws:
             make_pdf(ws.documents_dir / "cxl" / "good.pdf", pages=["Widget text describes how the widget is mounted on the frame."])

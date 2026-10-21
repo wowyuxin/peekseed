@@ -9,7 +9,9 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -204,6 +206,46 @@ class InitTests(unittest.TestCase):
                 with contextlib.redirect_stdout(io.StringIO()):
                     workspace.init()
                 self.assertEqual(document.read_text(), "user data")
+
+
+class GitignoreTests(unittest.TestCase):
+    def test_default_workspace_uses_the_anchored_plan_entry(self):
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+            with working_directory(tmp):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    report = workspace.init()
+            self.assertEqual(report["gitignore"]["entry"], "/workspace/")
+            self.assertEqual(
+                (Path(tmp) / ".gitignore").read_text().count("/workspace/"), 1)
+
+    @unittest.skipUnless(shutil.which("git"), "git is required for this check")
+    def test_custom_named_workspace_really_is_ignored(self):
+        """A workspace named ``ws`` must be ignored as ``/ws/``, not /workspace/."""
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            subprocess.run(["git", "init", "-q", str(repo)], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with contextlib.redirect_stdout(io.StringIO()):
+                report = workspace.init(str(repo / "ws"))
+            self.assertEqual(report["gitignore"]["entry"], "/ws/")
+            content = (repo / ".gitignore").read_text()
+            self.assertIn("/ws/\n", content)
+            ignored = subprocess.run(
+                ["git", "-C", str(repo), "check-ignore", "-q", "ws"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self.assertEqual(ignored.returncode, 0, "git does not ignore the workspace")
+            doctor = workspace.doctor(str(repo / "ws"))
+            self.assertFalse(
+                any("not in .gitignore" in issue for issue in doctor["issues"]),
+                doctor["issues"],
+            )
+            self.assertEqual(doctor["git"]["entry"], "/ws/")
+            # Re-running init must not append a second entry.
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init(str(repo / "ws"))
+            self.assertEqual((repo / ".gitignore").read_text().count("/ws/"), 1)
 
 
 class DoctorTests(unittest.TestCase):

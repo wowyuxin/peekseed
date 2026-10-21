@@ -254,7 +254,7 @@ def _find_git_root(start):
     return None
 
 
-def _gitignore_has_entry(gitignore, entry=GITIGNORE_ENTRY):
+def _gitignore_has_entry(gitignore, entry):
     try:
         lines = gitignore.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -262,20 +262,45 @@ def _gitignore_has_entry(gitignore, entry=GITIGNORE_ENTRY):
     return any(line.strip() == entry for line in lines)
 
 
+def gitignore_entry(root, base=None):
+    """The anchored ignore pattern that covers ``root`` from ``base``.
+
+    A workspace can live in a directory with any name, so hardcoding
+    ``/workspace/`` would leave ``<repo>/ws`` unignored. The pattern is derived
+    from the workspace's location relative to the checkout (``/ws/`` for
+    ``<repo>/ws``); for the default ``./workspace`` at the repository root it is
+    exactly :data:`GITIGNORE_ENTRY` (``/workspace/``).
+    """
+    root = Path(root).expanduser().resolve()
+    base = Path(base).expanduser().resolve() if base else root.parent
+    try:
+        relative = root.relative_to(base)
+        parts = relative.as_posix()
+    except ValueError:
+        parts = root.name
+    if parts in ("", "."):
+        parts = root.name
+    return "/" + parts.strip("/") + "/"
+
+
 def guard_gitignore(root):
-    """Ensure ``/workspace/`` is ignored in the containing git checkout.
+    """Ensure the workspace is ignored in the containing git checkout.
 
     The checkout is the nearest ancestor of ``root`` with a ``.git``; when
     ``root`` is not inside one the current directory's ``.gitignore`` is used
-    (the CLI is normally run from the project directory). Returns a small
-    report instead of raising: a read-only checkout must not break ``init``.
+    (the CLI is normally run from the project directory). The entry is anchored
+    and derived from the workspace path, so a custom-named workspace is really
+    ignored. Returns a small report instead of raising: a read-only checkout
+    must not break ``init``.
     """
     root = Path(root).expanduser().resolve()
     git_root = _find_git_root(root)
     # A workspace outside any checkout is normally created from the project
     # directory, so the guard is written next to the code the user just cloned.
-    gitignore = (git_root / ".gitignore") if git_root else (Path.cwd() / ".gitignore")
-    present = _gitignore_has_entry(gitignore)
+    base = git_root if git_root else Path.cwd().resolve()
+    gitignore = base / ".gitignore"
+    entry = gitignore_entry(root, base)
+    present = _gitignore_has_entry(gitignore, entry)
     changed = False
     if not present:
         try:
@@ -284,7 +309,7 @@ def guard_gitignore(root):
                 existing += "\n"
             if existing:
                 existing += "\n"
-            text = existing + "# peekseed workspace (documents + derived data)\n" + GITIGNORE_ENTRY + "\n"
+            text = existing + "# peekseed workspace (documents + derived data)\n" + entry + "\n"
             _write_text_atomic(gitignore, text)
             present = True
             changed = True
@@ -293,7 +318,7 @@ def guard_gitignore(root):
     return {
         "git_root": str(git_root) if git_root else None,
         "path": str(gitignore),
-        "entry": GITIGNORE_ENTRY,
+        "entry": entry,
         "present": present,
         "changed": changed,
     }
@@ -386,10 +411,12 @@ def _git_report(root):
             tracked = bool(result.stdout.strip())
         except (OSError, subprocess.SubprocessError):
             tracked = False
+    entry = gitignore_entry(root, git_root)
     if ignored is None:
-        ignored = _gitignore_has_entry(git_root / ".gitignore")
+        ignored = _gitignore_has_entry(git_root / ".gitignore", entry)
     return {
         "root": str(git_root),
+        "entry": entry,
         "ignored": bool(ignored),
         "tracked": bool(tracked),
         "gitignore": str(git_root / ".gitignore"),
@@ -589,7 +616,7 @@ def doctor(explicit=None):
         if not git.get("ignored"):
             issues.append(
                 "the workspace is inside a git checkout but %s is not in "
-                ".gitignore; run `peekseed init`." % GITIGNORE_ENTRY
+                ".gitignore; run `peekseed init`." % git.get("entry")
             )
         if git.get("tracked"):
             issues.append(

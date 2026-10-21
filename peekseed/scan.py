@@ -778,10 +778,13 @@ def _process_collection(
     if chunker_changed or extractor_changed:
         content_changed = True
 
-    dirty, stale_reasons = _index_dirty(
-        dataset_dir, link, entries, content_changed, chunker_changed,
-        extractor_changed,
-    ) if link is not None else (False, [])
+    if link is not None:
+        dirty, stale_reasons = _index_dirty(
+            dataset_dir, link, entries, content_changed, chunker_changed,
+            extractor_changed,
+        )
+    else:
+        dirty, stale_reasons = False, []
     report["reasons"].extend(stale_reasons)
     report["reasons"].extend(reasons)
 
@@ -830,6 +833,9 @@ def _process_collection(
                                     make_dataset("chunked", build_sources))
     index_states, index_reasons = _index_states(dataset_dir)
     report["reasons"].extend(index_reasons)
+    # Reasons that describe the pre-build index are only true if the build does
+    # not happen; a successful rebuild replaces them with the final state.
+    pre_build_reasons = list(dict.fromkeys(stale_reasons + index_reasons))
     if needs_build:
         base, width = index_span
         try:
@@ -843,6 +849,10 @@ def _process_collection(
             embed_calls = int(info.get("n") or 0)
             index_states = ["indexed"]
             status = "error" if has_error else "indexed"
+            report["reasons"] = [
+                reason for reason in report["reasons"]
+                if reason not in pre_build_reasons
+            ]
             if has_error:
                 failures = sum(
                     1 for entry in entries

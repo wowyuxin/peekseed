@@ -41,7 +41,10 @@ def isolated_workspace(tmp):
     """A real project checkout with a workspace inside it, and PEEKSEED_* pinned."""
     project = Path(tmp) / "project"
     project.mkdir()
-    (project / ".git").mkdir()          # a checkout, so the gitignore guard has a home
+    # A real checkout, so the gitignore guard and `git check-ignore` behave as
+    # they do for a user (an empty .git directory makes git exit 128).
+    import subprocess
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
     workspace_root = project / "ws"
     saved = {key: os.environ.pop(key) for key in list(os.environ)
              if key.startswith("PEEKSEED_")}
@@ -112,7 +115,15 @@ class GateOneTests(unittest.TestCase):
             self.assertTrue((derived / "manifest.json").is_file())
             self.assertTrue((derived / "config" / "links.json").is_file())
             gitignore = (project / ".gitignore").read_text(encoding="utf-8")
-            self.assertIn("\n/workspace/\n", "\n" + gitignore.strip() + "\n")
+            # The anchored entry names the actual workspace path: the default
+            # ./workspace gives "/workspace/", any other location gives its own
+            # relative pattern (this fixture uses "ws").
+            self.assertIn("\n/ws/\n", "\n" + gitignore.strip() + "\n")
+            import subprocess
+            ignored = subprocess.run(
+                ["git", "-C", str(project), "check-ignore", "-q", "ws"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.assertEqual(ignored.returncode, 0)
 
             make_pdf(ws / "documents" / "manual.pdf",
                      pages=["The widget is mounted with two screws."])

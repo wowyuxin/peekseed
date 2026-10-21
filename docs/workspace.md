@@ -53,9 +53,10 @@ peekseed scan                               # reconcile documents/ with the mani
 ```
 
 `init` prints every resolved absolute path, writes an empty link store (0600),
-initialises `manifest.json`, and ensures an **anchored** `/workspace/` entry in the
-`.gitignore` of the enclosing git checkout. Anchoring matters: the pattern
-`/workspace/` only matches the workspace at the repository root, so an unrelated
+initialises `manifest.json`, and ensures an **anchored** entry for the workspace
+path in the `.gitignore` of the enclosing git checkout: `/workspace/` for the
+default `./workspace`, or `/ws/` for a custom `--workspace ws`. Anchoring matters:
+the pattern only matches that exact path from the repository root, so an unrelated
 `docs/workspace/` folder is not silently ignored. If the workspace itself is a
 tracked path in a checkout, `doctor` warns and the guard refuses to treat it as
 safe — documents must never be committed to a repository.
