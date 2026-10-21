@@ -155,29 +155,39 @@ Mutating `/api/*` routes require the token when enabled and reject a hostile
 CLI wiring lives in `peekseed/__main__.py` (Lead-owned) and calls the module
 functions above; teammates must not edit it.
 
-## Ownership (write scopes)
+## Module map
 
-| Workstream | Owner | Files |
-|---|---|---|
-| Contracts, CLI, acceptance | Lead | `peekseed/contracts.py`, `peekseed/__main__.py`, `peekseed/ingest/__init__.py`, `tests/test_contracts.py`, `tests/test_acceptance.py`, `tests/test_cli.py`, `docs/*` |
-| W1 + W2 | workspace teammate | `peekseed/workspace.py`, `peekseed/scan.py`, `peekseed/config.py`, `peekseed/ingest/chunk.py`, `tests/test_workspace.py`, `tests/test_scan.py`, `tests/test_chunk.py` |
-| W3 | extract teammate | `peekseed/extract.py`, `tests/test_extract.py` |
-| W5 | index teammate | `peekseed/ingest/index.py`, `tests/test_index.py`, `tests/test_ingest.py` (IndexBuildTests region) |
-| W8 | security teammate | `peekseed/security.py`, `peekseed/app.py`, `tests/test_security.py` |
-
-`tests/test_ingest.py` is shared: the index teammate edits only `IndexBuildTests`
-and `tests/test_index.py` owns new coverage; the workspace teammate edits no
-class there (its chunk additions are additive and keep existing tests green).
+| Module | Responsibility |
+|---|---|
+| `peekseed/contracts.py` | Versioned schemas, content ids, space identity, probe, atomic JSON, upgrades |
+| `peekseed/workspace.py`, `config.py` | Workspace resolution, `init`/`doctor`/`status`/`move`, derived-root paths |
+| `peekseed/scan.py` | Manifest diff by sha256, extraction cache, chunk rebuild, dirty-collection builds |
+| `peekseed/extract.py` | Format extraction and versioned extractor identity (core + optional extras) |
+| `peekseed/ingest/chunk.py` | Heading-aware chunker with content-derived ids |
+| `peekseed/ingest/index.py` | Generation-atomic indexes, probe, jobs, `load_index`/`index_state`/`reindex` |
+| `peekseed/security.py`, `app.py` | Token/Host/Origin gate, streaming upload limits, inline `/pdf` |
+| `peekseed/migrate.py` | Explicit schema migration (dry-run default) |
+| `peekseed/__main__.py` | CLI wiring for all of the above |
 
 ## Acceptance (audit §6.10)
 
-1. `init --workspace /tmp/ws` creates the tree + anchored `/workspace/` gitignore
-   entry; `documents/` mtimes/hashes unchanged after a scan.
+Tests 1–6 and 9–11 are verified end-to-end by `tests/test_acceptance.py`
+(`GateOneTests` … `GateElevenTests`); each module also has its own unit suite
+(`test_workspace`, `test_scan`, `test_extract`, `test_index`, `test_security`,
+`test_contracts`, `test_migrate`, `test_chunk`, `test_engine`, `test_cli`).
+
+1. `init --workspace /tmp/ws` creates the tree + anchored gitignore entry;
+   `documents/` hashes/mtimes unchanged after a scan.
 2. Drop PDF A → scan → indexed; scan again → `0 new, 0 changed`, **0** embed calls.
-3. Add PDF B to an indexed collection → scan → B searchable.
-4. Kill mid-build → previous index still serves; restart → interrupted job state.
-5. Corrupt `vectors.npy` → `needs_reindex`, not silently vanished.
+3. Add PDF B to an indexed collection → scan → B searchable, A's ids unchanged.
+4. Cancel/kill mid-build → previous index still serves; restart resumes the
+   incomplete generation; crash-left jobs are `interrupted`, not `failed`.
+5. Corrupt `vectors.npy` → collection `needs_reindex` with a reason.
 6. Change chunker version → collection `stale`; `reindex --dry-run` prints scope.
 9. Zip-slip/symlink escape and `/pdf` traversal rejected; `/pdf` is `inline`.
 10. Hostile `Origin`/`Host` on mutating routes rejected; token required when set.
-11. 10 GB upload rejected without RAM growth; file-count/total limits enforced.
+11. A 10 GB upload is rejected without RAM growth; file-count/total limits hold.
+
+Not yet wired (next workstreams, not 0.1.0 gates 1–6/9–11): probe check at query
+time returning 409 (W6), persisted job API (`GET/DELETE /api/jobs`, cancel/resume
+buttons — W7), SSRF validation inside `links.py`, and the UI workspace panel.
