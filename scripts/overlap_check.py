@@ -11,9 +11,12 @@ Both services must answer a JSON search endpoint with this request shape::
     POST <base><path>  {"dataset": "...", "query": "...", "topk": 10}
     -> {"results": [{"id": "...", ...}, ...]}
 
-Adjust ``--path``/``--id-key`` for a service that differs (for example a baseline
-whose result rows carry ``chunk`` instead of ``id``). API keys, if needed, are
-read from ``--token`` and sent as a bearer header; the token is never printed.
+A baseline may use a different body key. For example smart-search expects
+``corpus`` instead of ``dataset``: use ``--baseline-body-field corpus`` and
+``--baseline-dataset CXL_3p1_extracted``. ``--dataset`` remains a fallback for
+both sides. Adjust ``--path``/``--id-key`` too when the result rows differ (for
+example the shared ``section`` field). API keys are read from ``--token`` (both
+services) or ``--baseline-token`` and sent as bearer headers; never printed.
 
 Usage::
 
@@ -47,7 +50,7 @@ def load_queries(path):
     return value
 
 
-def provider(base, path, dataset, topk, token):
+def provider(base, path, dataset, topk, token, body_field="dataset"):
     url = base.rstrip("/") + path
 
     def search(query):
@@ -56,8 +59,8 @@ def provider(base, path, dataset, topk, token):
             headers["Authorization"] = "Bearer " + token
         body = {"query": query, "topk": topk}
         if dataset:
-            body["dataset"] = dataset
-        with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=120.0)) as client:
+            body[body_field] = dataset
+        with httpx.Client(timeout=httpx.Timeout(120.0, connect=5.0)) as client:
             response = client.post(url, json=body, headers=headers)
         response.raise_for_status()
         data = response.json()
@@ -74,11 +77,23 @@ def main(argv=None):
     parser.add_argument("--baseline", required=True, help="baseline base URL")
     parser.add_argument("--candidate", required=True, help="candidate base URL")
     parser.add_argument("--queries", required=True, help="JSON list or line-delimited queries")
-    parser.add_argument("--dataset", default="", help="dataset id (optional)")
+    parser.add_argument("--dataset", default="",
+                        help="dataset id for both services (optional fallback)")
+    parser.add_argument("--baseline-dataset", default=None,
+                        help="baseline dataset/corpus id (defaults to --dataset)")
+    parser.add_argument("--candidate-dataset", default=None,
+                        help="candidate dataset id (defaults to --dataset)")
+    parser.add_argument("--baseline-body-field", default="dataset",
+                        help="baseline request body key for its dataset/corpus")
+    parser.add_argument("--candidate-body-field", default="dataset",
+                        help="candidate request body key for its dataset")
     parser.add_argument("--path", default="/api/search", help="search path on both services")
     parser.add_argument("--id-key", default="id", help="result row field to compare")
     parser.add_argument("--topk", type=int, default=10)
-    parser.add_argument("--token", default="", help="bearer token for both services (never printed)")
+    parser.add_argument("--token", default="",
+                        help="bearer token for both services (never printed)")
+    parser.add_argument("--baseline-token", default="",
+                        help="baseline bearer token, overriding --token")
     parser.add_argument("--min-overlap", type=float, default=0.0,
                         help="exit 1 when mean overlap is below this fraction")
     parser.add_argument("--out", default="", help="write the JSON report here")
@@ -87,15 +102,27 @@ def main(argv=None):
     queries = load_queries(args.queries)
     if not queries:
         raise SystemExit("no queries")
+    baseline_dataset = args.baseline_dataset if args.baseline_dataset is not None else args.dataset
+    candidate_dataset = args.candidate_dataset if args.candidate_dataset is not None else args.dataset
+    baseline_token = args.baseline_token or args.token
     report = overlap.compare(
         queries,
-        provider(args.baseline, args.path, args.dataset, args.topk, args.token),
-        provider(args.candidate, args.path, args.dataset, args.topk, args.token),
+        provider(args.baseline, args.path, baseline_dataset, args.topk,
+                 baseline_token, args.baseline_body_field),
+        provider(args.candidate, args.path, candidate_dataset, args.topk,
+                 args.token, args.candidate_body_field),
         key=args.id_key, topk=args.topk,
     )
     report["baseline"] = args.baseline.rstrip("/") + args.path
     report["candidate"] = args.candidate.rstrip("/") + args.path
-    report["dataset"] = args.dataset
+    report["dataset"] = {
+        "baseline": baseline_dataset,
+        "candidate": candidate_dataset,
+    }
+    report["body_fields"] = {
+        "baseline": args.baseline_body_field,
+        "candidate": args.candidate_body_field,
+    }
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     for row in report["queries"]:
