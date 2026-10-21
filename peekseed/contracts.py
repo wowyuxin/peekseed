@@ -83,6 +83,8 @@ __all__ = [
     "new_manifest",
     "probe_sha256",
     "read_json",
+    "sha256_bytes",
+    "sha256_file",
     "space_identity",
     "space_key",
     "stale_reasons",
@@ -310,9 +312,31 @@ def extractor_label(extractor):
     return "%s@%s" % (name, version or "unknown")
 
 
+def sha256_bytes(data):
+    """The hex sha256 of a byte string (used for probe text and small payloads)."""
+    return hashlib.sha256(bytes(data)).hexdigest()
+
+
+def sha256_file(path):
+    """The hex sha256 of a file's content, read in 1 MiB blocks.
+
+    Content is identity for ingestion: a moved or renamed file is the same
+    document, while a modified file is a new one. Reading in blocks keeps a
+    10 GB file from being held in memory.
+    """
+    digest = hashlib.sha256()
+    with open(str(path), "rb") as handle:
+        while True:
+            block = handle.read(1 << 20)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def probe_sha256():
     """The sha256 of the fixed probe text (stored in ``info.json``)."""
-    return hashlib.sha256(PROBE_TEXT.encode("utf-8")).hexdigest()
+    return sha256_bytes(PROBE_TEXT.encode("utf-8"))
 
 
 def has_probe(info):
