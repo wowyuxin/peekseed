@@ -4136,6 +4136,10 @@ async function saveTokenForm(ev){
       tokenMsg('That token did not match the service.',true);
     }else{
       storeToken(value);
+      const pageMsg=$('#msg');
+      if(pageMsg && pageMsg.textContent.indexOf('This service needs a token')===0){
+        pageMsg.textContent='';
+      }
       tokenMsg('Token saved for this browser.',false);
     }
   }catch(e){
