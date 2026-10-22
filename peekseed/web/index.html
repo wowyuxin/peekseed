@@ -1552,6 +1552,26 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
     </div>
     <p class="settings-msg" id="settingsMsg" role="status" aria-live="polite"></p>
     <div class="hist-body settings-body">
+      <section class="settings-group" id="settingsTokenGroup">
+        <h3 class="settings-group-h">Service token (PEEKSEED_TOKEN)</h3>
+        <p class="note">This is the local service access token, generated in
+        <span class="mono">deploy/env/peekseed.env</span> — <b>not</b> a model-provider API key.
+        It is required for search, ask, uploads and link changes. Paste it once; it is kept only
+        in this browser. You can also open the page as <span class="mono">/#token=…</span> to
+        store it in one step.</p>
+        <form id="tokenForm" class="settings-form" autocomplete="off" novalidate>
+          <div class="settings-grid">
+            <label class="set-field set-wide"><span>PEEKSEED_TOKEN value</span>
+              <input id="tokenInput" type="password" autocomplete="new-password"
+                     placeholder="paste the PEEKSEED_TOKEN value (not a model API key)"></label>
+          </div>
+          <div class="settings-actions">
+            <button id="tokenSave" type="submit">Save token</button>
+            <button id="tokenClear" class="secondary" type="button">Clear stored token</button>
+          </div>
+        </form>
+        <p class="settings-msg" id="tokenMsg" role="status" aria-live="polite"></p>
+      </section>
       <div class="settings-links" id="settingsLinks"><span class="hist-empty">Loading links…</span></div>
       <form id="settingsForm" class="settings-form" autocomplete="off" novalidate>
         <h3 id="settingsFormTitle">Add a model link</h3>
@@ -1594,6 +1614,42 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 
 <script>
 const $=(s)=>document.querySelector(s);
+
+/* ---- service token -------------------------------------------------------
+   The server gates mutating /api/* requests with PEEKSEED_TOKEN. The UI has no
+   server session, so the shared token is kept in this browser and attached to
+   every non-GET /api request. Provision it by opening the page with #token=…
+   (the fragment never reaches the server) or by pasting it in Settings. */
+const TOKEN_KEY='peekseedToken';
+function readToken(){ try{ return localStorage.getItem(TOKEN_KEY)||''; }catch(e){ return ''; } }
+function storeToken(value){
+  try{ if(value) localStorage.setItem(TOKEN_KEY,value); else localStorage.removeItem(TOKEN_KEY); }catch(e){}
+}
+function hasToken(){ return !!readToken(); }
+try{
+  const m=(location.hash||'').match(/^#token=(.+)$/);
+  if(m){ storeToken(decodeURIComponent(m[1])); history.replaceState(null,'',location.pathname+location.search); }
+}catch(e){}
+const nativeFetch=window.fetch.bind(window);
+window.fetch=function(input,init){
+  const url=typeof input==='string'?input:(input&&input.url)||'';
+  const method=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
+  if(url.indexOf('/api/')===0&&method!=='GET'&&method!=='HEAD'){
+    const token=readToken();
+    if(token){
+      init=init?Object.assign({},init):{};
+      const headers=new Headers(init.headers||(input&&input.headers)||{});
+      if(!headers.has('Authorization')) headers.set('Authorization','Bearer '+token);
+      init.headers=headers;
+    }
+  }
+  return nativeFetch(input,init);
+};
+function streamFailure(status){
+  if(status===401) return 'stream failed (401) — this service requires a token. '
+    +'Open Settings → Service token and save it, or reload with #token=…';
+  return 'stream failed ('+status+')';
+}
 
 /* ---- tiny helpers -------------------------------------------------------- */
 function esc(s){
@@ -2157,7 +2213,7 @@ async function doSearch(){
     if(!r.ok || !r.body){
       // Only transport-level failures reach here: every search error is reported
       // as an {"error":…} line inside the stream.
-      error={status:r.status, detail:'stream failed ('+r.status+')'};
+      error={status:r.status, detail:streamFailure(r.status)};
     } else {
       const reader=r.body.getReader(); const dec=new TextDecoder(); let buf='';
       const NL=String.fromCharCode(10);
@@ -3261,7 +3317,7 @@ async function askNow(questionOverride){
       headers:{'Content-Type':'application/json'},signal:ac.signal,
       body:JSON.stringify(bodyOut)});
     if(!r.ok||!r.body){
-      error={detail:'stream failed ('+r.status+')'};
+      error={detail:streamFailure(r.status)};
     } else {
       const reader=r.body.getReader(); const dec=new TextDecoder(); let buf='';
       const NL=String.fromCharCode(10);
@@ -4052,11 +4108,69 @@ async function settingsAction(linkId,act){
     settingsMsg('Could not '+act+' "'+(link.label||linkId)+'": '+(e.message||e),true);
   }
 }
+function tokenMsg(text,isError){
+  const el=$('#tokenMsg'); if(!el) return;
+  el.innerHTML=isError?('<span class="err">'+esc(text)+'</span>'):esc(text||'');
+  el.classList.toggle('is-error',!!isError);
+}
+function paintTokenState(){
+  const input=$('#tokenInput'), clear=$('#tokenClear');
+  if(!input) return;
+  input.value='';
+  input.placeholder=hasToken()
+    ? 'a token is stored — paste a new one to replace it'
+    : 'paste the service token';
+  if(clear) clear.disabled=!hasToken();
+}
+async function saveTokenForm(ev){
+  ev.preventDefault();
+  const input=$('#tokenInput');
+  const value=input?input.value.trim():'';
+  if(!value){ tokenMsg('Paste the service token first.',true); return; }
+  const btn=$('#tokenSave'); if(btn) btn.disabled=true;
+  try{
+    // A POST with an empty body reaches auth before validation: 401 means the
+    // token is wrong, anything else means auth accepted it (422 is the body).
+    const r=await nativeFetch('/api/search',{method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+value},
+      body:'{}'});
+    if(r.status===401){
+      tokenMsg('That token did not match the service.',true);
+    }else{
+      storeToken(value);
+      const pageMsg=$('#msg');
+      if(pageMsg && pageMsg.textContent.indexOf('This service needs a token')===0){
+        pageMsg.textContent='';
+      }
+      tokenMsg('Token saved for this browser.',false);
+    }
+  }catch(e){
+    tokenMsg('Could not verify the token: '+(e.message||e),true);
+  }finally{
+    if(btn) btn.disabled=false;
+    paintTokenState();
+  }
+}
+function clearToken(){
+  storeToken('');
+  tokenMsg('Stored token cleared; reads still work, but mutations need a token.',false);
+  paintTokenState();
+}
+function maybeTokenNotice(){
+  if(hasToken()) return;
+  const msg=$('#msg');
+  if(msg && !msg.textContent.trim()){
+    msg.innerHTML='<span class="err">This service needs a token for search, ask and uploads. '
+      +'Open Settings → Service token to add it, or reload with '
+      +'<span class="mono">#token=…</span>.</span>';
+  }
+}
 function openSettings(){
   const m=$('#settingsModal'); if(!m) return;
   m.hidden=false;
   try{ history.replaceState(null,'','#links'); }catch(e){}
   settingsMsg('');
+  paintTokenState();
   setSyncFields();
   loadSettings();
   setTimeout(()=>{ const c=$('#settingsClose'); if(c) c.focus(); },30);
@@ -4085,7 +4199,10 @@ $('#setCancel').onclick=()=>{
   setResetForm();
   settingsMsg(was?'Edit cancelled — the form is blank.':'Form cleared.');
 };
+$('#tokenForm').addEventListener('submit',saveTokenForm);
+$('#tokenClear').onclick=clearToken;
 setResetForm();
+setTimeout(maybeTokenNotice,0);
 
 /* ---- datasets dialog ------------------------------------------------------
    Datasets are uploaded here and indexed here: POST /api/datasets stages the
