@@ -9,7 +9,7 @@ point it at the embedding and chat endpoints you already run or subscribe to.
 Documents and indexes stay on your machine unless a configured model endpoint
 receives text you send it deliberately.
 
-> **Status: 0.1.0rc1 (release candidate).** The 0.1.0 API, workspace layout and
+> **Status: 0.1.0rc2 (release candidate).** The 0.1.0 API, workspace layout and
 > data schemas are frozen for the release; folder scanning and OCR are 0.2.0
 > features. See [CHANGELOG.md](CHANGELOG.md) and [docs/release.md](docs/release.md).
 

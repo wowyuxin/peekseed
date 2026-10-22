@@ -6,6 +6,36 @@ All notable changes to peekseed are recorded here. The format follows
 published as `0.1.0rcN`; see [docs/release.md](docs/release.md) for the
 version/tag policy.
 
+## 0.1.0rc2 - 2026-10-21
+
+Second release candidate: deployment-validated fixes on top of rc1. Still
+pre-publish; validated from a pinned clone (see docs/release.md).
+
+### Added
+
+- **Browser service-token provisioning.** When the server requires
+  `PEEKSEED_TOKEN`, the UI previously had no way to send it, so search, ask,
+  uploads and link changes failed with `401` behind a trusted proxy. Settings
+  now has a **Service token** field (kept only in this browser), the page
+  accepts `#token=…` on first load, and every non-GET `/api/*` request carries
+  the Bearer header; a `401` explains how to provision the token.
+
+### Fixed
+
+- **Overlap acceptance harness.** `scripts/overlap_check.py` can now send a
+  different body key per side (`--baseline-body-field`, `--candidate-body-field`)
+  and a separate baseline dataset and token (`--baseline-dataset`,
+  `--baseline-token`), keeping `--dataset`/`--token` as fallbacks for both
+  sides; it also builds a valid `httpx.Timeout`. This makes the P4 top-k
+  overlap record reproducible against a baseline whose search endpoint names
+  its collection `corpus` instead of `dataset`.
+
+### Changed
+
+- Deployment-only wording was generalized (the UI token help and the overlap
+  harness example), so the published tree carries no deployment paths or
+  internal corpus ids.
+
 ## 0.1.0rc1 - 2026-10-21
 
 First release candidate of the 0.1.0 line. Not yet published to PyPI; the
