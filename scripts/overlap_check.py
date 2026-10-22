@@ -13,7 +13,7 @@ Both services must answer a JSON search endpoint with this request shape::
 
 A baseline may use a different body key. For example smart-search expects
 ``corpus`` instead of ``dataset``: use ``--baseline-body-field corpus`` and
-``--baseline-dataset CXL_3p1_extracted``. ``--dataset`` remains a fallback for
+``--baseline-dataset cxl``. ``--dataset`` remains a fallback for
 both sides. Adjust ``--path``/``--id-key`` too when the result rows differ (for
 example the shared ``section`` field). API keys are read from ``--token`` (both
 services) or ``--baseline-token`` and sent as bearer headers; never printed.
