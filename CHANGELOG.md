@@ -6,6 +6,27 @@ All notable changes to peekseed are recorded here. The format follows
 published as `0.1.0rcN`; see [docs/release.md](docs/release.md) for the
 version/tag policy.
 
+## 0.1.0rc3 - 2026-10-22
+
+Third release candidate: opt-in local model process control.
+
+### Added
+
+- **Local model control.** A deployment that runs its embedder/reranker as
+  local processes can now start and stop them from a panel through peekseed
+  itself: `GET /api/control-status` returns each stage's health and whether the
+  active link is locally controllable, and `POST /api/links/{id}/start|stop`
+  runs the stage's configured serve script. The machine-local config lives in
+  `config/local_models.json` (0600, never committed) and is entirely optional:
+  without it nothing changes and no command can run. Only absolute, executable
+  scripts named in that file are ever invoked (never through a shell), the
+  health URL must be loopback, and the link's loopback port must match, so a
+  remote link cannot be handed a local command. Both the config file and
+the serve script must be owned by the service user and must not be
+writable by group or others; the config is opened with `O_NOFOLLOW`,
+re-checked with `fstat`, and the script is re-validated immediately before
+every execution.
+
 ## 0.1.0rc2 - 2026-10-21
 
 Second release candidate: deployment-validated fixes on top of rc1. Still

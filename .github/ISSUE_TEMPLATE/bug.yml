@@ -18,7 +18,7 @@ body:
     attributes:
       label: peekseed version
       description: Output of `peekseed version` (or `python -m peekseed version`).
-      placeholder: "peekseed 0.1.0rc2"
+      placeholder: "peekseed 0.1.0rc3"
     validations:
       required: true
   - type: input
