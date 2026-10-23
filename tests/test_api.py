@@ -3,6 +3,7 @@ import json
 import os
 import time
 import unittest
+from pathlib import Path
 
 from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
 
@@ -350,6 +351,242 @@ class ProbeQueryGateTests(unittest.TestCase):
             self.assertEqual(bad.status_code, 409, bad.text)
             self.assertIn("no stored probe", bad.json()["detail"])
 
+
+class LocalModelControlErrorsTests(unittest.TestCase):
+    """Failure mapping and auth for the local model control endpoints."""
+
+    def setUp(self):
+        import tempfile
+
+        from peekseed import localmodels
+
+        self._saved = os.environ.get("PEEKSEED_LOCAL_MODELS_FILE")
+        self._saved_token = os.environ.get("PEEKSEED_TOKEN")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        script = Path(self._tmp.name) / "serve.sh"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        self.script = script
+        localmodels.reset_cache()
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PEEKSEED_LOCAL_MODELS_FILE", None)
+        else:
+            os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = self._saved
+        if self._saved_token is None:
+            os.environ.pop("PEEKSEED_TOKEN", None)
+        else:
+            os.environ["PEEKSEED_TOKEN"] = self._saved_token
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from peekseed import app as app_module
+        app_module.reset_state()
+        return TestClient(app_module.create_app())
+
+    def _write_config(self, stage):
+        path = Path(self._tmp.name) / "local_models.json"
+        path.write_text(json.dumps({"version": 1, "stages": {"embed": stage}}))
+        path.chmod(0o600)
+        return path
+
+    def _link(self, client):
+        response = client.post("/api/links", json={
+            "role": "embed", "label": "Panel embed", "protocol": "custom",
+            "base_url": "http://127.0.0.1:9", "model": "fake-model",
+            "enabled": True})
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["link"]
+
+    def test_malformed_config_degrades_the_poll_instead_of_500(self):
+        path = self._write_config({"script": "relative.sh",
+                                   "health_url": "http://127.0.0.1:9/health"})
+        os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = str(path)
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._link(client)
+            data = client.get("/api/control-status")
+            self.assertEqual(data.status_code, 200, data.text)
+            stage = data.json()["stages"]["embed"]
+            self.assertEqual(stage["link_id"], link["id"])
+            self.assertFalse(stage["capabilities"]["start_stop"])
+            self.assertIn("absolute path", stage["detail"])
+            # The mutating call still fails loudly: it cannot run anything.
+            started = client.post("/api/links/%s/start" % link["id"])
+            self.assertEqual(started.status_code, 500, started.text)
+
+    def test_script_failure_maps_to_502(self):
+        from unittest import mock
+
+        path = self._write_config({"script": str(self.script),
+                                   "health_url": "http://127.0.0.1:9/health",
+                                   "models": [{"id": "fake-model",
+                                               "label": "Fake"}]})
+        os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = str(path)
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._link(client)
+            from peekseed import localmodels
+            with mock.patch.object(
+                    localmodels, "start",
+                    side_effect=localmodels.StartError(
+                        "the embed script failed (exit 1): boom")):
+                response = client.post("/api/links/%s/start" % link["id"])
+            self.assertEqual(response.status_code, 502, response.text)
+            self.assertIn("boom", response.json()["detail"])
+
+    def test_mutating_control_needs_the_service_token(self):
+        from unittest import mock
+
+        path = self._write_config({"script": str(self.script),
+                                   "health_url": "http://127.0.0.1:9/health",
+                                   "models": [{"id": "fake-model",
+                                               "label": "Fake"}]})
+        os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = str(path)
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._link(client)          # created before the token is on
+            os.environ["PEEKSEED_TOKEN"] = "sekrit"
+            anonymous = client.post("/api/links/%s/start" % link["id"])
+            self.assertEqual(anonymous.status_code, 401, anonymous.text)
+            from peekseed import localmodels
+            with mock.patch.object(
+                    localmodels, "start",
+                    return_value={"running": True, "model": "fake-model",
+                                  "label": "Fake", "detail": ""}):
+                allowed = client.post(
+                    "/api/links/%s/start" % link["id"],
+                    headers={"Authorization": "Bearer sekrit"})
+            self.assertEqual(allowed.status_code, 200, allowed.text)
+            self.assertTrue(allowed.json()["running"])
+
+
+
+class LocalModelControlTests(unittest.TestCase):
+    """The panel-facing local model control API (GET control-status, start/stop)."""
+
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from peekseed import app as app_module
+        app_module.reset_state()
+        return TestClient(app_module.create_app())
+
+    def _add_link(self, client, **overrides):
+        payload = {"role": "embed", "label": "Fake embed", "protocol": "openai",
+                   "base_url": "http://127.0.0.1:9/v1", "model": "test-embed",
+                   "enabled": True}
+        payload.update(overrides)
+        response = client.post("/api/links", json=payload)
+        self.assertEqual(response.status_code, 201, response.text)
+        return response.json()["link"]
+
+    def setUp(self):
+        import tempfile
+
+        from peekseed import localmodels
+
+        self._saved = os.environ.get("PEEKSEED_LOCAL_MODELS_FILE")
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        script = Path(self._tmp.name) / "serve.sh"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        self.cfg = Path(self._tmp.name) / "local_models.json"
+        self.cfg.write_text(json.dumps({
+            "version": 1,
+            "stages": {"embed": {
+                "label": "Fake embedder",
+                "script": str(script),
+                "port_env": "PORT",
+                "health_url": "http://127.0.0.1:9/health",
+                "models": [{"id": "fake-model", "label": "Fake 2B"}],
+            }},
+        }))
+        self.cfg.chmod(0o600)
+        os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = str(self.cfg)
+        localmodels.reset_cache()
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PEEKSEED_LOCAL_MODELS_FILE", None)
+        else:
+            os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = self._saved
+
+    def _embed_link(self, client, base_url="http://127.0.0.1:9"):
+        return self._add_link(client, label="Panel embed", protocol="custom",
+                              base_url=base_url, model="fake-model")
+
+    def test_control_status_reports_local_capabilities(self):
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._embed_link(client)
+            data = client.get("/api/control-status").json()
+            stage = data["stages"]["embed"]
+            self.assertEqual(stage["link_id"], link["id"])
+            self.assertTrue(stage["capabilities"]["start_stop"])
+            self.assertEqual(stage["capabilities"]["models"], ["fake-model"])
+            self.assertFalse(stage["running"])
+            self.assertEqual(data["models"],
+                             [{"model": "fake-model", "label": "Fake 2B"}])
+            # The rerank stage has no link here: a readout, not an error.
+            self.assertEqual(data["stages"]["rerank"]["link_id"], "")
+            self.assertFalse(data["stages"]["rerank"]["capabilities"]["start_stop"])
+
+    def test_control_status_without_config_is_a_supported_state(self):
+        os.environ["PEEKSEED_LOCAL_MODELS_FILE"] = str(
+            Path(self._tmp.name) / "does-not-exist.json")
+        with temp_data_root() as root:
+            client = self._client()
+            self._embed_link(client)
+            data = client.get("/api/control-status").json()
+            self.assertFalse(data["stages"]["embed"]["capabilities"]["start_stop"])
+
+    def test_start_and_stop_delegate_to_the_local_process(self):
+        from unittest import mock
+
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._embed_link(client)
+            with mock.patch("peekseed.localmodels.start",
+                            return_value={"running": True, "model": "fake-model",
+                                          "label": "Fake embedder",
+                                          "detail": ""}) as start:
+                response = client.post("/api/links/%s/start" % link["id"],
+                                       json={"model": "fake-model"})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertTrue(response.json()["running"])
+                self.assertEqual(response.json()["link_id"], link["id"])
+                start.assert_called_once()
+            with mock.patch("peekseed.localmodels.stop",
+                            return_value={"running": False}) as stop:
+                response = client.post("/api/links/%s/stop" % link["id"])
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertFalse(response.json()["running"])
+                stop.assert_called_once()
+
+    def test_unknown_model_is_rejected_before_anything_runs(self):
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._embed_link(client)
+            response = client.post("/api/links/%s/start" % link["id"],
+                                   json={"model": "not-configured"})
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("unknown embedding model", response.json()["detail"])
+
+    def test_remote_link_cannot_be_started(self):
+        with temp_data_root() as root:
+            client = self._client()
+            link = self._embed_link(client, base_url="http://192.0.2.1:9")
+            response = client.post("/api/links/%s/start" % link["id"])
+            self.assertEqual(response.status_code, 400, response.text)
+            self.assertIn("not a local process", response.json()["detail"])
+
+    def test_missing_link_is_404(self):
+        with temp_data_root() as root:
+            client = self._client()
+            self.assertEqual(client.post("/api/links/nope/start").status_code, 404)
 
 if __name__ == "__main__":
     unittest.main()

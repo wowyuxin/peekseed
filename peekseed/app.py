@@ -38,7 +38,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from . import (__version__, answer as answer_mod, config, contracts, ingest,
-               links, prompts, security, workspace)
+               links, localmodels, prompts, security, workspace)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -161,6 +161,7 @@ def reset_state():
         _HISTORY = None
     config.reset_cache()
     links.reset_cache()
+    localmodels.reset_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -1354,6 +1355,134 @@ def create_app():
         except links.LinkConfigError as exc:
             _link_config_500(exc)
         return {"links": _links_status(), "checked_at": time.time()}
+
+    # --- local model control (optional, machine-local) -------------------
+    def _local_models_500(exc):
+        raise HTTPException(500, "the local model config is not readable: %s"
+                                 % exc)
+
+    @app.get("/api/control-status")
+    def control_status():
+        """One poll for a local control panel: stages, models, links, answer.
+
+        This is a READ: it probes each configured stage link's health URL and
+        reports whether the link is locally controllable, so a panel can render
+        Start/Stop honestly. A missing local_models.json is a normal "no local
+        models on this machine" state. A config that exists but cannot be
+        trusted is reported ON THE STAGES (start_stop false, detail explains)
+        instead of failing the whole poll: the panel must stay usable.
+        """
+        try:
+            raw_links = links.links()
+            default_answer = links.default_answer_link()
+        except links.LinkConfigError as exc:
+            _link_config_500(exc)
+
+        local_error = ""
+        try:
+            localmodels.load()
+        except localmodels.LocalModelsError as exc:
+            local_error = str(exc)
+        try:
+            local_models = localmodels.models()
+        except localmodels.LocalModelsError:
+            local_models = []
+
+        stages = {}
+        for role in links.STAGE_ROLES:
+            link = links.active(role)
+            if link is None:
+                # A stage link that exists but is not enabled is still worth
+                # controlling: the panel may start the process before the user
+                # enables the link. Prefer the first locally controllable one.
+                if not local_error:
+                    try:
+                        link = next(
+                            (candidate for candidate in links.links(role)
+                             if localmodels.local_stage(candidate)), None)
+                    except localmodels.LocalModelsError as exc:
+                        local_error = str(exc)
+            if link is None:
+                stages[role] = {
+                    "running": False, "model": "", "label": "",
+                    "detail": local_error or "no %s link configured" % role,
+                    "link_id": "", "base_url": "", "enabled": False,
+                    "capabilities": {"start_stop": False, "models": []},
+                }
+                continue
+            if local_error:
+                stages[role] = {
+                    "running": False, "model": "",
+                    "label": link.get("label") or "",
+                    "detail": local_error,
+                    "link_id": link["id"],
+                    "base_url": link.get("base_url") or "",
+                    "enabled": bool(link.get("enabled")),
+                    "capabilities": {"start_stop": False, "models": []},
+                }
+                continue
+            try:
+                entry = localmodels.status(link)
+                caps = localmodels.capabilities(link)
+            except localmodels.LocalModelsError as exc:
+                entry = {"running": False, "model": "", "label": "",
+                         "detail": str(exc)}
+                caps = {"start_stop": False, "models": []}
+            entry["link_id"] = link["id"]
+            entry["base_url"] = link.get("base_url") or ""
+            entry["enabled"] = bool(link.get("enabled"))
+            entry["capabilities"] = caps
+            stages[role] = entry
+
+        return {
+            "service": {"ok": True},
+            "models": local_models,
+            "stages": stages,
+            "links": [links.mask(item) for item in raw_links],
+            "answer": {"configured": default_answer is not None,
+                       "default_provider": (default_answer or {}).get("id")},
+        }
+
+    @app.post("/api/links/{link_id}/start")
+    def links_start(link_id: str, payload: Optional[dict] = None):
+        """Start one local link's process (the embed stage takes a model)."""
+        try:
+            link = links.get(link_id)
+        except links.LinkConfigError as exc:
+            _link_config_500(exc)
+        if link is None:
+            raise HTTPException(404, "no link with id '%s'" % link_id)
+        model = (payload or {}).get("model")
+        if model is not None and not isinstance(model, str):
+            raise HTTPException(400, "model must be a string")
+        try:
+            out = localmodels.start(link, model=model)
+        except localmodels.NotLocalError as exc:
+            raise HTTPException(400, str(exc))
+        except localmodels.StartError as exc:
+            raise HTTPException(502, str(exc))
+        except localmodels.LocalModelsError as exc:
+            _local_models_500(exc)
+        out["link_id"] = link_id
+        return out
+
+    @app.post("/api/links/{link_id}/stop")
+    def links_stop(link_id: str, payload: Optional[dict] = None):
+        """Stop one local link's process."""
+        try:
+            link = links.get(link_id)
+        except links.LinkConfigError as exc:
+            _link_config_500(exc)
+        if link is None:
+            raise HTTPException(404, "no link with id '%s'" % link_id)
+        try:
+            return localmodels.stop(link)
+        except localmodels.NotLocalError as exc:
+            raise HTTPException(400, str(exc))
+        except localmodels.StartError as exc:
+            raise HTTPException(502, str(exc))
+        except localmodels.LocalModelsError as exc:
+            _local_models_500(exc)
 
     # --- search -----------------------------------------------------------
     @app.post("/api/search")

@@ -10,11 +10,11 @@ endpoints the user configured.
                      |
                      v
    +----------------- app.py (FastAPI) -----------------+
-   |  search | ask | agent | datasets | links | history |
+   |  search | ask | agent | datasets | links | localmodels | history |
    +----+---------+---------+----------+---------+------+
         |         |         |          |         |
         v         v         v          v         v
-    engine.py  answer.py  agent.py   ingest/    links.py
+    engine.py  answer.py  agent.py   ingest/    links.py   localmodels.py
         |         |         |          |         |
         +---------+---------+----------+---------+----> httpx --> user models
                                 |
@@ -33,6 +33,7 @@ endpoints the user configured.
 | `extract.py` | Format extraction (PDF, Markdown, HTML, TXT, EPUB, `.eml`; optional extras) with a versioned extractor identity. |
 | `config.py` | Resolve the workspace-derived root and every path under it; settings; bind host/port. |
 | `links.py` | Model-link config store: schema, validation, masking, atomic 0600 write. |
+| `localmodels.py` | Optional machine-local control of local model processes: config, probes, start/stop. |
 | `engine.py` | Pure retrieval: tokenizer, BM25, cosine, reciprocal-rank fusion, optional rerank hook, `DatasetIndex`/`IndexStore`. |
 | `answer.py` | OpenAI-compatible streaming chat client and generic grounded-answer prompt builders. |
 | `prompts.py` | Generic prompt strings used by the answer and research paths. |

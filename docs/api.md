@@ -58,6 +58,9 @@ are not listed.
 | POST | `/api/links/{id}/use` | Enable/disable a link |
 | POST | `/api/links/{id}/test` | Probe a link's endpoint |
 | GET | `/api/links/status` | Reachability of every link |
+| GET | `/api/control-status` | Panel poll: local stages, models, links |
+| POST | `/api/links/{id}/start` | Start a local link's process |
+| POST | `/api/links/{id}/stop` | Stop a local link's process |
 | POST | `/api/search` | Search one dataset |
 | POST | `/api/search/stream` | Search, streaming stage events |
 | GET | `/api/ask-status` | Answer-model status and limits |
@@ -252,6 +255,29 @@ never echoed.
 
 `{"links": {"<id>": {"ok"| "reachable", "detail", …}}, "checked_at": <epoch>}`.
 Best-effort; a failed probe is data, not an error.
+
+### `GET /api/control-status`
+
+One poll for a local control panel:
+`{"service", "models": [{"model", "label"}], "stages": {"embed": {...},
+"rerank": {...}}, "links": [...], "answer": {"configured", "default_provider"}}`.
+Each stage entry is `{running, model, label, detail, link_id, base_url, enabled,
+capabilities: {"start_stop", "models"}}`. `start_stop` is true only when
+`config/local_models.json` configures that role and the link points at the same
+`capabilities: {"start_stop", "models"}}`. `start_stop` is true only when
+`config/local_models.json` configures that role and the link points at the same
+loopback port; a missing config file is the supported "no local models" state.
+A config file that cannot be trusted does NOT fail this poll: the stage entries
+carry `start_stop: false` and the reason in `detail`.
+
+### `POST /api/links/{id}/start` / `POST /api/links/{id}/stop`
+
+Start or stop the local process behind one link. The link must be locally
+controllable (see [local-models.md](local-models.md)); otherwise the call is
+`400`. The body may name `{"model": "<id>"}` for the embed stage; start returns
+the same running/model/label shape as a control-status stage entry. A script
+failure is `502` with the script's last output line. Both are mutating `/api/*`
+requests, so they need the service token when `PEEKSEED_TOKEN` is set.
 
 ## Search
 
