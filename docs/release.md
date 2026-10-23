@@ -137,16 +137,44 @@ Copy this into the release PR or tracking issue and tick each item.
 - [ ] Final release only: signed tag `vX.Y.Z` created at publish, verified with
       `git verify-tag`, pointing at the deployed/built commit.
 - [ ] PyPI upload after TestPyPI; artifacts' hashes recorded/reproducible.
+- [ ] SBOM (CycloneDX JSON) generated and attached next to `SHA256SUMS`.
+- [ ] PEP 740 attestations visible on PyPI; the TestPyPI install smoke passed.
+- [ ] GitHub Release published from the matching CHANGELOG section.
 - [ ] Published tag is never moved; `CHANGELOG.md` and release notes published.
 - [ ] Post-release: `main` remains green; next `rcN+1`/patch plan documented if
       anything was yanked.
 
-## Notes for this pre-publish repository
+## Release workflow (`.github/workflows/release.yml`)
 
-- There is currently no git remote and nothing has been pushed, tagged or
-  published. The policy above applies as soon as a public repository exists;
-  until then, "pre-publish" builds are local-only and must not be uploaded
-  anywhere outside TestPyPI.
+A final `vX.Y.Z` tag (one without `rc`) triggers the release workflow:
+
+1. **build** (read-only) — checks out the tag, builds sdist+wheel from that
+   exact commit, runs `scripts/verify_release.py`, writes `SHA256SUMS`,
+   generates a CycloneDX JSON SBOM from the installed wheel environment and
+   uploads the `release-dist` artifact.
+2. **publish-testpypi** — `environment: testpypi` (manual approval), Trusted
+   Publishing to TestPyPI. Install from TestPyPI in a clean venv and run the
+   post-publish smoke before approving the next environment.
+3. **publish-pypi** — `environment: pypi` (manual approval), Trusted Publishing
+   to PyPI with PEP 740 attestations (on by default; do not disable them).
+4. **github-release** — creates the GitHub Release from the tag using the
+   matching CHANGELOG section, attaching the distributions, `SHA256SUMS` and the
+   CycloneDX SBOM.
+
+No repository secrets or long-lived tokens are involved: publishing and
+attestations use OIDC through trusted publishers configured on TestPyPI and PyPI
+(`owner`/`repository`/`workflow`/`environment`). `rc` tags are skipped by every
+job, so pre-release tags stay private and unpublished.
+
+## This repository's release setup
+
+- True source and public repository: `https://github.com/wowyuxin/peekseed`.
+  While pre-publish, the private iCloud bare mirror is the transport; the GitHub
+  remote is added at publication.
+- Deployment pinning happens before publication: the Mac mini installs a wheel
+  built from a pinned clone at the deployed commit (`deploy/upgrade.sh`), so the
+  final `0.1.0` tag points at a commit that has already been deployed and
+  smoke-tested.
 - `scripts/serve.sh` is a local operator helper, not part of the release
   artifact contract beyond shipping in the sdist.
 - Packaging metadata is PEP 639: `license = "MIT"`, `license-files =

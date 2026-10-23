@@ -43,13 +43,12 @@ pymupdf = ["pymupdf>=1.24"]
 test = ["pytest>=8.0"]
 
 [project.urls]
-# The public GitHub repository is created at publish time. These are the
-# planned canonical URLs (GitHub org `peekseed`, repo `peekseed`); update here
-# if the final name changes before the 0.1.0 release.
-Homepage = "https://github.com/peekseed/peekseed"
-Repository = "https://github.com/peekseed/peekseed"
-Issues = "https://github.com/peekseed/peekseed/issues"
-Changelog = "https://github.com/peekseed/peekseed/blob/main/CHANGELOG.md"
+# The public repository is the maintainer's personal GitHub account; these
+# URLs must match the repository that publishes the package (see release.md).
+Homepage = "https://github.com/wowyuxin/peekseed"
+Repository = "https://github.com/wowyuxin/peekseed"
+Issues = "https://github.com/wowyuxin/peekseed/issues"
+Changelog = "https://github.com/wowyuxin/peekseed/blob/main/CHANGELOG.md"
 
 [project.scripts]
 peekseed = "peekseed.__main__:main"

@@ -116,6 +116,8 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(urls[key].startswith("https://github.com/"),
                             "%s must be an https GitHub URL" % key)
         self.assertEqual(urls["Homepage"], urls["Repository"])
+        self.assertTrue(urls["Homepage"].endswith("/peekseed"),
+                        "the public repository must be <owner>/peekseed")
 
     def test_ci_workflow_exists_and_covers_supported_python(self):
         workflow = ROOT / ".github" / "workflows" / "ci.yml"

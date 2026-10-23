@@ -1,0 +1,138 @@
+name: Release
+
+# Only final release tags publish. rc tags (`vX.Y.ZrcN`) match the `v*` filter
+# but every job carries an `if` that skips anything containing "rc", so
+# pre-release tags stay private and unpublished.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Default to read-only; publishing jobs request only `id-token: write` (OIDC
+# Trusted Publishing) and the GitHub Release job requests `contents: write`.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHONUNBUFFERED: "1"
+  RELEASE_VERSION: ${{ github.ref_name }}
+
+jobs:
+  build:
+    name: build sdist, wheel and SBOM
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install build wheel "setuptools>=77"
+      - name: Build sdist and wheel
+        run: python -m build
+      - name: Verify release artifacts
+        run: python scripts/verify_release.py dist/ --expected-version "${RELEASE_VERSION#v}"
+      - name: Write and verify checksums
+        run: |
+          cd dist
+          sha256sum *.whl *.tar.gz > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Create the SBOM environment
+        run: |
+          python -m venv "$RUNNER_TEMP/sbom-venv"
+          "$RUNNER_TEMP/sbom-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/sbom-venv/bin/python" -m pip install dist/*.whl
+      - name: Generate SBOM (CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: ${{ runner.temp }}/sbom-venv
+          format: cyclonedx-json
+          output-file: dist/peekseed-${{ github.ref_name }}.cdx.json
+          upload-artifact: false
+      - name: Assert the SBOM exists
+        run: test -s "dist/peekseed-${{ github.ref_name }}.cdx.json"
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-testpypi:
+    name: publish to TestPyPI
+    needs: build
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/peekseed
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      # Trusted Publishing + PEP 740 attestations (on by default). The
+      # `testpypi` environment approval is the manual gate: install from
+      # TestPyPI in a clean venv and run the post-publish smoke before
+      # approving the PyPI environment.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: dist/
+
+  publish-pypi:
+    name: publish to PyPI
+    needs: publish-testpypi
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/peekseed
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/
+
+  github-release:
+    name: create GitHub release
+    needs: publish-pypi
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - name: Extract release notes from CHANGELOG
+        run: python scripts/changelog_section.py "${RELEASE_VERSION}" > "$RUNNER_TEMP/release-notes.md"
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ runner.temp }}/release-notes.md
+          fail_on_unmatched_files: true
+          files: |
+            dist/SHA256SUMS
+            dist/*.cdx.json
+            dist/*.whl
+            dist/*.tar.gz
