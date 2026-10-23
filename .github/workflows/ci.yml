@@ -116,6 +116,9 @@ jobs:
           required = [
               "peekseed/web/index.html",
               "docs/api.md",
+              "docs/install.md",
+              "docs/deploy.md",
+              "docs/local-models.md",
               "docs/release.md",
               "docs/security.md",
               "tests/test_packaging.py",

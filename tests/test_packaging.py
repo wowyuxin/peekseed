@@ -99,6 +99,24 @@ class PackagingTests(unittest.TestCase):
                          "THIRD-PARTY-NOTICES.md", ".env.example"):
             self.assertIn("include " + filename, text)
 
+    def test_public_install_docs_exist_and_are_linked(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        for name in ("docs/install.md", "docs/deploy.md",
+                     "docs/local-models.md"):
+            path = ROOT / name
+            self.assertTrue(path.is_file(), name)
+            self.assertIn("](%s)" % name, readme,
+                          "README must link %s" % name)
+
+    def test_project_urls_point_at_the_public_repo(self):
+        urls = self.project.get("urls")
+        self.assertIsNotNone(urls, "[project.urls] is missing")
+        for key in ("Homepage", "Repository", "Issues", "Changelog"):
+            self.assertIn(key, urls)
+            self.assertTrue(urls[key].startswith("https://github.com/"),
+                            "%s must be an https GitHub URL" % key)
+        self.assertEqual(urls["Homepage"], urls["Repository"])
+
     def test_ci_workflow_exists_and_covers_supported_python(self):
         workflow = ROOT / ".github" / "workflows" / "ci.yml"
         self.assertTrue(workflow.is_file(), workflow)

@@ -43,7 +43,8 @@ Not defended (out of scope for a single-user local tool):
 | `PEEKSEED_TOKEN` | Shared secret required on mutating `/api/*` requests | unset = auth off |
 | `PEEKSEED_ALLOWED_HOSTS` | Comma-separated `host[:port]` allowlist for `Host`/`Origin` | unset = Host check off |
 | `PEEKSEED_HOST` | Bind host; always accepted for mutating requests | `127.0.0.1` |
-| `PEEKSEED_DATA` | Derived data root (created 0700) | `./data` |
+| `PEEKSEED_WORKSPACE` | Workspace root: `documents/` plus derived `.peekseed/` | `./workspace` |
+| `PEEKSEED_DATA` | Override for the derived data root only (created 0700) | `<workspace>/.peekseed` |
 
 With **both** `PEEKSEED_TOKEN` and `PEEKSEED_ALLOWED_HOSTS` unset, behaviour is
 the plain local single-user loopback server: reads and writes are open, and only
@@ -58,10 +59,12 @@ X-Peekseed-Token: <token>
 ```
 
 A missing or wrong token is `401` with a short JSON detail; the token is never
-echoed. `GET`/`HEAD` requests stay open, so browsing the UI never needs the
-token. The bundled web UI does not yet attach the token itself, so with a token
-set, browser writes need a small UI change (tracked as a follow-up) or a reverse
-proxy that injects the header.
+echoed. `GET` requests stay open, so browsing the UI never needs the token. The
+bundled web UI supports the token: open the page once as `/#token=…` (the
+fragment never reaches the server) or paste it in **Settings → Service token**;
+the value stays in browser storage and is attached as
+`Authorization: Bearer …` to non-GET `/api/*` requests. A reverse proxy can
+instead inject the header server-side.
 
 When `PEEKSEED_ALLOWED_HOSTS` is set (for example `192.168.1.10:8030,box.lan`),
 every mutating request must carry a matching `Host`. Loopback names

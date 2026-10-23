@@ -159,11 +159,12 @@ rebuildable; `peekseed workspace move PATH` moves the whole tree. See
 ## Model links
 
 A **link** is one configured endpoint, stored in
-`<workspace>/.peekseed/config/links.json`. There are no bundled models, and
-model processes are never started or stopped by peekseed — run your own server
-and point a link at it. The UI is the normal way to create links; the same
-links can be seeded headlessly with `PEEKSEED_EMBED_*`, `PEEKSEED_RERANK_*`
-and `PEEKSEED_ANSWER_*` variables (see `.env.example`).
+`<workspace>/.peekseed/config/links.json`. There are no bundled models: run
+your own server and point a link at it. The UI is the normal way to create
+links; the same links can be seeded headlessly with `PEEKSEED_EMBED_*`,
+`PEEKSEED_RERANK_*` and `PEEKSEED_ANSWER_*` variables (see `.env.example`).
+A deployment that runs its models as local processes can optionally start and
+stop them from the panel ([docs/local-models.md](docs/local-models.md)).
 
 The four endpoint contracts are summarised here; the full schema, validation
 rules and examples are in [docs/model-links.md](docs/model-links.md).
@@ -232,12 +233,20 @@ when no index exists for the active space.
 
 ## Documentation
 
+New here? Start with [docs/install.md](docs/install.md).
+
+- [docs/install.md](docs/install.md) — install, first workspace, model links,
+  the first dataset and troubleshooting.
+- [docs/deploy.md](docs/deploy.md) — run it as a single-user service: exposure,
+  smoke checks, backups, upgrades and rollback.
 - [docs/api.md](docs/api.md) — HTTP routes, request/response shapes, stream
   events and the persisted job record (new in 0.1.0).
 - [docs/workspace.md](docs/workspace.md) — workspace layout, manifest,
   collections and migrations.
 - [docs/model-links.md](docs/model-links.md) — link schema and endpoint
   contracts.
+- [docs/local-models.md](docs/local-models.md) — optional start/stop control
+  for local model processes.
 - [docs/ingestion.md](docs/ingestion.md), [docs/formats.md](docs/formats.md) —
   extraction, chunking, embedding spaces and format/licence notes.
 - [docs/contracts.md](docs/contracts.md), [docs/architecture.md](docs/architecture.md)
