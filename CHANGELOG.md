@@ -6,6 +6,34 @@ All notable changes to peekseed are recorded here. The format follows
 published as `0.1.0rcN`; see [docs/release.md](docs/release.md) for the
 version/tag policy.
 
+## 0.1.0rc4 - 2026-10-23
+
+Fourth release candidate: public installation and deployment documentation
+(D3). There are no runtime behaviour changes beyond the version string.
+
+### Added
+
+- **Public install and deployment guides.** `docs/install.md` takes a new user
+  from a clean machine to a first dataset: requirements, install, workspace,
+  model links, headless workflows, backup semantics and troubleshooting.
+  `docs/deploy.md` covers a single-user server deployment: loopback bind plus
+  TLS termination, a pinned install, a manual process or optional
+  systemd/launchd units, Tailscale or reverse-proxy exposure, an HTTP smoke
+  sequence, backups with a restore drill, forward-only upgrades and rollback.
+- **PyPI project links.** `[project.urls]` now carries Homepage, Repository,
+  Issues and Changelog for the public repository created at publish time.
+
+### Changed
+
+- README links the new guides, and the model-link section now describes the
+  optional local-model start/stop control instead of claiming peekseed never
+  manages model processes.
+- `docs/security.md` documents the browser token provisioning (`#token=…` /
+  Settings -> Service token) and the current workspace/derived defaults.
+- `.env.example` reflects the workspace root, `PEEKSEED_TOKEN` and
+  `PEEKSEED_ALLOWED_HOSTS`; the stale "no authentication" note is gone.
+- The CI sdist check and packaging tests assert that the new docs ship.
+
 ## 0.1.0rc3 - 2026-10-22
 
 Third release candidate: opt-in local model process control.

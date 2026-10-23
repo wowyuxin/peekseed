@@ -152,7 +152,7 @@ jobs:
 
           import peekseed
 
-          assert peekseed.__version__ == "0.1.0rc3", peekseed.__version__
+          assert peekseed.__version__ == "0.1.0rc4", peekseed.__version__
           module_path = pathlib.Path(peekseed.__file__).resolve()
           assert module_path.is_relative_to(pathlib.Path(sys.prefix).resolve()), (
               "smoke test imported the source tree instead of the sdist: %s"
