@@ -47,7 +47,10 @@ artifacts while the surface is validated. For each `rcN`:
    venv and `peekseed version` prints the expected version.
 4. Upload to **TestPyPI** only, then install from TestPyPI in a fresh venv and
    smoke-test (`peekseed version`, import `peekseed`, read the UI file). RC
-   artifacts are not uploaded to PyPI.
+   artifacts are not uploaded to PyPI. TestPyPI does not mirror PyPI
+   dependencies and can contain unrelated projects with the same names, so
+   install only the project itself without dependencies (see the TestPyPI
+   guidance in the post-publish section below).
 5. Pre-publish tags are optional and private. While the repo is on the private
    mirror (before PyPI/GitHub publication), an rc commit may be tagged
    `vX.Y.ZrcN` so the deployment can pin it; such a tag is not a release
@@ -168,11 +171,57 @@ attestations use OIDC through trusted publishers configured on TestPyPI and PyPI
 (`owner`/`repository`/`workflow`/`environment`). `rc` tags are skipped by every
 job, so pre-release tags stay private and unpublished.
 
+## Post-publish smoke (PyPI)
+
+After the `pypi` environment is approved, install from the public index in a
+fresh venv and smoke-test exactly what users will get:
+
+```bash
+python3 -m venv /tmp/peekseed-pypi
+/tmp/peekseed-pypi/bin/pip install 'peekseed==X.Y.Z'
+/tmp/peekseed-pypi/bin/peekseed version
+/tmp/peekseed-pypi/bin/peekseed init --workspace /tmp/peekseed-pypi/ws
+/tmp/peekseed-pypi/bin/peekseed serve --workspace /tmp/peekseed-pypi/ws --port 8031 &
+curl -fsS http://127.0.0.1:8031/health
+```
+
+Compare the wheel/sdist SHA256 with the GitHub Release `SHA256SUMS`; the PyPI
+JSON endpoint lists both files and their digests:
+
+```bash
+curl -s https://pypi.org/pypi/peekseed/json | python3 -m json.tool
+```
+
+The PEP 740 attestations are exposed per file under
+`https://pypi.org/integrity/<project>/<version>/<filename>/provenance`.
+
+### Troubleshooting the first PyPI publish
+
+- **TestPyPI install fails because a dependency is not ours** — TestPyPI does
+  not mirror PyPI dependencies and can contain unrelated projects with the same
+  names. Download only this project without dependencies and resolve the rest
+  from PyPI:
+
+  ```bash
+  python -m pip download --no-deps \
+    --index-url https://test.pypi.org/simple/ peekseed==X.Y.Z -d /tmp/dist
+  python -m pip install /tmp/dist/peekseed-*.whl
+  ```
+
+- **`publish-testpypi` succeeds but `publish-pypi` fails with
+  `400 Non-user identities cannot create new projects`** — the pending
+  publisher's *PyPI Project Name* does not exactly match the
+  `[project].name` metadata (`peekseed`). Correct the field on
+  <https://pypi.org/manage/account/publishing/> and then re-run **only the
+  failed jobs**; re-running all jobs would try to upload the same files to
+  TestPyPI again and be rejected.
+
 ## This repository's release setup
 
 - True source and public repository: `https://github.com/wowyuxin/peekseed`.
-  While pre-publish, the private iCloud bare mirror is the transport; the GitHub
-  remote is added at publication.
+  The iCloud bare mirror (`MacGitHub/peekseed.git`) remains a local
+  transport/backup for the deployment's pinned builds; GitHub is the primary
+  public remote.
 - Deployment pinning happens before publication: the Mac mini installs a wheel
   built from a pinned clone at the deployed commit (`deploy/upgrade.sh`), so the
   final `0.1.0` tag points at a commit that has already been deployed and
