@@ -1,9 +1,9 @@
 # Release policy
 
 This document is the version/tag policy for peekseed and the checklist the
-release manager follows. It is deliberately conservative: peekseed is
-pre-publish, local-first software, so **no release artifact may be produced
-from an unreviewed or dirty tree**, and a published tag is never moved.
+release manager follows. It is deliberately conservative: **no release
+artifact may be produced from an unreviewed or dirty tree**, and a published
+tag is never moved.
 
 ## Versioning
 

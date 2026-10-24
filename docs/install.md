@@ -6,10 +6,9 @@ ingest your first PDFs. It is written for a single-user local install. If the
 machine will stay on and serve other devices, continue with
 [deploy.md](deploy.md).
 
-> **Version note.** This page targets peekseed **0.1.0**. While 0.1.0 is still
-> a release candidate, publishing is the last step of the release checklist
-> ([release.md](release.md)): until `pip install peekseed` resolves from PyPI,
-> build and install the wheel or sdist from this repository.
+> **Version note.** This page targets peekseed **0.1.0**, the first published
+> release. Version and tag policy are in [release.md](release.md); the source
+> and release artifacts live in the public GitHub repository.
 
 ## Requirements
 

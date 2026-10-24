@@ -6,6 +6,50 @@ All notable changes to peekseed are recorded here. The format follows
 published as `0.1.0rcN`; see [docs/release.md](docs/release.md) for the
 version/tag policy.
 
+## 0.1.0 - 2026-10-23
+
+First public release: local-first AI research over your own documents. This
+section rolls up the four release candidates; the rc sections below record the
+deployment-validation history.
+
+### Added
+
+- **Workspace and ingestion.** One workspace root (`documents/` plus derived
+  `.peekseed/`) with `peekseed init`, `status`, `doctor`, `workspace move` and
+  schema `migrate`; PDF upload via the UI/API or `peekseed index`; persisted,
+  cancellable and resumable index jobs; generation-atomic indexes with a probe
+  canary; `/pdf` served inline for page citation links.
+- **Search, ask and research.** Hybrid keyword+vector search, optional rerank,
+  streaming grounded answers with numbered excerpt chips and saved history, and
+  an opt-in tool-using research agent (`PEEKSEED_AGENT=1`) that audits its
+  citations against a ledger.
+- **Import contract.** `peekseed import --manifest` reproduces prebuilt or
+  Chroma-exported corpora without re-embedding (versioned manifest, deterministic
+  ids, probe verification, all-or-nothing per collection).
+- **Browser UI and model links.** Single-file web UI, Settings for model links
+  and browser service-token provisioning (`#token=...` / Settings -> Service
+  token), and optional local-model start/stop control driven by a machine-local
+  0600 config file.
+- **Documentation and packaging.** Public install ([install.md](docs/install.md))
+  and deployment ([deploy.md](docs/deploy.md)) guides, API/contracts/workspace
+  docs, PEP 639 metadata, CI on Python 3.11-3.14, community files and a
+  tag-triggered release workflow (TestPyPI -> PyPI, PEP 740 attestations,
+  CycloneDX SBOM).
+
+### Changed
+
+- rc2 fixed browser writes against the service token; rc3 added optional local
+  model control; rc4 added the public documentation (D3). The rc sections below
+  have the details.
+
+### Security
+
+- Single-user local-first posture: loopback bind by default, per-install
+  `PEEKSEED_TOKEN` for mutating API calls, Host/Origin allowlisting for
+  deliberate network exposure, streaming upload limits, filename sanitising,
+  SSRF checks on model links, 0700/0600 data modes and `no-store` API responses.
+  See [docs/security.md](docs/security.md).
+
 ## 0.1.0rc4 - 2026-10-23
 
 Fourth release candidate: public installation and deployment documentation

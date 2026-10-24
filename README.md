@@ -9,9 +9,9 @@ point it at the embedding and chat endpoints you already run or subscribe to.
 Documents and indexes stay on your machine unless a configured model endpoint
 receives text you send it deliberately.
 
-> **Status: 0.1.0rc4 (release candidate).** The 0.1.0 API, workspace layout and
-> data schemas are frozen for the release; folder scanning and OCR are 0.2.0
-> features. See [CHANGELOG.md](CHANGELOG.md) and [docs/release.md](docs/release.md).
+> **Status: 0.1.0.** The 0.1.0 API, workspace layout and data schemas are
+> frozen for the release; folder scanning and OCR are 0.2.0 features. See
+> [CHANGELOG.md](CHANGELOG.md) and [docs/release.md](docs/release.md).
 
 ## Contents
 
@@ -187,7 +187,7 @@ when no index exists for the active space.
 
 ## 0.1.0 vs 0.2.0
 
-**0.1.0 (this release candidate)** — the upload-driven product:
+**0.1.0 (this release)** — the upload-driven product:
 
 - Workspace init/status/doctor/workspace move, versioned data schemas
   (`dataset.json`/`info.json` schema 2, manifest/job schema 1) with

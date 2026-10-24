@@ -26,7 +26,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_project_identity(self):
         self.assertEqual(self.project["name"], "peekseed")
-        self.assertEqual(self.project["version"], "0.1.0rc4")
+        self.assertEqual(self.project["version"], "0.1.0")
         self.assertEqual(self.project["requires-python"], ">=3.11")
         self.assertEqual(self.project["description"],
                          "Local-first AI research framework over your own documents")
@@ -35,7 +35,7 @@ class PackagingTests(unittest.TestCase):
         from peekseed import __version__
 
         self.assertEqual(__version__, self.project["version"])
-        self.assertEqual(__version__, "0.1.0rc4")
+        self.assertEqual(__version__, "0.1.0")
 
     def test_pep639_license_metadata(self):
         # PEP 639: an SPDX expression plus explicit license files, never the

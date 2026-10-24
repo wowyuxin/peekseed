@@ -78,9 +78,9 @@ python3 -m venv /srv/peekseed/venv
 /srv/peekseed/venv/bin/peekseed version   # peekseed 0.1.0
 ```
 
-**Pre-publish note.** Until 0.1.0 is on PyPI (the last step of
-[release.md](release.md)), build the wheel or sdist from this repository and
-install that file into the venv:
+**Release artifact.** Install the exact released version (`pip install
+'peekseed==0.1.0'`). If the host cannot reach PyPI, build the same commit and
+install the wheel or sdist from this repository:
 
 ```bash
 python -m build --wheel             # or: pip wheel . --no-deps -w dist
