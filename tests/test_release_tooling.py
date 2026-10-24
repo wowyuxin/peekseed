@@ -82,6 +82,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             self.assertIn(needle, self.workflow)
 
+    def test_pypi_uploads_only_receive_distributions(self):
+        # PyPI rejects non-distribution files in packages-dir: SHA256SUMS and
+        # the SBOM live in their own artifact, and publish jobs download only
+        # `release-dist`.
+        self.assertIn("name: release-dist", self.workflow)
+        self.assertIn("name: release-meta", self.workflow)
+        self.assertIn("path: release-meta/", self.workflow)
+        self.assertIn("release-meta/SHA256SUMS", self.workflow)
+        self.assertIn("packages-dir: dist/", self.workflow)
+
     def test_release_tooling_scripts_exist_and_run_offline(self):
         for name in ("verify_release.py", "changelog_section.py"):
             self.assertTrue((ROOT / "scripts" / name).is_file(), name)

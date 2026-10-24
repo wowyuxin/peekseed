@@ -41,9 +41,9 @@ jobs:
         run: python scripts/verify_release.py dist/ --expected-version "${RELEASE_VERSION#v}"
       - name: Write and verify checksums
         run: |
-          cd dist
-          sha256sum *.whl *.tar.gz > SHA256SUMS
-          sha256sum -c SHA256SUMS
+          mkdir -p release-meta
+          (cd dist && sha256sum *.whl *.tar.gz) > release-meta/SHA256SUMS
+          (cd dist && sha256sum -c ../release-meta/SHA256SUMS)
       - name: Create the SBOM environment
         run: |
           python -m venv "$RUNNER_TEMP/sbom-venv"
@@ -54,15 +54,25 @@ jobs:
         with:
           path: ${{ runner.temp }}/sbom-venv
           format: cyclonedx-json
-          output-file: dist/peekseed-${{ github.ref_name }}.cdx.json
+          output-file: release-meta/peekseed-${{ github.ref_name }}.cdx.json
           upload-artifact: false
-      - name: Assert the SBOM exists
-        run: test -s "dist/peekseed-${{ github.ref_name }}.cdx.json"
-      - name: Upload release artifacts
+      - name: Assert the release metadata exists
+        run: |
+          test -s "release-meta/peekseed-${{ github.ref_name }}.cdx.json"
+          test -s release-meta/SHA256SUMS
+      # PyPI rejects any non-distribution file in the upload directory, so the
+      # checksums and SBOM must never travel with the wheel/sdist.
+      - name: Upload distributions
         uses: actions/upload-artifact@v4
         with:
           name: release-dist
           path: dist/
+          if-no-files-found: error
+      - name: Upload release metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-meta
+          path: release-meta/
           if-no-files-found: error
 
   publish-testpypi:
@@ -123,6 +133,10 @@ jobs:
         with:
           name: release-dist
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-meta
+          path: release-meta
       - name: Extract release notes from CHANGELOG
         run: python scripts/changelog_section.py "${RELEASE_VERSION}" > "$RUNNER_TEMP/release-notes.md"
       - name: Publish GitHub release
@@ -131,7 +145,5 @@ jobs:
           body_path: ${{ runner.temp }}/release-notes.md
           fail_on_unmatched_files: true
           files: |
-            dist/SHA256SUMS
-            dist/*.cdx.json
-            dist/*.whl
-            dist/*.tar.gz
+            dist/*
+            release-meta/*

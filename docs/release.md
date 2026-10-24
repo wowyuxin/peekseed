@@ -149,9 +149,11 @@ Copy this into the release PR or tracking issue and tick each item.
 A final `vX.Y.Z` tag (one without `rc`) triggers the release workflow:
 
 1. **build** (read-only) — checks out the tag, builds sdist+wheel from that
-   exact commit, runs `scripts/verify_release.py`, writes `SHA256SUMS`,
-   generates a CycloneDX JSON SBOM from the installed wheel environment and
-   uploads the `release-dist` artifact.
+   exact commit, runs `scripts/verify_release.py`, writes `SHA256SUMS` and a
+   CycloneDX JSON SBOM into a separate `release-meta` artifact, and uploads the
+   distributions as `release-dist`. The publishing jobs consume only
+   `release-dist`, so PyPI receives exactly the wheel and sdist (PyPI rejects
+   any non-distribution file in the upload directory).
 2. **publish-testpypi** — `environment: testpypi` (manual approval), Trusted
    Publishing to TestPyPI. Install from TestPyPI in a clean venv and run the
    post-publish smoke before approving the next environment.
