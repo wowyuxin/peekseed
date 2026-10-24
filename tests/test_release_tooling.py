@@ -55,7 +55,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_workflow_is_tag_triggered_and_skips_rc(self):
         self.assertIn("tags:", self.workflow)
         self.assertIn('"v*"', self.workflow)
+        self.assertIn("startsWith(github.ref, 'refs/tags/v')", self.workflow)
         self.assertIn("contains(github.ref_name, 'rc')", self.workflow)
+        self.assertNotIn("workflow_dispatch:", self.workflow)
 
     def test_workflow_uses_trusted_publishing_with_environments(self):
         for needle in (
