@@ -27,6 +27,18 @@ No system packages are required for the default PDF path. Optional formats are
 opt-in extras (`office`, `tables`, `ocr`, `layout`/`pymupdf`); do not make them
 import-time requirements of the core package.
 
+## Branches and releases
+
+- `main` is the release line: it only moves when a release is cut, and every
+  release is a signed `vX.Y.Z` tag. Do not open feature PRs against `main`.
+- `dev` is the integration branch: open every feature/fix/docs PR against
+  `dev`. CI runs on pushes to `dev` and `main`, and on all pull requests.
+- Cut short-lived feature branches from `dev` (`feat/...`, `fix/...`,
+  `chore/...`); dependabot also targets `dev`.
+- Version bumps, tags and PyPI publishing happen only in the release process
+  described in [docs/release.md](docs/release.md). A released `main` stays
+  frozen until the next release; urgent fixes land on `dev` first.
+
 ## Tests
 
 The suite is deliberately offline: `tests/fixtures.py` implements fake
@@ -82,8 +94,7 @@ copyleft terms (for example PyMuPDF) must stay opt-in and documented in
   `PEEKSEED_*` secrets belong in `.env` (untracked) or the environment.
 - **Do not bump the version or create tags** in a normal PR. Version bumps and
   tags happen only in the release process described in
-  [docs/release.md](docs/release.md) and are done by the release manager from a
-  pinned commit.
+  [docs/release.md](docs/release.md).
 - Do not reformat files unrelated to your change; CI lints the whole tree, and
   unrelated churn makes review harder.
 - Prefer a linear, readable commit history. Squash fixup commits before asking
