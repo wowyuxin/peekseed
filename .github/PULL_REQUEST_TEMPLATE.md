@@ -1,6 +1,8 @@
 ## Summary
 
-<!-- What does this PR change, and why? Link the issue it closes, if any. -->
+<!-- What does this PR change, and why? Link the issue it closes, if any.
+     Open feature/fix/docs PRs against the `dev` branch; `main` is the
+     release line and only moves at release time. -->
 
 Closes #
 
