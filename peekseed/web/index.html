@@ -104,6 +104,11 @@ kbd{font:11px/1 var(--mono);color:var(--faint);background:var(--panel-2);
   border-bottom:1px solid var(--line-soft);
 }
 .brand{display:flex;align-items:center;gap:9px;min-width:0;font-size:14px;}
+.brand-home{display:flex;align-items:center;gap:9px;background:none;border:none;
+  padding:0;margin:0;font:inherit;color:inherit;cursor:pointer;border-radius:9px;
+  min-width:0;}
+.brand-home:hover .brand-name{color:var(--accent);}
+.brand-home:focus-visible{outline:1px solid var(--accent);outline-offset:2px;}
 .brand-mark{width:28px;height:28px;border-radius:9px;flex:none;display:grid;place-items:center;
   background:linear-gradient(135deg,var(--accent),#5eead4);color:#080a0f;
   box-shadow:0 4px 14px rgba(124,156,255,.30);}
@@ -148,6 +153,7 @@ main{max-width:1180px;margin:0 auto;padding:30px 0 0;min-width:0;}
 
 /* ---- rail: recent searches + live pipeline ----------------------------- */
 .rail{display:none;}
+#railToggleBtn,.rail-resizer{display:none;} /* revealed with the rail in the ≥1280px block */
 .rail-section-h{display:flex;align-items:center;justify-content:space-between;gap:8px;
   padding:0 4px;margin:2px 0 8px;font-size:10.5px;font-weight:650;letter-spacing:.09em;
   text-transform:uppercase;color:var(--faint);}
@@ -888,11 +894,26 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 
 /* ---- responsive --------------------------------------------------------- */
 @media (min-width:1280px){
-  .shell{grid-template-columns:252px minmax(0,1fr);gap:30px;}
+  .shell{grid-template-columns:var(--rail-w,252px) minmax(0,1fr);gap:30px;}
   .rail{display:flex;flex-direction:column;gap:16px;position:sticky;top:86px;
     max-height:calc(100vh - 116px);padding:22px 0 8px;min-height:0;}
   .rail-list{flex:0 1 auto;}
   main{padding-top:24px;}
+  /* Sidebar fold: the app-bar panel button toggles the rail (like the Harness
+     sidebar); when folded the grid collapses and the button shows active. */
+  #railToggleBtn{display:flex;}
+  body.rail-folded .shell{grid-template-columns:minmax(0,1fr);gap:0;}
+  body.rail-folded .rail{display:none;}
+  body.rail-folded #railToggleBtn{color:var(--accent);}
+  /* Sidebar resize: an invisible strip on the rail's right edge that lights up
+     on hover; drag it, focus + arrow keys, or double-click to reset. */
+  .rail-resizer{display:block;position:absolute;top:0;right:-7px;width:14px;height:100%;
+    cursor:col-resize;touch-action:none;z-index:6;}
+  .rail-resizer::after{content:"";position:absolute;top:0;bottom:0;left:5px;width:3px;
+    border-radius:2px;background:transparent;transition:background .15s;}
+  .rail-resizer:hover::after,body.rail-resizing .rail-resizer::after{background:var(--line-strong);}
+  .rail-resizer:focus-visible::after{background:var(--accent);}
+  body.rail-resizing{cursor:col-resize;user-select:none;}
 }
 @media (max-width:1023px){
   .empty{grid-template-columns:1fr;}
@@ -1141,13 +1162,25 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 
 <header class="appbar">
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true">
-      <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
-        <path d="M8 1.6 13.4 4.5v5.8L8 13.2 2.6 10.3V4.5L8 1.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
-        <path d="M8 5.2 10.8 6.7v3L8 11.2 5.2 9.7v-3L8 5.2Z" fill="currentColor"/>
+    <button class="iconbtn" id="railToggleBtn" type="button" aria-expanded="true"
+            aria-label="Hide sidebar" title="Hide sidebar  [">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"
+           stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4.5" width="18" height="15" rx="2.5"/>
+        <path d="M9.5 4.5v15"/>
       </svg>
-    </span>
-    <span class="brand-name">peekseed</span>
+    </button>
+    <button class="brand-home" id="brandHomeBtn" type="button"
+            aria-label="Home: back to search and expand the sidebar"
+            title="Home — expand sidebar and start a new search">
+      <span class="brand-mark" aria-hidden="true">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none">
+          <path d="M8 1.6 13.4 4.5v5.8L8 13.2 2.6 10.3V4.5L8 1.6Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+          <path d="M8 5.2 10.8 6.7v3L8 11.2 5.2 9.7v-3L8 5.2Z" fill="currentColor"/>
+        </svg>
+      </span>
+      <span class="brand-name">peekseed</span>
+    </button>
     <span class="brand-sep">/</span>
     <span class="brand-page">search &amp; research</span>
   </div>
@@ -1231,6 +1264,9 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
       <div class="rail-section-h"><span>Pipeline</span><button class="rail-pipeline-btn" id="railPipeBtn" type="button">Status</button></div>
       <div class="rail-stages" id="railStages"></div>
     </div>
+    <div class="rail-resizer" id="railResizer" role="separator" aria-orientation="vertical"
+         tabindex="0" aria-label="Resize sidebar: drag, arrow keys, or double-click to reset"
+         title="Drag to resize · double-click to reset"></div>
   </aside>
 
   <div class="maincol">
@@ -1746,6 +1782,70 @@ function applyTheme(t){
 }
 $('#themeBtn').onclick=()=>
   applyTheme(document.documentElement.dataset.theme==='light'?'dark':'light');
+
+/* ---- rail fold ------------------------------------------------------------
+   The left rail folds away to give the page the full width; the app-bar panel
+   button toggles it, the choice is remembered, and "[" works from the
+   keyboard too. */
+const RAIL_FOLD_KEY='peekseedRailFolded';
+function railFolded(){ return document.body.classList.contains('rail-folded'); }
+function applyRailFold(folded){
+  folded=!!folded;
+  document.body.classList.toggle('rail-folded',folded);
+  try{ localStorage.setItem(RAIL_FOLD_KEY,folded?'1':'0'); }catch(e){}
+  const btn=$('#railToggleBtn');
+  if(btn){
+    btn.setAttribute('aria-expanded',folded?'false':'true');
+    btn.title=folded?'Show sidebar  [':'Hide sidebar  [';
+    btn.setAttribute('aria-label',btn.title);
+  }
+}
+function toggleRailFold(){ applyRailFold(!railFolded()); }
+$('#railToggleBtn').onclick=toggleRailFold;
+try{ if(localStorage.getItem(RAIL_FOLD_KEY)==='1') applyRailFold(true); }catch(e){}
+
+/* ---- rail width -----------------------------------------------------------
+   The sidebar column is user-resizable: drag its edge, focus it and use the
+   arrow keys, or double-click to reset. The width is remembered in px and
+   applied through the --rail-w variable the ≥1280px grid consumes. */
+const RAIL_W_KEY='peekseedRailWidth';
+const RAIL_W_MIN=200, RAIL_W_MAX=440, RAIL_W_DEFAULT=252;
+function clampRailW(w){ return Math.max(RAIL_W_MIN,Math.min(RAIL_W_MAX,Math.round(w))); }
+function currentRailW(){
+  return parseInt(document.documentElement.style.getPropertyValue('--rail-w'),10)
+         ||RAIL_W_DEFAULT;
+}
+function applyRailWidth(w){
+  document.documentElement.style.setProperty('--rail-w',clampRailW(w)+'px');
+  try{ localStorage.setItem(RAIL_W_KEY,String(clampRailW(w))); }catch(e){}
+}
+try{ applyRailWidth(parseInt(localStorage.getItem(RAIL_W_KEY),10)||RAIL_W_DEFAULT); }catch(e){}
+(function(){
+  const h=$('#railResizer');
+  if(!h) return;
+  let startX=0,startW=0;
+  function onMove(ev){ applyRailWidth(startW+(ev.clientX-startX)); }
+  function onUp(){
+    document.body.classList.remove('rail-resizing');
+    window.removeEventListener('pointermove',onMove);
+    window.removeEventListener('pointerup',onUp);
+  }
+  h.addEventListener('pointerdown',function(ev){
+    if(railFolded()) return;
+    ev.preventDefault();
+    startX=ev.clientX;
+    startW=currentRailW();
+    document.body.classList.add('rail-resizing');
+    window.addEventListener('pointermove',onMove);
+    window.addEventListener('pointerup',onUp);
+  });
+  h.addEventListener('dblclick',function(){ applyRailWidth(RAIL_W_DEFAULT); });
+  h.addEventListener('keydown',function(ev){
+    if(ev.key==='ArrowLeft'){ applyRailWidth(currentRailW()-16); ev.preventDefault(); }
+    else if(ev.key==='ArrowRight'){ applyRailWidth(currentRailW()+16); ev.preventDefault(); }
+    else if(ev.key==='Enter'||ev.key===' '){ applyRailWidth(RAIL_W_DEFAULT); ev.preventDefault(); }
+  });
+})();
 
 /* ---- the pipeline drawer --------------------------------------------------
    The machinery lives in a drawer, not on the page: the composer owns the page
@@ -3486,6 +3586,13 @@ function newSearch(){
 }
 $('#newSearchBtn').onclick=newSearch;
 $('#newSearchTop').onclick=newSearch;
+/* The brand mark is "home": from anywhere (any drawer, any folded state) it
+   expands the sidebar and resets to the empty search page. */
+$('#brandHomeBtn').onclick=function(){
+  applyRailFold(false);
+  newSearch();
+  try{ window.scrollTo({top:0,behavior:'smooth'}); }catch(e){}
+};
 
 /* ---- search history ------------------------------------------------------
    Completed searches and their dialogs persist server-side, LRU by last view.
@@ -4655,6 +4762,13 @@ document.addEventListener('keydown',function(ev){
      &&!pipelineOpen()){
     ev.preventDefault();
     $('#q').focus(); $('#q').select();
+    return;
+  }
+  if(ev.key==='['&&!typing&&!ev.ctrlKey&&!ev.metaKey&&!ev.altKey
+     &&$('#histModal').hidden&&$('#settingsModal').hidden&&$('#datasetsModal').hidden
+     &&!workspaceOpen()&&!pipelineOpen()){
+    ev.preventDefault();
+    toggleRailFold();
     return;
   }
   if(ev.key==='Enter'&&(ev.ctrlKey||ev.metaKey)&&t!==$('#q')&&t!==$('#askQ')
