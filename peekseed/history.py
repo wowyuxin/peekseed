@@ -44,7 +44,11 @@ import time
 import uuid
 
 
-SCHEMA_VERSION = 2
+# v3: meta rows carry a bounded `sources` list (distinct source files from the
+# search results) for the UI's per-source history filter. A v2 index is not
+# rewritten in place: the version mismatch triggers a rebuild from the entry
+# files, which recomputes every meta row with the new field.
+SCHEMA_VERSION = 3
 
 # --- defaults (env-overridable) --------------------------------------------
 HISTORY_MAX = int(os.environ.get("HISTORY_MAX", "20"))
@@ -132,6 +136,28 @@ def _entry_size(entry):
         return len(json.dumps(entry, ensure_ascii=False).encode("utf-8"))
     except (TypeError, ValueError):
         return 0
+
+
+# Distinct source files are kept per meta row for the UI's source filter. The
+# cap bounds the index; rows are ordered by rank, so the first hits win.
+_META_SOURCES_MAX = 12
+
+
+def _result_sources(results):
+    """Distinct non-empty ``source`` values from result rows, rank order."""
+    out = []
+    for r in results or []:
+        if not isinstance(r, dict):
+            continue
+        src = r.get("source")
+        if not src:
+            continue
+        src = str(src)
+        if src not in out:
+            out.append(src)
+            if len(out) >= _META_SOURCES_MAX:
+                break
+    return out
 
 
 def _recompute_kind(entry):
@@ -485,6 +511,8 @@ class HistoryStore:
                                    "started_at": last.get("started_at")}
         # filterable questions (bounded)
         m["questions"] = [r.get("question") for r in runs if r.get("question")][:10]
+        # filterable source files (bounded): distinct, rank order
+        m["sources"] = _result_sources((entry.get("search") or {}).get("results"))
         # store the search.id alias in meta for convenience
         m["history_id"] = entry.get("id")
         return m

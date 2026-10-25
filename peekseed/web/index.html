@@ -793,6 +793,19 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .hist-filter input{flex:1;height:34px;background:none;border:none;outline:none;color:var(--text);
   font:inherit;font-size:13px;min-width:0;}
 .hist-filter input::placeholder{color:var(--faint);}
+/* The source filter sits at the right end of the row, behind a hairline. */
+.hist-filter select{flex:none;max-width:46%;height:34px;background:none;border:none;
+  border-left:1px solid var(--line);outline:none;color:var(--muted);font:inherit;
+  font-size:12px;padding:0 2px 0 10px;cursor:pointer;text-overflow:ellipsis;}
+.hist-filter select:hover,.hist-filter select:focus{color:var(--text);}
+.rail-src{margin:0 0 7px;}
+.rail-src select{width:100%;background:var(--bg-soft);color:var(--muted);
+  border:1px solid var(--line);border-radius:8px;padding:5px 22px 5px 8px;font:inherit;
+  font-size:11px;line-height:1.3;min-height:26px;-webkit-appearance:none;appearance:none;
+  text-overflow:ellipsis;cursor:pointer;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='7' viewBox='0 0 10 7'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%239aa3b5' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center;}
+.rail-src select:hover,.rail-src select:focus{color:var(--text);border-color:var(--line-strong);}
 .hist-body{padding:10px 16px 16px;overflow-y:auto;overscroll-behavior:contain;min-height:0;}
 .hist-empty{color:var(--faint);font-size:12.5px;padding:12px 2px;display:block;}
 .hist-item{display:block;width:100%;text-align:left;background:var(--bg-soft);
@@ -1257,6 +1270,12 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
       New search
     </button>
     <div class="rail-section-h"><span>Recent</span><button id="railClear" type="button">Clear</button></div>
+    <div class="rail-src">
+      <select id="railSrc" aria-label="Filter history by source file"
+              title="Filter recent searches by source file">
+        <option value="">All sources</option>
+      </select>
+    </div>
     <div class="rail-list" id="histRail">
       <span class="rail-empty">Searches you run appear here.</span>
     </div>
@@ -1565,6 +1584,9 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
         <circle cx="10.8" cy="10.8" r="6.6"/><path d="m16 16 4.2 4.2"/>
       </svg>
       <input type="text" id="histFilter" placeholder="Filter searches…" autocomplete="off">
+      <select id="histSrc" aria-label="Filter by source file" title="Filter by source file">
+        <option value="">All sources</option>
+      </select>
     </div>
     <div class="hist-body" id="histList"><span class="hist-empty">No saved searches yet.</span></div>
     <div class="hist-kbd"><kbd>↑</kbd><kbd>↓</kbd> navigate <kbd>esc</kbd> close</div>
@@ -3598,7 +3620,7 @@ $('#brandHomeBtn').onclick=function(){
    Completed searches and their dialogs persist server-side, LRU by last view.
    The History button opens a browsing dialog; the rail is the same list on a
    wide screen. Clicking an entry re-opens its result set and thread. */
-let HIST=[], HIST_Q='', HIST_MAX=20;
+let HIST=[], HIST_Q='', HIST_SRC='', HIST_MAX=20;
 /* A stored entry keeps its result set inside its search log, not at the top
    level. Both shapes are accepted so an older entry still reopens. */
 function entryResults(entry){
@@ -3631,31 +3653,63 @@ async function loadHistory(){
     return;
   }
   HIST=entries; HIST_MAX=max;
+  paintHistSrcFilters();
   paintHistory();
 }
+/* The source-file filter: one select in the dialog, one on the rail, sharing
+   HIST_SRC. Options are the distinct sources across all entries (the server
+   keeps a bounded `sources` list per meta row, first hits by rank). */
+function histSourceOptions(){
+  const seen=[];
+  for(const e of HIST) for(const s of (e.sources||[])) if(seen.indexOf(s)<0) seen.push(s);
+  seen.sort(function(a,b){ return a.localeCompare(b); });
+  return '<option value="">All sources</option>'+seen.map(function(s){
+    // label by basename: paths are long and the dropdown is narrow
+    const parts=String(s).split('/');
+    return `<option value="${escAttr(s)}">${esc(parts[parts.length-1]||s)}</option>`;
+  }).join('');
+}
+function paintHistSrcFilters(){
+  for(const id of ['#histSrc','#railSrc']){
+    const sel=$(id);
+    if(sel) sel.innerHTML=histSourceOptions();
+  }
+  // A selection can go stale (entry evicted/cleared) — drop it if so.
+  const sel=$('#histSrc');
+  if(HIST_SRC&&sel&&sel.value!==HIST_SRC){
+    HIST_SRC='';
+    for(const id of ['#histSrc','#railSrc']){ const s=$(id); if(s) s.value=''; }
+  }else{
+    for(const id of ['#histSrc','#railSrc']){ const s=$(id); if(s) s.value=HIST_SRC; }
+  }
+}
 /* Two views of one list: the rail on a wide screen and the dialog everywhere
-   else. The filter applies to both. */
+   else. The text and source filters apply to both. */
 function paintHistory(){
   const q=HIST_Q.trim().toLowerCase();
-  const rows=q?HIST.filter(e=>{
+  const rows=HIST.filter(e=>{
+    if(HIST_SRC&&(e.sources||[]).indexOf(HIST_SRC)<0) return false;
+    if(!q) return true;
     const hay=[e.query||'', e.dataset_label||e.dataset||'', e.model_label||'']
-      .concat(e.questions||[]).join('\n').toLowerCase();
+      .concat(e.questions||[]).concat(e.sources||[]).join('\n').toLowerCase();
     return hay.indexOf(q)>=0;
-  }) : HIST;
+  });
   const sub=$('#histHeadSub');
   if(sub){
     const max=HIST_MAX||20;
-    sub.textContent='The last '+max+' searches and dialogs, most recently viewed first.';
+    sub.textContent=HIST_SRC
+      ?`Searches that used “${HIST_SRC.split('/').pop()}” — the last ${max}, most recently viewed first.`
+      :'The last '+max+' searches and dialogs, most recently viewed first.';
   }
   const list=$('#histList');
   if(list){
     list.innerHTML=rows.length?rows.map(e=>historyBadge(e,false)).join('')
-      :`<span class="hist-empty">${HIST.length?'No searches or dialogs match that filter.':'No saved searches yet.'}</span>`;
+      :`<span class="hist-empty">${HIST.length?(HIST_SRC&&!HIST_Q.trim()?'No searches used that source file.':'No searches or dialogs match that filter.'):'No saved searches yet.'}</span>`;
   }
   const rail=$('#histRail');
   if(rail){
     rail.innerHTML=rows.length?rows.map(e=>historyBadge(e,true)).join('')
-      :`<span class="rail-empty">${HIST.length?'No matches.':'Searches you run appear here.'}</span>`;
+      :`<span class="rail-empty">${HIST.length?(HIST_SRC?'No searches used that source.':'No matches.'):'Searches you run appear here.'}</span>`;
   }
 }
 /* One row for the history list and the rail. */
@@ -3704,6 +3758,18 @@ $('#histFilter').addEventListener('input',function(){
   HIST_Q=this.value||'';
   paintHistory();
 });
+// The two source selects stay in step; either one drives both views.
+for(const srcSel of ['#histSrc','#railSrc']){
+  const sel=$(srcSel);
+  if(sel) sel.addEventListener('change',function(){
+    HIST_SRC=this.value||'';
+    for(const other of ['#histSrc','#railSrc']){
+      const s=$(other);
+      if(s&&s!==this) s.value=HIST_SRC;
+    }
+    paintHistory();
+  });
+}
 // ↑/↓ walk the filtered list; Enter opens the focused row (it is a button).
 document.addEventListener('keydown',function(ev){
   if($('#histModal').hidden) return;
