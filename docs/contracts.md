@@ -17,9 +17,10 @@ deployment repo).
 ├── .peekseed/                        DERIVED; rebuildable; safe to delete
 │   ├── manifest.json                 scan state                     schema 1
 │   ├── config/links.json             0600
-│   ├── datasets/<collection>/        dataset.json schema 2, chunks.jsonl,
+│   ├── datasets/<collection>/        dataset.json schema 3, chunks.jsonl,
 │   │                                 index/<space>/generations/<uuid>/ + CURRENT
-│   ├── extracted/<sha256>.json       extraction cache
+│   ├── peels/<peel_id>/              peelfeed corpora (read-only for peekseed)
+│   ├── extracted/<sha256>.json       legacy extraction cache (unused)
 │   ├── history/
 │   ├── jobs/<id>.json                job record schema 1
 │   └── uploads/                      staging for an upload in progress
@@ -36,12 +37,13 @@ migration hint, never duplicated silently.
 | Contract | Schema | Notes |
 |---|---|---|
 | `manifest.json` | 1 | `created_at`, `last_scan`, `extractor`, `chunker`, `documents[{path,collection,sha256,bytes,pages,status,seen_at}]` |
-| `dataset.json` | 2 | `id`, `name`, `sources[{name,path,sha256,bytes,pages,extractor,status}]`, optional collection `status` |
-| chunk row | — | `id` (content-derived 16 hex), `ordinal`, `source`, `source_sha256`, `block_index`, `chunk_index`, `chunker_version`, pages, breadcrumb, `doc`, `text`, `heading_only` |
-| `info.json` | 2 | `space`, `generation`, `n`, `dim`, `embedding{link_id,model,protocol,dim,normalized,doc_prefix,query_prefix,probe}`, `chunker`, `extractor`, `documents_digest`, `sources` |
+| `dataset.json` | 3 | `id`, `name`, `sources[{name,path,sha256,bytes,pages,extractor,status,extraction{state,peel_id,conversion_id,profile,engine,validation,...}}]`, optional collection `status` |
+| chunk row | — | `id` (content-derived 16 hex), `ordinal`, `source`, `source_sha256`, `block_index`, `chunk_index`, `chunker_version`, pages, breadcrumb, `doc`, `text`, `heading_only`; optional peelfeed fields `kind`, `image_paths`, `source_pages`, `char_count`, `parts`/`part`, `prev`/`next`, `canonical_ids`, `engine`, `conversion_id`, `peel_id` |
+| `info.json` | 3 | `space`, `generation`, `n`, `dim`, `embedding{...probe}`, `chunker` (peel contract), `extractor` (peelfeed), `documents_digest`, `corpus_digest`, `peel{peel_id,conversion_id,profile,validation}`, `skipped_sources`, `sources` |
 | job record | 1 | `id`, `kind`, `collection`, `state`, `progress`, `cancel_requested`, timestamps |
 
-Helpers: `chunk_id()`, `documents_digest()`, `space_key()` / `space_identity()`,
+Helpers: `chunk_id()`, `documents_digest()`, `corpus_digest()`,
+`extraction_state()`/`extraction_default()`, `space_key()` / `space_identity()`,
 `probe_sha256()`, `stale_reasons()`, `new_manifest()`, `new_job()`,
 `validate_*()`, `upgrade_dataset()`, `upgrade_info()`, `read_json()` /
 `write_json_atomic()`.
@@ -72,28 +74,6 @@ its existing `Paths` attributes (`PEEKSEED_DATA` still overrides the root;
 existing tests must stay green). It gains `manifest_file`, `extracted_dir`,
 `jobs_dir`, `workspace_root`, `documents_dir`.
 
-### `peekseed.extract` (W3)
-
-```python
-EXTRACTOR_API = 1
-SUPPORTED_EXTENSIONS = {...}
-class OcrRequired(IngestError)   # message names file and page
-
-extract(path, *, ocr=None) -> dict
-    # {"pages": [{"page": 1-based int, "text": str}],
-    #  "extractor": {"name": str, "version": str},
-    #  "pages_count": int, "needs_ocr": bool}
-extractor_identity_for(path) -> dict
-cache_key(sha256, extractor) -> str   # cache filename: "<sha256>.json"
-available_extractors() -> list[str]
-ocr_available() -> bool
-```
-
-Core formats: PDF text (`pypdf`, `[pymupdf]`/`[ocr]` optional fallbacks),
-Markdown, HTML, TXT, EPUB, `.eml` with stdlib only. Extractor identity is
-provenance: a version change invalidates chunks. Optional extras (`office`,
-`tables`, `ocr`, `layout`) are detected lazily and never imported in core.
-
 ### `peekseed.scan` (W2)
 
 ```python
@@ -105,18 +85,21 @@ files[...], collections{id: {status, sources, chunks, embed_calls, reasons}}, em
 
 Behaviour: walk `documents/` (skip hidden/`*.part`/`~$*`/`.DS_Store`; resolve
 symlinks, reject escapes), sha256 each file, diff the manifest (moved/renamed = a
-path update, not a new document), extraction cache keyed by
-`(sha256, extractor identity)`, chunk new/changed files with content-derived ids,
-write `dataset.json` (schema 2) + `chunks.jsonl`, then build the index for dirty
-collections when a link is supplied. One corrupt file marks that source `error`
-with a reason and continues. `--prune` removes missing sources (chunks too).
-A second scan of unchanged documents makes **zero** embed calls.
+path update, not a new document), reconcile `dataset.json` (schema 3) source
+entries with `status="uploaded"` and `extraction.state="not_extracted"`
+(preserving an existing extraction block when content is unchanged), and report
+index state read-only. It writes no chunks, builds no index and makes **zero**
+embed calls. `link` is accepted for compatibility but ignored. One unreadable
+file marks that source `error` with a reason and continues. `--prune` removes
+missing sources (explicit data loss).
 
 ### `peekseed.ingest.index` (W5)
 
 ```python
-build_index(dataset_dir, link, *, target_chars=1200, max_chars=2000,
-            progress=None, batch_size=32, job=None, cancel=None) -> dict  # info.json
+build_index(dataset_dir, link, *, progress=None, batch_size=32, job=None,
+            cancel=None, lock=None, force=False) -> dict  # info.json (+up_to_date)
+# raises NoExtractedSources when no source has a usable peel corpus
+peel_root() -> Path        # PEELFEED_ROOT (legacy PEEKSEED_PEELFEED_ROOT accepted) or <data_root>/peels
 load_index(dataset_dir, space) -> {"info", "vectors", "meta"}
 index_state(dataset_dir, space, *, chunker=None, extractor=None) -> dict
     # {"status": "indexed|stale|needs_reindex|not_indexed", "reasons": [...], "generation": str}
@@ -124,6 +107,13 @@ probe_cosine(link, dataset_dir, space) -> float     # live embedder vs stored pr
 verify_probe(link, dataset_dir, space) -> None      # raises ProbeMismatch (< 0.999)
 reindex(dataset_dir, link, *, dry_run=False, gc=False) -> dict   # scope estimate
 ```
+
+Input: every source with `extraction.state == "extracted"` is read from
+`<peel_root>/<peel_id>/extract/corpus/` and gated on realpath allowlist +
+`manifest.source_sha256` + recorded `conversion_id` + `validation.errors == 0`.
+There is no in-process extraction fallback; non-extracted sources are listed in
+`skipped_sources`. A second build over the same corpora returns the live info
+with zero embed calls unless `force=True` (reindex).
 
 Layout: `index/<space>/generations/<uuid>/{vectors.npy,meta.json,info.json,probe.npy}`
 and `CURRENT` (one line: uuid) written **last** with `os.replace`. A crash leaves
@@ -133,6 +123,27 @@ preallocated `vectors.npy` (memmap), retries 429/5xx/timeouts with backoff,
 checkpoints per batch, and resumes from the checkpoint. A job record is written to
 `.peekseed/jobs/<id>.json` and updated (`running` → `succeeded|failed|interrupted`).
 `cancel` is a callable checked between batches.
+
+### `peekseed.peelfeed` (CLI seam)
+
+```python
+config_path() -> Path       # <data_root>/config/peelfeed.json (0600, seeded from env)
+load() -> dict              # cli, python, repo, root, enabled, timeout, poll,
+                            # llm_mode, chunk_profile (env wins over the file)
+handshake(force=False) -> dict   # `peelfeed capabilities`, cached 60 s, never raises
+status(probe=False) -> {"config", "handshake"}
+client() -> PeelfeedClient       # capabilities/status/status_all/ingest/review/
+                                 # decide/rebuild/event/archive
+extraction_state_for_peel(state) / extraction_from_summary(summary, previous=…)
+```
+
+The engine is invoked as a subprocess (`PEEKSEED_PEELFEED_CLI`, or
+`PEEKSEED_PEELFEED_PYTHON -m peelfeed.cli` with `PYTHONPATH=<repo>`) with
+`--root <root>` and `--json`; stdout is parsed and a nonzero exit raises
+`PeelfeedError` (`PeelfeedUnavailable` when the command cannot start). There is
+no daemon, HTTP client, base URL or token. The shared peel root is
+`PEELFEED_ROOT` (legacy `PEEKSEED_PEELFEED_ROOT` accepted), default
+`<data_root>/peels`.
 
 ### `peekseed.security` (W8)
 
@@ -151,9 +162,9 @@ Mutating `/api/*` routes require the token when enabled and reject a hostile
 
 `peekseed init [--workspace PATH]`, `scan [--prune] [--link ID]`, `status`,
 `doctor`, `workspace path|move PATH`, `reindex --all --link ID [--dry-run] [--gc]`,
-`import --manifest FILE [--dry-run]`, `migrate [--dry-run]`, `serve`, `version`,
-and the legacy `index`. CLI wiring lives in `peekseed/__main__.py` and calls the
-module functions above.
+`migrate [--dry-run]`, `serve`, `version`, and `index` (storage-only upload).
+The `import` command was removed with the old importer (M-1); extraction is a
+peelfeed job. CLI wiring lives in `peekseed/__main__.py`.
 
 ## Module map
 
@@ -161,14 +172,12 @@ module functions above.
 |---|---|
 | `peekseed/contracts.py` | Versioned schemas, content ids, space identity, probe, atomic JSON, upgrades |
 | `peekseed/workspace.py`, `config.py` | Workspace resolution, `init`/`doctor`/`status`/`move`, derived-root paths |
-| `peekseed/scan.py` | Manifest diff by sha256, extraction cache, chunk rebuild, dirty-collection builds |
-| `peekseed/extract.py` | Format extraction and versioned extractor identity (core + optional extras) |
-| `peekseed/ingest/chunk.py` | Heading-aware chunker with content-derived ids |
-| `peekseed/ingest/index.py` | Generation-atomic indexes, probe, jobs, `load_index`/`index_state`/`reindex` |
+| `peekseed/scan.py` | Manifest diff by sha256, dataset/source reconciliation, extraction/index state reporting (no extraction) |
+| `peekseed/ingest/index.py` | Storage-only uploads, peelfeed corpus reader/gate, generation-atomic indexes, probe, jobs, `load_index`/`index_state`/`reindex` |
 | `peekseed/ingest/lock.py` | Per-collection writer lock with stale-holder detection |
-| `peekseed/importer.py` | Versioned corpus manifest import, zero-re-embed copy, Chroma export |
+| `peekseed/peelfeed.py` | peelfeed CLI adapter: env-seeded config, capabilities handshake, ingest/review/decide/rebuild/event/archive subprocess calls |
 | `peekseed/overlap.py` | Top-k ranking overlap for the cutover acceptance record |
-| `peekseed/security.py`, `app.py` | Token/Host/Origin gate, streaming upload limits, inline `/pdf` |
+| `peekseed/security.py`, `app.py` | Token/Host/Origin gate, streaming upload limits, inline `/pdf`, peelfeed routes |
 | `peekseed/migrate.py` | Explicit schema migration (dry-run default) |
 | `peekseed/__main__.py` | CLI wiring for all of the above |
 
@@ -176,14 +185,15 @@ module functions above.
 
 Tests 1–6 and 9–11 are verified end-to-end by `tests/test_acceptance.py`
 (`GateOneTests` … `GateElevenTests`); each module also has its own unit suite
-(`test_workspace`, `test_scan`, `test_extract`, `test_index`, `test_security`,
-`test_contracts`, `test_migrate`, `test_chunk`, `test_engine`, `test_cli`,
-`test_jobs`, `test_import`, `test_overlap`, `test_packaging`).
+(`test_workspace`, `test_scan`, `test_index`, `test_security`,
+`test_contracts`, `test_migrate`, `test_engine`, `test_cli`, `test_jobs`,
+`test_peelfeed`, `test_overlap`, `test_packaging`).
 
 1. `init --workspace /tmp/ws` creates the tree + anchored gitignore entry;
    `documents/` hashes/mtimes unchanged after a scan.
-2. Drop PDF A → scan → indexed; scan again → `0 new, 0 changed`, **0** embed calls.
-3. Add PDF B to an indexed collection → scan → B searchable, A's ids unchanged.
+2. Drop PDF A → scan stores it (`uploaded`); scan again → `0 new, 0 changed`,
+   **0** embed calls; after a fake peel + build → indexed.
+3. Add PDF B, extract it (fake peel) → build → B searchable, A's ids unchanged.
 4. Cancel/kill mid-build → previous index still serves; restart resumes the
    incomplete generation; crash-left jobs are `interrupted`, not `failed`.
 5. Corrupt `vectors.npy` → collection `needs_reindex` with a reason.

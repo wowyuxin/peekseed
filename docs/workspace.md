@@ -17,7 +17,8 @@ workspace/                          one directory to back up
 │   ├── manifest.json               scan state: paths, content hashes, statuses
 │   ├── config/links.json           model endpoints (0600, keys masked in the UI)
 │   ├── datasets/<collection>/      dataset.json, chunks.jsonl, index/<space>/
-│   ├── extracted/<sha256>.json     extraction cache
+│   ├── peels/<peel_id>/            peelfeed corpora (source, extract/corpus, .peel)
+│   ├── extracted/<sha256>.json     legacy extraction cache (unused)
 │   ├── history/                    search and dialog history
 │   ├── jobs/<id>.json              persistent, cancellable jobs
 │   └── uploads/                    staging for an upload in progress
@@ -49,7 +50,7 @@ peekseed workspace path                     # print the resolved absolute root
 peekseed workspace move ~/new-research      # move the tree as one unit
 peekseed doctor                             # paths, gitignore/checkout check, links, schemas
 peekseed status                             # last scan, collections, stale/missing files
-peekseed scan                               # preview only: scan workflow ships in 0.2.0
+peekseed scan                               # discover/hash documents; reconcile datasets (no extraction)
 ```
 
 The workspace is also exposed over HTTP: `GET /api/workspace` returns the served
@@ -77,9 +78,10 @@ These are enforced by tests, not just documented:
 2. **Derived data is rebuildable.** Deleting `.peekseed/` loses no documents; the
    next scan rebuilds the state.
 3. **Every chunk traces to `source_sha256`,** and every index records the source
-   hashes plus extractor, chunker and embedding identity it was built from.
-4. **Scan is idempotent** (0.2.0 workflow; the engine already honours it). A second
-   scan of unchanged documents makes zero embed calls.
+   hashes plus peelfeed extractor, peel/conversion identity, chunk contract and
+   embedding identity it was built from.
+4. **Scan is idempotent.** A second scan of unchanged documents writes nothing and
+   makes zero embed calls (it builds no index at all).
 5. **Paths are allowlisted.** Only `documents/` is scanned, served and watched;
    symlinks are resolved and rejected when they escape. `/pdf` serves only the
    dataset's own `original/` copies.
@@ -93,7 +95,8 @@ A file is identified by its sha256. That means:
 - **moving** a document (for example into a subfolder) is not a new document: the
   manifest updates its path and keeps it `unchanged`;
 - **renaming** follows the same rule;
-- **editing** a document is `changed`, and only that collection is rebuilt.
+- **editing** a document is `changed`, its extraction block resets to
+  `not_extracted`, and the file needs a new Extract + index build.
 
 This avoids the classic "move = new asset, re-embed everything" trap and makes
 incremental ingestion safe, because chunk ids are derived from the source content

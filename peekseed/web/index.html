@@ -1123,6 +1123,35 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .ds-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start;}
 .ds-actions button{padding:5px 10px;font-size:11.5px;min-height:28px;border-radius:7px;}
 .ds-progress{margin-top:10px;}
+.ds-sources{display:flex;flex-direction:column;gap:5px;margin-top:3px;}
+.ds-src{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:4px 0;
+  border-top:1px dashed var(--line-soft);min-width:0;}
+.ds-src:first-child{border-top:none;}
+.src-name{font:11px var(--mono);color:var(--text);overflow-wrap:anywhere;flex:1 1 140px;min-width:0;}
+.src-chip{font:9.5px var(--mono);text-transform:uppercase;letter-spacing:.05em;
+  border:1px solid var(--line);border-radius:5px;padding:1px 5px;white-space:nowrap;}
+.src-chip.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.src-chip.warn{color:var(--warn);border-color:rgba(251,191,36,.35);}
+.src-chip.bad{color:var(--bad);border-color:rgba(251,113,133,.35);}
+.src-chip.muted{color:var(--faint);}
+.ds-src button{padding:3px 8px;font-size:10.5px;min-height:24px;border-radius:6px;}
+.pf-banner{margin:8px 18px 0;padding:7px 10px;border-radius:8px;font-size:11.5px;
+  line-height:1.5;border:1px solid var(--line);background:var(--panel-2);color:var(--muted);}
+.pf-banner.warn{color:var(--warn);border-color:rgba(251,191,36,.35);}
+.pf-banner.bad{color:var(--bad);border-color:rgba(251,113,133,.35);}
+.pf-banner.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.pf-banner[hidden]{display:none;}
+.review-list{display:flex;flex-direction:column;gap:8px;}
+.review-item{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;padding:9px;
+  border:1px solid var(--line);border-radius:10px;background:var(--panel);}
+.review-item.decided-accept{border-color:var(--ok-line);}
+.review-item.decided-reject{border-color:rgba(251,113,133,.4);}
+.review-main{flex:1 1 240px;min-width:0;display:flex;flex-direction:column;gap:4px;}
+.review-msg{font-size:12px;line-height:1.5;overflow-wrap:anywhere;}
+.review-meta{font:10.5px var(--mono);color:var(--faint);overflow-wrap:anywhere;}
+.review-asset{font-size:11px;color:var(--accent);overflow-wrap:anywhere;}
+.review-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start;}
+.review-actions button{padding:5px 10px;font-size:11px;min-height:27px;border-radius:7px;}
 .set-field input[type=file]{padding:6px 7px;font-size:12px;color:var(--muted);cursor:pointer;}
 .set-field input[type=file]::file-selector-button{font:inherit;font-size:11.5px;
   font-weight:600;margin-right:8px;padding:4px 9px;border-radius:7px;cursor:pointer;
@@ -1523,6 +1552,7 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
       <button class="hist-close" id="datasetsClose" type="button" aria-label="Close">&#215;</button>
     </div>
     <p class="settings-msg" id="datasetMsg" role="status" aria-live="polite"></p>
+    <div class="pf-banner" id="peelfeedBanner" hidden></div>
     <div class="hist-body settings-body">
       <div class="settings-links ds-list" id="datasetList"><span class="hist-empty">Loading datasets…</span></div>
       <form id="datasetForm" class="settings-form" autocomplete="off" novalidate>
@@ -1544,6 +1574,24 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
           <button id="datasetAddBtn" type="submit">Add dataset</button>
         </div>
       </form>
+    </div>
+  </div>
+</div>
+
+<!-- Peel review: review items come from peelfeed through the proxy route; a
+     decision is written to the peel's corrections log by peelfeed, and Apply &
+     rebuild asks peelfeed to re-run normalize/gate/chunk. -->
+<div class="hist-overlay" id="reviewModal" hidden>
+  <div class="hist-dialog settings-dialog" role="dialog" aria-modal="true"
+       aria-label="Peel review">
+    <div class="hist-head">
+      <div><h2>Review peel</h2><p id="reviewHeadSub">Review items and evidence from peelfeed.</p></div>
+      <button class="secondary" id="reviewRebuildBtn" type="button">Apply &amp; rebuild</button>
+      <button class="hist-close" id="reviewClose" type="button" aria-label="Close">&#215;</button>
+    </div>
+    <p class="settings-msg" id="reviewMsg" role="status" aria-live="polite"></p>
+    <div class="hist-body settings-body">
+      <div class="review-list" id="reviewList"><span class="hist-empty">Loading review items…</span></div>
     </div>
   </div>
 </div>
@@ -2099,9 +2147,97 @@ function datasetStateBits(ds){
 function datasetOptionLabel(ds){
   return (ds.name||ds.id)+' · '+datasetStateBits(ds).join(' · ');
 }
+let PF_STATUS=null;
+let DATASET_SOURCES={};
+let REVIEW_CTX=null;
+const PEEL_STATE_LABEL={uploaded:'not extracted',not_extracted:'not extracted',
+  queued:'queued',running:'running',extracted:'extracted',failed:'failed',stale:'stale'};
+function peelfeedAvailable(){
+  return !!(PF_STATUS&&PF_STATUS.handshake&&PF_STATUS.handshake.available);
+}
+function peelfeedConfig(){ return (PF_STATUS&&PF_STATUS.config)||{}; }
+async function loadPeelfeedStatus(){
+  try{ PF_STATUS=await getJSON('/api/peelfeed/status'); }
+  catch(e){ PF_STATUS=null; }
+  paintPeelfeedBanner();
+}
+function paintPeelfeedBanner(){
+  const el=$('#peelfeedBanner'); if(!el) return;
+  const cfg=peelfeedConfig(), hs=(PF_STATUS&&PF_STATUS.handshake)||{};
+  let text='', kind='info';
+  if(!PF_STATUS){
+    text='Could not read the peelfeed status; extraction may be unavailable.';
+    kind='bad';
+  }else if(!cfg.configured){
+    text='peelfeed is not configured. Uploads and file management work; '
+      +'Extract is disabled until PEEKSEED_PEELFEED_CLI (or '
+      +'PEEKSEED_PEELFEED_PYTHON) is set and peekseed is restarted.';
+    kind='warn';
+  }else if(!hs.available){
+    text='peelfeed CLI is unavailable ('+((hs.error)||'not reachable')+'). Uploads and '
+      +'file management keep working; Extract is disabled.';
+    kind='warn';
+  }else{
+    text='peelfeed '+(hs.version||'')+' reachable via CLI · formats: '
+      +(((hs.formats||[]).join(', '))||'?')+' · profiles: '
+      +(((hs.profiles||[]).join(', '))||'?');
+    kind='ok';
+  }
+  el.hidden=false; el.className='pf-banner '+kind; el.textContent=text;
+}
+function sourceExtraction(src){ return (src&&src.extraction)||{}; }
+function sourceState(src){
+  const st=sourceExtraction(src).state;
+  return st||(src&&src.status)||'not_extracted';
+}
+function sourceChipClass(state){
+  if(state==='extracted') return 'ok';
+  if(state==='failed') return 'bad';
+  if(state==='queued'||state==='running'||state==='stale') return 'warn';
+  return 'muted';
+}
+function sourceChipHtml(state){
+  return '<span class="src-chip '+sourceChipClass(state)+'">'
+    +esc(PEEL_STATE_LABEL[state]||state)+'</span>';
+}
+function extractedSources(dsId){
+  return (DATASET_SOURCES[dsId]||[]).filter(s=>sourceState(s)==='extracted');
+}
+async function loadDatasetSources(){
+  DATASET_SOURCES={};
+  await Promise.all(DATASETS.map(async ds=>{
+    try{
+      const r=await getJSON('/api/datasets/'+encodeURIComponent(ds.id)+'/sources');
+      DATASET_SOURCES[ds.id]=(r&&r.sources)||[];
+    }catch(e){ DATASET_SOURCES[ds.id]=[]; }
+  }));
+}
+function sourceRowHtml(dsId,src){
+  const state=sourceState(src);
+  const ex=sourceExtraction(src);
+  const reviewN=Number(((ex.validation||{}).review_items)||0);
+  const available=peelfeedAvailable();
+  const busy=(state==='queued'||state==='running');
+  const canExtract=available&&src.present&&!busy;
+  const label=(state==='extracted'||state==='stale'||state==='failed')?'Re-extract':'Extract';
+  const why=available
+    ? (src.present?'Ask peelfeed to build a peel for this file'
+                 :'the stored file is missing')
+    : 'peelfeed is not configured or unreachable';
+  let actions='<button type="button" class="secondary" data-act="extract"'
+    +' data-sha="'+escAttr(src.sha256||'')+'"'
+    +(canExtract?'':' disabled')+' title="'+escAttr(why)+'">'+esc(label)+'</button>';
+  if(state==='extracted'&&reviewN>0){
+    actions+='<button type="button" class="secondary" data-act="review"'
+      +' data-sha="'+escAttr(src.sha256||'')+'">Review ('+reviewN+')</button>';
+  }
+  return '<div class="ds-src"><span class="src-name">'+esc(src.name||'?')+'</span>'
+    +sourceChipHtml(state)+actions+'</div>';
+}
 async function loadDatasets(){
   const d=await getJSON('/api/datasets');
   DATASETS=(d&&Array.isArray(d.datasets))?d.datasets:[];
+  await loadDatasetSources();
   const sel=$('#dataset'); if(!sel) return;
   const prev=sel.value;
   sel.innerHTML=DATASETS.length
@@ -4392,6 +4528,8 @@ function datasetRow(ds){
   const chunks=Number(ds.chunks||0);
   const idx=(ds.indexes||[]);
   const names=datasetSourceNames(ds);
+  const sources=DATASET_SOURCES[ds.id]||[];
+  const extracted=extractedSources(ds.id).length;
   const srcTxt=names.length
     ? names.slice(0,3).join(', ')+(names.length>3?' +'+(names.length-3)+' more':'')
     : 'no source files';
@@ -4405,23 +4543,31 @@ function datasetRow(ds){
       }).join('')
     : '<span class="mchip">no index yet</span>';
   const embed=embedLink();
-  const why=embed
-    ? 'Build the vector index with '+linkLabel(embed)+(linkModel(embed)?(' ('+linkModel(embed)+')'):'')
-    : 'Add or enable an embedding link in Settings first.';
+  let why='';
+  if(!embed) why='Add or enable an embedding link in Settings first.';
+  else if(!extracted) why='Extract at least one source with peelfeed first '
+    +'(peekseed reads the peel corpus, not the PDF).';
+  else why='Build the vector index with '+linkLabel(embed)
+    +(linkModel(embed)?(' ('+linkModel(embed)+')'):'');
+  const srcRows=sources.length
+    ? '<div class="ds-sources">'+sources.map(src=>sourceRowHtml(ds.id,src)).join('')+'</div>'
+    : '';
   return '<div class="ds-row" data-id="'+escAttr(ds.id)+'">'
     +'<div class="ds-main">'
     +'<div class="ds-title"><span class="ds-name">'+esc(ds.name||ds.id)+'</span>'
     +'<span class="set-badge">'+esc(ds.id)+'</span></div>'
     +'<div class="ds-meta">'
     +(chunks?chunks.toLocaleString()+' chunk'+(chunks===1?'':'s'):'no chunks yet')
-    +' · '+names.length+' source'+(names.length===1?'':'s')+' · '+esc(srcTxt)
+    +' · '+names.length+' source'+(names.length===1?'':'s')
+    +' · '+extracted+' extracted · '+esc(srcTxt)
     +'</div>'
     +'<div class="ds-indexes">'+idxHtml+'</div>'
+    +srcRows
     +(embed?'':'<div class="ds-meta">Add or enable an embedding link in Settings to build an index.</div>')
     +'</div>'
     +'<div class="ds-actions">'
     +'<button type="button" class="secondary" data-act="build"'
-    +(embed?'':' disabled')+' title="'+escAttr(why)+'">Build index</button>'
+    +((embed&&extracted)?'':' disabled')+' title="'+escAttr(why)+'">Build index</button>'
     +'<button type="button" class="secondary" data-act="delete">Delete</button>'
     +'</div></div>';
 }
@@ -4434,10 +4580,12 @@ function paintDatasetDialog(){
   }
   box.innerHTML=DATASETS.map(datasetRow).join('');
 }
-function datasetAction(id,act,btn){
+function datasetAction(id,act,btn,sha){
   const ds=DATASETS.find(d=>d.id===id);
   if(!ds) return;
   if(act==='build'){ buildDataset(ds.id,btn); return; }
+  if(act==='extract'){ extractSource(ds.id,sha,btn); return; }
+  if(act==='review'){ openReview(ds.id,sha); return; }
   if(act==='delete'){
     if(!window.confirm('Delete dataset "'+(ds.name||id)+'" and its index? '
                        +'This cannot be undone.')) return;
@@ -4525,6 +4673,150 @@ async function pollJob(jobId,datasetId,report){
   report('The index build is still running in the background. Press Refresh to see '
     +'whether the index appeared.',false);
 }
+async function extractSource(dsId,sha,btn){
+  if(!peelfeedAvailable()){
+    datasetsMsg('peelfeed is not configured or unavailable; configure '
+      +'PEEKSEED_PEELFEED_CLI (or PEEKSEED_PEELFEED_PYTHON) and restart '
+      +'peekseed.',true);
+    return;
+  }
+  if(btn){ btn.disabled=true; btn.textContent='Extracting…'; }
+  datasetsMsg('Asking peelfeed to extract "'+sha.slice(0,8)+'"…');
+  try{
+    const r=await callJSON('/api/datasets/'+encodeURIComponent(dsId)
+      +'/sources/'+encodeURIComponent(sha)+'/extract',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({})});
+    const peel=(r&&r.peel)||{};
+    datasetsMsg('Extraction queued'+(peel.reused?' (peelfeed reused an existing peel)':'')
+      +'. Polling status…');
+    await pollPeel(dsId,sha);
+  }catch(e){
+    datasetsMsg('Could not start extraction: '+(e.message||e),true);
+    await loadDatasets();
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent='Extract'; }
+  }
+}
+async function pollPeel(dsId,sha){
+  const interval=(Number(peelfeedConfig().poll)||2)*1000;
+  for(let i=0;i<600;i++){
+    await sleep(interval);
+    let sources=[];
+    try{
+      const r=await getJSON('/api/datasets/'+encodeURIComponent(dsId)+'/sources');
+      sources=(r&&r.sources)||[];
+      DATASET_SOURCES[dsId]=sources;
+    }catch(e){
+      datasetsMsg('Lost the extraction status ('+(e.message||e)+'). Press Refresh.',true);
+      return;
+    }
+    const src=sources.find(s=>s.sha256===sha);
+    const state=src?sourceState(src):'';
+    if(state==='extracted'||state==='failed'||state==='stale'){
+      const ex=src?sourceExtraction(src):{};
+      const reviewN=Number(((ex.validation||{}).review_items)||0);
+      if(state==='extracted'){
+        datasetsMsg('Extracted "'+((src&&src.name)||sha)+'" ('
+          +((src&&src.pages)||0)+' pages'
+          +(reviewN?(', '+reviewN+' review item(s)'):'')
+          +'). Build index to make it searchable.');
+      }else if(state==='failed'){
+        datasetsMsg('Extraction failed for "'+((src&&src.name)||sha)+'": '
+          +((ex.error)||'unknown error'),true);
+      }else{
+        datasetsMsg('The peel for "'+((src&&src.name)||sha)+'" is stale; press Re-extract.',true);
+      }
+      await loadDatasets();
+      return;
+    }
+    datasetsMsg('Extracting "'+((src&&src.name)||sha)+'"… '+(PEEL_STATE_LABEL[state]||state));
+  }
+  datasetsMsg('Extraction is still running in the background; press Refresh to check again.',false);
+}
+async function openReview(dsId,sha){
+  REVIEW_CTX={dataset:dsId,sha:sha};
+  const m=$('#reviewModal'); if(!m) return;
+  m.hidden=false;
+  $('#reviewMsg').textContent='';
+  $('#reviewList').innerHTML='<span class="hist-empty">Loading review items…</span>';
+  try{
+    const r=await getJSON('/api/datasets/'+encodeURIComponent(dsId)
+      +'/sources/'+encodeURIComponent(sha)+'/review');
+    paintReview(r);
+  }catch(e){
+    $('#reviewList').innerHTML='<span class="hist-empty">Could not load review: '
+      +esc(e.message||e)+'</span>';
+  }
+}
+function paintReview(r){
+  const items=(r&&r.items)||[];
+  const llm=(r&&r.llm)||{};
+  $('#reviewHeadSub').textContent='Peel '+((r&&r.peel_id)||'')+' · '
+    +items.length+' review item(s)'+(llm.available?' · LLM available':' · LLM off');
+  if(!items.length){
+    $('#reviewList').innerHTML='<span class="hist-empty">No review items.</span>';
+    return;
+  }
+  $('#reviewList').innerHTML=items.map(function(it){
+    const asset=(it.asset)||{};
+    const pages=(asset.pages||[]).join(',')||'?';
+    const assetUrl=asset.path
+      ? '/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)+'/sources/'
+        +encodeURIComponent(REVIEW_CTX.sha)+'/assets/'+asset.path
+      : '';
+    return '<div class="review-item" data-item="'+escAttr(it.id)+'">'
+      +'<div class="review-main">'
+      +'<div class="review-msg">'+esc(it.message||'')+'</div>'
+      +'<div class="review-meta">'+esc(asset.kind||'asset')+' · '+esc(asset.id||'')
+      +' · p.'+esc(pages)+'</div>'
+      +(assetUrl?'<a class="review-asset" target="_blank" rel="noopener" href="'
+          +escAttr(assetUrl)+'">open '+esc(asset.path)+'</a>':'')
+      +'</div>'
+      +'<div class="review-actions">'
+      +'<button type="button" class="secondary" data-dec="accept">Accept</button>'
+      +'<button type="button" class="secondary" data-dec="reject">Reject</button>'
+      +'</div></div>';
+  }).join('');
+}
+async function decideReview(btn){
+  const item=btn.closest('.review-item');
+  if(!item||!REVIEW_CTX) return;
+  const itemId=item.getAttribute('data-item');
+  const decision=btn.getAttribute('data-dec');
+  btn.disabled=true;
+  try{
+    await callJSON('/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)
+      +'/sources/'+encodeURIComponent(REVIEW_CTX.sha)+'/review/'
+      +encodeURIComponent(itemId),{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({decision:decision})});
+    item.classList.add('decided-'+decision);
+    item.querySelectorAll('button').forEach(function(b){ b.disabled=true; });
+    $('#reviewMsg').textContent='Decision "'+decision+'" recorded for '+itemId+'.';
+  }catch(e){
+    $('#reviewMsg').innerHTML='<span class="err">'+esc(e.message||e)+'</span>';
+    btn.disabled=false;
+  }
+}
+async function rebuildReviewed(){
+  if(!REVIEW_CTX) return;
+  const btn=$('#reviewRebuildBtn');
+  btn.disabled=true; btn.textContent='Rebuilding…';
+  try{
+    await callJSON('/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)
+      +'/sources/'+encodeURIComponent(REVIEW_CTX.sha)+'/rebuild',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({reasons:['review decisions']})});
+    $('#reviewMsg').textContent='Rebuild queued; the source returns to extracted '
+      +'when peelfeed finishes. Press Refresh to update the chip.';
+    await loadDatasets();
+  }catch(e){
+    $('#reviewMsg').innerHTML='<span class="err">'+esc(e.message||e)+'</span>';
+  }finally{
+    btn.disabled=false; btn.textContent='Apply & rebuild';
+  }
+}
 async function addDataset(ev){
   ev.preventDefault();
   const name=($('#datasetName').value||'').trim();
@@ -4565,6 +4857,7 @@ async function openDatasets(){
   datasetsMsg('');
   try{
     await loadLinks();
+    await loadPeelfeedStatus();
     await loadDatasets();
   }catch(e){
     datasetsMsg('Could not read the datasets: '+(e.message||e),true);
@@ -4583,6 +4876,7 @@ $('#datasetsModal').addEventListener('click',function(ev){
 $('#datasetsRefreshBtn').onclick=async()=>{
   try{
     await loadLinks();
+    await loadPeelfeedStatus();
     await loadDatasets();
     datasetsMsg('Refreshed.');
   }catch(e){ datasetsMsg('Could not refresh: '+(e.message||e),true); }
@@ -4591,9 +4885,19 @@ $('#datasetList').addEventListener('click',function(ev){
   const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-act]'):null;
   if(!btn) return;
   const row=btn.closest('.ds-row'); if(!row) return;
-  datasetAction(row.getAttribute('data-id'),btn.getAttribute('data-act'),btn);
+  datasetAction(row.getAttribute('data-id'),btn.getAttribute('data-act'),btn,
+                btn.getAttribute('data-sha')||'');
 });
 $('#datasetForm').addEventListener('submit',addDataset);
+$('#reviewList').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-dec]'):null;
+  if(btn) decideReview(btn);
+});
+$('#reviewRebuildBtn').onclick=rebuildReviewed;
+$('#reviewClose').onclick=function(){ const m=$('#reviewModal'); if(m) m.hidden=true; };
+$('#reviewModal').addEventListener('click',function(ev){
+  if(ev.target===this){ const m=$('#reviewModal'); if(m) m.hidden=true; }
+});
 
 /* ---- workspace dialog ----------------------------------------------------
    Read-mostly: GET /api/workspace gives the served absolute paths, last scan and

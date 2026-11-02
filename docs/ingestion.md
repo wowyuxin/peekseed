@@ -1,89 +1,130 @@
 # Ingestion and indexes
 
-Ingestion turns a folder of documents into a searchable vector index without ever
-modifying your files. The pipeline is incremental and idempotent:
+peekseed turns uploaded files into a searchable vector index without ever
+modifying your files. Since M-1, **extraction is not a peekseed feature**: it is
+a separate peelfeed job per source file, and peekseed consumes the corpus that
+job writes. The pipeline is:
 
 ```
-documents/ ──scan──▶ manifest.json ──diff by sha256──▶ extraction cache
-             │                                              │
-             │                                              ▼
-             │                                        chunk (stable ids)
-             │                                              │
-             │                                              ▼
-             │                                   embed (batched, checkpointed)
-             │                                              │
-             └────────────────────────────────────▶ index/<space>/generations/<uuid>/
-                                                            + CURRENT (written last)
-                                                            ──▶ search
+upload ──▶ <dataset>/original/<file> + dataset.json (status=uploaded, no parse)
+           │
+           ▼  user clicks Extract (or POST .../sources/{sha}/extract)
+peelfeed ──▶ peelfeed ingest (CLI subprocess) → <peel_root>/<peel_id>/extract/corpus/{manifest,chunks,validation,...}
+           │
+           ▼  Build index (or POST /api/datasets/{id}/index)
+build_index ──▶ read corpus (gate: realpath/sha/conversion/validation.errors==0)
+             ──▶ map corpus chunks → peekseed chunk contract (stable ids)
+             ──▶ embed (batched, checkpointed)
+             ──▶ index/<space>/generations/<uuid>/ + CURRENT (written last)
+             ──▶ search
 ```
 
-## Scanning (0.2.0)
+Upload and extraction are deliberately decoupled: uploading, listing, opening and
+deleting files all work with no peelfeed configured. Search/ask only work for a
+dataset whose sources have been extracted **and** indexed.
 
-The scan engine is implemented and tested, but the **scan workflow** — the CLI
-`scan`/`--watch`, `POST /api/scan`, and the UI Scan panel — is a **0.2.0**
-feature. 0.1.0's supported ingestion paths are the upload API/UI and
-`peekseed import`; there is no `POST /api/scan` route in 0.1.0. The contracts
-below (manifest, statuses, idempotency) are what the 0.2.0 workflow will expose.
+## Upload (storage only)
 
-`peekseed scan` (preview) walks `documents/`, hashes each file and compares it
-with `manifest.json`:
+`POST /api/datasets` (create a collection + upload) or
+`POST /api/datasets/{id}/sources` (upload into an existing collection) validate
+the PDF magic/extension, stream the bytes to disk with the per-file/file-count/
+total limits enforced as they arrive, sanitize the filename before any path is
+built (zip-slip safe), and copy the file into `<dataset>/original/`.
 
+`dataset.json` gets one source entry:
+
+```json
+{
+  "name": "manual.pdf", "path": "original/manual.pdf",
+  "sha256": "…", "bytes": 12345, "pages": 0,
+  "status": "uploaded",
+  "extraction": {"state": "not_extracted", "peel_id": "", "conversion_id": "",
+                 "profile": "", "engine": "", "validation": {"errors": 0,
+                 "review_items": 0}, "started_at": null, "finished_at": null,
+                 "error": null}
+}
 ```
-walk documents/ (skip hidden, *.part, ~$*, .DS_Store; resolve symlinks, reject escapes)
-  → for each file: sha256, bytes, mtime
-  → diff against manifest: new | unchanged | changed | missing
-  → extraction cache hit by sha256 (extractor version in the key)
-  → a collection is dirty if its source hash set changed, or chunker/extractor changed
-  → rebuild only dirty collections; one writer per collection
-```
+
+Same content uploaded twice is idempotent (one stored copy, one source entry).
+There is no page count, no extraction and no chunking at upload time.
+
+## Per-source extraction state
+
+`GET /api/datasets/{id}/sources` returns each source with its extraction block.
+The state chip is one of `not_extracted | queued | running | extracted | failed |
+stale`. `Extract` runs `peelfeed ingest` with the stored file's path (the CLI
+copies it into the peel), then records `state="queued"` and a background worker
+polls `peelfeed status` until the peel is ready or failed. The UI polls until
+`extracted` (or `failed` with a readable reason and a Retry action). peelfeed's
+`.peel` log is the source of truth for the peel state; peekseed only stores the
+last observed state and identity in `dataset.json`.
+
+Review (crop + evidence + LLM suggestion) and Apply & rebuild run the peelfeed
+CLI (`review`/`decide`/`rebuild`); they never rewrite the corpus themselves.
+
+## Scanning
+
+`peekseed scan` reconciles `documents/` with `manifest.json` and the datasets. It
+is **discovery only** now: it hashes files, diffs by content, writes/updates
+`dataset.json` source entries (preserving an existing extraction block when the
+content is unchanged), and reports index state read-only. It writes no chunks,
+builds no index and calls no embedding link.
 
 - **Identity is content-based.** A moved or renamed file is `unchanged` with an
-  updated path; a modified file is `changed`.
-- **Missing files are reported, not deleted.** Chunks are kept until
-  `peekseed scan --prune`, which is explicit data loss.
-- **Failure isolation.** One corrupt or encrypted file becomes `error` with a
-  reason naming the file and page; the rest of the collection still indexes and
-  the scan does not abort.
-- **Idempotent.** A second scan of unchanged documents makes **zero** embedding
-  calls.
-- **Statuses** are per file and per collection: `new`, `unchanged`, `changed`,
-  `missing`, `extracted`, `chunked`, `embedded`, `indexed`, `error`, `skipped`;
-  a collection additionally reports `stale` (inputs changed) and `needs_reindex`
-  (the index on disk is unreadable or invalid).
+  updated path; a modified file is `changed` and its extraction block resets to
+  `not_extracted`.
+- **Missing files are reported, not deleted.** Their source entries are kept
+  until `peekseed scan --prune` (explicit data loss).
+- **Failure isolation.** One unreadable file becomes `error` with a reason naming
+  the file; the rest of the collection is still reconciled.
+- **Idempotent.** A second scan of unchanged documents writes nothing and makes
+  **zero** embedding calls.
+- **Statuses** are per file (`new`, `unchanged`, `changed`, `missing`,
+  `uploaded`, `error`, `skipped`) and per collection (`uploaded`, `extracted`,
+  `indexed`, `stale`, `needs_reindex`, `missing`, `error`, …).
 
-`manifest.json` records the schema, last scan time, extractor and chunker
-versions, and per document `{path, collection, sha256, bytes, pages, status,
-seen_at}`.
+`manifest.json` records the schema, last scan time, extractor/chunker labels and
+per document `{path, collection, sha256, bytes, pages, status, seen_at}`.
 
-## Extraction
+## Chunk contract (from the peel corpus)
 
-See [formats](formats.md). Extraction results are cached under
-`.peekseed/extracted/<sha256>.json`, keyed by the document hash **and** the
-extractor identity. A parser upgrade therefore invalidates the cache and the
-chunks it fed — the index's provenance says exactly what produced it.
+peekseed does not chunk. The canonical unit is the peelfeed corpus chunk; it is
+mapped to peekseed's chunk record per design §4.2:
 
-## Chunking and stable ids
+- required fields unchanged: `id`, `dataset`, `source`, `source_sha256`,
+  `page_start`, `page_end`, `section`, `chapter`, `numbering`, `parent`, `path`,
+  `doc`, `text`, `heading_only`, `block_index`, `chunk_index`,
+  `chunker_version`;
+- optional corpus fields carried through: `kind`, `image_paths`, `source_pages`,
+  `char_count`, `parts`/`part`, `prev`/`next`, `canonical_ids`, `engine`,
+  `conversion_id`, `peel_id`.
 
-The chunker is heading-aware: Markdown hashes, numbered headings, ALL CAPS lines
-and short title-case lines start a section and maintain a breadcrumb. Body text is
-packed into chunks between `target_chars` (1,200) and `max_chars` (2,000), at
-paragraph boundaries where possible.
+`doc` keeps the embedding/BM25 semantics: the section path on the first line,
+then the chunk body. `text` is the reader view (page markers, table markdown, row
+atoms) used by the UI/answer path. `chunker_version` is `1`
+(`PEEL_CHUNKER_VERSION`), the peelfeed chunk-contract version.
 
-Every chunk carries provenance: `source`, `source_sha256`, `page_start`,
-`page_end`, `section`, `chapter`, `numbering`, `path`, `doc` (the embedded text:
-breadcrumb + body), `text` (the reader view with `[p.N]` markers) and
-`heading_only`.
-
-Chunk ids are **content-derived**:
+Chunk ids stay **content-derived**:
 
 ```
 id = sha256(source_sha256 | block_index | chunk_index | chunker_version)[:16]
 ```
 
-Adding file B to a collection cannot renumber file A's chunks, which is what makes
-incremental embedding safe. The human-facing `ordinal` is a separate display field
-and may change freely; the id does not. Changing `chunker_version` deliberately
-changes every id and marks the collection `stale`.
+`block_index` is the ordinal of the chunk's first block in the corpus
+`blocks.jsonl` (stable and page-independent); `chunk_index` is the chunk's
+position within its source. Adding file B cannot renumber file A's chunks.
+
+## Corpus gate before indexing
+
+`build_index` refuses a source (per-source reason) unless the peel directory
+resolves under `PEELFEED_ROOT` (default `<data_root>/peels`) after
+`realpath`, `manifest.source_sha256` equals the stored sha256,
+`manifest.conversion_id` equals the recorded conversion id, and
+`validation.errors` is empty. Non-extracted sources are listed in
+`skipped_sources`; zero extracted sources is `no_extracted_sources` (HTTP 409).
+
+A second Build index over the same corpora/chunker returns the live `info.json`
+unchanged with **zero** embedding calls; `peekseed reindex` forces a rebuild.
 
 ## Embedding and the probe
 
@@ -126,16 +167,33 @@ The loader validates `schema`, row alignment (`vectors` rows == metadata rows ==
 reported as `needs_reindex` — never silently skipped and never half-served.
 `peekseed reindex --gc` removes generations older than `CURRENT`.
 
+`info.json` also records the extraction provenance:
+
+```json
+"extractor": {"name": "peelfeed", "version": "<engine fingerprint>"},
+"chunker": {"name": "peel", "version": 1, "target_chars": 8000,
+            "max_chars": 12000, "image_cap": 3},
+"peel": {"peel_id": "cxl-3p1-b2bbd2c1", "conversion_id": "…", "profile": "cxl",
+         "validation": {"errors": 0, "review_items": 248}},
+"documents_digest": "…", "corpus_digest": "…",
+"skipped_sources": [{"name": "pending.pdf", "state": "not_extracted",
+                     "reason": "not extracted yet; run Extract with peelfeed"}]
+```
+
+A changed source set, a rebuilt peel (new conversion id) or a chunker version
+change makes the collection `stale`.
+
 ## Jobs, retries and cancellation
 
-A build is a persisted job (`.peekseed/jobs/<id>.json`): `queued → running →
-succeeded | failed | interrupted | cancelled`, with phase, counts and fraction.
-429/5xx/timeout responses are retried with exponential backoff and jitter;
-permanent errors fail the job with a user-facing message (no API key, no machine
-path). A cancel request is checked between batches: it stops the build, leaves the
-previous generation serving and keeps the checkpoint for a later resume. If the
-process dies, the job stays `running` on disk and is marked `interrupted` on the
-next status/doctor read — with a Resume action in the UI, not a false "failed".
+An index build is a persisted job (`.peekseed/jobs/<id>.json`): `queued →
+running → succeeded | failed | interrupted | cancelled`, with phase, counts and
+fraction. 429/5xx/timeout responses are retried with exponential backoff and
+jitter; permanent errors fail the job with a user-facing message (no API key, no
+machine path). A cancel request is checked between batches: it stops the build,
+leaves the previous generation serving and keeps the checkpoint for a later
+resume. If the process dies, the job stays `running` on disk and is marked
+`interrupted` on the next status/doctor read — with a Resume action in the UI,
+not a false "failed".
 
 One writer per collection is enforced by a lock file with pid and timestamp;
 stale locks are detected and the user is told, not blocked forever.
@@ -155,15 +213,15 @@ estimated embed calls) and writes nothing. For a remote embedder, the cost and t
 privacy implication (document text leaves the machine) are printed before anything
 is sent.
 
-## Limits and failure modes (0.1.0)
+## Limits and failure modes
 
 - Uploads: 50 MB per file, 50 files, 200 MB total; streamed to disk with the
   limits enforced while reading, not after. Filenames are sanitized before any
-  directory is created (zip-slip safe).
+  directory is created (zip-slip safe). Uploads stay available with peelfeed down.
 - `/pdf/<dataset>/<file>` is served **inline** so `#page=N` opens the browser's
   native viewer; only the dataset's own `original/` copies are served, with
   traversal and symlink escapes rejected.
-- One corrupt document does not fail a scan; one corrupt index does not hide the
-  healthy ones.
-- No OCR by default, no table/figure fidelity, no watcher by default, no ANN/vector
-  database in 0.1.0. These are documented limitations, not surprises.
+- One unreadable document does not fail a scan; one corrupt index does not hide
+  the healthy ones.
+- Extraction quality, OCR and table/figure fidelity are peelfeed concerns
+  (profiles/gates), not peekseed's. See [formats](formats.md).

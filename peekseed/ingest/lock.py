@@ -22,7 +22,7 @@ import socket
 import time
 from pathlib import Path
 
-from .pdf import IngestError
+from .errors import IngestError
 
 __all__ = ["CollectionBusy", "CollectionLock", "collection_lock"]
 

@@ -1,10 +1,14 @@
 """End-to-end acceptance tests for audit §6.10 gates 1-6 and 9-11.
 
 These exercise the workspace + ingestion core the way a user does: a real
-workspace tree, real PDFs from ``tests.fixtures``, a fake model server, and the
-CLI/app entry points. Unit coverage for each module lives beside it
-(``test_workspace``/``test_scan``/``test_index``/``test_security``); this file is
-the gate evidence that they compose.
+workspace tree, real PDFs from ``tests.fixtures``, a fake model server, a fake
+peelfeed peel corpus, and the CLI/app entry points. Unit coverage for each module
+lives beside it (``test_workspace``/``test_scan``/``test_index``/
+``test_security``); this file is the gate evidence that they compose.
+
+Since M-1 the scan is storage-only and extraction is a peelfeed job: the gates
+that used to say "scan → indexed" now say "scan → uploaded; extract (fake peel)
+→ build index → indexed".
 """
 
 import contextlib
@@ -18,7 +22,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
+from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
 
 
 def fake_link(fake, model="test-embed", **extra):
@@ -100,6 +104,12 @@ def collection_state(report, name):
     return states[name]
 
 
+def dataset_sources(dataset_dir):
+    from peekseed import contracts
+    return contracts.validate_dataset(
+        contracts.read_json(Path(dataset_dir) / "dataset.json"))["sources"]
+
+
 class GateOneTests(unittest.TestCase):
     """1. init creates the tree + anchored gitignore; scan leaves documents untouched."""
 
@@ -131,18 +141,27 @@ class GateOneTests(unittest.TestCase):
             report = scan.scan(str(ws))
             self.assertEqual(report["counts"]["new"], 1)
             self.assertEqual(report["counts"]["errors"], 0)
-            self.assertGreaterEqual(collection_state(report, "default")["chunks"], 1)
+            collection = collection_state(report, "default")
+            self.assertEqual(collection["status"], "uploaded")
+            self.assertEqual(collection["chunks"], 0)
+            # Storage only: the file is recorded, never parsed.
+            sources = dataset_sources(derived / "datasets" / "default")
+            self.assertEqual(sources[0]["status"], "uploaded")
+            self.assertEqual(sources[0]["extraction"]["state"], "not_extracted")
             # Not one byte, size or mtime changed in the user's tree.
             self.assertEqual(document_snapshot(ws / "documents"), before)
 
 
 class GateTwoTests(unittest.TestCase):
-    """2. Drop A -> scan -> indexed; scan again -> 0 new, 0 changed, 0 embed calls."""
+    """2. Drop A -> scan stores it; scan again -> 0 new, 0 changed, 0 embed calls.
 
-    def test_scan_is_incremental_and_idempotent(self):
+    Extraction + build then make it searchable; a second build is free.
+    """
+
+    def test_scan_is_incremental_and_a_second_index_is_free(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
                 FakeModelServer(dim=8) as fake:
-            from peekseed import scan
+            from peekseed import ingest, scan
             link = fake_link(fake)
             ws.mkdir(parents=True, exist_ok=True)
             scan.scan(str(ws), link=None)      # create the tree
@@ -152,27 +171,41 @@ class GateTwoTests(unittest.TestCase):
 
             first = scan.scan(str(ws), link=link)
             self.assertEqual(first["counts"]["new"], 1)
-            self.assertEqual(collection_state(first, "cxl")["status"], "indexed")
-            embed_requests = len(fake.requests)
-            self.assertGreater(embed_requests, 0)
-            chunks = (derived / "datasets" / "cxl" / "chunks.jsonl").read_text().splitlines()
-            self.assertGreaterEqual(len(chunks), 1)
-            record = json.loads(chunks[0])
-            self.assertEqual(len(record["source_sha256"]), 64)
-            self.assertEqual(len(record["id"]), 16)
+            self.assertEqual(collection_state(first, "cxl")["status"], "uploaded")
+            self.assertEqual(first["embed_calls"], 0)
+            self.assertEqual(len(fake.requests), 0)
 
             second = scan.scan(str(ws), link=link)
             self.assertEqual(second["counts"]["new"], 0)
             self.assertEqual(second["counts"]["changed"], 0)
             self.assertEqual(second["counts"]["unchanged"], 1)
             self.assertEqual(second["embed_calls"], 0)
-            # Zero embed calls means literally zero requests to the model server.
-            self.assertEqual(len(fake.requests), embed_requests)
-            self.assertEqual(collection_state(second, "cxl")["status"], "indexed")
+            self.assertEqual(len(fake.requests), 0)
+
+            dataset_dir = derived / "datasets" / "cxl"
+            make_peel("cxl", pages=[
+                "Alpha. The widget is mounted with two screws. " * 20,
+                "Beta. Press the green button to start the widget. " * 20,
+            ], source="a.pdf")
+            info = ingest.build_index(dataset_dir, link)
+            self.assertGreater(info["n"], 0)
+            requests_after_build = len(fake.requests)
+            self.assertGreater(requests_after_build, 0)
+            chunks = (dataset_dir / "chunks.jsonl").read_text().splitlines()
+            self.assertGreaterEqual(len(chunks), 1)
+            record = json.loads(chunks[0])
+            self.assertEqual(len(record["source_sha256"]), 64)
+            self.assertEqual(len(record["id"]), 16)
+
+            again = ingest.build_index(dataset_dir, link)
+            self.assertTrue(again.get("up_to_date"))
+            self.assertEqual(len(fake.requests), requests_after_build)
+            self.assertEqual(collection_state(scan.scan(str(ws), link=link),
+                                              "cxl")["status"], "indexed")
 
 
 class GateThreeTests(unittest.TestCase):
-    """3. Add PDF B to an indexed collection -> scan -> B searchable; A's ids stable."""
+    """3. Add PDF B, extract it, build -> B searchable; A's ids stable."""
 
     def test_adding_a_file_makes_it_searchable_without_renumbering_others(self):
         with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
@@ -180,10 +213,13 @@ class GateThreeTests(unittest.TestCase):
             from peekseed import engine, ingest, scan
             link = fake_link(fake)
             scan.scan(str(ws), link=None)
-            a_pdf = make_pdf(ws / "documents" / "cxl" / "a.pdf",
-                             pages=["Alpha. The widget is mounted with two screws. " * 20])
+            make_pdf(ws / "documents" / "cxl" / "a.pdf",
+                     pages=["Alpha. The widget is mounted with two screws. " * 20])
             scan.scan(str(ws), link=link)
             dataset_dir = derived / "datasets" / "cxl"
+            make_peel("cxl", pages=["Alpha. The widget is mounted with two screws. " * 20],
+                      source="a.pdf")
+            ingest.build_index(dataset_dir, link)
             a_ids = sorted(row["id"] for row in ingest.read_chunks(dataset_dir)
                            if row.get("source") == "a.pdf")
             self.assertGreaterEqual(len(a_ids), 1)
@@ -192,7 +228,11 @@ class GateThreeTests(unittest.TestCase):
                      pages=["Sprocket calibration. Turn the sprocket clockwise. " * 20])
             report = scan.scan(str(ws), link=link)
             self.assertEqual(report["counts"]["new"], 1)
-            self.assertEqual(collection_state(report, "cxl")["status"], "indexed")
+            self.assertIn(collection_state(report, "cxl")["status"],
+                          ("extracted", "stale"))
+            make_peel("cxl", pages=["Sprocket calibration. Turn the sprocket clockwise. " * 20],
+                      source="b.pdf")
+            ingest.build_index(dataset_dir, link)
 
             # A's content-derived ids did not move when B was added.
             after_ids = sorted(row["id"] for row in ingest.read_chunks(dataset_dir)
@@ -220,13 +260,21 @@ class GateFourTests(unittest.TestCase):
             from peekseed import ingest, scan
             link = fake_link(fake)
             scan.scan(str(ws), link=None)
+            pages = []
             for index in range(3):
+                pages.append("Widget paragraph %d. " % index * 20)
                 make_pdf(ws / "documents" / "cxl" / ("doc%d.pdf" % index),
-                         pages=["Widget paragraph %d. " % index * 20,
-                                "Another widget paragraph %d. " % index * 20])
-            first = scan.scan(str(ws), link=link)
-            self.assertEqual(collection_state(first, "cxl")["status"], "indexed")
+                         pages=[pages[-1], "Another widget paragraph %d. " % index * 20])
+            scan.scan(str(ws), link=link)
             dataset_dir = derived / "datasets" / "cxl"
+            for index in range(3):
+                make_peel("cxl", pages=[
+                    "Widget paragraph %d. " % index * 20,
+                    "Another widget paragraph %d. " % index * 20,
+                ], source="doc%d.pdf" % index)
+            first = ingest.build_index(dataset_dir, link, batch_size=2)
+            self.assertEqual(collection_state(scan.scan(str(ws), link=link),
+                                              "cxl")["status"], "indexed")
             generation_dir = current_generation_dir(dataset_dir)
             committed = (generation_dir.parent.parent / "CURRENT").read_text().strip()
             info = ingest.dataset_indexes(dataset_dir)[0]
@@ -241,7 +289,7 @@ class GateFourTests(unittest.TestCase):
 
             with self.assertRaises(ingest.IndexCancelled):
                 ingest.build_index(dataset_dir, link, batch_size=2,
-                                   target_chars=200, max_chars=400, cancel=cancel)
+                                   force=True, cancel=cancel)
             self.assertEqual(
                 (generation_dir.parent.parent / "CURRENT").read_text().strip(),
                 committed,
@@ -264,8 +312,7 @@ class GateFourTests(unittest.TestCase):
             )
 
             # Restart: resume the incomplete generation and commit it.
-            resumed = ingest.build_index(dataset_dir, link, batch_size=2,
-                                         target_chars=200, max_chars=400)
+            resumed = ingest.build_index(dataset_dir, link, batch_size=2)
             self.assertEqual(
                 (generation_dir.parent.parent / "CURRENT").read_text().strip(),
                 resumed["generation"],
@@ -286,6 +333,9 @@ class GateFiveTests(unittest.TestCase):
                      pages=["Widget text about buttons and screws. " * 20])
             scan.scan(str(ws), link=link)
             dataset_dir = derived / "datasets" / "cxl"
+            make_peel("cxl", pages=["Widget text about buttons and screws. " * 20],
+                      source="a.pdf")
+            ingest.build_index(dataset_dir, link)
             generation_dir = current_generation_dir(dataset_dir)
             (generation_dir / "vectors.npy").write_bytes(b"corrupt")
 
@@ -317,6 +367,9 @@ class GateSixTests(unittest.TestCase):
                      pages=["Widget text about buttons and screws. " * 20])
             scan.scan(str(ws), link=link)
             dataset_dir = derived / "datasets" / "cxl"
+            make_peel("cxl", pages=["Widget text about buttons and screws. " * 20],
+                      source="a.pdf")
+            ingest.build_index(dataset_dir, link)
             info = ingest.dataset_indexes(dataset_dir)[0]
             space_dir = dataset_dir / "index" / info["space"]
             committed = (space_dir / "CURRENT").read_text().strip()

@@ -15,3 +15,6 @@ workspace/
 
 # OS / editor
 .DS_Store
+
+# peekseed workspace (documents + derived data)
+/ws/

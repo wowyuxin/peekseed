@@ -99,6 +99,35 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(buffer.getvalue().strip(),
                                  str((project / "workspace").resolve()))
 
+    def test_help_has_no_import_command(self):
+        from peekseed.__main__ import build_parser
+        parser = build_parser()
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            parser.print_help()
+        text = buffer.getvalue()
+        self.assertNotIn("import", text)
+        self.assertIn("index", text)
+
+    def test_index_stores_without_extraction(self):
+        from tests.fixtures import make_pdf
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+            project = Path(tmp)
+            make_pdf(project / "a.pdf", pages=["Widget page."])
+            with working_directory(project):
+                from peekseed.__main__ import main
+                buffer = io.StringIO()
+                with contextlib.redirect_stdout(buffer):
+                    self.assertEqual(main(["index", "--name", "My docs",
+                                           "--file", "a.pdf"]), 0)
+                text = buffer.getvalue()
+                self.assertIn("status=uploaded", text)
+                self.assertIn("peelfeed", text)
+                dataset_dir = (project / "workspace" / ".peekseed"
+                               / "datasets" / "my-docs")
+                self.assertTrue((dataset_dir / "original" / "a.pdf").is_file())
+                self.assertFalse((dataset_dir / "chunks.jsonl").exists())
+
     def test_migrate_is_dry_run_by_default(self):
         with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
             project = Path(tmp)
@@ -118,7 +147,7 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(main(["migrate"]), 0)
                 text = buffer.getvalue()
                 self.assertIn("dry-run (nothing written)", text)
-                self.assertIn("schema 1 -> 2", text)
+                self.assertIn("schema 1 -> 3", text)
                 self.assertIn('"version": 1', (dataset_dir / "dataset.json").read_text())
 
 

@@ -34,15 +34,18 @@ peekseed has three moving parts:
 1. **Model links** — the embedder, an optional reranker, and one or more chat
    models, all configured in the browser (Settings) or seeded from environment
    variables. No model is bundled and no key is ever baked into the code.
-2. **Datasets** — PDFs you upload. A background job extracts text, chunks it,
-   embeds each chunk with the enabled embedder and writes a compact vector
-   index. Everything is derived from one workspace root.
+2. **Datasets** — PDFs you upload (stored only). Extraction is provided by the
+   optional **peelfeed** engine, one peel per file; a Build-index job reads those
+   corpora, embeds each canonical chunk with the enabled embedder and writes a
+   compact vector index. Everything is derived from one workspace root.
 3. **Work modes** — keyword+vector search, one-shot grounded answers, and an
    optional research agent that uses tools to read the dataset itself.
 
 The whole stack is Python plus one static HTML file; there is no database, no
-message queue and no JavaScript build step. PDF text extraction uses `pypdf`,
-so a default install needs no system libraries.
+message queue and no JavaScript build step. peekseed's dependency set is the web
+stack only: it never imports `pypdf`, `docling` or `torch`. Extraction is a
+separate engine (peelfeed) with its own process and venv, so uploads and file
+management keep working with no extraction engine configured.
 
 ## Requirements
 
@@ -53,15 +56,14 @@ so a default install needs no system libraries.
 - Disk space for your documents plus the derived index (roughly the text size,
   not a copy of the PDFs, which are stored once).
 
-Optional extras are opt-in and never imported at startup:
+The only optional extra is the test suite:
 
 | Extra | Adds | Why |
 |---|---|---|
-| `office` | `python-docx`, `python-pptx` | DOCX/PPTX extraction |
-| `tables` | `openpyxl` | XLSX extraction |
-| `ocr` | `pytesseract`, `Pillow` | OCR for scanned PDFs (**0.2.0 workflow**) |
-| `layout` / `pymupdf` | `pymupdf` | alternative PDF extractor/renderer |
 | `test` | `pytest` | the offline test suite |
+
+Extraction formats/dependencies belong to peelfeed, not peekseed (see
+[docs/formats.md](docs/formats.md)).
 
 ## Install and quick start
 
@@ -81,8 +83,10 @@ default. Open <http://127.0.0.1:8030>, then:
    or custom `/embed` endpoint; a reranker is optional).
 2. **Datasets** → name the dataset, choose one or more PDFs, click
    *Add dataset*.
-3. On the new row, click **Build index** and watch progress (the job is
-   persisted, cancellable and resumable).
+3. If peelfeed is configured, click **Extract** on the file row (state chip
+   `not_extracted → queued → running → extracted`). Then click **Build index**
+   and watch progress (the job is persisted, cancellable and resumable). With no
+   peelfeed, upload/list/delete work and Build index returns a clear 409.
 4. **Search** the dataset; tick results and click **Ask about these**; switch
    to *Research* when the agent mode is enabled.
 
@@ -93,31 +97,38 @@ pip install -e '.[test]'
 python -m pytest -q
 ```
 
-For headless machines, `peekseed index --name "My docs" --file a.pdf` uploads
-and indexes without a browser, and `peekseed status` / `peekseed doctor`
-inspect the workspace.
+For headless machines, `peekseed index --name "My docs" --file a.pdf` stores a
+dataset without a browser (extraction is triggered through the API/UI once
+peelfeed is configured), and `peekseed status` / `peekseed doctor` inspect the
+workspace.
 
 ## The 0.1.0 workflow
 
-The core loop is **upload → index → search → ask → research**:
+The core loop is **upload → (Extract) → index → search → ask → research**:
 
 1. **Upload.** POST a PDF to `POST /api/datasets` (the UI does this); the
    original file is stored once under
    `<workspace>/.peekseed/datasets/<id>/original/`.
-2. **Index.** `POST /api/datasets/{id}/index` starts a persisted background job
-   that extracts text, chunks it (~1,200 characters, page ranges and section
-   breadcrumbs preserved), embeds the chunks and writes the vector index for
-   the active embedding space. A second job for the same dataset returns `409`
-   while the writer lock is held; `DELETE /api/jobs/{id}` cancels between
-   batches and `POST /api/jobs/{id}/resume` continues the same record.
-3. **Search.** `POST /api/search` fuses keyword and vector retrieval, then
+2. **Extract (optional engine).** `POST /api/datasets/{id}/sources/{sha}/extract`
+   asks peelfeed to build a peel for that file; the UI polls the per-source state
+   until `extracted`/`failed` and offers Review + Apply & rebuild. With no
+   peelfeed, Extract is disabled (API 503) and uploads still work.
+3. **Index.** `POST /api/datasets/{id}/index` starts a persisted background job
+   that reads each extracted peel corpus (gated on the peel-root allowlist, the
+   source sha256, the conversion id and zero validation errors), maps the
+   canonical chunks, embeds them and writes the vector index for the active
+   embedding space. Non-extracted sources are listed as skipped; no extracted
+   source is a 409 `no_extracted_sources`. A second job for the same dataset
+   returns `409` while the writer lock is held; `DELETE /api/jobs/{id}` cancels
+   between batches and `POST /api/jobs/{id}/resume` continues the same record.
+4. **Search.** `POST /api/search` fuses keyword and vector retrieval, then
    optionally reranks the pool. Results carry dataset, file, page range and
    excerpt so the UI can open the original PDF at the right page.
-4. **Ask.** `POST /api/ask/stream` retrieves a bounded set of excerpts and
+5. **Ask.** `POST /api/ask/stream` retrieves a bounded set of excerpts and
    streams a grounded answer from the configured chat model. The answer cites
    excerpts as `[n]`; the numbered chips beside it are the authoritative links
    (the in-text numbers are the model's and are not validated).
-5. **Research.** `POST /api/agent/stream` (opt-in via `PEEKSEED_AGENT=1`) runs
+6. **Research.** `POST /api/agent/stream` (opt-in via `PEEKSEED_AGENT=1`) runs
    a tool-using agent that can search, read chunks, list datasets and finish
    with a cited answer, bounded by step, tool-call and wall-clock limits.
 
@@ -148,6 +159,7 @@ A `.env` in the working directory (template: `.env.example`) is read by
 <workspace>/documents/                      user-owned; one top-level folder = one collection
 <workspace>/.peekseed/config/links.json     model endpoints; keys mode 0600, masked in the API
 <workspace>/.peekseed/datasets/<id>/        original PDFs, chunks.jsonl, index/<space>/
+<workspace>/.peekseed/peels/<peel_id>/      peelfeed corpora (source, extract/corpus, .peel)
 <workspace>/.peekseed/jobs/                 persisted, cancellable job records
 <workspace>/.peekseed/history/              saved ask/research history
 ```
@@ -190,11 +202,11 @@ when no index exists for the active space.
 **0.1.0 (this release)** — the upload-driven product:
 
 - Workspace init/status/doctor/workspace move, versioned data schemas
-  (`dataset.json`/`info.json` schema 2, manifest/job schema 1) with
+  (`dataset.json`/`info.json` schema 3, manifest/job schema 1) with
   `peekseed migrate` upgrades.
-- PDF upload via UI/API or `peekseed index`; optional `office`, `tables` and
-  `pymupdf`/`layout` extraction extras are installed but belong to the 0.2.0
-  folder-scan flow — the 0.1.0 upload path is PDF-only.
+- PDF upload via UI/API or `peekseed index` — **storage only** (no pypdf/docling
+  in peekseed). Extraction is a peelfeed job; with no engine configured uploads,
+  file management and deletes still work and Extract is disabled.
 - Background index jobs: persisted records, cancel, resume, writer lock;
   embedding-space identity and reindex with dry-run/GC.
 - Hybrid keyword+vector search, optional rerank, streaming ask with citations,
@@ -204,13 +216,11 @@ when no index exists for the active space.
 
 **0.2.0 (planned)** — folder-driven ingestion:
 
-- The `documents/` folder scan workflow: watching, hashing/diffing, staleness
-  and dirty-collection rebuilds, exposed as `POST /api/scan` and in the UI.
-  (`peekseed scan` exists in 0.1.0 as a preview command; it writes derived state
-  under `.peekseed/` but is not part of the 0.1.0 promise.)
-- OCR for scanned PDFs (the `ocr` extra and Tesseract plumbing are prepared
-  but not wired into the 0.1.0 flow).
-- Broader ingestion ergonomics on top of the same workspace contract.
+- A `documents/` folder scan workflow on top of the storage-only scan
+  (`peekseed scan` already discovers/hashes/reconciles; watching and automatic
+  extraction jobs are planned).
+- Broader peelfeed profiles/formats and multimodal embedding on top of the same
+  workspace + corpus contract.
 
 ## Known limitations
 
@@ -219,9 +229,11 @@ when no index exists for the active space.
 - **No TLS and loopback by default.** Bind to loopback or put it behind a
   reverse proxy; use `PEEKSEED_TOKEN` and `PEEKSEED_ALLOWED_HOSTS` if you must
   reach it over a network.
-- **No folder scanning yet** (0.2.0): documents enter through upload or
-  `peekseed index`; `peekseed scan` is a preview.
-- **No OCR yet** (0.2.0): scanned/image-only PDFs extract little or no text.
+- **Extraction is external.** peekseed does not parse documents; without a
+  configured peelfeed engine there is no extraction, Review or search over new
+  files (upload/list/delete still work).
+- **Scan is discovery-only.** `peekseed scan` reconciles `documents/` and
+  `dataset.json`; it does not build indexes.
 - **No bundled models** and no model lifecycle management: answer quality and
   embedding compatibility are the configured endpoints' responsibility.
 - **Index rebuilds are required** when the embedding link's id or model
@@ -248,12 +260,11 @@ New here? Start with [docs/install.md](docs/install.md).
 - [docs/local-models.md](docs/local-models.md) — optional start/stop control
   for local model processes.
 - [docs/ingestion.md](docs/ingestion.md), [docs/formats.md](docs/formats.md) —
-  extraction, chunking, embedding spaces and format/licence notes.
+  upload → peelfeed corpus → index, the chunk contract, embedding spaces and
+  format/profile notes.
 - [docs/contracts.md](docs/contracts.md), [docs/architecture.md](docs/architecture.md)
   — module boundaries and the invariants the tests enforce.
 - [docs/security.md](docs/security.md) — threat model and upload limits.
-- [docs/import.md](docs/import.md) — `peekseed import --manifest` (idempotent
-  corpus migration, zero re-embed, probe canary, overlap harness).
 - [docs/release.md](docs/release.md) — version/tag policy and release
   checklist.
 - [CHANGELOG.md](CHANGELOG.md), [CONTRIBUTING.md](CONTRIBUTING.md),
@@ -276,6 +287,7 @@ See [docs/security.md](docs/security.md) for the threat model and
 ## License
 
 peekseed is licensed under the [MIT License](LICENSE). Third-party dependency
-licenses and the optional PyMuPDF (AGPL-3.0 or commercial) caveat are recorded
-in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md); CI checks the default
-dependency closure has no AGPL/GPL packages.
+licenses are recorded in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md); CI
+checks the default dependency closure has no AGPL/GPL packages. peekseed itself
+does not depend on PyMuPDF/docling/torch — those belong to the separate peelfeed
+engine.

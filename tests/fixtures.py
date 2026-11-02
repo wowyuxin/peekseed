@@ -1,17 +1,23 @@
 """Offline fixtures for peekseed's test suite.
 
 Nothing here needs a model or the network: a small HTTP server implements the
-four contracts peekseed speaks (OpenAI embeddings, custom /embed, /rerank,
-OpenAI chat), and a tiny PDF writer produces real one-page documents so the PDF
-path can be tested with pypdf.
+four model contracts peekseed speaks (OpenAI embeddings, custom /embed, /rerank,
+OpenAI chat), a tiny PDF writer produces valid one-page uploads,
+:func:`make_peel` builds a fake peelfeed peel corpus (manifest/chunks/blocks/
+validation/review/assets + source copy) so the corpus read path can be tested
+without the extraction engine, and :class:`FakePeelfeedCli` is a fake peelfeed
+executable so the CLI seam (config, capabilities handshake, ingest polling,
+review/decide/rebuild/event/archive) can be tested without the real engine.
 """
 
 import contextlib
+import hashlib
 import json
 import math
 import os
 import re
 import shutil
+import sys
 import tempfile
 import threading
 import zlib
@@ -351,3 +357,535 @@ def sample_chunks(dataset_id="docs", source="manual.pdf"):
             "heading_only": False,
         })
     return chunks
+
+
+# --- fake peelfeed peels ---------------------------------------------------
+
+def _peel_slug(name):
+    text = re.sub(r"[^a-z0-9._-]+", "-", str(name or "").lower())
+    return text.strip("-._")[:40] or "peel"
+
+
+def make_peel(dataset, *, pages=None, source=None, profile="generic",
+              validation_errors=None, peel_root=None, engine="peelfeed-test@1",
+              conversion_salt="1", chunks=None):
+    """Create a fake peelfeed peel for one dataset source and mark it extracted.
+
+    ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. The peel is
+    written under ``PEELFEED_ROOT`` (legacy ``PEEKSEED_PEELFEED_ROOT`` accepted,
+    else ``<data_root>/peels``) with the files
+    :func:`peekseed.ingest.build_index` consumes: ``manifest.json``,
+    ``chunks.jsonl``, ``blocks.jsonl``, ``assets.jsonl``, ``validation.json``,
+    ``review_queue.json`` and a copy of the source under ``source/``. The dataset
+    source entry is updated to ``status="extracted"`` with the peel identity.
+
+    Returns ``{"peel_id", "peel_dir", "conversion_id"}``.
+    """
+    from peekseed import config, contracts
+
+    if isinstance(dataset, dict):
+        dataset_dir = Path(dataset["dir"])
+        dataset_id = str(dataset.get("id") or dataset_dir.name)
+    else:
+        dataset_id = str(dataset)
+        dataset_dir = Path(config.paths().datasets_dir) / dataset_id
+    metadata = contracts.read_json(dataset_dir / "dataset.json")
+    sources = [entry for entry in metadata.get("sources") or []
+               if isinstance(entry, dict)]
+    entry = None
+    for candidate in sources:
+        if source is None or str(candidate.get("name") or "") == source:
+            if str(candidate.get("sha256") or ""):
+                entry = candidate
+                break
+    if entry is None:
+        raise AssertionError("no source with a sha256 in %s" % dataset_dir)
+    sha = str(entry["sha256"]).lower()
+    name = str(entry["name"])
+    relative = str(entry.get("path") or ("original/" + name))
+    candidates = [dataset_dir / relative, dataset_dir / "original" / name]
+    # Workspace-scan sources live under documents/, not in the dataset copy.
+    try:
+        from peekseed import workspace as workspace_module
+        candidates.append(Path(config.paths().workspace_root) / "documents"
+                          / relative)
+        candidates.append(Path(config.paths().documents_dir) / relative)
+        candidates.append(workspace_module.resolve().documents_dir / relative)
+    except Exception:
+        pass
+    source_file = next((path for path in candidates if path.is_file()), None)
+    if source_file is None:
+        raise AssertionError("no stored source file for %s (tried %s)"
+                             % (name, ", ".join(str(path) for path in candidates)))
+    if peel_root is None:
+        peel_root = Path(os.environ.get("PEELFEED_ROOT")
+                         or os.environ.get("PEEKSEED_PEELFEED_ROOT")
+                         or (config.paths().root / "peels"))
+    peel_root = Path(peel_root)
+    peel_id = "%s-%s" % (_peel_slug(Path(name).stem), sha[:8])
+    peel_dir = peel_root / peel_id
+    corpus = peel_dir / "extract" / "corpus"
+    (peel_dir / "source").mkdir(parents=True, exist_ok=True)
+    corpus.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(str(source_file), str(peel_dir / "source" / name))
+
+    conversion_id = hashlib.sha256(
+        ("conv|%s|%s|%s" % (sha, profile, conversion_salt)).encode()
+    ).hexdigest()
+    if pages is None:
+        pages = [
+            "Widget installation. The widget is mounted on the frame with two screws.",
+            "Widget operation. Press the green button to start the widget.",
+        ]
+    if chunks is None:
+        chunks = []
+        for number, page_text in enumerate(pages, start=1):
+            section = "Section %d" % number
+            chunks.append({
+                "schema_version": 2,
+                "id": "fake-unit-%06d" % number,
+                "conversion_id": conversion_id,
+                "kind": "text",
+                "section": section,
+                "numbering": "",
+                "parent": "",
+                "path": section,
+                "page_start": number,
+                "page_end": number,
+                "source_pages": [number],
+                "pdf_y": 0,
+                "image_paths": [],
+                "block_ids": ["p%04d-b0000" % number],
+                "canonical_ids": ["fake-unit-%06d" % number],
+                "char_count": len(page_text),
+                "parts": 1,
+                "part": 1,
+                "text": "# %s\n\n<!-- page: %d -->\n\n%s"
+                        % (section, number, page_text),
+            })
+    blocks = []
+    for chunk in chunks:
+        for block_id in chunk.get("block_ids") or []:
+            blocks.append({
+                "id": block_id,
+                "kind": chunk.get("kind") or "text",
+                "page": int(chunk.get("page_start") or 1),
+                "text": str(chunk.get("text") or ""),
+            })
+    manifest = {
+        "schema_version": 2,
+        "conversion_id": conversion_id,
+        "title": Path(name).stem,
+        "profile": profile,
+        "source": name,
+        "source_sha256": sha,
+        "pages": len(pages),
+        "engine": engine,
+        "chunks": len(chunks),
+    }
+    validation = {
+        "schema_version": 2,
+        "conversion_id": conversion_id,
+        "partial": False,
+        "errors": list(validation_errors or []),
+        "checks": {},
+        "review_items": 0,
+        "char_limit_exceptions": 0,
+    }
+    review_queue = {"warnings": [], "char_limit_exceptions": [],
+                    "outline_reconciliations": []}
+    contracts.write_json_atomic(corpus / "manifest.json", manifest)
+    contracts.write_json_atomic(corpus / "validation.json", validation)
+    contracts.write_json_atomic(corpus / "review_queue.json", review_queue)
+    (corpus / "assets.jsonl").write_text("", encoding="utf-8")
+    (corpus / "blocks.jsonl").write_text(
+        "\n".join(json.dumps(block, ensure_ascii=False) for block in blocks)
+        + ("\n" if blocks else ""),
+        encoding="utf-8",
+    )
+    (corpus / "chunks.jsonl").write_text(
+        "\n".join(json.dumps(chunk, ensure_ascii=False) for chunk in chunks)
+        + ("\n" if chunks else ""),
+        encoding="utf-8",
+    )
+    entry["status"] = "extracted"
+    entry["pages"] = len(pages)
+    entry["extraction"] = {
+        "state": "extracted",
+        "peel_id": peel_id,
+        "conversion_id": conversion_id,
+        "profile": profile,
+        "engine": engine,
+        "validation": {"errors": 0, "review_items": 0},
+        "started_at": contracts.utc_now(),
+        "finished_at": contracts.utc_now(),
+        "error": None,
+    }
+    metadata["schema"] = contracts.DATASET_SCHEMA
+    metadata["sources"] = sources
+    metadata["extractor"] = "peelfeed@" + engine
+    metadata["chunker"] = contracts.chunker_label()
+    metadata["updated_at"] = contracts.utc_now()
+    contracts.write_json_atomic(dataset_dir / "dataset.json", metadata)
+    return {"peel_id": peel_id, "peel_dir": str(peel_dir),
+            "conversion_id": conversion_id}
+
+
+# --- fake peelfeed CLI -----------------------------------------------------
+
+_FAKE_CLI_SCRIPT = r'''#!%(python)s
+"""A fake peelfeed CLI for tests: prints JSON, records calls, can fail/timeout."""
+import hashlib
+import json
+import os
+import sys
+import time
+
+STATE = %(state)r
+LOG = %(log)r
+
+DEFAULT_CAPABILITIES = {
+    "engine": "peelfeed",
+    "version": "0.1.0",
+    "cli_protocol": 1,
+    "corpus_schema": 2,
+    "chunk_contract": 1,
+    "peel_event_schema": 1,
+    "chunker_version": 1,
+    "formats": ["pdf"],
+    "profiles": ["cxl", "ddr5", "dwc", "generic", "pcie", "pipe"],
+    "chunk_profiles": ["default", "large", "small"],
+    "llm_modes": ["off", "review", "aggressive"],
+    "peel_root": "/tmp/fake-peels",
+    "docling": {"python": "/tmp/docling-python", "python_present": True,
+                "models_present": True},
+}
+
+DEFAULT_REVIEW = {
+    "peel_id": "peel",
+    "review_items": 2,
+    "items": [
+        {"id": "table-p0001-01/header", "message": "no header cells",
+         "asset": {"id": "table-p0001-01", "kind": "table",
+                   "caption": "Table 1-1", "pages": [1],
+                   "path": "tables/table-1-1.json", "segments": []},
+         "suggestion": None},
+        {"id": "figure-1-1/labels", "message": "no native labels",
+         "asset": {"id": "figure-1-1", "kind": "figure",
+                   "caption": "Figure 1-1", "pages": [2],
+                   "path": "images/fig_1_1.png", "segments": []},
+         "suggestion": None},
+    ],
+    "char_limit_exceptions": [],
+    "outline_reconciliations": [],
+    "asset_stats": {"tables": 1, "figures": 1},
+    "corrections": 0,
+    "llm": {"available": False, "prompt_set": ""},
+}
+
+
+def load_state():
+    try:
+        with open(STATE, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    with open(STATE, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+
+def emit(payload):
+    print(json.dumps(payload))
+    return 0
+
+
+def fail(message, code=2):
+    print("error: " + message, file=sys.stderr)
+    return code
+
+
+def option(rest, name):
+    for index, item in enumerate(rest):
+        if item == name and index + 1 < len(rest):
+            return rest[index + 1]
+    return None
+
+
+VALUE_FLAGS = {
+    "--root", "--item", "--decision", "--note", "--evidence", "--model",
+    "--confidence", "--event", "--data", "--reason", "--profile",
+    "--chunk-profile", "--llm", "--limit", "--pages", "--slug",
+    "--collection", "--device",
+}
+
+
+def positionals(rest):
+    values = []
+    skip = False
+    for item in rest:
+        if skip:
+            skip = False
+            continue
+        if item in VALUE_FLAGS:
+            skip = True
+            continue
+        if item.startswith("-"):
+            continue
+        values.append(item)
+    return values
+
+
+def first_positional(rest):
+    values = positionals(rest)
+    return values[0] if values else None
+
+
+def main():
+    argv = sys.argv[1:]
+    if argv[:2] == ["-m", "peelfeed.cli"]:
+        argv = argv[2:]
+    with open(LOG, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({
+            "argv": argv,
+            "peel_root": os.environ.get("PEELFEED_ROOT"),
+            "pythonpath": os.environ.get("PYTHONPATH"),
+        }) + "\n")
+    if not argv:
+        return fail("missing command")
+    command, rest = argv[0], argv[1:]
+    state = load_state()
+    root = option(rest, "--root")
+
+    if command == "capabilities":
+        delay = float(state.get("capabilities_delay") or 0)
+        if delay:
+            time.sleep(delay)
+        if state.get("capabilities_fail"):
+            return fail("capabilities failed")
+        payload = dict(DEFAULT_CAPABILITIES)
+        payload.update(state.get("capabilities") or {})
+        payload["peel_root"] = root or os.environ.get("PEELFEED_ROOT") or ""
+        return emit(payload)
+
+    peels = state.get("peels") or {}
+
+    if command == "status":
+        peel_id = first_positional(rest)
+        if peel_id is None:
+            # Mirror the real CLI: the list form is a *summary* (the source is a
+            # name, not the {sha256,...} dict; no conversion_id).
+            summaries = []
+            for identifier, peel in peels.items():
+                summaries.append({
+                    "peel_id": identifier,
+                    "state": peel.get("state"),
+                    "profile": peel.get("profile"),
+                    "counts": peel.get("counts"),
+                    "validation": peel.get("validation"),
+                    "source": (peel.get("source") or {}).get("name"),
+                })
+            return emit(summaries)
+        if peel_id not in peels:
+            return fail("no such peel", 3)
+        return emit(peels[peel_id])
+
+    if command == "ingest":
+        source = first_positional(rest)
+        if not source or not os.path.isfile(source):
+            return fail("source not found")
+        with open(source, "rb") as handle:
+            sha = hashlib.sha256(handle.read()).hexdigest()
+        if state.get("ingest_fail"):
+            return fail("simulated ingest failure")
+        peel_id = state.get("ingest_peel_id") or ("peel-" + sha[:8])
+        pages = int(state.get("ingest_pages") or 2)
+        review_items = int(state.get("ingest_review_items") or 0)
+        errors = list(state.get("ingest_errors") or [])
+        peels[peel_id] = {
+            "peel_id": peel_id,
+            "state": "converting",
+            "source": {"name": os.path.basename(source),
+                       "size": os.path.getsize(source),
+                       "sha256": sha, "pages": pages},
+            "profile": state.get("ingest_profile") or "generic",
+            "conversion_id": "",
+            "counts": {"pages": pages, "chunks": pages},
+            "validation": {"errors": [], "review_items": review_items},
+            "review_items": review_items,
+            "error": None,
+        }
+        state["peels"] = peels
+        save_state(state)
+        time.sleep(float(state.get("ingest_seconds") or 0))
+        conversion_id = hashlib.sha256(("conv|" + sha).encode()).hexdigest()
+        summary = dict(peels[peel_id])
+        summary.update({
+            "state": "failed" if errors else "ready",
+            "conversion_id": conversion_id,
+            "validation": {"errors": errors, "review_items": review_items},
+            "error": "validation failed" if errors else None,
+        })
+        peels[peel_id] = summary
+        state["peels"] = peels
+        save_state(state)
+        emit({
+            "ok": not errors,
+            "peel": summary,
+            "ingest": {"reused": bool(state.get("ingest_reused")),
+                       "pages": pages},
+            "profile": {"name": summary["profile"],
+                        "matched_by": "fixture", "confidence": 0.5},
+            "convert": {"cached": False, "seconds": {}},
+            "normalize": {"cached": False, "reasons": [], "counts": {}},
+            "gates": {"pass": not errors, "errors": errors, "warnings": [],
+                      "checks": 1},
+            "adjudicate": {},
+        })
+        return int(state.get("ingest_exit") or 0)
+
+    if command == "review":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3)
+        payload = dict(state.get("review") or DEFAULT_REVIEW)
+        payload["peel_id"] = peel_id
+        return emit(payload)
+
+    if command == "decide":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3)
+        item = option(rest, "--item")
+        decision = option(rest, "--decision")
+        if decision not in ("accept", "reject", "override"):
+            return fail("decision must be accept|reject|override")
+        state.setdefault("decisions", []).append({
+            "peel_id": peel_id,
+            "item": item,
+            "decision": decision,
+            "note": option(rest, "--note"),
+            "evidence": option(rest, "--evidence"),
+            "model": option(rest, "--model"),
+            "confidence": option(rest, "--confidence"),
+        })
+        save_state(state)
+        return emit({"ok": True, "peel_id": peel_id, "item_id": item,
+                     "decision": decision, "corrections": 1,
+                     "note": "corrections are append-only; run peelfeed rebuild"})
+
+    if command == "rebuild":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3)
+        if state.get("rebuild_fail"):
+            return fail("simulated rebuild failure")
+        peels[peel_id]["state"] = "rebuilding"
+        save_state(state)
+        time.sleep(float(state.get("rebuild_seconds") or 0))
+        peels[peel_id]["state"] = "ready"
+        peels[peel_id]["error"] = None
+        save_state(state)
+        return emit({"ok": True, "peel": peels[peel_id],
+                     "normalize": {"cached": False, "counts": {},
+                                   "reasons": []},
+                     "gates": {"pass": True, "errors": []}})
+
+    if command == "event":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3)
+        event = option(rest, "--event")
+        if event not in ("embed", "feedback"):
+            return fail("event must be embed|feedback")
+        raw = option(rest, "--data")
+        state.setdefault("events", []).append({
+            "peel_id": peel_id,
+            "event": event,
+            "data": json.loads(raw) if raw else {},
+        })
+        save_state(state)
+        return emit({"ok": True, "peel_id": peel_id,
+                     "event": {"event": event}})
+
+    if command == "archive":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3)
+        peels[peel_id]["state"] = "archived"
+        save_state(state)
+        return emit({"ok": True, "peel_id": peel_id, "state": "archived",
+                     "note": "peel archived (source kept)"})
+
+    return fail("unknown command: " + command)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+class FakePeelfeedCli:
+    """A fake ``peelfeed`` executable for tests (no daemon, no HTTP).
+
+    Writes a small Python script to a temp directory, records every invocation
+    (argv + the ``PEELFEED_ROOT`` it was given) to a JSON Lines log, and answers
+    from a JSON state file the test controls. The script can simulate slow
+    ``capabilities``, a failing ``ingest``, gate errors and rebuild timing.
+    """
+
+    def __init__(self, root, state=None):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.state_path = self.root / "fake-peelfeed-state.json"
+        self.log_path = self.root / "fake-peelfeed-calls.jsonl"
+        self.path = self.root / "fake-peelfeed"
+        self.write(state or {})
+
+    def write(self, state):
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        self.log_path.write_text("", encoding="utf-8")
+        script = _FAKE_CLI_SCRIPT % {
+            "python": sys.executable,
+            "state": str(self.state_path),
+            "log": str(self.log_path),
+        }
+        self.path.write_text(script, encoding="utf-8")
+        self.path.chmod(0o755)
+        return self
+
+    def update(self, **values):
+        state = self.state()
+        state.update(values)
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+        return state
+
+    def state(self):
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def calls(self):
+        calls = []
+        try:
+            text = self.log_path.read_text(encoding="utf-8")
+        except OSError:
+            return calls
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                calls.append(json.loads(line))
+            except ValueError:
+                continue
+        return calls
+
+    def clear_calls(self):
+        self.log_path.write_text("", encoding="utf-8")
+
+    def commands(self):
+        return [call["argv"][0] for call in self.calls() if call.get("argv")]

@@ -1,5 +1,23 @@
 """Dataset storage, generation-atomic vector indexes and job records.
 
+Uploads are **storage only**: a file is copied into ``original/`` with its
+sha256/bytes recorded and ``status="uploaded"``; peekseed never parses a
+document. Extraction is owned by the peelfeed engine (a separate process/venv),
+which writes one peel directory per source under ``peel_root``::
+
+    <peel_root>/<slug>-<sha256[:8]>/
+        source/<original.pdf>
+        extract/corpus/{manifest.json,chunks.jsonl,assets.jsonl,
+                        validation.json,review_queue.json,blocks.jsonl,...}
+        .peel
+
+:func:`build_index` reads every source whose ``extraction.state`` is
+``"extracted"`` from its peel corpus (gated on the realpath allowlist, the
+source sha256, the recorded ``conversion_id`` and ``validation.errors == 0``),
+maps the corpus chunks onto peekseed's chunk contract, embeds them through the
+configured link and writes the same generation-atomic numpy index as before.
+There is deliberately **no in-process extraction fallback**.
+
 A dataset directory owns the uploaded files, the canonical ``chunks.jsonl`` and
 one index per embedding space::
 
@@ -54,13 +72,12 @@ import httpx
 import numpy as np
 
 from .. import contracts
-from .chunk import chunk_pages
-from .pdf import IngestError, extract_pdf, page_count
+from .errors import IngestError
 
 __all__ = [
     "IndexCancelled",
-    "IndexState",
     "NeedsReindex",
+    "NoExtractedSources",
     "ProbeMismatch",
     "PROBE_MIN_COSINE",
     "active_job_for",
@@ -73,18 +90,23 @@ __all__ = [
     "embed_query",
     "embed_space_key",
     "embed_texts",
+    "find_source",
     "index_state",
     "job_cancel_requested",
     "job_path",
     "list_jobs",
     "load_index",
     "mark_interrupted_jobs",
+    "peel_root",
     "probe_cosine",
     "read_chunks",
+    "remove_source",
     "read_job",
     "reindex",
     "request_cancel",
     "sanitize_filename",
+    "stored_source_path",
+    "update_source",
     "verify_probe",
     "write_chunks",
     "write_job",
@@ -95,6 +117,21 @@ DEFAULT_BATCH_SIZE = 32
 EMBED_TIMEOUT = 120.0
 MAX_DATASET_ID = 64
 MAX_FILENAME_LENGTH = 120
+
+#: Env override for the peelfeed ``peel_root`` (the only tree peekseed may read).
+#: ``PEELFEED_ROOT`` is the shared deploy name; the historical
+#: ``PEEKSEED_PEELFEED_ROOT`` is still accepted as a fallback.
+PEEL_ROOT_ENV = "PEELFEED_ROOT"
+LEGACY_PEEL_ROOT_ENV = "PEEKSEED_PEELFEED_ROOT"
+#: Corpus files peekseed consumes from one peel (design §2.1/§4.3).
+PEEL_CORPUS_FILES = ("manifest.json", "chunks.jsonl", "assets.jsonl",
+                     "validation.json", "review_queue.json")
+#: Newer corpus schema versions are refused rather than guessed at.
+SUPPORTED_CORPUS_SCHEMA = 2
+#: The chunker version recorded on chunks read from a peel corpus.
+PEEL_CHUNKER_VERSION = contracts.PEEL_CHUNKER_VERSION
+#: A PDF must start with this magic; storage-only uploads still validate it.
+PDF_MAGIC = b"%PDF-"
 
 #: Retry policy for transient embed failures (429/5xx/timeouts/connect errors).
 RETRY_ATTEMPTS = 3
@@ -139,12 +176,44 @@ _META_PROVENANCE_FIELDS = (
     "ordinal",
     "block_kind",
 )
+# Optional fields added by the peelfeed corpus contract (design §4.2); copied
+# when present so an index can serve crops/pages/canonical ids without re-reading
+# the peel at query time.
+_META_PEEL_FIELDS = (
+    "kind",
+    "image_paths",
+    "source_pages",
+    "char_count",
+    "parts",
+    "part",
+    "prev",
+    "next",
+    "canonical_ids",
+    "engine",
+    "conversion_id",
+    "peel_id",
+)
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _HTTP_STATUS = re.compile(r"HTTP (\d{3})")
 
 
 class NeedsReindex(IngestError):
     """The index on disk is missing, unreadable or internally inconsistent."""
+
+
+class NoExtractedSources(IngestError):
+    """No source in the dataset has a usable peelfeed corpus.
+
+    ``code`` lets the HTTP layer map this to 409 without string matching;
+    ``skipped`` names every source that was skipped and why, so the response can
+    list them instead of silently ignoring them.
+    """
+
+    code = "no_extracted_sources"
+
+    def __init__(self, message, skipped=None):
+        self.skipped = list(skipped or [])
+        super().__init__(message)
 
 
 class ProbeMismatch(IngestError):
@@ -561,24 +630,44 @@ def _dataset_root(dataset):
 
 
 def add_source(dataset, source_path):
-    """Copy one source file into a dataset's ``original/`` directory.
+    """Store one uploaded file in a dataset's ``original/`` directory.
+
+    Upload is deliberately **storage only**: the file's magic/extension is
+    checked, the bytes are copied (atomically enough: a same-content file is
+    reused, a different file with the same name gets a numbered suffix), its
+    sha256/bytes are recorded and the source is marked ``status="uploaded"``
+    with ``extraction.state="not_extracted"``. No page count, extraction or
+    chunking happens here -- extraction is a separate, user-triggered peelfeed
+    job (design §4.5).
 
     ``dataset`` is the metadata dictionary returned by :func:`create_dataset`
-    (it must carry the dataset directory under ``dir``); a dataset directory path
-    is also accepted. The filename is sanitised, an existing different file with
-    the same name is never overwritten (a numbered suffix is used instead), and
-    the resulting ``{name, path, sha256, bytes, pages, extractor, status}`` entry
-    is appended to ``dataset.json`` ``sources`` and returned. Adding the same file
-    twice is idempotent and returns the existing entry.
+    (it must carry the dataset directory under ``dir``); a dataset directory
+    path is also accepted. Adding the same content twice is idempotent and
+    returns the existing entry (content, not path, is identity).
     """
     dataset_dir_path = _dataset_root(dataset)
     source = Path(source_path)
     if not source.is_file():
         raise IngestError("Source file not found: '%s'." % source.name)
+    if source.suffix.lower() != ".pdf":
+        raise IngestError(
+            "Unsupported file type '%s': uploads are PDFs; extraction formats "
+            "are decided by the peelfeed profile." % (source.suffix or "unknown")
+        )
+    try:
+        with open(str(source), "rb") as handle:
+            if handle.read(len(PDF_MAGIC)) != PDF_MAGIC:
+                raise IngestError("'%s' is not a PDF (missing %%PDF- header)."
+                                  % source.name)
+    except OSError as exc:
+        raise IngestError("Could not read '%s': %s." % (source.name, exc)) from None
+
     metadata = _read_dataset_json(dataset_dir_path)
     original = dataset_dir_path / "original"
     original.mkdir(parents=True, exist_ok=True)
+    digest = _file_digest(source)
 
+    sources = _source_entries(metadata.get("sources"))
     base_name = sanitize_filename(source.name)
     name = base_name
     target = original / name
@@ -588,6 +677,21 @@ def add_source(dataset, source_path):
         name = "%s-%d%s" % (stem, counter, suffix)
         target = original / name
         counter += 1
+    existing = next(
+        (entry for entry in sources if str(entry.get("name") or "") == name),
+        None,
+    )
+    if existing is not None and target.is_file():
+        # Re-uploading the same file is idempotent: one stored copy, one entry.
+        if str(existing.get("sha256") or "").lower() != digest:
+            existing["sha256"] = digest
+            existing["bytes"] = _size(target)
+            metadata["sources"] = sources
+            _write_json_atomic(dataset_dir_path / "dataset.json", metadata,
+                               indent=2)
+        if isinstance(dataset, dict):
+            dataset["sources"] = _source_entries(sources)
+        return dict(existing)
     if not target.exists():
         try:
             shutil.copyfile(str(source), str(target))
@@ -596,34 +700,22 @@ def add_source(dataset, source_path):
                 "Could not store '%s' in the dataset: %s." % (base_name, exc)
             ) from None
 
-    pages = 0
-    extractor = ""
-    if target.suffix.lower() == ".pdf":
-        try:
-            pages = page_count(target)
-        except IngestError:
-            pages = 0
     entry = {
         "name": name,
         "path": "original/" + name,
-        "sha256": _file_digest(target),
+        "sha256": digest,
         "bytes": _size(target),
-        "pages": pages,
-        "extractor": extractor,
-        "status": "new",
+        "pages": 0,
+        "extractor": "",
+        "status": "uploaded",
+        "extraction": contracts.extraction_default(),
     }
-
-    sources = _source_entries(metadata.get("sources"))
     for index, existing in enumerate(sources):
         if str(existing.get("name") or "") == name:
-            if not existing.get("bytes") or not existing.get("pages") or not existing.get("sha256"):
-                sources[index] = {**dict(existing), **entry}
-                metadata["sources"] = sources
-                _write_json_atomic(dataset_dir_path / "dataset.json", metadata, indent=2)
-            if isinstance(dataset, dict):
-                dataset["sources"] = _source_entries(metadata.get("sources"))
-            return entry
-    sources.append(entry)
+            sources[index] = {**dict(existing), **entry}
+            break
+    else:
+        sources.append(entry)
     metadata["schema"] = contracts.DATASET_SCHEMA
     metadata["sources"] = sources
     metadata.setdefault("updated_at", _now())
@@ -631,6 +723,100 @@ def add_source(dataset, source_path):
     if isinstance(dataset, dict):
         dataset["sources"] = [dict(item) for item in sources]
     return entry
+
+
+def _entries_by_sha(dataset_dir):
+    """``{sha256: entry}`` for every declared source with a content hash."""
+    metadata = _read_dataset_json(dataset_dir)
+    found = {}
+    for entry in _source_entries(metadata.get("sources")):
+        sha = str(entry.get("sha256") or "").lower()
+        if sha:
+            found.setdefault(sha, entry)
+    return found
+
+
+def find_source(dataset_dir, sha):
+    """One source entry by content hash (a copy), or None."""
+    sha = str(sha or "").lower()
+    if not sha:
+        return None
+    entry = _entries_by_sha(dataset_dir).get(sha)
+    return dict(entry) if entry is not None else None
+
+
+def stored_source_path(dataset_dir, entry):
+    """The stored file for a source entry (``original/`` copy), or None."""
+    return _source_file(dataset_dir, entry)
+
+
+def update_source(dataset_dir, sha, *, status=None, extraction=None,
+                  pages=None, extractor=None):
+    """Merge fields into one ``dataset.json`` source and persist it atomically.
+
+    ``extraction`` replaces the whole per-source block; callers build it from the
+    peelfeed summary so a stale state cannot survive a refresh.
+    """
+    dataset_dir = Path(dataset_dir)
+    metadata = _read_dataset_json(dataset_dir)
+    sources = _source_entries(metadata.get("sources"))
+    sha = str(sha or "").lower()
+    for position, entry in enumerate(sources):
+        if str(entry.get("sha256") or "").lower() != sha:
+            continue
+        updated = dict(entry)
+        if status is not None:
+            updated["status"] = str(status)
+        if extractor is not None:
+            updated["extractor"] = str(extractor)
+        if pages is not None:
+            updated["pages"] = int(pages)
+        if extraction is not None:
+            updated["extraction"] = dict(extraction)
+        sources[position] = updated
+        metadata["schema"] = contracts.DATASET_SCHEMA
+        metadata["sources"] = sources
+        metadata["updated_at"] = _now()
+        validated = contracts.validate_dataset(metadata)
+        _write_json_atomic(dataset_dir / "dataset.json", validated, indent=2)
+        return dict(updated)
+    return None
+
+
+def remove_source(dataset_dir, sha, *, delete_file=True):
+    """Remove one source entry (and optionally its stored file).
+
+    The peel itself is owned by peelfeed; ``DELETE /api/datasets/{id}/sources/
+    {sha}?peel=keep|delete`` decides separately whether to archive it. Removing
+    the source leaves the index/chunks stale until the next build, which the
+    normal staleness gate reports.
+    """
+    dataset_dir = Path(dataset_dir)
+    metadata = _read_dataset_json(dataset_dir)
+    sources = _source_entries(metadata.get("sources"))
+    sha = str(sha or "").lower()
+    removed = None
+    kept = []
+    for entry in sources:
+        if removed is None and str(entry.get("sha256") or "").lower() == sha:
+            removed = dict(entry)
+            continue
+        kept.append(entry)
+    if removed is None:
+        return None
+    if delete_file:
+        stored = _source_file(dataset_dir, removed)
+        if stored is not None:
+            try:
+                stored.unlink()
+            except OSError:
+                pass
+    metadata["schema"] = contracts.DATASET_SCHEMA
+    metadata["sources"] = kept
+    metadata["updated_at"] = _now()
+    _write_json_atomic(dataset_dir / "dataset.json",
+                       contracts.validate_dataset(metadata), indent=2)
+    return removed
 
 
 def _original_files(dataset_dir):
@@ -736,8 +922,13 @@ def _meta_record(chunk):
     for field in _META_PROVENANCE_FIELDS:
         if chunk.get(field) is not None:
             record[field] = chunk[field]
+    for field in _META_PEEL_FIELDS:
+        if chunk.get(field) is not None:
+            record[field] = chunk[field]
     return {field: record[field] for field in _META_FIELDS if field in record} | {
         field: record[field] for field in _META_PROVENANCE_FIELDS if field in record
+    } | {
+        field: record[field] for field in _META_PEEL_FIELDS if field in record
     }
 
 
@@ -1147,6 +1338,7 @@ def _dataset_sources_for_digest(dataset_dir):
         rows.append({
             "path": str(entry.get("path") or entry.get("name") or ""),
             "sha256": sha,
+            "extraction": dict(entry.get("extraction") or {}),
         })
     return rows
 
@@ -1169,9 +1361,10 @@ def index_state(dataset_dir, space, *, chunker=None, extractor=None):
         return {"status": "needs_reindex", "reasons": [str(exc)],
                 "generation": "", "space": str(space)}
     info = loaded["info"]
+    sources = _dataset_sources_for_digest(dataset_dir)
     reasons = contracts.stale_reasons(
-        info, _dataset_sources_for_digest(dataset_dir),
-        chunker=chunker, extractor=extractor,
+        info, sources, chunker=chunker, extractor=extractor,
+        corpus_digest=_corpus_digest(sources),
     )
     if not contracts.has_probe(info):
         reasons.append("index has no stored embedding probe")
@@ -1494,6 +1687,68 @@ def mark_interrupted_jobs(jobs_dir):
     return interrupted
 
 
+def _collect_corpus_chunks(dataset_dir, dataset):
+    """Read every extracted source's peel corpus into one chunk sequence.
+
+    Returns ``(chunks, peels, skipped)`` where ``peels`` names the peels read and
+    ``skipped`` lists every source that could not contribute (with a reason), so
+    callers can report them instead of silently dropping data.
+    """
+    dataset_id = str(dataset.get("id") or Path(dataset_dir).name)
+    root = peel_root()
+    chunks = []
+    peels = []
+    skipped = []
+    for entry in _source_entries(dataset.get("sources")):
+        name = str(entry.get("name") or "")
+        block = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
+        state = contracts.extraction_state(entry)
+        peel_id = str(block.get("peel_id") or "")
+        if state != "extracted" or not peel_id:
+            if state == "not_extracted":
+                reason = "not extracted yet; run Extract with peelfeed"
+            else:
+                reason = "extraction is %s; re-extract it with peelfeed" % state
+            skipped.append({"name": name, "state": state, "reason": reason})
+            continue
+        peel = _read_peel(dataset_dir, entry, root, dataset_id)
+        chunks.extend(peel["records"])
+        peels.append({"name": name, "peel": peel["peel"]})
+    if not chunks:
+        raise NoExtractedSources(
+            "no_extracted_sources: no source in dataset '%s' has a usable "
+            "peelfeed corpus; upload files, configure peelfeed and Extract them "
+            "first." % dataset_id,
+            skipped=skipped,
+        )
+    return chunks, peels, skipped
+
+
+def _current_info_if_up_to_date(dataset_dir, space, n, digest, corpus, chunker,
+                                extractor):
+    """The live ``info.json`` when it already describes these exact inputs."""
+    try:
+        loaded = load_index(dataset_dir, space)
+    except NeedsReindex:
+        return None
+    info = loaded["info"]
+    recorded_chunker = info.get("chunker") if isinstance(info.get("chunker"), dict) else {}
+    if int(info.get("n") or 0) != int(n):
+        return None
+    if str(info.get("documents_digest") or "") != str(digest):
+        return None
+    if str(info.get("corpus_digest") or "") != str(corpus):
+        return None
+    if (recorded_chunker.get("name"), recorded_chunker.get("version")) != (
+            chunker.get("name"), chunker.get("version")):
+        return None
+    if (info.get("extractor") or {}) != extractor:
+        return None
+    if not contracts.has_probe(info):
+        return None
+    return info
+
+
 # --- source summaries -----------------------------------------------------
 
 
@@ -1516,12 +1771,346 @@ def _source_file(dataset_dir, entry):
     return None
 
 
+# --- peelfeed corpus reader -----------------------------------------------
+
+
+def peel_root():
+    """The only tree peekseed may read a peel corpus from.
+
+    ``PEELFEED_ROOT`` wins (shared deploy name); the historical
+    ``PEEKSEED_PEELFEED_ROOT`` is accepted as a fallback. Otherwise the default
+    is ``<data_root>/peels`` (design §1.7). Every read is realpath-checked
+    against this root, so a symlink or a hand-written ``peel_id`` cannot escape it.
+    """
+    raw = os.environ.get(PEEL_ROOT_ENV) or os.environ.get(LEGACY_PEEL_ROOT_ENV)
+    if raw:
+        return Path(raw).expanduser().resolve()
+    try:
+        from .. import config
+
+        return (config.paths().root / "peels").resolve()
+    except Exception as exc:
+        raise IngestError(
+            "Could not resolve the peel root (%s); set %s."
+            % (type(exc).__name__, PEEL_ROOT_ENV)
+        ) from None
+
+
+def _resolve_peel_dir(root, peel_id):
+    """Resolve one peel directory under ``root`` (realpath allowlist gate)."""
+    identifier = str(peel_id or "").strip()
+    if (not identifier or identifier in (".", "..") or "/" in identifier
+            or "\\" in identifier or "\x00" in identifier):
+        raise IngestError("invalid peel id '%s'." % identifier)
+    root = Path(root).resolve()
+    candidate = (root / identifier).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        raise IngestError(
+            "peel '%s' resolves outside the peel root; refusing to read it."
+            % identifier
+        ) from None
+    if not candidate.is_dir():
+        raise IngestError("peel '%s' does not exist under the peel root."
+                          % identifier)
+    return candidate
+
+
+def _read_jsonl(path, label):
+    """Read a JSON Lines corpus file; a bad line is a per-peel refusal."""
+    path = Path(path)
+    if not path.is_file():
+        return []
+    rows = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for number, line in enumerate(handle, 1):
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except ValueError as exc:
+                    raise IngestError("%s line %d is not valid JSON: %s"
+                                      % (label, number, exc)) from None
+                if not isinstance(record, dict):
+                    raise IngestError("%s line %d is not a JSON object."
+                                      % (label, number))
+                rows.append(record)
+    except OSError as exc:
+        raise IngestError("Could not read %s: %s." % (label, exc)) from None
+    return rows
+
+
+def _validation_error_count(validation):
+    """Count validation errors (the corpus stores a list; older ones an int)."""
+    if not isinstance(validation, dict):
+        return 0
+    errors = validation.get("errors")
+    if isinstance(errors, list):
+        return len(errors)
+    if isinstance(errors, int) and not isinstance(errors, bool):
+        return errors
+    return 0
+
+
+def _review_item_count(validation, review_queue):
+    if isinstance(validation, dict):
+        value = validation.get("review_items")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    if isinstance(review_queue, dict):
+        warnings = review_queue.get("warnings")
+        if isinstance(warnings, list):
+            return len(warnings)
+    return 0
+
+
+def _peel_source_file(peel_dir, name):
+    """The read-only source copy inside a peel (by name, else the only file)."""
+    source_dir = Path(peel_dir) / "source"
+    candidate = source_dir / str(name or "")
+    if name and candidate.is_file():
+        return candidate
+    try:
+        files = sorted(path for path in source_dir.iterdir() if path.is_file())
+    except OSError:
+        return None
+    return files[0] if len(files) == 1 else None
+
+
+def _corpus_chunk_record(raw, entry, dataset_id, position, ordinal, block_map,
+                         manifest, peel_id):
+    """Map one peelfeed corpus chunk onto peekseed's chunk contract (§4.2).
+
+    The corpus chunk is the canonical unit; peekseed only adds its content-derived
+    id, its source identity and the two views (``doc`` for BM25/embedding,
+    ``text`` for the reader). The id uses the ordinal of the chunk's first block
+    in ``blocks.jsonl`` when available (stable and page-independent), else the
+    chunk's position in the corpus.
+    """
+    sha = str(entry.get("sha256") or "").lower()
+    page_start = _int(raw.get("page_start") or raw.get("page") or 1, 1)
+    page_start = max(1, page_start)
+    page_end = max(page_start, _int(raw.get("page_end") or page_start, page_start))
+    text = str(raw.get("text") or "").strip()
+    section = str(raw.get("section") or "")
+    path = str(raw.get("path") or section)
+    numbering = str(raw.get("numbering") or "")
+    parent = str(raw.get("parent") or "")
+    chapter = str(raw.get("chapter") or "")
+    if not chapter:
+        chapter = path.split("/")[0].strip() if "/" in path else (path or section)
+    block_ids = raw.get("block_ids") if isinstance(raw.get("block_ids"), list) else []
+    block_index = None
+    if block_ids:
+        block_index = block_map.get(str(block_ids[0]))
+    if block_index is None:
+        block_index = position
+    identifier = contracts.chunk_id(sha, block_index, position, PEEL_CHUNKER_VERSION)
+    body = text or section or identifier
+    breadcrumb = path or section
+    doc = (breadcrumb + "\n\n" + body) if breadcrumb else body
+    kind = str(raw.get("kind") or "text")
+    image_paths = [str(value) for value in raw.get("image_paths") or []]
+    source_pages = [
+        max(1, _int(value, page_start)) for value in raw.get("source_pages") or []
+    ] or [page_start]
+    record = {
+        "id": identifier,
+        "dataset": dataset_id,
+        "source": str(entry.get("name") or ""),
+        "source_sha256": sha,
+        "page_start": page_start,
+        "page_end": page_end,
+        "section": section,
+        "chapter": chapter,
+        "numbering": numbering,
+        "parent": parent,
+        "path": path,
+        "doc": doc,
+        "text": body,
+        "heading_only": bool(raw.get("heading_only")),
+        "block_index": block_index,
+        "chunk_index": position,
+        "chunker_version": PEEL_CHUNKER_VERSION,
+        "ordinal": ordinal,
+        "pdf_y": _int(float(raw.get("pdf_y") or 0), 0),
+        "block_kind": kind,
+        "kind": kind,
+        "image_paths": image_paths,
+        "source_pages": source_pages,
+        "char_count": max(1, len(body)),
+        "parts": max(1, _int(raw.get("parts") or 1, 1)),
+        "part": max(1, _int(raw.get("part") or 1, 1)),
+        "canonical_ids": [str(value) for value in raw.get("canonical_ids") or [identifier]],
+        "engine": str(manifest.get("engine") or ""),
+        "conversion_id": str(manifest.get("conversion_id") or ""),
+        "peel_id": peel_id,
+    }
+    prev = str(raw.get("prev") or "")
+    next_value = str(raw.get("next") or "")
+    if prev:
+        record["prev"] = prev
+    if next_value:
+        record["next"] = next_value
+    return record
+
+
+def _read_peel(dataset_dir, entry, root, dataset_id):
+    """Read one extracted source's corpus, refusing anything that fails a gate.
+
+    Gates (design §4.6): the peel dir must resolve under ``peel_root``, the
+    corpus manifest's ``source_sha256`` must equal the stored source's sha256,
+    the recorded ``conversion_id`` must match the manifest, and
+    ``validation.errors`` must be 0. A failure names the source and the reason;
+    it never falls back to re-extracting the PDF.
+    """
+    name = str(entry.get("name") or "")
+    extraction = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
+    peel_id = str(extraction.get("peel_id") or "").strip()
+    peel_dir = _resolve_peel_dir(root, peel_id)
+    corpus_dir = peel_dir / "extract" / "corpus"
+    for filename in PEEL_CORPUS_FILES:
+        if not (corpus_dir / filename).is_file():
+            raise IngestError(
+                "source '%s': peel '%s' has no corpus/%s."
+                % (name, peel_id, filename)
+            )
+    manifest = _read_json(corpus_dir / "manifest.json", None)
+    if not isinstance(manifest, dict):
+        raise IngestError("source '%s': peel '%s' manifest.json is not an object."
+                          % (name, peel_id))
+    schema = manifest.get("schema_version") or manifest.get("schema")
+    if isinstance(schema, int) and not isinstance(schema, bool) \
+            and schema > SUPPORTED_CORPUS_SCHEMA:
+        raise IngestError(
+            "source '%s': peel '%s' corpus schema %d is newer than this peekseed "
+            "build supports (%d); upgrade peekseed."
+            % (name, peel_id, schema, SUPPORTED_CORPUS_SCHEMA)
+        )
+    validation = _read_json(corpus_dir / "validation.json", None)
+    review_queue = _read_json(corpus_dir / "review_queue.json", None)
+    build_summary = _read_json(corpus_dir / "build_summary.json", None)
+    if not isinstance(build_summary, dict):
+        build_summary = {}
+    assets = _read_jsonl(corpus_dir / "assets.jsonl", "assets.jsonl")
+    chunks = _read_jsonl(corpus_dir / "chunks.jsonl", "chunks.jsonl")
+    blocks_path = corpus_dir / "blocks.jsonl"
+    blocks = _read_jsonl(blocks_path, "blocks.jsonl") if blocks_path.is_file() else []
+
+    sha = str(entry.get("sha256") or "").lower()
+    manifest_sha = str(manifest.get("source_sha256") or "").lower()
+    if not sha or manifest_sha != sha:
+        raise IngestError(
+            "source '%s': peel '%s' was built from a different source "
+            "(manifest sha256 %s != stored %s); re-extract it."
+            % (name, peel_id, manifest_sha[:12] or "?", sha[:12] or "?")
+        )
+    manifest_conversion = str(manifest.get("conversion_id") or "")
+    recorded_conversion = str(extraction.get("conversion_id") or "")
+    if not recorded_conversion:
+        raise IngestError(
+            "source '%s': no recorded conversion_id for peel '%s'; re-extract it."
+            % (name, peel_id)
+        )
+    if recorded_conversion != manifest_conversion:
+        raise IngestError(
+            "source '%s': peel '%s' conversion_id does not match the recorded one "
+            "(peel %s, recorded %s); re-extract it."
+            % (name, peel_id, manifest_conversion[:12] or "?",
+               recorded_conversion[:12] or "?")
+        )
+    errors = _validation_error_count(validation)
+    if errors:
+        first = ""
+        if isinstance(validation, dict) and isinstance(validation.get("errors"), list):
+            first = str(validation["errors"][0])[:160]
+        raise IngestError(
+            "source '%s': peel '%s' validation has %d error(s)%s; fix it with "
+            "peelfeed before indexing."
+            % (name, peel_id, errors, (": " + first) if first else "")
+        )
+    validation_conversion = str((validation or {}).get("conversion_id") or "") \
+        if isinstance(validation, dict) else ""
+    if validation_conversion and validation_conversion != manifest_conversion:
+        raise IngestError(
+            "source '%s': peel '%s' validation.json does not belong to this "
+            "conversion; re-extract it." % (name, peel_id)
+        )
+    source_file = _peel_source_file(peel_dir, name)
+    if source_file is None:
+        raise IngestError("source '%s': peel '%s' has no source file."
+                          % (name, peel_id))
+    expected_bytes = _int(entry.get("bytes") or 0, 0)
+    try:
+        actual_bytes = source_file.stat().st_size
+    except OSError:
+        actual_bytes = 0
+    if expected_bytes and actual_bytes and actual_bytes != expected_bytes:
+        raise IngestError(
+            "source '%s': peel '%s' source file is %d bytes, the stored source is "
+            "%d; re-extract it."
+            % (name, peel_id, actual_bytes, expected_bytes)
+        )
+
+    block_map = {}
+    for position, block in enumerate(blocks):
+        identifier = str(block.get("id") or "")
+        if identifier:
+            block_map.setdefault(identifier, position)
+    records = []
+    for position, raw in enumerate(chunks):
+        records.append(_corpus_chunk_record(
+            raw, entry, dataset_id, position, len(records) + 1, block_map,
+            manifest, peel_id,
+        ))
+    if not records:
+        raise IngestError("source '%s': peel '%s' corpus has no chunks."
+                          % (name, peel_id))
+    engine_info = build_summary.get("engine") \
+        if isinstance(build_summary.get("engine"), dict) else {}
+    engine = str(
+        engine_info.get("fingerprint")
+        or engine_info.get("version")
+        or manifest.get("engine")
+        or manifest.get("engine_fingerprint")
+        or extraction.get("engine")
+        or ""
+    )
+    counts = build_summary.get("counts") if isinstance(
+        build_summary.get("counts"), dict) else {}
+    pages = _int(counts.get("pages") or manifest.get("pages") or 0, 0)
+    for record in records:
+        record["engine"] = engine
+    peel_info = {
+        "peel_id": peel_id,
+        "conversion_id": manifest_conversion,
+        "profile": str(manifest.get("profile") or extraction.get("profile") or ""),
+        "validation": {
+            "errors": 0,
+            "review_items": _review_item_count(validation, review_queue),
+        },
+        "engine": engine,
+        "pages": pages,
+        "assets": len(assets),
+    }
+    return {"records": records, "peel": peel_info, "entry": entry,
+            "manifest": manifest}
+
+
+# --- source summaries -----------------------------------------------------
+
+
 def _sources_summary(dataset_dir, dataset):
-    """Provenance rows for ``info.json``: name, path, sha256, pages and bytes.
+    """Provenance rows for ``info.json``: identity, pages and extraction state.
 
     Declared upload order wins over directory order. A hash is computed from the
-    file when ``dataset.json`` predates content hashing; when the file is gone the
-    entry is marked ``missing`` with no hash rather than inventing one.
+    file when ``dataset.json`` predates content hashing; when the file is gone
+    the entry is marked ``missing`` with no hash rather than inventing one. The
+    per-source ``extraction`` block is carried through so an index records which
+    peel/conversion produced its chunks.
     """
     dataset_dir = Path(dataset_dir)
     declared = []
@@ -1537,12 +2126,6 @@ def _sources_summary(dataset_dir, dataset):
         file_path = _source_file(dataset_dir, entry) if not sha else None
         if not sha and file_path is not None:
             sha = _file_digest(file_path)
-        pages = _int(entry.get("pages"), 0)
-        if pages <= 0 and file_path is not None and file_path.suffix.lower() == ".pdf":
-            try:
-                pages = page_count(file_path)
-            except IngestError:
-                pages = 0
         byte_size = _int(entry.get("bytes"), 0) or (
             _size(file_path) if file_path is not None else 0
         )
@@ -1551,7 +2134,9 @@ def _sources_summary(dataset_dir, dataset):
             "path": path,
             "sha256": sha,
             "bytes": byte_size,
-            "pages": pages,
+            "pages": _int(entry.get("pages"), 0),
+            "extraction": dict(entry.get("extraction") or
+                               contracts.extraction_default()),
         }
         if not sha:
             row["status"] = "missing"
@@ -1565,72 +2150,27 @@ def _sources_summary(dataset_dir, dataset):
             "path": "original/" + name,
             "sha256": _file_digest(path),
             "bytes": _size(path),
-            "pages": page_count(path) if path.suffix.lower() == ".pdf" else 0,
+            "pages": 0,
+            "extraction": contracts.extraction_default(),
         })
     return rows
 
 
-def _chunks_from_pdfs(dataset_dir, dataset_id, target_chars, max_chars, notify):
-    """Extract and chunk every PDF under ``original/`` into one chunk sequence."""
-    original = Path(dataset_dir) / "original"
-    files = (
-        sorted(
-            path
-            for path in original.iterdir()
-            if path.is_file() and path.suffix.lower() == ".pdf"
-        )
-        if original.is_dir()
-        else []
-    )
-    if not files:
-        raise IngestError(
-            "No chunks.jsonl and no PDF files under original/; nothing to index."
-        )
-    chunks = []
-    next_id = 1
-    total = len(files)
-    for index, path in enumerate(files):
-        notify(
-            0.02 + 0.18 * (float(index) / max(1, total)),
-            "Extracting %s" % path.name,
-        )
-        pages = extract_pdf(path)
-        notify(
-            0.02 + 0.18 * ((float(index) + 0.5) / max(1, total)),
-            "Chunking %s" % path.name,
-        )
-        produced = chunk_pages(
-            pages,
-            target_chars=target_chars,
-            max_chars=max_chars,
-            dataset_id=dataset_id,
-            source=path.name,
-            source_sha256=_file_digest(path),
-            id_start=next_id,
-        )
-        chunks.extend(produced)
-        next_id += len(produced)
-    notify(0.22, "Chunked %d source file(s)" % total)
-    return chunks
-
-
 def _extractor_identity(dataset):
-    """The extractor that produced a dataset's chunks, from its provenance labels."""
+    """The peelfeed engine identity recorded for a dataset's extracted sources."""
     label = str((dataset or {}).get("extractor") or "")
-    if "@" in label and label != "mixed":
-        name, _, version = label.partition("@")
-        return {"name": name, "version": version}
-    labels = set()
+    if label.startswith("peelfeed@"):
+        return {"name": "peelfeed", "version": label.split("@", 1)[1]}
+    versions = set()
     for entry in _source_entries((dataset or {}).get("sources")):
-        value = str(entry.get("extractor") or "")
-        if value:
-            labels.add(value)
-    labels.discard("mixed")
-    if len(labels) == 1:
-        value = labels.pop()
-        if "@" in value:
-            name, _, version = value.partition("@")
-            return {"name": name, "version": version}
+        block = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
+        version = str(block.get("engine") or "")
+        if version:
+            versions.add(version)
+    if len(versions) == 1:
+        return {"name": "peelfeed", "version": versions.pop()}
+    if versions:
+        return {"name": "peelfeed", "version": "mixed"}
     return {"name": "", "version": ""}
 
 
@@ -1641,17 +2181,25 @@ def _documents_digest(sources):
         return ""
 
 
+def _corpus_digest(sources):
+    try:
+        return contracts.corpus_digest(sources)
+    except contracts.ContractError:
+        return ""
+
+
 # --- resumable generations -------------------------------------------------
 
 
-def _find_resumable_generation(space_dir, *, space, digest, chunker, n):
+def _find_resumable_generation(space_dir, *, space, digest, chunker, n,
+                              corpus=None):
     """An interrupted generation that can continue from its checkpoint.
 
-    Compatibility is exact: same space, same documents digest, same chunker
-    version, same chunk count, a readable vector memmap of that row count and a
-    stored probe whose dimension matches the memmap width. Anything else starts a
-    fresh generation, because resuming into a changed corpus would write vectors
-    that do not belong to their rows.
+    Compatibility is exact: same space, same documents digest, same peel corpus
+    digest, same chunker version, same chunk count, a readable vector memmap of
+    that row count and a stored probe whose dimension matches the memmap width.
+    Anything else starts a fresh generation, because resuming into a changed
+    corpus would write vectors that do not belong to their rows.
     """
     for generation_dir in reversed(_generation_dirs(space_dir)):
         progress = _read_json(generation_dir / PROGRESS_FILE, None)
@@ -1664,6 +2212,8 @@ def _find_resumable_generation(space_dir, *, space, digest, chunker, n):
         if str(progress.get("space") or "") != str(space):
             continue
         if str(progress.get("documents_digest") or "") != str(digest):
+            continue
+        if corpus is not None and str(progress.get("corpus_digest") or "") != str(corpus):
             continue
         recorded_chunker = progress.get("chunker") or {}
         if (recorded_chunker.get("name"), recorded_chunker.get("version")) != (
@@ -1698,12 +2248,14 @@ def _open_vectors(generation_dir, n, dim):
     )
 
 
-def _write_progress(generation_dir, *, space, digest, chunker, n, dim, row):
+def _write_progress(generation_dir, *, space, digest, chunker, n, dim, row,
+                    corpus=None):
     _write_json_atomic(
         Path(generation_dir) / PROGRESS_FILE,
         {
             "space": str(space),
             "documents_digest": str(digest),
+            "corpus_digest": str(corpus or ""),
             "chunker": dict(chunker),
             "n": int(n),
             "dim": int(dim),
@@ -1729,13 +2281,18 @@ def _cancelled(cancel, job):
 
 
 def _build_info(dataset, dataset_id, space, generation, dim, n, link, sources,
-                chunker, extractor, digest):
+                chunker, extractor, digest, corpus, peels, skipped):
     target = _link_target(link)
     embedding = contracts.space_identity(link, dim=dim)
     embedding["probe"] = {
         "text_sha256": contracts.probe_sha256(),
         "file": PROBE_FILE,
     }
+    if len(peels) == 1:
+        peel_block = dict(peels[0])
+    else:
+        peel_block = {"peels": [dict(peel) for peel in peels],
+                      "count": len(peels)}
     info = {
         "schema": contracts.INFO_SCHEMA,
         "dataset": dataset_id,
@@ -1752,28 +2309,101 @@ def _build_info(dataset, dataset_id, space, generation, dim, n, link, sources,
         "chunker": dict(chunker),
         "extractor": dict(extractor),
         "documents_digest": str(digest),
+        "corpus_digest": str(corpus),
+        "peel": peel_block,
+        "skipped_sources": [dict(item) for item in skipped],
         "sources": sources,
     }
     return contracts.validate_info(info)
+
+
+def _peel_extractor(peels):
+    """The ``info.extractor`` identity for the peels an index was built from."""
+    versions = sorted({str(peel.get("engine") or "") for peel in peels})
+    versions = [version for version in versions if version]
+    if len(versions) == 1:
+        return {"name": "peelfeed", "version": versions[0]}
+    if len(versions) > 1:
+        return {"name": "peelfeed", "version": "mixed"}
+    return {"name": "peelfeed", "version": ""}
+
+
+def _refresh_extraction(dataset_dir, dataset, peels):
+    """Write the peel identity/pages/validation back into ``dataset.json``.
+
+    The extract route records ``queued`` and then polls peelfeed, but the corpus
+    manifest is the authoritative source for page count/validation/engine. Doing
+    this refresh at build time also repairs a dataset whose extraction block was
+    written by an older peekseed build.
+    """
+    dataset_dir = Path(dataset_dir)
+    sources = _source_entries(dataset.get("sources"))
+    by_name = {str(peel["name"]): peel["peel"] for peel in peels}
+    changed = False
+    for entry in sources:
+        peel = by_name.get(str(entry.get("name") or ""))
+        if peel is None:
+            continue
+        extraction = dict(entry.get("extraction") or contracts.extraction_default())
+        updated = dict(extraction)
+        updated["state"] = "extracted"
+        updated["peel_id"] = str(peel.get("peel_id") or "")
+        updated["conversion_id"] = str(peel.get("conversion_id") or "")
+        updated["profile"] = str(peel.get("profile") or "")
+        updated["engine"] = str(peel.get("engine") or "")
+        updated["validation"] = dict(peel.get("validation") or
+                                     {"errors": 0, "review_items": 0})
+        updated["finished_at"] = extraction.get("finished_at") or _now()
+        updated["error"] = None
+        if updated != extraction:
+            entry["extraction"] = updated
+            changed = True
+        pages = _int(peel.get("pages") or 0, 0)
+        if pages and _int(entry.get("pages") or 0, 0) != pages:
+            entry["pages"] = pages
+            changed = True
+        if str(entry.get("status") or "") != "extracted":
+            entry["status"] = "extracted"
+            changed = True
+    if not changed:
+        return dataset
+    extractor = _peel_extractor([peel["peel"] for peel in peels])
+    metadata = dict(dataset)
+    metadata["schema"] = contracts.DATASET_SCHEMA
+    metadata["sources"] = sources
+    metadata["extractor"] = contracts.extractor_label(extractor)
+    metadata["chunker"] = contracts.chunker_label()
+    metadata["updated_at"] = _now()
+    metadata = contracts.validate_dataset(metadata)
+    _write_json_atomic(dataset_dir / "dataset.json", metadata, indent=2)
+    return metadata
 
 
 def build_index(
     dataset_dir,
     link,
     *,
-    target_chars=1200,
-    max_chars=2000,
     progress=None,
     batch_size=DEFAULT_BATCH_SIZE,
     job=None,
     cancel=None,
     lock=None,
+    force=False,
 ):
-    """Build (or rebuild) one dataset's index for one embedding link.
+    """Build (or rebuild) one dataset's index from its peelfeed corpora.
 
-    ``chunks.jsonl`` is the canonical input: when it exists it is used as-is;
-    otherwise every PDF under ``original/`` is extracted and chunked first and the
-    result is written back. Then:
+    Every source whose ``extraction.state == "extracted"`` is read from its peel
+    corpus (``<peel_root>/<peel_id>/extract/corpus``), gated on the realpath
+    allowlist, the source sha256, the recorded ``conversion_id`` and
+    ``validation.errors == 0``. Sources that are not extracted are listed in
+    ``info.json`` ``skipped_sources`` -- never silently ignored -- and when no
+    source is extracted :class:`NoExtractedSources` is raised (the HTTP layer maps
+    it to 409). There is **no in-process extraction fallback**.
+
+    ``chunks.jsonl`` is rewritten from the corpus chunks (the canonical input).
+    An index already built from the same corpora/chunker/extractor is returned
+    unchanged, so a second build makes **zero** embedding calls unless
+    ``force=True`` (``reindex`` passes it). Then:
 
     * the fixed probe text is embedded and stored (the space-mismatch gate);
     * every chunk is embedded in batches into a **preallocated** memmap, with a
@@ -1785,14 +2415,13 @@ def build_index(
 
     ``progress(frac, message)`` is called with a 0..1 fraction at each stage.
     ``cancel`` is a zero-argument callable checked between batches. Returns the
-    ``info.json`` content.
+    ``info.json`` content (plus ``up_to_date=True`` when nothing was rebuilt).
 
     ``job`` is either the persisted job record the caller wants this build to
     own (the API creates the record and passes it, so the job id the client polls
     is the record on disk) or a legacy in-memory dict kept for compatibility.
     ``lock`` is an already-held :class:`peekseed.ingest.lock.CollectionLock`;
-    when omitted the builder takes the collection's writer lock itself, so CLI and
-    scan callers cannot race the server either.
+    when omitted the builder takes the collection's writer lock itself.
     """
     dataset_dir = Path(dataset_dir)
     if not dataset_dir.is_dir():
@@ -1846,41 +2475,54 @@ def build_index(
         legacy_job["message"] = "preparing"
 
     try:
-        notify(0.0, "Preparing dataset")
-        chunks = read_chunks(dataset_dir)
-        if chunks:
-            notify(0.05, "Loaded %d existing chunk(s)" % len(chunks))
-        else:
-            chunks = _chunks_from_pdfs(
-                dataset_dir, dataset_id, target_chars, max_chars, notify
-            )
-            if not chunks:
-                raise IngestError(
-                    "No extractable text was found in the dataset's PDF files."
-                )
-            write_chunks(dataset_dir, chunks)
-            notify(0.15, "Wrote %d chunk(s)" % len(chunks))
+        notify(0.0, "Reading peel corpora")
+        chunks, peels, skipped = _collect_corpus_chunks(dataset_dir, dataset)
+        dataset = _refresh_extraction(dataset_dir, dataset, peels)
         total = len(chunks)
+        notify(0.02, "Read %d chunk(s) from %d peel(s)" % (total, len(peels)))
+        existing_chunks = read_chunks(dataset_dir)
+        if existing_chunks != chunks:
+            write_chunks(dataset_dir, chunks)
+            notify(0.05, "Wrote %d chunk(s)" % total)
         if not total:
             raise IngestError("No chunks to index for dataset '%s'." % dataset_id)
 
         sources = _sources_summary(dataset_dir, dataset)
         digest = _documents_digest(sources)
-        chunker = contracts.chunker_identity(target_chars, max_chars)
-        extractor = _extractor_identity(dataset)
+        corpus = _corpus_digest(sources)
+        chunker = contracts.chunker_identity()
+        extractor = _peel_extractor([item["peel"] for item in peels])
+        peel_list = [item["peel"] for item in peels]
         texts = [_embedding_text(chunk) for chunk in chunks]
 
         space_dir = _space_dir(dataset_dir, space)
         space_dir.mkdir(parents=True, exist_ok=True)
         generation_dirs = _generation_dirs(space_dir)
 
-        # The probe fixes the dimension before the memmap is preallocated, and
-        # resumes use the already-stored probe so no embed call is wasted.
+        # An interrupted generation is resumed before the up-to-date shortcut:
+        # the user asked for a build and the checkpoint is already paid for.
+        # `force=True` (reindex) always starts a fresh generation.
         resumable, start_row = (None, 0)
-        if generation_dirs:
+        if not force and generation_dirs:
             resumable, start_row = _find_resumable_generation(
-                space_dir, space=space, digest=digest, chunker=chunker, n=total,
+                space_dir, space=space, digest=digest, chunker=chunker,
+                n=total, corpus=corpus,
             )
+        if not force and resumable is None:
+            current = _current_info_if_up_to_date(
+                dataset_dir, space, total, digest, corpus, chunker, extractor)
+            if current is not None:
+                notify(1.0, "Index is up to date: %d chunk(s)" % total)
+                _job_touch(job_record, jobs_dir, state="succeeded", phase="done",
+                           done=total, total=total, fraction=1.0)
+                if legacy_job is not None:
+                    legacy_job["progress"] = 1.0
+                    legacy_job["message"] = "index up to date: %d chunks" % total
+                if own_lock is not None:
+                    own_lock.release()
+                result = dict(current)
+                result["up_to_date"] = True
+                return result
         generation = uuid.uuid4().hex[:16]
         generation_dir = space_dir / GENERATIONS_DIR / generation
         resumed = False
@@ -1899,7 +2541,8 @@ def build_index(
             generation_dir.mkdir(parents=True, exist_ok=True)
             _save_probe(generation_dir / PROBE_FILE, probe_vector)
             _write_progress(generation_dir, space=space, digest=digest,
-                            chunker=chunker, n=total, dim=dim, row=0)
+                            chunker=chunker, n=total, dim=dim, row=0,
+                            corpus=corpus)
         else:
             notify(0.2, "Resuming generation %s at row %d/%d"
                    % (generation, start_row, total))
@@ -1943,7 +2586,8 @@ def build_index(
             vectors.flush()
             row += len(subset)
             _write_progress(generation_dir, space=space, digest=digest,
-                            chunker=chunker, n=total, dim=dim, row=row)
+                            chunker=chunker, n=total, dim=dim, row=row,
+                            corpus=corpus)
             fraction = 0.3 + 0.6 * (row / max(1, total))
             notify(fraction, "Embedded %d/%d chunk(s)" % (row, total))
             _job_touch(job_record, jobs_dir, done=row, fraction=fraction)
@@ -1953,7 +2597,8 @@ def build_index(
 
         notify(0.93, "Writing index files")
         info = _build_info(dataset, dataset_id, space, generation, dim, total,
-                           link, sources, chunker, extractor, digest)
+                           link, sources, chunker, extractor, digest, corpus,
+                           peel_list, skipped)
         _write_json_atomic(generation_dir / "info.json", info, indent=2)
         # The atomic pointer flip is the commit point: before this line the
         # previous generation is live, after it the new one is.
@@ -2033,7 +2678,7 @@ def reindex(dataset_dir, link, *, dry_run=False, gc=False, progress=None):
     if dry_run:
         return report
 
-    info = build_index(dataset_dir, link, progress=progress)
+    info = build_index(dataset_dir, link, progress=progress, force=True)
     report["space"] = info.get("space")
     report["n"] = info.get("n")
     if gc:

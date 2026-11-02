@@ -7,11 +7,13 @@
     python -m peekseed reindex --all --link ID [--dry-run] [--gc]
     python -m peekseed migrate [--apply]
     python -m peekseed serve [--host H] [--port P]
-    python -m peekseed index --name "My docs" --file a.pdf   # explicit upload
+    python -m peekseed index --name "My docs" --file a.pdf   # storage-only upload
 
 `serve` is what most people want; the workspace commands exist so a headless
-machine can ingest and repair a workspace without opening a browser. Both the CLI
-and the API call the same modules, so the two can never drift apart.
+machine can scan/store and repair a workspace without opening a browser. Both the
+CLI and the API call the same modules, so the two can never drift apart.
+Extraction is a peelfeed job (triggered from the UI/API), never a peekseed CLI
+step: uploads are storage only.
 """
 
 import argparse
@@ -87,13 +89,12 @@ def cmd_init(args):
 
 
 def cmd_scan(args):
-    from . import links, scan
+    from . import scan
     _apply_workspace_argument(args)
-    link = _active_embed_link(links, args.link)
-    if link is None:
-        print("no enabled embed link: scanning will chunk documents but cannot "
-              "build an index (configure an embed link in the UI).")
-    report = scan.scan(args.workspace, prune=args.prune, link=link,
+    if args.link:
+        print("note: scan no longer builds indexes; --link is ignored "
+              "(extract with peelfeed, then build the index).")
+    report = scan.scan(args.workspace, prune=args.prune,
                        progress=_progress_printer() if not args.quiet else None)
     counts = report.get("counts") or {}
     print("scanned %d file(s): %d new, %d changed, %d unchanged, %d missing, "
@@ -129,6 +130,27 @@ def cmd_status(args):
                  state.get("chunks", 0),
                  (" - " + "; ".join(state.get("reasons") or []))
                  if state.get("reasons") else ""))
+    peelfeed = report.get("peelfeed") or {}
+    cfg = peelfeed.get("config") or {}
+    handshake = peelfeed.get("handshake") or {}
+    if cfg:
+        if cfg.get("configured"):
+            command = cfg.get("cli") or cfg.get("python") or ""
+            print("peelfeed: CLI %s (root %s)" % (command, cfg.get("root")))
+            if handshake.get("available"):
+                print("  reachable: %s %s, corpus schema %s, formats %s"
+                      % (handshake.get("engine") or "peelfeed",
+                         handshake.get("version") or "?",
+                         handshake.get("corpus_schema") or "?",
+                         ",".join(handshake.get("formats") or []) or "?"))
+            else:
+                print("  extraction unavailable: %s"
+                      % (handshake.get("error") or "not reachable"))
+        elif cfg.get("error"):
+            print("peelfeed: %s" % cfg["error"])
+        else:
+            print("peelfeed: not configured (uploads and file management work; "
+                  "extraction is disabled)")
     errors = report.get("errors") or []
     for error in errors:
         print("  error: %s" % error, file=sys.stderr)
@@ -144,6 +166,20 @@ def cmd_doctor(args):
     for label in ("documents_dir", "derived_dir", "links_file"):
         if paths.get(label):
             print("  %-12s %s" % (label + ":", paths[label]))
+    peelfeed = report.get("peelfeed") or {}
+    cfg = peelfeed.get("config") or {}
+    handshake = peelfeed.get("handshake") or {}
+    if cfg.get("configured"):
+        state = "reachable" if handshake.get("available") else "unreachable"
+        command = cfg.get("cli") or cfg.get("python") or ""
+        print("  peelfeed: %s (%s)" % (state, command))
+        if not handshake.get("available"):
+            print("    extraction unavailable: %s (uploads still work)"
+                  % (handshake.get("error") or "not reachable"))
+    elif cfg.get("error"):
+        print("  peelfeed: config error: %s" % cfg["error"])
+    else:
+        print("  peelfeed: not configured (optional; extraction disabled)")
     issues = report.get("issues") or []
     if not issues:
         print("doctor: no issues found")
@@ -210,34 +246,26 @@ def cmd_reindex(args):
     return exit_code
 
 
-def cmd_import(args):
-    """Import a corpus described by a versioned manifest (idempotent)."""
-    from . import importer, workspace
+def cmd_index(args):
+    """Explicit upload path: create a dataset and store files (no extraction)."""
+    from . import config, ingest
     _apply_workspace_argument(args)
-    try:
-        report = importer.import_corpus(args.manifest, workspace=args.workspace,
-                                        dry_run=args.dry_run)
-    except importer.CorpusImportError as exc:
-        print("import failed: %s" % exc, file=sys.stderr)
-        return 1
-    except (OSError, ValueError) as exc:
-        print("import failed: %s" % exc, file=sys.stderr)
-        return 1
-    if report.get("dry_run"):
-        print("dry run: workspace %s" % report["workspace"]["root"])
-        for row in report["collections"]:
-            suffix = "" if row["documents_exist"] else " (documents missing)"
-            print("  %-20s %-9s -> %s%s"
-                  % (row["id"], row["kind"], row["target"], suffix))
-        return 0
-    print("imported into %s" % report["workspace"]["root"])
-    for row in report["collections"]:
-        if row["status"] == "skipped":
-            print("  %-20s skipped (%s)" % (row["id"], row.get("reason", "")))
-            continue
-        print("  %-20s %-8s %s chunk(s), space %s, probe cosine %.6f"
-              % (row["id"], row["status"], row.get("chunks", 0),
-                 row.get("space"), row.get("probe_cosine", 0.0)))
+    config.ensure()
+    if not args.file:
+        print("at least one --file is required", file=sys.stderr)
+        return 2
+    dataset = ingest.create_dataset(config.paths(), args.name, note=args.note or "")
+    stored = []
+    for path in args.file:
+        if not os.path.isfile(path):
+            print("not a file: %s" % path, file=sys.stderr)
+            return 2
+        stored.append(ingest.add_source(dataset, path))
+    print("dataset %s: stored %d source file(s) (status=uploaded)"
+          % (dataset["id"], len(stored)))
+    print("extraction is provided by peelfeed: configure PEEKSEED_PEELFEED_CLI "
+          "(or PEEKSEED_PEELFEED_PYTHON), then Extract the file in the UI and "
+          "build the index.")
     return 0
 
 
@@ -267,32 +295,6 @@ def cmd_serve(args):
     print("peekseed: http://%s:%d/  (workspace: %s)" % (host, port, ws.root),
           flush=True)
     uvicorn.run(create_app(), host=host, port=port, log_level="info")
-    return 0
-
-
-def cmd_index(args):
-    """Explicit upload path (kept for compatibility with the pre-workspace UI)."""
-    from . import config, links
-    from . import ingest
-    _apply_workspace_argument(args)
-    config.ensure()
-    if not args.file:
-        print("at least one --file is required", file=sys.stderr)
-        return 2
-    link = _active_embed_link(links, args.link)
-    if link is None:
-        return 2
-    dataset = ingest.create_dataset(config.paths(), args.name, note=args.note or "")
-    for path in args.file:
-        if not os.path.isfile(path):
-            print("not a file: %s" % path, file=sys.stderr)
-            return 2
-        ingest.add_source(dataset, path)
-    print("dataset %s: %d source file(s)" % (dataset["id"], len(args.file)))
-    info = ingest.build_index(ingest.dataset_dir(dataset["id"]), link,
-                              progress=_progress_printer())
-    print("indexed %d chunks in space %s (dim %d)"
-          % (info.get("n", 0), info.get("space"), info.get("dim", 0)))
     return 0
 
 
@@ -341,14 +343,6 @@ def build_parser():
     move.add_argument("target", help="new workspace directory")
     p.set_defaults(func=cmd_workspace)
 
-    p = sub.add_parser("import", help="import a corpus from a versioned manifest")
-    _add_workspace_argument(p)
-    p.add_argument("--manifest", required=True, metavar="FILE",
-                   help="corpus manifest JSON (schema 1)")
-    p.add_argument("--dry-run", action="store_true",
-                   help="print the plan without writing or embedding")
-    p.set_defaults(func=cmd_import)
-
     p = sub.add_parser("reindex", help="rebuild an index in a new embedding space")
     _add_workspace_argument(p)
     p.add_argument("--all", action="store_true", help="every collection")
@@ -371,12 +365,11 @@ def build_parser():
     p.add_argument("--port", type=int, default=None, help="bind port (default 8030)")
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("index", help="add files as a dataset and build its index")
+    p = sub.add_parser("index", help="store files as a dataset (no extraction)")
     _add_workspace_argument(p)
     p.add_argument("--name", required=True, help="display name for the dataset")
-    p.add_argument("--file", action="append", default=[], help="PDF to add (repeatable)")
+    p.add_argument("--file", action="append", default=[], help="PDF to store (repeatable)")
     p.add_argument("--note", default="", help="optional note")
-    p.add_argument("--link", default=None, help="embed link id (default: active)")
     p.set_defaults(func=cmd_index)
 
     p = sub.add_parser("version", help="print the version")

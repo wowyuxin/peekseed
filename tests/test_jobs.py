@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
+from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
 
 LONG_PAGE = (
     "Widget installation and operation. " * 20
@@ -62,7 +62,11 @@ class JobApiBase(unittest.TestCase):
             "/api/datasets", data={"name": name},
             files=[("files", ("manual.pdf", pdf.read_bytes(), "application/pdf"))])
         self.assertEqual(response.status_code, 201, response.text)
-        return response.json()["dataset"]
+        dataset = response.json()["dataset"]
+        # Extraction is a peelfeed job; tests use a fake corpus so the index
+        # build has real input.
+        make_peel(dataset["id"], pages=pages)
+        return dataset
 
     def _wait(self, client, job_id, wanted=("succeeded", "failed", "cancelled",
                                             "interrupted"), timeout=20.0):

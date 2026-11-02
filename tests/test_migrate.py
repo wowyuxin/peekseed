@@ -70,12 +70,14 @@ class MigrateTests(unittest.TestCase):
             self.assertFalse(report["dry_run"])
             self.assertEqual(report["errors"], [])
             dataset = contracts.read_json(root / "datasets/docs/dataset.json")
-            self.assertEqual(dataset["schema"], 2)
+            self.assertEqual(dataset["schema"], 3)
             self.assertEqual(dataset["sources"][0]["sha256"], contracts.sha256_file(
                 root / "datasets/docs/original/a.pdf"))
-            self.assertEqual(dataset["sources"][0]["status"], "indexed")
+            self.assertEqual(dataset["sources"][0]["status"], "uploaded")
+            self.assertEqual(dataset["sources"][0]["extraction"]["state"],
+                             "not_extracted")
             info = contracts.read_json(root / "datasets/docs/index/link__model/info.json")
-            self.assertEqual(info["schema"], 2)
+            self.assertEqual(info["schema"], 3)
             contracts.validate_info(info)
             # A schema-1 index has no stored probe; the report says so rather than
             # pretending the migrated index is gateable.
@@ -97,22 +99,22 @@ class MigrateTests(unittest.TestCase):
             root = Path(tmp)
             dataset_dir = build_legacy_root(root)
             raw = json.loads((dataset_dir / "dataset.json").read_text())
-            raw["schema"] = 3
+            raw["schema"] = 4
             (dataset_dir / "dataset.json").write_text(json.dumps(raw), encoding="utf-8")
             report = migrate.migrate(root, apply=True)
             self.assertEqual(len(report["errors"]), 1)
             self.assertIn("newer", report["errors"][0]["error"])
             after = json.loads((dataset_dir / "dataset.json").read_text())
-            self.assertEqual(after["schema"], 3)
+            self.assertEqual(after["schema"], 4)
 
     def test_format_report_mentions_mode_and_errors(self):
         report = {"root": "/tmp/ws", "dry_run": True,
                   "actions": [{"kind": "dataset.json", "from_schema": 1,
-                               "to_schema": 2, "sources": 2, "missing_sources": ["gone.pdf"]}],
+                               "to_schema": 3, "sources": 2, "missing_sources": ["gone.pdf"]}],
                   "errors": []}
         text = migrate.format_report(report)
         self.assertIn("dry-run", text)
-        self.assertIn("schema 1 -> 2", text)
+        self.assertIn("schema 1 -> 3", text)
         self.assertIn("gone.pdf", text)
 
     def test_empty_root_reports_nothing_to_do(self):

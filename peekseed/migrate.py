@@ -8,16 +8,22 @@ prints exactly what would change, and only rewrites files (atomically) with
 
 Two artifacts are versioned today:
 
-* ``dataset.json`` -- schema 1 (``version: 1``) gains per-source ``sha256``,
-  ``extractor`` and ``status``; the hash is computed from the file on disk, never
-  invented (a source whose file is missing is marked ``new`` with no hash).
-* ``info.json`` -- schema 1 gains the full embedding-space identity, chunker
-  version, documents digest and the probe slots. A schema-1 index has no stored
-  probe vector; :func:`peekseed.contracts.has_probe` is false until the index is
-  rebuilt (or ``peekseed index`` re-embeds the probe), which the report says
-  explicitly instead of pretending the index is gateable.
+* ``dataset.json`` -- schema 1/2 gains per-source ``sha256``/``bytes``/
+  ``status`` and (schema 3) the ``extraction`` block. The hash is computed from
+  the file on disk, never invented (a source whose file is missing is marked
+  ``new`` with no hash). A legacy source is marked ``not_extracted``: its old
+  in-process extraction cannot be reused, so it needs a peelfeed peel before it
+  can be indexed again.
+* ``info.json`` -- schema 1/2 gains the full embedding-space identity, chunker
+  identity, documents/corpus digests, peel provenance and the probe slots. A
+  schema-1 index has no stored probe vector;
+  :func:`peekseed.contracts.has_probe` is false until the index is rebuilt (or
+  ``peekseed index`` re-embeds the probe), which the report says explicitly
+  instead of pretending the index is gateable.
 
-Downgrades are unsupported: restoring a backup is the rollback path.
+There are no extraction-cache migrations: peekseed no longer owns an extraction
+cache (the peel directory is the cache). Downgrades are unsupported: restoring a
+backup is the rollback path.
 """
 
 from pathlib import Path

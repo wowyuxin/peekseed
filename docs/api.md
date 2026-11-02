@@ -42,10 +42,19 @@ are not listed.
 | GET | `/api/workspace` | Served absolute paths, last scan, collection state |
 | GET | `/api/collections` | Collection list with status/staleness |
 | GET | `/api/datasets` | Dataset list |
-| GET | `/api/datasets/{id}/sources` | Per-source provenance rows |
-| POST | `/api/datasets` | Upload PDFs, create a dataset |
+| GET | `/api/datasets/{id}/sources` | Per-source storage + extraction/index state (refreshes queued/running peels) |
+| POST | `/api/datasets` | Upload PDFs (storage only), create a dataset |
+| POST | `/api/datasets/{id}/sources` | Upload PDFs into an existing dataset (storage only) |
+| POST | `/api/datasets/{id}/sources/{sha}/extract` | Ask peelfeed to build a peel (503 when unavailable) |
+| GET | `/api/datasets/{id}/sources/{sha}/review` | Proxy peelfeed's review queue |
+| POST | `/api/datasets/{id}/sources/{sha}/review/{item}` | Proxy one review decision |
+| POST | `/api/datasets/{id}/sources/{sha}/rebuild` | Proxy peelfeed's rebuild (apply corrections) |
+| POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
+| GET | `/api/datasets/{id}/sources/{sha}/assets/{path}` | Proxy one peel/corpus asset (crop, page image, table) |
+| DELETE | `/api/datasets/{id}/sources/{sha}` | Remove a source; `?peel=keep|delete` |
+| GET | `/api/peelfeed/status` | peelfeed CLI config, capabilities handshake, queue counts |
 | DELETE | `/api/datasets/{id}` | Delete a dataset and its derived data |
-| POST | `/api/datasets/{id}/index` | Start an index build job |
+| POST | `/api/datasets/{id}/index` | Start an index build job (409 `no_extracted_sources` when none extracted) |
 | GET | `/api/jobs` | List job records (newest first) |
 | GET | `/api/jobs/{id}` | One job record |
 | DELETE | `/api/jobs/{id}` | Request cancellation between batches |
@@ -131,10 +140,19 @@ on disk:
 {"dataset": "cxl",
  "sources": [{"name": "CXL_spec.pdf",
               "path": "/…/datasets/cxl/original/CXL_spec.pdf",
-              "sha256": "a6694b69…", "bytes": 12400000, "pages": 1166,
-              "extractor": "pypdf@6.21.1", "status": "indexed",
+              "sha256": "a6694b69…", "bytes": 12400000, "pages": 0,
+              "extractor": "", "status": "uploaded",
+              "extraction": {"state": "not_extracted", "peel_id": "",
+                             "conversion_id": "", "profile": "", "engine": "",
+                             "validation": {"errors": 0, "review_items": 0},
+                             "started_at": null, "finished_at": null,
+                             "error": null},
               "present": true}]}
 ```
+
+`status`/`extraction.state` is one of `uploaded|not_extracted|queued|running|
+extracted|failed|stale` (the per-source chip). Extraction is a peelfeed job;
+uploading never parses the file.
 
 ### `POST /api/datasets`
 
@@ -155,6 +173,85 @@ Serves the stored original **inline** (`Content-Disposition: inline`,
 `application/pdf`) so the browser's own viewer opens it and `#page=N` jumps to a
 chunk's page. The name is basename-checked and the resolved file must stay inside
 the dataset's `original/`; traversal and symlink escapes are `400`.
+
+## peelfeed (extraction engine, CLI only)
+
+peekseed stores uploads; **peelfeed** extracts. The seam is the peelfeed command
+line: peekseed runs `peelfeed …` as a subprocess and reads JSON from stdout — no
+import of peelfeed's code, no daemon, no base URL, no token. Configuration lives
+in `<data_root>/config/peelfeed.json` (0600), seeded once from
+`PEEKSEED_PEELFEED_{CLI,PYTHON,REPO,ENABLED,TIMEOUT,POLL,LLM_MODE,CHUNK_PROFILE}`
+plus `PEELFEED_ROOT`; environment values win over the file.
+
+### `GET /api/peelfeed/status`
+
+```json
+{"config": {"cli": "/…/peelfeed/.venv/bin/peelfeed", "python": "",
+            "repo": "/…/peelfeed", "root": "/…/workspace/.peekseed/peels",
+            "enabled": true, "configured": true, "timeout": 7200.0,
+            "poll": 2.0, "llm_mode": "off", "chunk_profile": "default",
+            "path": "/…/config/peelfeed.json", "seeded": true},
+ "handshake": {"available": true, "engine": "peelfeed", "version": "0.1.0",
+               "cli_protocol": 1, "corpus_schema": 2, "chunk_contract": 1,
+               "chunker_version": 1, "formats": ["pdf"],
+               "profiles": ["cxl", "generic", …],
+               "chunk_profiles": ["default", "large", "small"],
+               "llm_modes": ["off", "review", "aggressive"],
+               "docling": {"python": "…", "python_present": true,
+                           "models_present": true},
+               "peel_root": "/…/peels", "error": null, "checked_at": "…"},
+ "queue": {"count": 3, "states": {"extracted": 2, "not_extracted": 1}}}
+```
+
+The handshake runs `peelfeed capabilities` and is cached 60 s. When unconfigured
+or the CLI cannot start the response says `available: false` with a short
+reason; uploads, listing, opening the original PDF and deletion keep working,
+and Extract is disabled (HTTP 503). `queue` counts every stored source by its
+`extraction.state`.
+
+### `POST /api/datasets/{id}/sources/{sha}/extract`
+
+Body (all optional): `{profile?, llm_mode?, chunk_profile?, force?}`. Records
+`extraction.state="queued"` and starts a background thread that runs
+`peelfeed ingest <stored path> --root <root> --profile … --llm … --chunk-profile
+…` and polls `peelfeed status` every `PEEKSEED_PEELFEED_POLL` seconds (looking
+the peel up by source sha until the id is known). The response is
+`{source, peel{peel_id,state,reused}, capabilities}`; the chip moves
+`queued → running → extracted|failed` as the poller and the ingest result
+arrive. 503 when the CLI is unavailable (the source is marked `failed` with a
+CLI-related error so Retry is honest); 409 when the stored file is missing.
+
+### Review / rebuild / events / assets
+
+- `GET …/review` runs `peelfeed review <peel_id> --json` and returns the queue
+  (`items` with asset crops/evidence, suggestions, LLM availability).
+- `POST …/review/{item}` with `{decision: "accept"|"reject"|"override", note?,
+  evidence?, model?, confidence?}` runs `peelfeed decide` (append-only
+  corrections log).
+- `POST …/rebuild` returns `202` and runs `peelfeed rebuild` in a thread while
+  polling status; the source chip returns to `extracted` when it finishes.
+- `POST …/events` with `{event: "embed"|"feedback", data?}` runs `peelfeed
+  event` and appends the event to the peel's `.peel` log.
+- `GET …/assets/{path}` serves a peel-relative (`<root>/<peel_id>/<path>`) or
+  corpus-relative (`<root>/<peel_id>/extract/corpus/<path>`) asset from disk.
+  Every candidate is realpath-checked under the configured peel root
+  (traversal is `403`) and served with the guessed content type.
+
+### `DELETE /api/datasets/{id}/sources/{sha}?peel=keep|delete`
+
+Removes the source entry (and its stored copy) from the dataset. The default
+`peel=keep` leaves the peel for audit/rollback; `peel=delete` runs `peelfeed
+archive` best-effort. The index/chunks are not rewritten: the next build reports
+the source-set change as staleness.
+
+### Per-source extraction state
+
+`GET /api/datasets/{id}/sources` returns each source with
+`extraction={state, peel_id, conversion_id, profile, engine, validation,
+started_at, finished_at, error}` and `indexed`. The state chip is one of
+`not_extracted | queued | running | extracted | failed | stale`; queued/running
+sources are refreshed from `peelfeed status` when the list is read (cheap when
+unavailable: the 60 s handshake cache answers without a CLI call).
 
 ## Jobs
 
@@ -186,10 +283,19 @@ stale and does not block.
 ### `POST /api/datasets/{id}/index`
 
 Body: `{"link": "<embed link id>"}` (optional; default is the enabled embed
-link). Acquires the collection's writer lock, writes a `queued` record, returns
-`202 {"job": "<id>", "state": "queued"}` and starts the build on a worker thread.
-`409` when no enabled embed link, or when the collection is already being
-written.
+link). The route first checks that at least one source has
+`extraction.state == "extracted"` with a `peel_id`: with none it returns
+`409 {"detail": "no_extracted_sources: …"}` listing the skipped sources and
+never creates a job. Otherwise it acquires the collection's writer lock, writes
+a `queued` record, returns `202 {"job": "<id>", "state": "queued"}` and starts
+the build on a worker thread. `409` also when no enabled embed link or when the
+collection is already being written.
+
+The build reads each extracted source's peelfeed corpus (gate: peel-root
+realpath allowlist, source sha256, recorded conversion id,
+`validation.errors == 0`), writes `chunks.jsonl`, embeds and flips `CURRENT`.
+Non-extracted sources are listed in `info.json` `skipped_sources`. Building an
+already-current index makes **zero** embed calls (`up_to_date`).
 
 ### `GET /api/jobs`
 

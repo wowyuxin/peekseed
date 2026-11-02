@@ -19,7 +19,8 @@ Layout under that root (created on first use):
     <root>/config/links.json       model links; 0600; keys masked in responses
     <root>/config/settings.json    optional UI title/tagline/examples
     <root>/datasets/<id>/          uploaded sources, chunks.jsonl, index/<space>/
-    <root>/extracted/<sha256>.json extraction cache
+    <root>/peels/<peel>/           peelfeed corpora (read-only; extraction owner)
+    <root>/extracted/              legacy extraction cache (unused since M-1)
     <root>/history/                search + dialog history
     <root>/jobs/<id>.json          persisted job records
     <root>/uploads/                temporary staging for an upload in progress
@@ -77,6 +78,8 @@ class Paths(object):
         self.links_file = self.config_dir / "links.json"
         self.settings_file = self.config_dir / "settings.json"
         self.datasets_dir = root / "datasets"
+        # Legacy extraction-cache path; nothing writes it any more (peelfeed
+        # owns extraction and its peel directories are the cache).
         self.extracted_dir = root / "extracted"
         self.manifest_file = root / "manifest.json"
         self.history_dir = root / "history"

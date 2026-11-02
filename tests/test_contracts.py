@@ -15,7 +15,7 @@ SHA_B = "b" * 64
 
 def sample_info(**overrides):
     data = {
-        "schema": 2,
+        "schema": 3,
         "dataset": "cxl",
         "space": "embed-local__qwen3-vl-embedding-2b-8bit-mlx",
         "generation": "0f9c2a1e",
@@ -35,14 +35,27 @@ def sample_info(**overrides):
             "query_prefix": "",
             "probe": {"text_sha256": contracts.probe_sha256(), "file": "probe.npy"},
         },
-        "chunker": {"name": "headings", "version": 1, "target_chars": 1200, "max_chars": 2000},
-        "extractor": {"name": "pypdf", "version": "6.21.1"},
+        "chunker": {"name": "peel", "version": 1, "target_chars": 8000,
+                    "max_chars": 12000, "image_cap": 3},
+        "extractor": {"name": "peelfeed", "version": "peelfeed-test@1"},
         "documents_digest": contracts.documents_digest(
             [{"path": "documents/cxl/a.pdf", "sha256": SHA_A}]
         ),
+        "corpus_digest": contracts.corpus_digest(
+            [{"path": "documents/cxl/a.pdf", "sha256": SHA_A,
+              "extraction": {"state": "extracted", "peel_id": "peel-a",
+                             "conversion_id": "c" * 64}}]
+        ),
+        "peel": {"peel_id": "peel-a", "conversion_id": "c" * 64,
+                 "profile": "generic",
+                 "validation": {"errors": 0, "review_items": 0}},
         "sources": [
             {"name": "a.pdf", "path": "documents/cxl/a.pdf", "sha256": SHA_A,
-             "bytes": 10, "pages": 2},
+             "bytes": 10, "pages": 2,
+             "extraction": {"state": "extracted", "peel_id": "peel-a",
+                            "conversion_id": "c" * 64, "profile": "generic",
+                            "engine": "peelfeed-test@1",
+                            "validation": {"errors": 0, "review_items": 0}}},
         ],
     }
     data.update(overrides)
@@ -51,14 +64,19 @@ def sample_info(**overrides):
 
 def sample_dataset(**overrides):
     data = {
-        "schema": 2,
+        "schema": 3,
         "id": "cxl",
         "name": "CXL",
         "created_at": "2026-10-20T20:00:00Z",
         "notes": "",
         "sources": [
             {"name": "a.pdf", "path": "documents/cxl/a.pdf", "sha256": SHA_A,
-             "bytes": 10, "pages": 2, "extractor": "pypdf@6.21.1", "status": "indexed"},
+             "bytes": 10, "pages": 2, "extractor": "",
+             "status": "extracted",
+             "extraction": {"state": "extracted", "peel_id": "peel-a",
+                            "conversion_id": "c" * 64, "profile": "generic",
+                            "engine": "peelfeed-test@1",
+                            "validation": {"errors": 0, "review_items": 0}}},
         ],
     }
     data.update(overrides)
@@ -203,12 +221,31 @@ class ManifestTests(unittest.TestCase):
 class DatasetTests(unittest.TestCase):
     def test_dataset_validates(self):
         validated = contracts.validate_dataset(sample_dataset())
-        self.assertEqual(validated["schema"], 2)
+        self.assertEqual(validated["schema"], 3)
         self.assertEqual(validated["sources"][0]["sha256"], SHA_A)
+        self.assertEqual(validated["sources"][0]["extraction"]["state"], "extracted")
+        self.assertEqual(validated["sources"][0]["extraction"]["peel_id"], "peel-a")
 
     def test_dataset_refuses_a_newer_schema(self):
         with self.assertRaises(contracts.SchemaTooNew):
-            contracts.validate_dataset(sample_dataset(schema=3))
+            contracts.validate_dataset(sample_dataset(schema=4))
+
+    def test_dataset_accepts_an_uploaded_source_with_no_extraction(self):
+        data = sample_dataset()
+        data["sources"] = [{"name": "a.pdf", "path": "original/a.pdf",
+                            "sha256": SHA_A, "bytes": 10, "status": "uploaded",
+                            "extraction": {"state": "not_extracted"}}]
+        validated = contracts.validate_dataset(data)
+        self.assertEqual(validated["sources"][0]["status"], "uploaded")
+        self.assertEqual(validated["sources"][0]["extraction"]["state"],
+                         "not_extracted")
+        self.assertEqual(validated["sources"][0]["extraction"]["peel_id"], "")
+
+    def test_dataset_rejects_an_unknown_extraction_state(self):
+        data = sample_dataset()
+        data["sources"][0]["extraction"]["state"] = "wat"
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_dataset(data)
 
     def test_dataset_upgrade_from_version_1(self):
         legacy = {
@@ -220,9 +257,12 @@ class DatasetTests(unittest.TestCase):
             "notes": "n",
         }
         upgraded = contracts.upgrade_dataset(legacy, sha256_of=lambda path: SHA_A)
-        self.assertEqual(upgraded["schema"], 2)
+        self.assertEqual(upgraded["schema"], 3)
         self.assertEqual(upgraded["sources"][0]["sha256"], SHA_A)
-        self.assertEqual(upgraded["sources"][0]["status"], "indexed")
+        # A legacy source has no reusable extraction: it is stored, not extracted.
+        self.assertEqual(upgraded["sources"][0]["status"], "uploaded")
+        self.assertEqual(upgraded["sources"][0]["extraction"]["state"],
+                         "not_extracted")
         # A missing file keeps no hash and is marked new rather than guessed.
         upgraded = contracts.upgrade_dataset(legacy, sha256_of=lambda path: None)
         self.assertEqual(upgraded["sources"][0]["sha256"], "")
@@ -238,10 +278,24 @@ class InfoTests(unittest.TestCase):
         validated = contracts.validate_info(sample_info())
         self.assertEqual(validated["embedding"]["dim"], 8)
         self.assertTrue(contracts.has_probe(validated))
+        self.assertEqual(validated["extractor"]["name"], "peelfeed")
+        self.assertEqual(validated["peel"]["peel_id"], "peel-a")
+        self.assertEqual(len(validated["corpus_digest"]), 64)
 
     def test_info_refuses_a_newer_schema(self):
         with self.assertRaises(contracts.SchemaTooNew):
-            contracts.validate_info(sample_info(schema=3))
+            contracts.validate_info(sample_info(schema=4))
+
+    def test_info_accepts_a_multi_source_peel_list(self):
+        data = sample_info(peel={"peels": [
+            {"peel_id": "peel-a", "conversion_id": "c" * 64, "profile": "generic",
+             "validation": {"errors": 0, "review_items": 0}},
+            {"peel_id": "peel-b", "conversion_id": "d" * 64, "profile": "generic",
+             "validation": {"errors": 0, "review_items": 3}},
+        ]})
+        validated = contracts.validate_info(data)
+        self.assertEqual(validated["peel"]["count"], 2)
+        self.assertEqual(validated["peel"]["peels"][1]["validation"]["review_items"], 3)
 
     def test_info_rejects_disagreeing_mirrors(self):
         with self.assertRaises(contracts.ContractError):
@@ -258,19 +312,26 @@ class InfoTests(unittest.TestCase):
             "sources": [{"name": "a.pdf", "pages": 2, "bytes": 5}],
         }
         upgraded = contracts.upgrade_info(legacy)
-        self.assertEqual(upgraded["schema"], 2)
+        self.assertEqual(upgraded["schema"], 3)
         self.assertFalse(contracts.has_probe(upgraded))
         self.assertEqual(upgraded["embedding"]["dim"], 4)
         self.assertEqual(upgraded["chunker"]["version"], contracts.CHUNKER_VERSION)
+        self.assertEqual(upgraded["peel"], {"peels": [], "count": 0})
+        self.assertEqual(upgraded["corpus_digest"], "")
 
     def test_stale_reasons(self):
         sources = [{"path": "documents/cxl/a.pdf", "sha256": SHA_A}]
         info = sample_info()
+        extracted = [{"path": "documents/cxl/a.pdf", "sha256": SHA_A,
+                      "extraction": {"state": "extracted", "peel_id": "peel-a",
+                                     "conversion_id": "c" * 64}}]
         self.assertEqual(
             contracts.stale_reasons(
-                info, sources,
+                info, extracted,
                 chunker=contracts.chunker_identity(),
-                extractor=contracts.extractor_identity("pypdf", "6.21.1"),
+                extractor=contracts.extractor_identity("peelfeed",
+                                                       "peelfeed-test@1"),
+                corpus_digest=contracts.corpus_digest(extracted),
             ),
             [],
         )
@@ -283,9 +344,15 @@ class InfoTests(unittest.TestCase):
         )
         self.assertTrue(any("chunker changed" in reason for reason in reasons))
         reasons = contracts.stale_reasons(
-            info, sources, extractor=contracts.extractor_identity("pypdf", "7.0.0")
+            info, sources, extractor=contracts.extractor_identity("peelfeed", "v2")
         )
         self.assertTrue(any("extractor changed" in reason for reason in reasons))
+        rebuilt = [{"path": "documents/cxl/a.pdf", "sha256": SHA_A,
+                    "extraction": {"state": "extracted", "peel_id": "peel-a",
+                                   "conversion_id": "e" * 64}}]
+        reasons = contracts.stale_reasons(
+            info, rebuilt, corpus_digest=contracts.corpus_digest(rebuilt))
+        self.assertTrue(any("peel corpus changed" in reason for reason in reasons))
 
 
 class JobTests(unittest.TestCase):
@@ -332,6 +399,29 @@ class ChunkRowTests(unittest.TestCase):
     def test_chunk_row_rejects_bad_page_range(self):
         with self.assertRaises(contracts.ContractError):
             contracts.validate_chunk(sample_chunk(page_start=5, page_end=4))
+
+    def test_chunk_row_carries_the_peelfeed_optional_fields(self):
+        validated = contracts.validate_chunk(sample_chunk(
+            kind="table",
+            image_paths=["images/table-1-1.png"],
+            source_pages=[2, 3],
+            char_count=120,
+            parts=2,
+            part=1,
+            prev="cxl-unit-000001",
+            next="cxl-unit-000003",
+            canonical_ids=["table-1-1"],
+            engine="peelfeed/0.1",
+            conversion_id="c" * 64,
+            peel_id="peel-a",
+            block_kind="table",
+        ))
+        self.assertEqual(validated["kind"], "table")
+        self.assertEqual(validated["image_paths"], ["images/table-1-1.png"])
+        self.assertEqual(validated["source_pages"], [2, 3])
+        self.assertEqual(validated["parts"], 2)
+        self.assertEqual(validated["conversion_id"], "c" * 64)
+        self.assertEqual(validated["peel_id"], "peel-a")
 
 
 class JsonIOTests(unittest.TestCase):

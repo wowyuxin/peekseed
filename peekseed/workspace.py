@@ -8,9 +8,9 @@ A workspace is a plain folder with two halves:
 
 ``.peekseed/``
     Derived, rebuildable state: the scan manifest, model links, datasets and
-    their indexes, the extraction cache, history, job records and upload
-    staging. Deleting it loses only rebuildable data -- except model links,
-    which are the one derived-tree file worth backing up.
+    their indexes, peels (read-only peelfeed corpora), history, job records and
+    upload staging. Deleting it loses only rebuildable data -- except model
+    links, which are the one derived-tree file worth backing up.
 
 This module owns resolution of that folder. The order is explicit argument,
 ``PEEKSEED_WORKSPACE``, ``./workspace`` and finally ``~/peekseed`` (only when
@@ -57,7 +57,7 @@ GITIGNORE_ENTRY = "/workspace/"
 # history and derived datasets, none of which belong to other local users.
 _DERIVED_MODE = 0o700
 _DOCUMENTS_MODE = 0o755
-_DERIVED_CHILDREN = ("config", "datasets", "extracted", "history", "jobs",
+_DERIVED_CHILDREN = ("config", "datasets", "history", "jobs",
                      "uploads")
 
 # Resolution warnings are printed once per process and kind: a server resolves
@@ -153,6 +153,9 @@ class Workspace(object):
         self.links_file = self.config_dir / "links.json"
         self.settings_file = self.config_dir / "settings.json"
         self.datasets_dir = self.derived_dir / "datasets"
+        # Legacy extraction-cache location (pre-M-1). Kept on the object so
+        # old deployments and API consumers still see the path, but nothing
+        # writes it: peelfeed owns extraction now.
         self.extracted_dir = self.derived_dir / "extracted"
         self.history_dir = self.derived_dir / "history"
         self.jobs_dir = self.derived_dir / "jobs"
@@ -639,8 +642,23 @@ def doctor(explicit=None):
         "issues": issues,
         "git": git,
         "links": links,
+        "peelfeed": _peelfeed_report(probe=True),
         "schemas": schemas,
     }
+
+
+def _peelfeed_report(probe=False):
+    """The peelfeed config (CLI/python/root) and, optionally, CLI reachability."""
+    try:
+        from . import peelfeed
+    except Exception:  # pragma: no cover - optional module
+        return {"configured": False, "error": "peelfeed module is unavailable"}
+    try:
+        return peelfeed.status(probe=probe, timeout=2.0)
+    except Exception as exc:  # noqa: BLE001 - doctor must not crash
+        return {"configured": False,
+                "error": "peelfeed config is not readable (%s)"
+                         % type(exc).__name__}
 
 
 # --- status ----------------------------------------------------------------
@@ -823,6 +841,7 @@ def status_for(ws):
         "workspace": ws.as_dict(),
         "last_scan": None if manifest_error else manifest.get("last_scan"),
         "collections": collections,
+        "peelfeed": _peelfeed_report(probe=False),
         "counts": {
             "documents": len(entries),
             "missing": sum(1 for entry in entries

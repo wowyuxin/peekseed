@@ -18,6 +18,7 @@ Two design rules run through every endpoint:
 import hashlib
 import json
 import logging
+import mimetypes
 import os
 import queue
 import re
@@ -38,7 +39,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from . import (__version__, answer as answer_mod, config, contracts, ingest,
-               links, localmodels, prompts, security, workspace)
+               links, localmodels, peelfeed, prompts, security, workspace)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -162,6 +163,7 @@ def reset_state():
     config.reset_cache()
     links.reset_cache()
     localmodels.reset_cache()
+    peelfeed.reset_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -353,13 +355,28 @@ def _workspace_report():
     return workspace.status_for(workspace.Workspace(paths.workspace_root, paths.root))
 
 
+def _indexed_shas(dataset_dir):
+    """Source sha256 values present in any built index of this dataset."""
+    found = set()
+    try:
+        indexes = ingest.dataset_indexes(dataset_dir)
+    except Exception:  # noqa: BLE001 - a broken index must not hide sources
+        return found
+    for info in indexes:
+        for source in info.get("sources") or []:
+            if isinstance(source, dict) and source.get("sha256"):
+                found.add(str(source["sha256"]).lower())
+    return found
+
+
 def _source_rows(dataset_dir):
     """Per-source provenance rows from ``dataset.json`` plus file presence.
 
     ``GET /api/datasets/{id}/sources`` is the honest counterpart of the upload
-    response: it says which files the index was built from, what hash/pages the
-    extractor saw, and whether the stored copy is still on disk.
+    response: it says which files are stored, their extraction state (peelfeed
+    peel identity) and whether the stored copy is still on disk.
     """
+    indexed = _indexed_shas(dataset_dir)
     try:
         raw = contracts.read_json(Path(dataset_dir) / "dataset.json")
     except contracts.ContractError as exc:
@@ -376,6 +393,9 @@ def _source_rows(dataset_dir):
         relative = str(entry.get("path") or "")
         candidate = Path(dataset_dir) / relative if relative else \
             Path(dataset_dir) / "original" / name
+        extraction = entry.get("extraction")
+        if not isinstance(extraction, dict):
+            extraction = contracts.extraction_default()
         rows.append({
             "name": name,
             "path": str(candidate),
@@ -384,6 +404,8 @@ def _source_rows(dataset_dir):
             "pages": entry.get("pages"),
             "extractor": str(entry.get("extractor") or ""),
             "status": str(entry.get("status") or ""),
+            "extraction": dict(extraction),
+            "indexed": str(entry.get("sha256") or "").lower() in indexed,
             "present": candidate.is_file(),
         })
     return rows
@@ -1086,10 +1108,622 @@ def create_app():
     def datasets_list():
         return {"datasets": _all_datasets()}
 
+    # --- peelfeed (the extraction engine) ---------------------------------
+    def _peelfeed_handshake():
+        try:
+            return peelfeed.handshake()
+        except peelfeed.PeelfeedConfigError as exc:
+            return {"available": False, "configured": False, "error": str(exc)}
+
+    def _require_peelfeed():
+        """503 with a readable reason when extraction is unavailable."""
+        hs = _peelfeed_handshake()
+        if hs.get("available"):
+            return hs
+        raise HTTPException(
+            503,
+            "extraction is unavailable: %s. Configure PEEKSEED_PEELFEED_CLI (the "
+            "peelfeed console script) or PEEKSEED_PEELFEED_PYTHON (its venv "
+            "interpreter) and restart peekseed; uploads and file management keep "
+            "working." % (hs.get("error") or "peelfeed is not configured"),
+        )
+
+    def _source_by_sha(directory, sha):
+        sha = str(sha or "").strip().lower()
+        if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            raise HTTPException(400, "invalid source sha256")
+        entry = ingest.find_source(directory, sha)
+        if entry is None:
+            raise HTTPException(404, "no source with sha256 '%s'" % sha[:12])
+        return entry
+
+    def _peel_id_of(entry):
+        block = entry.get("extraction") if isinstance(
+            entry.get("extraction"), dict) else {}
+        peel_id = str(block.get("peel_id") or "")
+        if not peel_id:
+            raise HTTPException(
+                409, "source '%s' has no peelfeed peel; run Extract first"
+                % (entry.get("name") or ""))
+        return peel_id
+
+    def _match_peel(rows, sha):
+        """Pick the peel for one source sha from ``peelfeed status`` list rows.
+
+        A full ``status <id>`` summary carries ``source{sha256}``, but the list
+        form only carries the source **name**. peelfeed peel ids are
+        content-addressed (``<slug>-<sha256[:8]>``), so the ``-<sha8>`` suffix is
+        the reliable lookup key for the list form.
+        """
+        sha = str(sha or "").lower()
+        if not sha:
+            return None
+        if isinstance(rows, dict):
+            rows = rows.get("peels") or []
+        suffix = "-" + sha[:8]
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            source = row.get("source")
+            if isinstance(source, dict):
+                if str(source.get("sha256") or "").lower() == sha:
+                    return row
+                continue
+            if str(row.get("peel_id") or "").endswith(suffix):
+                return row
+        return None
+
+    def _peel_by_sha(sha, engine=None):
+        """Best-effort peel summary lookup by source sha256 (the id may be new).
+
+        ``peelfeed status`` (no id) lists every peel; the extract route uses this
+        before the peel id is known and the poller uses it while ``ingest`` is
+        still running.
+        """
+        sha = str(sha or "").lower()
+        if not sha:
+            return None
+        try:
+            rows = (engine or peelfeed.client()).status_all()
+        except Exception:  # noqa: BLE001 - polling is best-effort
+            return None
+        return _match_peel(rows, sha)
+
+    def _persist_extraction(directory, sha, block):
+        """Merge one extraction block into ``dataset.json`` (best-effort)."""
+        try:
+            ingest.update_source(directory, sha, status=block.get("state"),
+                                 extraction=block, pages=block.get("pages"))
+        except ingest.IngestError:
+            return
+
+    def _poll_peel(directory, sha, block, engine, stop, peel_id=None):
+        """Update a source's extraction state from ``peelfeed status`` until done.
+
+        Runs in its own thread next to the long CLI command (ingest/rebuild), so
+        the chip moves queued → running while the engine works. It stops when
+        ``stop`` is set, before the worker writes the authoritative final block.
+        """
+        try:
+            interval = float(peelfeed.effective().get("poll") or 2.0)
+        except peelfeed.PeelfeedConfigError:
+            interval = 2.0
+        interval = max(0.05, interval)
+        while not stop.wait(interval):
+            try:
+                summary = (engine.status(peel_id) if peel_id
+                           else _peel_by_sha(sha, engine))
+            except peelfeed.PeelfeedError:
+                continue
+            if stop.is_set():
+                # The CLI command finished while this poll was in flight; the
+                # worker owns the final block, so do not persist a late "running".
+                break
+            if not isinstance(summary, dict):
+                continue
+            updated = peelfeed.extraction_from_summary(summary, previous=block)
+            if updated.get("state") in ("extracted", "failed"):
+                # Pollers never write terminal states: only the worker writes the
+                # authoritative extracted/failed block from the CLI result. This
+                # also prevents a late poll from downgrading a finished source.
+                continue
+            _persist_extraction(directory, sha, updated)
+
+    def _finish_extraction(directory, sha, block, outcome):
+        """Persist the final ``extracted``/``failed`` block after a CLI command."""
+        kind, error, result = outcome
+        updated = dict(block)
+        if kind == "ok" and isinstance(result, dict):
+            summary = result.get("peel")
+            if not isinstance(summary, dict):
+                summary = {}
+            updated = peelfeed.extraction_from_summary(summary, previous=block)
+            updated["peel_id"] = str(summary.get("peel_id")
+                                     or updated.get("peel_id") or "")
+            errors = int((updated.get("validation") or {}).get("errors") or 0)
+            state = str(summary.get("state") or "")
+            if state in ("failed", "archived", "deleted"):
+                kind = "failed"
+                error = str(summary.get("error") or "") or (
+                    "peelfeed reported state '%s'" % state)
+            elif errors:
+                kind = "failed"
+                error = "validation reported %d error(s)" % errors
+        if kind == "ok":
+            updated.update({"state": "extracted", "error": None})
+        else:
+            updated.update({"state": "failed",
+                            "error": (error or "unknown error")[:300]})
+        updated["finished_at"] = contracts.utc_now()
+        _persist_extraction(directory, sha, updated)
+
+    def _run_peel_command(directory, sha, block, peel_id, command):
+        """Run one long CLI command (ingest/rebuild) with a status poller.
+
+        The command runs synchronously in the worker; the poller updates the
+        source state every ``PEEKSEED_PEELFEED_POLL`` seconds. The poller is
+        stopped before the final block is written, so its last observation can
+        never overwrite the authoritative result.
+        """
+        engine = peelfeed.client()
+        stop = threading.Event()
+        poller = threading.Thread(
+            target=_poll_peel,
+            args=(directory, sha, block, engine, stop, peel_id),
+            name="peel-poll-%s" % sha[:8], daemon=True)
+        poller.start()
+        try:
+            result = command(engine)
+            outcome = ("ok", None, result)
+        except peelfeed.PeelfeedUnavailable as exc:
+            outcome = ("failed", "peelfeed unreachable: %s" % exc.detail, None)
+        except peelfeed.PeelfeedError as exc:
+            outcome = ("failed", "peelfeed failed: %s" % exc.detail, None)
+        except Exception as exc:  # noqa: BLE001 - a worker must not die silently
+            outcome = ("failed", "peelfeed failed (%s)" % type(exc).__name__,
+                       None)
+        finally:
+            stop.set()
+            poller.join(timeout=30.0)
+        _finish_extraction(directory, sha, block, outcome)
+
+    def _refresh_peel_states(directory):
+        """Poll peelfeed for queued/running sources and persist the new state.
+
+        Called by ``GET /api/datasets/{id}/sources`` (the UI poll) and before an
+        index build. Cheap when peelfeed is unavailable: the 60s handshake cache
+        answers without a CLI call, and terminal sources are never re-polled.
+        """
+        if not peelfeed.configured():
+            return
+        if not _peelfeed_handshake().get("available"):
+            return
+        try:
+            engine = peelfeed.client()
+        except Exception:  # noqa: BLE001 - config errors are reported elsewhere
+            return
+        try:
+            raw = contracts.read_json(Path(directory) / "dataset.json")
+        except contracts.ContractError:
+            return
+        if not isinstance(raw, dict):
+            return
+        pending = []
+        for entry in raw.get("sources") or []:
+            if not isinstance(entry, dict):
+                continue
+            block = entry.get("extraction") if isinstance(
+                entry.get("extraction"), dict) else {}
+            if str(block.get("state") or "") in ("queued", "running"):
+                pending.append((entry, block))
+        if not pending:
+            return
+        all_peels = None
+        for entry, block in pending:
+            peel_id = str(block.get("peel_id") or "")
+            sha = str(entry.get("sha256") or "").lower()
+            if not sha:
+                continue
+            try:
+                if peel_id:
+                    summary = engine.status(peel_id)
+                else:
+                    if all_peels is None:
+                        all_peels = engine.status_all()
+                    summary = _match_peel(all_peels, sha)
+            except peelfeed.PeelfeedError:
+                continue
+            if not isinstance(summary, dict):
+                continue
+            updated = peelfeed.extraction_from_summary(summary, previous=block)
+            if updated.get("state") in ("extracted", "failed"):
+                # Pollers never write terminal states: only the worker writes the
+                # authoritative extracted/failed block from the CLI result. This
+                # also prevents a late poll from downgrading a finished source.
+                continue
+            _persist_extraction(directory, sha, updated)
+
     @app.get("/api/datasets/{dataset_id}/sources")
     def dataset_sources(dataset_id: str):
         directory = _dataset_dir(dataset_id)
+        _refresh_peel_states(directory)
         return {"dataset": dataset_id, "sources": _source_rows(directory)}
+
+    def _queue_counts():
+        """Every stored source across datasets, counted by extraction state."""
+        states = {}
+        total = 0
+        root = config.ensure().datasets_dir
+        try:
+            names = sorted(os.listdir(root))
+        except OSError:
+            names = []
+        for name in names:
+            if name.startswith(".") or not (Path(root) / name).is_dir():
+                continue
+            try:
+                raw = contracts.read_json(Path(root) / name / "dataset.json")
+            except contracts.ContractError:
+                continue
+            if not isinstance(raw, dict):
+                continue
+            for entry in raw.get("sources") or []:
+                if not isinstance(entry, dict):
+                    continue
+                state = contracts.extraction_state(entry)
+                states[state] = states.get(state, 0) + 1
+                total += 1
+        return {"count": total, "states": states}
+
+    @app.get("/api/peelfeed/status")
+    def peelfeed_status():
+        """Config (CLI/python/root), reachability/capabilities and queue counts."""
+        payload = peelfeed.status(probe=False)
+        payload["queue"] = _queue_counts()
+        return payload
+
+    @app.post("/api/datasets/{dataset_id}/sources", status_code=201)
+    async def dataset_sources_upload(dataset_id: str,
+                                     files: List[UploadFile] = File(...)):
+        """Upload 1..N files into an existing dataset (storage only).
+
+        Same validation/limits/zip-slip guard as dataset creation; extraction is
+        a separate, user-triggered peelfeed job (design §4.5).
+        """
+        directory = _dataset_dir(dataset_id)
+        if not files:
+            raise HTTPException(400, "at least one PDF is required")
+        if len(files) > security.MAX_UPLOAD_FILES:
+            raise HTTPException(413, "a dataset accepts at most %d files"
+                                % security.MAX_UPLOAD_FILES)
+        staging = config.ensure().uploads_dir / ("upload-" + uuid.uuid4().hex)
+        added = []
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+            security.harden_dir(staging)
+            prepared = []
+            total = 0
+            for number, upload in enumerate(files):
+                raw_name = getattr(upload, "filename", "") or ""
+                filename = ingest.sanitize_filename(raw_name)
+                if not filename.lower().endswith(".pdf"):
+                    raise HTTPException(400, "%r is not a PDF" % filename)
+                part_dir = staging / ("%03d" % number)
+                part_dir.mkdir(parents=True, exist_ok=True)
+                security.harden_dir(part_dir)
+                temp = part_dir / filename
+                try:
+                    written = await security.stream_upload(
+                        upload, temp, total_used=total, expect_prefix=b"%PDF-")
+                except security.UploadInvalid:
+                    raise HTTPException(400, "%r is not a valid PDF" % filename)
+                except security.UploadLimitExceeded as exc:
+                    raise HTTPException(exc.status, exc.detail)
+                total += written
+                prepared.append(temp)
+            for temp in prepared:
+                added.append(ingest.add_source(directory, temp))
+            return {"dataset": _dataset_public(dataset_id),
+                    "sources": _source_rows(directory)}
+        except HTTPException:
+            for entry in added:
+                try:
+                    ingest.remove_source(directory, entry.get("sha256") or "")
+                except ingest.IngestError:
+                    pass
+            raise
+        except Exception as exc:  # noqa: BLE001 - ingestion errors are user-facing
+            for entry in added:
+                try:
+                    ingest.remove_source(directory, entry.get("sha256") or "")
+                except ingest.IngestError:
+                    pass
+            raise HTTPException(400, _http_detail(exc))
+        finally:
+            shutil.rmtree(str(staging), ignore_errors=True)
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/extract")
+    def source_extract(dataset_id: str, sha: str,
+                       payload: Optional[dict] = None):
+        """Ask the peelfeed CLI to build a peel for one stored source.
+
+        503 when peelfeed is unconfigured/unavailable (upload and file
+        management are unaffected); otherwise a background thread runs
+        ``peelfeed ingest`` and polls ``peelfeed status`` while it works, so the
+        source chip moves ``queued → running → extracted|failed``. The UI polls
+        ``GET …/sources`` until a terminal state.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        stored = ingest.stored_source_path(directory, entry)
+        if stored is None or not stored.is_file():
+            raise HTTPException(409, "the stored file for '%s' is missing"
+                                % (entry.get("name") or ""))
+        hs = _peelfeed_handshake()
+        if not hs.get("available"):
+            failed = dict(entry.get("extraction")
+                          or contracts.extraction_default())
+            failed.update({
+                "state": "failed",
+                "error": "peelfeed unavailable: %s"
+                         % (hs.get("error") or "not configured"),
+            })
+            ingest.update_source(directory, entry["sha256"], status="failed",
+                                 extraction=failed)
+            raise HTTPException(
+                503,
+                "extraction is unavailable: %s. Uploads and file management "
+                "keep working; configure PEEKSEED_PEELFEED_CLI (or "
+                "PEEKSEED_PEELFEED_PYTHON) and retry."
+                % (hs.get("error") or "peelfeed is not configured"),
+            )
+        body = payload or {}
+        cfg = peelfeed.effective()
+        request = {
+            "profile": body.get("profile") or None,
+            "llm_mode": body.get("llm_mode") or cfg["llm_mode"],
+            "chunk_profile": body.get("chunk_profile") or cfg["chunk_profile"],
+            "force": bool(body.get("force")),
+        }
+        source_sha = str(entry.get("sha256") or "").lower()
+        block = dict(entry.get("extraction") or contracts.extraction_default())
+        existing = None if request["force"] else _peel_by_sha(source_sha)
+        peel_id = str((existing or {}).get("peel_id")
+                      or block.get("peel_id") or "")
+        reused = bool(
+            existing
+            and str(existing.get("state") or "") in ("ready", "needs_review")
+            and not request["force"]
+        )
+        block.update({
+            "state": "queued",
+            "peel_id": peel_id,
+            "profile": str(request["profile"] or block.get("profile") or ""),
+            "started_at": contracts.utc_now(),
+            "finished_at": None,
+            "error": None,
+        })
+        ingest.update_source(directory, source_sha, status="queued",
+                             extraction=block)
+        threading.Thread(
+            target=_run_peel_command,
+            args=(directory, source_sha, block, peel_id,
+                  lambda engine: engine.ingest(
+                      str(stored.resolve()),
+                      profile=request["profile"],
+                      llm_mode=request["llm_mode"],
+                      chunk_profile=request["chunk_profile"],
+                      force=request["force"])),
+            name="peel-extract-%s" % source_sha[:8], daemon=True).start()
+        return {
+            "source": {"sha256": entry["sha256"],
+                       "name": entry.get("name") or "",
+                       "extraction": block},
+            "peel": {"peel_id": peel_id,
+                     "state": "queued",
+                     "reused": reused},
+            "capabilities": {
+                "version": hs.get("version"),
+                "profiles": hs.get("profiles"),
+                "chunk_profiles": hs.get("chunk_profiles"),
+                "llm_modes": hs.get("llm_modes"),
+            },
+        }
+
+    @app.get("/api/datasets/{dataset_id}/sources/{sha}/review")
+    def source_review(dataset_id: str, sha: str):
+        """Proxy ``peelfeed review`` (items, asset crops, LLM availability)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_peelfeed()
+        try:
+            return peelfeed.client().review(peel_id)
+        except peelfeed.PeelfeedUnavailable as exc:
+            raise HTTPException(503, "extraction is unavailable: %s" % exc.detail)
+        except peelfeed.PeelfeedError as exc:
+            raise HTTPException(
+                exc.status if exc.status in (400, 404, 409) else 502,
+                "peelfeed review failed: %s" % exc.detail)
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/{item:path}")
+    def source_review_item(dataset_id: str, sha: str, item: str,
+                           payload: Optional[dict] = None):
+        """Proxy ``peelfeed decide`` (append-only corrections log)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_peelfeed()
+        body = payload or {}
+        decision = str(body.get("decision") or "").strip().lower()
+        if decision not in ("accept", "reject", "override"):
+            raise HTTPException(400, "a review decision is required "
+                                     "(accept|reject|override)")
+        try:
+            return peelfeed.client().decide(
+                peel_id, item, decision,
+                note=body.get("note"),
+                evidence=body.get("evidence"),
+                model=body.get("model"),
+                confidence=body.get("confidence"))
+        except peelfeed.PeelfeedUnavailable as exc:
+            raise HTTPException(503, "extraction is unavailable: %s" % exc.detail)
+        except peelfeed.PeelfeedError as exc:
+            raise HTTPException(
+                exc.status if exc.status in (400, 404, 409) else 502,
+                "peelfeed review failed: %s" % exc.detail)
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/events")
+    def source_events(dataset_id: str, sha: str,
+                      payload: Optional[dict] = None):
+        """Append one ``embed``/``feedback`` event to the peel's ``.peel`` log."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_peelfeed()
+        body = payload or {}
+        event = str(body.get("event") or "").strip().lower()
+        if event not in ("embed", "feedback"):
+            raise HTTPException(400, "event must be 'embed' or 'feedback'")
+        data = body.get("data")
+        if not isinstance(data, dict):
+            data = {key: value for key, value in body.items() if key != "event"}
+        try:
+            return peelfeed.client().event(peel_id, event, data)
+        except peelfeed.PeelfeedUnavailable as exc:
+            raise HTTPException(503, "extraction is unavailable: %s" % exc.detail)
+        except peelfeed.PeelfeedError as exc:
+            raise HTTPException(
+                exc.status if exc.status in (400, 404, 409) else 502,
+                "peelfeed event failed: %s" % exc.detail)
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/rebuild", status_code=202)
+    def source_rebuild(dataset_id: str, sha: str,
+                       payload: Optional[dict] = None):
+        """Run ``peelfeed rebuild`` in a thread (apply corrections, re-gate).
+
+        The source moves ``running → extracted|failed`` as the CLI finishes; the
+        poller updates the chip while normalize/gate/chunk run.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_peelfeed()
+        body = payload or {}
+        reasons = body.get("reasons") or []
+        if not isinstance(reasons, list):
+            reasons = [str(reasons)]
+        reasons = [str(reason) for reason in reasons if str(reason).strip()]
+        block = dict(entry.get("extraction") or contracts.extraction_default())
+        block.update({"state": "running", "error": None})
+        ingest.update_source(directory, entry["sha256"], status="running",
+                             extraction=block)
+        threading.Thread(
+            target=_run_peel_command,
+            args=(directory, entry["sha256"], block, peel_id,
+                  lambda engine: engine.rebuild(peel_id, reasons)),
+            name="peel-rebuild-%s" % entry["sha256"][:8], daemon=True).start()
+        return {"source": {"sha256": entry["sha256"],
+                           "name": entry.get("name") or "",
+                           "extraction": block},
+                "peel": {"peel_id": peel_id, "state": "running"}}
+
+    @app.get("/api/datasets/{dataset_id}/sources/{sha}/assets/{path:path}")
+    def source_asset(dataset_id: str, sha: str, path: str):
+        """Serve one peel/corpus asset from the filesystem (no HTTP proxy).
+
+        The path is tried peel-relative first (``<root>/<peel>/<path>``) and then
+        corpus-relative (``<root>/<peel>/extract/corpus/<path>``). Every
+        candidate is realpath-checked against the configured peel root, so a
+        symlink or ``..`` cannot escape it; traversal is a 403.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_peelfeed()
+        try:
+            root = Path(peelfeed.effective()["root"]).expanduser().resolve()
+        except peelfeed.PeelfeedConfigError as exc:
+            raise HTTPException(503, "the peelfeed config is unreadable: %s" % exc)
+        identifier = str(peel_id or "").strip()
+        if (not identifier or identifier in (".", "..")
+                or "/" in identifier or "\\" in identifier
+                or "\x00" in identifier):
+            raise HTTPException(400, "invalid peel id")
+        peel_dir = (root / identifier).resolve()
+        try:
+            peel_dir.relative_to(root)
+        except ValueError:
+            raise HTTPException(403, "the peel resolves outside the peel root")
+        if not peel_dir.is_dir():
+            raise HTTPException(404, "peel '%s' is not on disk" % identifier)
+        relative = str(path or "").lstrip("/")
+        if not relative:
+            raise HTTPException(404, "no asset path")
+        escaped = False
+        for candidate in (peel_dir / relative,
+                          peel_dir / "extract" / "corpus" / relative):
+            resolved = candidate.resolve()
+            try:
+                resolved.relative_to(root)
+            except ValueError:
+                escaped = True
+                continue
+            if resolved.is_file():
+                media_type = (mimetypes.guess_type(str(resolved))[0]
+                              or "application/octet-stream")
+                return FileResponse(
+                    str(resolved),
+                    media_type=media_type,
+                    headers={"Cache-Control": "private, max-age=60"},
+                )
+        if escaped:
+            raise HTTPException(403, "the asset resolves outside the peel root")
+        raise HTTPException(404, "no asset '%s' in peel '%s'"
+                            % (relative, identifier))
+
+    @app.delete("/api/datasets/{dataset_id}/sources/{sha}")
+    def source_delete(dataset_id: str, sha: str, peel: str = "keep"):
+        """Remove a source; ``?peel=delete`` also archives its peelfeed peel.
+
+        The default keeps the peel for audit/rollback. The index/chunks are left
+        in place until the next build, which reports the source-set change as
+        staleness (never silently serving removed files as if they were current).
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        removed = ingest.remove_source(directory, entry["sha256"])
+        peel_result = {"action": "kept", "peel_id": ""}
+        block = entry.get("extraction") if isinstance(
+            entry.get("extraction"), dict) else {}
+        peel_id = str(block.get("peel_id") or "")
+        if str(peel or "keep").lower() == "delete":
+            if not peel_id:
+                peel_result = {"action": "none", "peel_id": ""}
+            elif not peelfeed.configured():
+                peel_result = {"action": "not_deleted",
+                               "peel_id": peel_id,
+                               "reason": "peelfeed is not configured"}
+            else:
+                try:
+                    result = peelfeed.client().archive(
+                        peel_id, reason="source deleted from peekseed")
+                    peel_result = {"action": "archived", "peel_id": peel_id,
+                                   "peel": result}
+                except peelfeed.PeelfeedUnavailable as exc:
+                    peel_result = {"action": "not_deleted",
+                                   "peel_id": peel_id,
+                                   "reason": exc.detail[:200]}
+                except peelfeed.PeelfeedError as exc:
+                    peel_result = {"action": "not_deleted",
+                                   "peel_id": peel_id,
+                                   "reason": exc.detail[:200]}
+        elif peel_id:
+            peel_result = {"action": "kept", "peel_id": peel_id}
+        reload_store()
+        return {"ok": True, "deleted": entry["sha256"],
+                "name": entry.get("name") or "", "peel": peel_result,
+                "removed": removed is not None}
 
     @app.post("/api/datasets", status_code=201)
     async def datasets_create(name: str = Form(...), note: str = Form(""),
@@ -1145,9 +1779,44 @@ def create_app():
 
         threading.Thread(target=work, name="peekseed-index", daemon=True).start()
 
+    def _extracted_sources(directory):
+        """``(extracted, skipped)`` source rows from ``dataset.json``."""
+        try:
+            raw = contracts.read_json(Path(directory) / "dataset.json")
+        except contracts.ContractError as exc:
+            raise HTTPException(500, _http_detail(exc))
+        if not isinstance(raw, dict):
+            raise HTTPException(500, "dataset.json is not readable")
+        extracted = []
+        skipped = []
+        for entry in raw.get("sources") or []:
+            if isinstance(entry, str):
+                entry = {"name": entry}
+            if not isinstance(entry, dict):
+                continue
+            state = contracts.extraction_state(entry)
+            block = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
+            row = {"name": str(entry.get("name") or ""), "state": state}
+            if state == "extracted" and str(block.get("peel_id") or ""):
+                extracted.append(row)
+            else:
+                skipped.append(row)
+        return extracted, skipped
+
     @app.post("/api/datasets/{dataset_id}/index", status_code=202)
     def datasets_index(dataset_id: str, payload: Optional[dict] = None):
         directory = _dataset_dir(dataset_id)
+        extracted, skipped = _extracted_sources(directory)
+        if not extracted:
+            names = ", ".join(
+                "%s (%s)" % (row["name"], row["state"]) for row in skipped
+            ) or "none"
+            raise HTTPException(
+                409,
+                "no_extracted_sources: no source in dataset '%s' has a peelfeed "
+                "corpus; upload files, configure peelfeed and Extract them first. "
+                "Sources: %s" % (dataset_id, names),
+            )
         link = _index_link((payload or {}).get("link"))
         jobs_dir = config.ensure().jobs_dir
         lock = ingest.CollectionLock(jobs_dir, dataset_id)

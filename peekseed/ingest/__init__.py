@@ -1,18 +1,22 @@
-"""peekseed ingestion: PDF text -> canonical chunks -> compact vector index.
+"""peekseed ingestion: storage-only uploads + peelfeed corpus -> vector index.
 
-The three stages are importable independently, but the pipeline is normally one
-call: :func:`build_index` extracts PDFs when ``chunks.jsonl`` does not exist yet,
-chunks them, embeds through a configured link and writes a plain-numpy index that
-needs no external service to read.
+Uploads never parse a document: :func:`add_source` stores the bytes and records
+the sha256/bytes. Extraction is owned by the peelfeed engine, which writes a peel
+corpus per source; :func:`build_index` reads those corpora (gated on the peel-root
+allowlist, the source sha256, the recorded conversion id and zero validation
+errors), embeds the canonical chunks through a configured link and writes a
+plain-numpy index that needs no external service to read.
 
-Nothing outside this package needs to know the PDF parser, the embed protocol or
-the on-disk index layout; the public functions below are the whole interface.
+Nothing outside this package needs to know the embed protocol or the on-disk
+index layout; the public functions below are the whole interface. There is no
+in-process PDF parser or chunker here (design §1.6).
 """
 
-from .chunk import chunk_pages
+from .errors import IngestError
 from .index import (
     IndexCancelled,
     NeedsReindex,
+    NoExtractedSources,
     PROBE_MIN_COSINE,
     ProbeMismatch,
     active_job_for,
@@ -25,26 +29,30 @@ from .index import (
     embed_query,
     embed_space_key,
     embed_texts,
+    find_source,
     index_state,
     job_cancel_requested,
     job_path,
     list_jobs,
     load_index,
     mark_interrupted_jobs,
+    peel_root,
     probe_cosine,
     probe_cosine_for_generation,
     read_chunks,
     read_job,
+    remove_source,
     reindex,
     request_cancel,
     sanitize_filename,
+    stored_source_path,
+    update_source,
     verify_probe,
     verify_probe_for_generation,
     write_chunks,
     write_job,
 )
 from .lock import CollectionBusy, CollectionLock, collection_lock
-from .pdf import IngestError, available, backend_name, extract_pdf, page_count
 
 __all__ = [
     "CollectionBusy",
@@ -52,14 +60,12 @@ __all__ = [
     "IndexCancelled",
     "IngestError",
     "NeedsReindex",
+    "NoExtractedSources",
     "PROBE_MIN_COSINE",
     "ProbeMismatch",
     "active_job_for",
     "add_source",
-    "available",
-    "backend_name",
     "build_index",
-    "chunk_pages",
     "collection_lock",
     "create_dataset",
     "dataset_dir",
@@ -68,21 +74,24 @@ __all__ = [
     "embed_query",
     "embed_space_key",
     "embed_texts",
-    "extract_pdf",
+    "find_source",
     "index_state",
     "job_cancel_requested",
     "job_path",
     "list_jobs",
     "load_index",
     "mark_interrupted_jobs",
-    "page_count",
+    "peel_root",
     "probe_cosine",
     "probe_cosine_for_generation",
     "read_chunks",
     "read_job",
+    "remove_source",
     "reindex",
     "request_cancel",
     "sanitize_filename",
+    "stored_source_path",
+    "update_source",
     "verify_probe",
     "verify_probe_for_generation",
     "write_chunks",

@@ -1,20 +1,22 @@
 """Tests for generation-atomic indexes, the probe gate and persisted jobs.
 
-Covers audit §6.10 gates 4, 5 and 6 plus the info.json schema-2/probe contract:
+Covers audit §6.10 gates 4, 5 and 6 plus the info.json schema-3/probe contract:
 a cancelled or failed build leaves the previous generation serving; a corrupt
 index is reported as needing a rebuild; a chunker change makes a collection
 stale; the probe detects an embedder that no longer matches the space.
+
+Indexes are built from fake peelfeed corpora (``tests.fixtures.make_peel``);
+there is no in-process extraction path any more.
 """
 
 import json
-import tempfile
 import unittest
 from pathlib import Path
 
 import numpy as np
 
 from peekseed import contracts, ingest
-from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
+from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
 
 
 def embed_link(fake, model="test-embed", **extra):
@@ -36,21 +38,38 @@ def build_dataset(root, fake, pages=None, name="Docs"):
     from peekseed import config
 
     dataset = ingest.create_dataset(config.paths(), name)
-    ingest.add_source(dataset, make_pdf(root / (name + ".pdf"),
-                                        pages=pages or ["Widget text about buttons."]))
+    ingest.add_source(dataset, make_pdf(root / (name + ".pdf"), pages=pages or
+                                        ["Widget text about buttons."]))
+    make_peel(dataset, pages=pages or ["Widget text about buttons."])
     return dataset
 
 
-def chunk_pages_for_test(n=5):
-    """Deterministic chunk rows with content-derived ids."""
-    from peekseed import ingest as ingest_module
-
-    pages = [{"page": index + 1, "text": "Paragraph number %d about widgets. " % index * 8}
-             for index in range(n)]
-    return ingest_module.chunk_pages(
-        pages, target_chars=200, max_chars=400, dataset_id="docs",
-        source="docs.pdf", source_sha256="a" * 64,
-    )
+def chunk_rows(n=5, source_sha="a" * 64):
+    """Deterministic chunk rows with content-derived ids (for legacy layout tests)."""
+    rows = []
+    for index in range(n):
+        text = "Paragraph number %d about widgets. " % index * 8
+        rows.append({
+            "id": contracts.chunk_id(source_sha, index, index,
+                                     contracts.PEEL_CHUNKER_VERSION),
+            "dataset": "docs",
+            "source": "docs.pdf",
+            "source_sha256": source_sha,
+            "page_start": index + 1,
+            "page_end": index + 1,
+            "section": "Section %d" % index,
+            "chapter": "",
+            "numbering": "",
+            "parent": "",
+            "path": "Section %d" % index,
+            "doc": "Section %d\n\n%s" % (index, text),
+            "text": text,
+            "heading_only": False,
+            "block_index": index,
+            "chunk_index": index,
+            "chunker_version": contracts.PEEL_CHUNKER_VERSION,
+        })
+    return rows
 
 
 class GenerationTests(unittest.TestCase):
@@ -61,8 +80,7 @@ class GenerationTests(unittest.TestCase):
                 "Operation. Press the green button to start the widget. " * 30,
             ])
             link = embed_link(fake)
-            info = ingest.build_index(dataset["dir"], link,
-                                      target_chars=200, max_chars=300)
+            info = ingest.build_index(dataset["dir"], link)
             space_dir = Path(dataset["dir"]) / "index" / info["space"]
             self.assertTrue((space_dir / "CURRENT").is_file())
             self.assertEqual((space_dir / "CURRENT").read_text().strip(),
@@ -79,10 +97,14 @@ class GenerationTests(unittest.TestCase):
                              (info["n"], info["dim"]))
             self.assertEqual(len(loaded["meta"]), info["n"])
             self.assertTrue(contracts.has_probe(loaded["info"]))
-            # The digest names exactly the inputs this index was built from.
+            # The digests name exactly the inputs this index was built from.
             self.assertEqual(
                 loaded["info"]["documents_digest"],
                 contracts.documents_digest(loaded["info"]["sources"]),
+            )
+            self.assertEqual(
+                loaded["info"]["corpus_digest"],
+                contracts.corpus_digest(loaded["info"]["sources"]),
             )
 
     def test_dangling_current_needs_reindex(self):
@@ -102,7 +124,7 @@ class GenerationTests(unittest.TestCase):
             from peekseed import config, ingest as ingest_module
 
             dataset = ingest_module.create_dataset(config.paths(), "Legacy")
-            chunks = chunk_pages_for_test(3)
+            chunks = chunk_rows(3)
             ingest_module.write_chunks(Path(dataset["dir"]), chunks)
             link = embed_link(fake)
             space = ingest_module.embed_space_key(link)
@@ -132,20 +154,18 @@ class GenerationTests(unittest.TestCase):
 
 class FailureIsolationTests(unittest.TestCase):
     def _dataset(self, root, fake):
-        dataset = build_dataset(root, fake, pages=[
+        return build_dataset(root, fake, pages=[
             "Alpha. The widget is mounted with two screws. " * 25,
             "Beta. Press the green button to start the widget. " * 25,
             "Gamma. The widget has a blue cover. " * 25,
         ])
-        return dataset
 
     def test_cancelled_build_keeps_the_previous_generation_and_resumes(self):
         with temp_data_root() as root, FakeModelServer(dim=8) as fake:
             dataset = self._dataset(root, fake)
             link = embed_link(fake)
-            first = ingest.build_index(dataset["dir"], link, batch_size=2,
-                                       target_chars=200, max_chars=400)
-            self.assertGreaterEqual(first["n"], 4)
+            first = ingest.build_index(dataset["dir"], link, batch_size=2)
+            self.assertGreaterEqual(first["n"], 3)
             space_dir = Path(dataset["dir"]) / "index" / first["space"]
             self.assertEqual((space_dir / "CURRENT").read_text().strip(),
                              first["generation"])
@@ -161,8 +181,7 @@ class FailureIsolationTests(unittest.TestCase):
 
             with self.assertRaises(ingest.IndexCancelled):
                 ingest.build_index(dataset["dir"], link, batch_size=2,
-                                   target_chars=200, max_chars=400,
-                                   cancel=cancel)
+                                   force=True, cancel=cancel)
             self.assertEqual((space_dir / "CURRENT").read_text().strip(),
                              first["generation"])
             # The cancelled build only paid for its probe and one batch.
@@ -175,6 +194,8 @@ class FailureIsolationTests(unittest.TestCase):
             self.assertEqual(len(incomplete), 1)
             progress = json.loads((incomplete[0] / "progress.json").read_text())
             self.assertGreater(progress["row"], 0)
+            self.assertEqual(progress["corpus_digest"],
+                             first["corpus_digest"])
 
             # A cancelled job record is persisted, not silently dropped.
             jobs = list((Path(root) / "jobs").glob("*.json"))
@@ -184,8 +205,7 @@ class FailureIsolationTests(unittest.TestCase):
             # Restart: the incomplete generation is resumed from its checkpoint
             # (no probe re-embed, only the remaining rows) and then committed.
             requests_before = len(fake.requests)
-            resumed = ingest.build_index(dataset["dir"], link, batch_size=2,
-                                         target_chars=200, max_chars=400)
+            resumed = ingest.build_index(dataset["dir"], link, batch_size=2)
             self.assertEqual(resumed["generation"], incomplete[0].name)
             self.assertEqual((space_dir / "CURRENT").read_text().strip(),
                              resumed["generation"])
@@ -223,10 +243,11 @@ class FailureIsolationTests(unittest.TestCase):
             dataset = self._dataset(root, fake)
             link = embed_link(fake)
             first = ingest.build_index(dataset["dir"], link, batch_size=2)
-            # A link that points nowhere makes the next build fail immediately.
+            # A link that points nowhere makes the next (forced) build fail.
             broken = dict(link, base_url="http://127.0.0.1:1")
             with self.assertRaises(ingest.IngestError):
-                ingest.build_index(dataset["dir"], broken, batch_size=2)
+                ingest.build_index(dataset["dir"], broken, batch_size=2,
+                                   force=True)
             space_dir = Path(dataset["dir"]) / "index" / first["space"]
             self.assertEqual((space_dir / "CURRENT").read_text().strip(),
                              first["generation"])
@@ -258,6 +279,20 @@ class StalenessTests(unittest.TestCase):
             finally:
                 contracts.CHUNKER_VERSION = original
 
+    def test_a_rebuilt_peel_makes_the_index_stale(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            dataset = build_dataset(root, fake)
+            info = ingest.build_index(dataset["dir"], embed_link(fake))
+            state = ingest.index_state(dataset["dir"], info["space"],
+                                       chunker=contracts.chunker_identity())
+            self.assertEqual(state["status"], "indexed")
+            make_peel(dataset, conversion_salt="2")
+            state = ingest.index_state(dataset["dir"], info["space"],
+                                       chunker=contracts.chunker_identity())
+            self.assertEqual(state["status"], "stale")
+            self.assertTrue(any("peel corpus changed" in reason
+                                for reason in state["reasons"]))
+
     def test_reindex_dry_run_writes_nothing(self):
         with temp_data_root() as root, FakeModelServer(dim=8) as fake:
             dataset = build_dataset(root, fake)
@@ -283,7 +318,7 @@ class StalenessTests(unittest.TestCase):
             dataset = build_dataset(root, fake)
             link = embed_link(fake)
             first = ingest.build_index(dataset["dir"], link)
-            second = ingest.build_index(dataset["dir"], link)
+            second = ingest.build_index(dataset["dir"], link, force=True)
             self.assertNotEqual(first["generation"], second["generation"])
             report = ingest.reindex(dataset["dir"], link, gc=True)
             # reindex rebuilds into a fresh generation and then drops every older

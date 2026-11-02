@@ -21,7 +21,7 @@ machine will stay on and serve other devices, continue with
 | Chat endpoint | OpenAI-compatible streaming `POST {base}/chat/completions`; needed for Ask and Research |
 | Reranker endpoint | optional custom `POST {base}/rerank` |
 | Disk | your documents plus the derived index; no database server |
-| System packages | none for the default PDF path (`pypdf`); OCR needs Tesseract and belongs to the 0.2.0 workflow |
+| Extraction engine | optional: **peelfeed** CLI (separate repo/venv; see [formats.md](formats.md)). Without it uploads/file management still work, Extract is disabled |
 
 peekseed bundles no models. You point its **links** at endpoints you already
 run or subscribe to; the four endpoint contracts are in
@@ -48,18 +48,10 @@ uv pip install peekseed
 peekseed version
 ```
 
-Optional extras are opt-in and never imported at startup:
-
-```bash
-pip install 'peekseed[office]'   # DOCX/PPTX extraction
-pip install 'peekseed[tables]'   # XLSX extraction
-pip install 'peekseed[layout]'   # alternative PDF extractor (PyMuPDF)
-pip install 'peekseed[ocr]'      # OCR plumbing (0.2.0 workflow; needs Tesseract)
-```
-
-The default install needs no system libraries: PDF text extraction uses
-`pypdf`. See [formats.md](formats.md) for the licence notes, especially the
-optional PyMuPDF (AGPL) extra.
+peekseed's dependency set is the web stack only (FastAPI/uvicorn/httpx/numpy/
+pydantic/python-multipart). It never imports `pypdf`, `docling` or `torch`:
+extraction is provided by the separate **peelfeed** engine, which has its own
+venv and dependencies. See [formats.md](formats.md).
 
 From a source checkout:
 
@@ -151,6 +143,23 @@ Open <http://127.0.0.1:8030>. Environment variables that matter here:
 | `PEEKSEED_ALLOWED_HOSTS` | unset | comma-separated `host[:port]` allowlist for `Host`/`Origin` |
 | `PEEKSEED_ENV_FILE` | unset | explicit dotenv file (otherwise `cwd/.env`, then project root) |
 | `PEEKSEED_AGENT` | off | enables the Research mode (`POST /api/agent/stream`) |
+| `PEEKSEED_PEELFEED_CLI` | unset | absolute path to the peelfeed console script (preferred); unset disables extraction unless a Python path is set |
+| `PEEKSEED_PEELFEED_PYTHON` | unset | absolute path to the peelfeed venv interpreter; fallback invocation is `python -m peelfeed.cli` |
+| `PEEKSEED_PEELFEED_REPO` | derived | peelfeed repo root for `PYTHONPATH` (derived from the CLI/python path when unset) |
+| `PEELFEED_ROOT` | `<data_root>/peels` | shared peel root; filesystem allowlist: peekseed only reads corpora under this prefix (legacy `PEEKSEED_PEELFEED_ROOT` accepted) |
+| `PEEKSEED_PEELFEED_ENABLED` | auto | `0` explicitly disables extraction even when a CLI/python path is set |
+| `PEEKSEED_PEELFEED_TIMEOUT` | `7200` | seconds; ingest/rebuild may run for the whole Docling conversion |
+| `PEEKSEED_PEELFEED_POLL` | `2` | seconds; how often the UI/worker polls `peelfeed status` |
+| `PEEKSEED_PEELFEED_LLM_MODE` | `off` | default `--llm` mode passed to ingest (`off\|review\|aggressive`) |
+| `PEEKSEED_PEELFEED_CHUNK_PROFILE` | `default` | default `--chunk-profile` passed to ingest |
+
+Extraction runs the **peelfeed CLI** as a subprocess; there is no daemon, base
+URL or token. Point `PEEKSEED_PEELFEED_CLI` at the console script, or
+`PEEKSEED_PEELFEED_PYTHON` at the peelfeed venv interpreter (peekseed then runs
+`python -m peelfeed.cli` with `PYTHONPATH` set to the repo). The first run seeds
+`<data_root>/config/peelfeed.json` (0600) from these values; environment values
+win over the file. `peekseed status`/`doctor` print the CLI path and whether it
+answers `capabilities`.
 
 Answer limits and agent budgets (`PEEKSEED_ASK_*`, `PEEKSEED_RERANK_*`,
 `PEEKSEED_AGENT_*`) are listed in [`.env.example`](../.env.example).
@@ -162,9 +171,12 @@ Answer limits and agent budgets (`PEEKSEED_ASK_*`, `PEEKSEED_RERANK_*`,
 2. **Datasets** — name a dataset, choose one or more PDFs, click *Add dataset*.
    The originals are copied under the workspace; the upload limits (50 MB per
    file, 50 files, 200 MB per request) are enforced before the body is parsed.
-3. On the row, click **Build index** and watch the persisted job: it extracts
-   text, chunks it (~1,200 characters with page ranges and section breadcrumbs),
-   embeds the chunks and writes a compact vector index.
+3. If peelfeed is configured, click **Extract** on the file row (the state chip
+   moves `not_extracted → queued → running → extracted`; Review is available for
+   extracted peels). Then click **Build index**: peekseed reads the peel corpus,
+   embeds the canonical chunks and writes a compact vector index. With no
+   peelfeed, upload/list/delete still work and Build index returns a clear 409
+   (`no_extracted_sources`).
 4. **Search** the dataset. Results carry dataset, file, page range and excerpt;
    a citation opens the stored PDF at the right page (`/pdf` is served inline).
 5. Tick results and click **Ask about these** for a grounded, streamed answer.
@@ -182,8 +194,11 @@ The full HTTP contract (routes, stream events, persisted job record) is in
 Everything the UI does on the upload path is available without a browser:
 
 ```bash
-# Upload PDFs and build one dataset synchronously (needs an enabled embed link).
+# Store PDFs as a dataset (storage only; no extraction, no embedding).
 peekseed index --name "My docs" --file a.pdf --file b.pdf
+
+# Reconcile documents/ with datasets/manifest (storage-only scan).
+peekseed scan
 
 # Inspect the workspace and the last scan.
 peekseed status
@@ -194,21 +209,13 @@ peekseed reindex --collection my-docs --link embed-local --dry-run
 peekseed reindex --collection my-docs --link embed-local
 peekseed reindex --all --gc          # drop generations older than CURRENT
 
-# Move a corpus between machines or reproduce a prebuilt corpus without
-# re-embedding (versioned manifest; probe canary; idempotent).
-peekseed import --manifest corpus.json --dry-run
-peekseed import --manifest corpus.json
-
 # Move the whole workspace as one unit.
 peekseed workspace move ~/new-workspace
 ```
 
-`peekseed import` is documented in [import.md](import.md); it needs an enabled
-embed link for the probe check and never calls an answer or rerank model.
-`peekseed scan` exists as a **preview** of the 0.2.0 folder-scan workflow and is
-not part of the 0.1.0 promise ([README](../README.md) has the 0.1.0/0.2.0
-split). `peekseed reindex` needs an enabled embed link; `--dry-run` prints the
-scope and writes nothing.
+Extraction is a per-file peelfeed job triggered from the UI/API; there is no
+`peekseed import` command any more. `peekseed reindex` needs an enabled embed
+link; `--dry-run` prints the scope and writes nothing.
 
 ## The workspace
 
@@ -218,7 +225,8 @@ scope and writes nothing.
 <workspace>/.peekseed/config/settings.json  optional UI title/tagline/examples
 <workspace>/.peekseed/manifest.json         scan state
 <workspace>/.peekseed/datasets/<id>/        originals, chunks.jsonl, index/<space>/
-<workspace>/.peekseed/extracted/            extraction cache
+<workspace>/.peekseed/peels/<peel_id>/      peelfeed corpora (read-only for peekseed)
+<workspace>/.peekseed/extracted/            legacy extraction cache (unused)
 <workspace>/.peekseed/history/              saved search/ask/research history
 <workspace>/.peekseed/jobs/                 persisted job records
 <workspace>/.peekseed/uploads/              temporary upload staging
@@ -262,7 +270,7 @@ pip uninstall peekseed
 | `403` on a mutating request | Host or Origin mismatch. Add the name you browse through (`host[:port]`) to `PEEKSEED_ALLOWED_HOSTS`; loopback names and the bind host are always accepted. |
 | `409` from search/ask | The embed link changed, the endpoint no longer reproduces the probe, or the index has no probe. Rebuild the index (`Build index` or `peekseed reindex`) with the same embed link/model. |
 | `409` from Build index | Another build holds the collection's writer lock. Wait for it, cancel it, or resume an interrupted job; stale locks are detected and do not block. |
-| PDF extracts little or no text | It is probably a scanned/image-only PDF. OCR is a 0.2.0 workflow; for 0.1.0 use text-based PDFs or extract text yourself. |
+| File is `not_extracted` / Build index 409 | Configure the peelfeed CLI (`PEEKSEED_PEELFEED_CLI`, or `PEEKSEED_PEELFEED_PYTHON`) and click Extract on the file row; extraction is not a peekseed feature. |
 | `peekseed init` refuses | The workspace path is tracked by a git checkout. Choose a path outside the checkout or one the checkout ignores. |
 | Port already in use | `peekseed serve --port 8031` (or set `PEEKSEED_PORT`); only one app process may use a workspace. |
 | Browser shows stale UI | Reload; the UI is served `no-cache` with an ETag. A hard reload clears a stale bundle. |
@@ -286,6 +294,5 @@ in [security.md](security.md).
 - [deploy.md](deploy.md) — run it as a background service on a home server.
 - [api.md](api.md), [workspace.md](workspace.md), [model-links.md](model-links.md),
   [local-models.md](local-models.md) — the contracts behind the UI.
-- [import.md](import.md) — versioned corpus imports without re-embedding.
 - [release.md](release.md), [CHANGELOG.md](../CHANGELOG.md) — version and
   upgrade policy.

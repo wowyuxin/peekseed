@@ -4,7 +4,7 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
+from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
 
 
 class DatasetIndexTests(unittest.TestCase):
@@ -103,6 +103,7 @@ class IndexStoreTests(unittest.TestCase):
             dataset = ingest.create_dataset(config.paths(), "Docs")
             ingest.add_source(dataset, make_pdf(root / "doc.pdf",
                                                 pages=["Widget text about buttons."]))
+            make_peel(dataset, pages=["Widget text about buttons."])
             link = {"id": "fake", "role": "embed", "label": "Fake",
                     "protocol": "openai", "base_url": fake.openai_base,
                     "model": "test-embed", "api_key": "", "enabled": True}

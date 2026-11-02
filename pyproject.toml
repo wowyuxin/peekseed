@@ -23,23 +23,18 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 dependencies = [
+  # Web-stack only. peekseed never imports torch/docling and never parses a
+  # document: extraction is provided by the separate peelfeed engine (its own
+  # venv), and peekseed reads only the corpus it writes (docs/formats.md).
   "fastapi>=0.110",
   "uvicorn>=0.27",
   "httpx>=0.27",
   "numpy>=1.24",
   "pydantic>=2.0",
-  "pypdf>=4.0",
   "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
-# Core formats are stdlib + pypdf only; every extra below is opt-in and never
-# imported at module load. See docs/formats.md for the license rationale.
-office = ["python-docx>=1.1", "python-pptx>=0.6.23"]
-tables = ["openpyxl>=3.1"]
-ocr = ["pytesseract>=0.3.10", "Pillow>=10.0"]
-layout = ["pymupdf>=1.24"]
-pymupdf = ["pymupdf>=1.24"]
 test = ["pytest>=8.0"]
 
 [project.urls]
@@ -52,6 +47,12 @@ Changelog = "https://github.com/wowyuxin/peekseed/blob/main/CHANGELOG.md"
 
 [project.scripts]
 peekseed = "peekseed.__main__:main"
+
+[tool.setuptools]
+# A plain editable .pth keeps imports working from the checkout's parent even
+# when the checkout itself is named peekseed/ (otherwise it shadows the finder
+# as an implicit namespace package).
+package-dir = {"" = "."}
 
 [tool.setuptools.packages.find]
 include = ["peekseed*"]
@@ -81,7 +82,6 @@ select = ["E4", "E7", "E9", "F"]
 "peekseed/agent.py" = ["F401", "E741"]
 "peekseed/answer.py" = ["F401"]
 "peekseed/app.py" = ["F401", "F841"]
-"peekseed/extract.py" = ["E731"]
 "peekseed/ingest/index.py" = ["F401", "F822", "F841"]
 "peekseed/links.py" = ["F841", "E741"]
 "peekseed/tools.py" = ["F841"]

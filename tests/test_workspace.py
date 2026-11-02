@@ -221,7 +221,8 @@ class GitignoreTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "git is required for this check")
     def test_custom_named_workspace_really_is_ignored(self):
         """A workspace named ``ws`` must be ignored as ``/ws/``, not /workspace/."""
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env(), \
+                working_directory(tmp):
             repo = Path(tmp) / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q", str(repo)], check=True,
@@ -298,7 +299,9 @@ class DoctorTests(unittest.TestCase):
                     self.assertNotIn(str(root), issue)
 
     def test_doctor_detects_an_unignored_git_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+        # doctor's peelfeed report resolves the default data root from the cwd.
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env(), \
+                working_directory(tmp):
             (Path(tmp) / ".git").mkdir()
             # A .gitignore without the anchored entry: init would add it, so no init.
             (Path(tmp) / ".gitignore").write_text("*.log\n")

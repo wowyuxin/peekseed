@@ -63,18 +63,23 @@ __all__ = [
     "COLLECTION_STATUSES",
     "ContractError",
     "DATASET_SCHEMA",
+    "EXTRACTION_STATES",
     "FILE_STATUSES",
     "INFO_SCHEMA",
     "JOB_SCHEMA",
     "JOB_STATES",
     "MANIFEST_SCHEMA",
+    "PEEL_CHUNKER_VERSION",
     "PROBE_TEXT",
     "SchemaTooNew",
     "chunk_id",
     "chunker_identity",
     "chunker_label",
+    "corpus_digest",
     "documents_digest",
     "ensure_current",
+    "extraction_default",
+    "extraction_state",
     "extractor_identity",
     "extractor_label",
     "file_status",
@@ -102,22 +107,34 @@ __all__ = [
 # --- contract versions -----------------------------------------------------
 
 MANIFEST_SCHEMA = 1
-DATASET_SCHEMA = 2
-INFO_SCHEMA = 2
+# Schema 3 adds per-source ``extraction`` state (peelfeed peel identity) and the
+# ``peel``/``corpus_digest`` provenance blocks to index metadata.
+DATASET_SCHEMA = 3
+INFO_SCHEMA = 3
 JOB_SCHEMA = 1
 
-CHUNKER_NAME = "headings"
+# Extraction is owned by peelfeed; peekseed only consumes its corpus. The chunk
+# contract version is part of every chunk id, so changing it forces a reindex.
+CHUNKER_NAME = "peel"
 CHUNKER_VERSION = 1
+#: The chunker version recorded for chunks read from a peelfeed corpus.
+PEEL_CHUNKER_VERSION = 1
 
-# File-level states. ``indexed`` is the terminal state (vectors exist and the
-# file is searchable); ``embedded`` is the same stage reported by an index build
-# in progress. ``missing`` keeps the last known hash so a prune is explicit.
+# File-level states. ``uploaded`` means the file is stored with no extraction
+# yet; the extraction states mirror ``extraction.state`` in dataset.json.
+# ``indexed`` is the terminal state (vectors exist and the file is searchable).
 FILE_STATUSES = (
+    "uploaded",
+    "not_extracted",
+    "queued",
+    "running",
+    "extracted",
+    "failed",
+    "stale",
     "new",
     "unchanged",
     "changed",
     "missing",
-    "extracted",
     "chunked",
     "embedded",
     "indexed",
@@ -125,13 +142,27 @@ FILE_STATUSES = (
     "skipped",
 )
 
-# Collection-level states. The pipeline states (extracted/chunked/embedded) are
-# transient; the terminal states are ``indexed``, ``stale`` (the index no longer
+#: The per-source extraction states written by the peelfeed extract path.
+EXTRACTION_STATES = (
+    "not_extracted",
+    "queued",
+    "running",
+    "extracted",
+    "failed",
+    "stale",
+)
+
+# Collection-level states. ``uploaded``/``extracted`` describe storage and peel
+# state; the terminal states are ``indexed``, ``stale`` (the index no longer
 # matches its inputs) and ``needs_reindex`` (the index on disk is unreadable or
-# invalid). ``not_indexed`` means chunked sources exist with no vectors yet.
+# invalid). ``not_indexed`` means extracted sources exist with no vectors yet.
 COLLECTION_STATUSES = (
     "new",
     "scanned",
+    "uploaded",
+    "not_extracted",
+    "queued",
+    "running",
     "extracted",
     "chunked",
     "embedding",
@@ -276,19 +307,61 @@ def chunk_id(source_sha256, block_index, chunk_index, chunker_version=None):
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:_ID_LEN]
 
 
-def chunker_identity(target_chars=1200, max_chars=2000):
-    """The provenance record for the chunker: name, version and size bounds."""
-    return {
+def chunker_identity(target_chars=8000, max_chars=12000, image_cap=3,
+                     profile_hash=""):
+    """The provenance record for the peelfeed chunk contract.
+
+    peekseed does not chunk documents any more: peelfeed writes the canonical
+    chunks, so the identity records the chunk contract version and the profile
+    the corpus was built with. ``profile_hash`` names the peelfeed chunk profile
+    (target/max chars, image cap) so a profile change is visible as staleness.
+    """
+    identity = {
         "name": CHUNKER_NAME,
         "version": CHUNKER_VERSION,
         "target_chars": int(target_chars),
         "max_chars": int(max_chars),
+        "image_cap": int(image_cap),
     }
+    if profile_hash:
+        identity["profile_hash"] = str(profile_hash)
+    return identity
 
 
 def chunker_label():
-    """A compact ``"headings@1"`` label for logs and manifest summaries."""
+    """A compact ``"peel@1"`` label for logs and manifest summaries."""
     return "%s@%d" % (CHUNKER_NAME, CHUNKER_VERSION)
+
+
+def extraction_default():
+    """The per-source extraction block of a freshly uploaded file."""
+    return {
+        "state": "not_extracted",
+        "peel_id": "",
+        "conversion_id": "",
+        "profile": "",
+        "engine": "",
+        "validation": {"errors": 0, "review_items": 0},
+        "started_at": None,
+        "finished_at": None,
+        "error": None,
+    }
+
+
+def extraction_state(entry):
+    """The extraction state of one source entry (``not_extracted`` when absent).
+
+    An old dataset.json has no ``extraction`` block; its sources predate the
+    peelfeed path and are therefore reported as not extracted rather than
+    guessed at.
+    """
+    if not isinstance(entry, dict):
+        return "not_extracted"
+    block = entry.get("extraction")
+    if not isinstance(block, dict):
+        return "not_extracted"
+    state = str(block.get("state") or "")
+    return state if state in EXTRACTION_STATES else "not_extracted"
 
 
 def extractor_identity(name, version):
@@ -300,7 +373,7 @@ def extractor_identity(name, version):
 
 
 def extractor_label(extractor):
-    """A compact ``"pypdf@6.21.1"`` label from an extractor identity dict."""
+    """A compact ``"peelfeed@<fingerprint>"`` label from an extractor identity dict."""
     if isinstance(extractor, (tuple, list)) and len(extractor) == 2:
         name, version = extractor
     elif isinstance(extractor, dict):
@@ -374,14 +447,47 @@ def documents_digest(sources):
     return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
 
 
-def stale_reasons(info, sources, *, chunker=None, extractor=None):
+def corpus_digest(sources):
+    """``sha256`` of the sorted peel identity of every source in a dataset.
+
+    ``documents_digest`` answers "did the source set change?". This digest
+    answers "did the extraction change?" -- it folds in each source's
+    ``extraction.peel_id`` and ``conversion_id`` so a rebuilt peel (new
+    conversion) makes an index stale even when the source PDF is unchanged.
+    Sources that are not extracted contribute their sha256 and state only, so
+    the digest still changes when such a source is added or removed.
+    """
+    lines = []
+    for entry in sources or []:
+        if not isinstance(entry, dict):
+            raise ContractError("each source entry must be a JSON object")
+        path = str(entry.get("path") or entry.get("name") or "").strip()
+        sha = str(entry.get("sha256") or "").strip().lower()
+        if not path:
+            raise ContractError("a source entry has no path or name")
+        _require_sha256(sha, "sha256", "source '%s'" % path)
+        block = entry.get("extraction") if isinstance(entry, dict) else None
+        block = block if isinstance(block, dict) else {}
+        lines.append("%s\x00%s\x00%s\x00%s\x00%s" % (
+            path,
+            sha,
+            extraction_state(entry),
+            str(block.get("peel_id") or ""),
+            str(block.get("conversion_id") or ""),
+        ))
+    lines.sort()
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()
+
+
+def stale_reasons(info, sources, *, chunker=None, extractor=None,
+                  corpus_digest=None):
     """Explain why an index no longer matches its inputs (empty list = current).
 
-    Three independent things can make an index stale: the source set changed
-    (``documents_digest``), the chunker version changed, or the extractor version
-    changed (extraction output feeds chunking, so its version invalidates chunks).
-    The returned list of short user-facing strings is what ``peekseed status``
-    and ``peekseed index --dry-run`` print.
+    Independent things can make an index stale: the source set changed
+    (``documents_digest``), the chunker/chunk profile changed, the extractor
+    changed, or a peel was rebuilt (``corpus_digest``). The returned list of
+    short user-facing strings is what ``peekseed status`` and ``peekseed reindex
+    --dry-run`` print.
     """
     if not isinstance(info, dict):
         return ["no index metadata"]
@@ -395,6 +501,15 @@ def stale_reasons(info, sources, *, chunker=None, extractor=None):
         reasons.append("index metadata has no documents_digest")
     elif digest is not None and recorded != digest:
         reasons.append("source documents changed since the index was built")
+
+    if corpus_digest is not None:
+        recorded_corpus = str(info.get("corpus_digest") or "")
+        if not recorded_corpus:
+            reasons.append("index metadata has no corpus_digest")
+        elif recorded_corpus != corpus_digest:
+            reasons.append(
+                "the peel corpus changed since the index was built "
+                "(a conversion was rebuilt or a source was re-extracted)")
 
     recorded_chunker = info.get("chunker") if isinstance(info.get("chunker"), dict) else {}
     if chunker is not None:
@@ -534,6 +649,37 @@ def new_job(kind, *, collection=None, job_id=None, created_at=None):
 # --- validation ------------------------------------------------------------
 
 
+def _validate_extraction(raw):
+    """Validate one source's ``extraction`` block; returns a normalised copy."""
+    if raw is None:
+        return extraction_default()
+    block = _require_dict(raw, "source extraction")
+    state = _require_status(block.get("state") or "not_extracted", "state",
+                            "source extraction", EXTRACTION_STATES)
+    out = extraction_default()
+    out["state"] = state
+    for field in ("peel_id", "conversion_id", "profile", "engine"):
+        value = block.get(field)
+        if value is not None:
+            out[field] = _require_str(str(value), field, "source extraction",
+                                      allow_empty=True)
+    validation = block.get("validation")
+    if isinstance(validation, dict):
+        out["validation"] = {
+            "errors": _require_int(validation.get("errors") or 0, "validation.errors",
+                                   "source extraction"),
+            "review_items": _require_int(validation.get("review_items") or 0,
+                                         "validation.review_items",
+                                         "source extraction"),
+        }
+    for field in ("started_at", "finished_at", "error"):
+        value = block.get(field)
+        if value is not None:
+            out[field] = _require_str(str(value), field, "source extraction",
+                                      allow_empty=True)
+    return out
+
+
 def _validate_source_entry(entry, kind):
     """Validate one source entry shared by ``dataset.json`` and ``info.json``."""
     entry = _require_dict(entry, "%s source entry" % kind)
@@ -558,7 +704,45 @@ def _validate_source_entry(entry, kind):
         status = entry.get("status")
         if status is not None:
             data["status"] = _require_status(status, "status", kind, FILE_STATUSES)
+    if entry.get("extraction") is not None or kind == "dataset.json":
+        data["extraction"] = _validate_extraction(entry.get("extraction"))
     return data
+
+
+def _validate_peel_info(raw):
+    """Validate the ``peel`` provenance block of an index.
+
+    A single-source index records one peel as a flat object; a multi-source index
+    records ``{"peels": [...], "count": N}``. Both shapes are accepted so a
+    dataset that gains sources does not need a schema change.
+    """
+    block = _require_dict(raw, "info.json field 'peel'")
+    if isinstance(block.get("peels"), list):
+        peels = [_validate_peel_entry(item) for item in block["peels"]]
+        return {"peels": peels, "count": len(peels)}
+    return _validate_peel_entry(block)
+
+
+def _validate_peel_entry(raw):
+    """Validate one peel identity: id, conversion, profile and validation."""
+    block = _require_dict(raw, "peel entry")
+    validation = block.get("validation")
+    validation = validation if isinstance(validation, dict) else {}
+    return {
+        "peel_id": _require_str(block.get("peel_id") or "", "peel_id", "peel entry",
+                                allow_empty=True),
+        "conversion_id": _require_str(block.get("conversion_id") or "",
+                                      "conversion_id", "peel entry",
+                                      allow_empty=True),
+        "profile": _require_str(block.get("profile") or "", "profile", "peel entry",
+                                allow_empty=True),
+        "validation": {
+            "errors": _require_int(validation.get("errors") or 0, "validation.errors",
+                                   "peel entry"),
+            "review_items": _require_int(validation.get("review_items") or 0,
+                                         "validation.review_items", "peel entry"),
+        },
+    }
 
 
 def validate_manifest(data):
@@ -684,9 +868,13 @@ def validate_info(data):
         "name": _require_str(chunker.get("name"), "name", "info.json chunker"),
         "version": _require_int(chunker.get("version"), "version", "info.json chunker", minimum=1),
     }
-    for field in ("target_chars", "max_chars"):
+    for field in ("target_chars", "max_chars", "image_cap"):
         if chunker.get(field) is not None:
             chunker_out[field] = _require_int(chunker[field], field, "info.json chunker", minimum=1)
+    if chunker.get("profile_hash") is not None:
+        chunker_out["profile_hash"] = _require_str(
+            chunker["profile_hash"], "profile_hash", "info.json chunker", allow_empty=True
+        )
 
     extractor = _require_dict(data.get("extractor"), "info.json field 'extractor'")
     extractor_out = {
@@ -707,6 +895,10 @@ def validate_info(data):
     digest_out = _require_sha256(
         digest or "", "documents_digest", "info.json", allow_empty=True
     )
+    corpus = data.get("corpus_digest")
+    corpus_out = _require_sha256(
+        corpus or "", "corpus_digest", "info.json", allow_empty=True
+    )
 
     normalised = {
         "schema": INFO_SCHEMA,
@@ -721,8 +913,27 @@ def validate_info(data):
         "chunker": chunker_out,
         "extractor": extractor_out,
         "documents_digest": digest_out,
+        "corpus_digest": corpus_out,
         "sources": sources,
     }
+    peel = data.get("peel")
+    if isinstance(peel, dict):
+        normalised["peel"] = _validate_peel_info(peel)
+    skipped = data.get("skipped_sources")
+    if isinstance(skipped, list):
+        normalised["skipped_sources"] = [
+            {
+                "name": _require_str(item.get("name"), "name", "skipped source",
+                                     allow_empty=True),
+                "state": _require_status(
+                    item.get("state") or "not_extracted", "state", "skipped source",
+                    EXTRACTION_STATES),
+                "reason": _require_str(item.get("reason") or "", "reason",
+                                       "skipped source", allow_empty=True),
+            }
+            for item in skipped
+            if isinstance(item, dict)
+        ]
     # Convenience mirrors kept for API/UI compatibility; validated when present.
     for field in ("link_id", "model", "protocol", "protocol_version"):
         if data.get(field) is not None:
@@ -827,6 +1038,35 @@ def validate_chunk(record, *, derive_id=False):
         normalised["pdf_y"] = _require_int(record["pdf_y"], "pdf_y", "chunk row")
     if record.get("block_kind") is not None:
         normalised["block_kind"] = _require_str(record["block_kind"], "block_kind", "chunk row")
+    # Optional peelfeed corpus fields (design §4.2). They are carried through so
+    # the UI/serve path can show crops, cross-page evidence and stable canonical
+    # ids without re-reading the peel at query time.
+    if record.get("kind") is not None:
+        normalised["kind"] = _require_str(record["kind"], "kind", "chunk row",
+                                          allow_empty=True)
+    for field in ("prev", "next", "engine", "conversion_id", "peel_id"):
+        if record.get(field) is not None:
+            normalised[field] = _require_str(str(record[field]), field, "chunk row",
+                                             allow_empty=True)
+    for field in ("char_count", "parts", "part"):
+        if record.get(field) is not None:
+            normalised[field] = _require_int(record[field], field, "chunk row",
+                                             minimum=1)
+    for field in ("image_paths", "source_pages", "canonical_ids"):
+        if record.get(field) is not None:
+            values = record[field]
+            if not isinstance(values, list):
+                raise ContractError("chunk row field '%s' must be a list." % field)
+            if field == "source_pages":
+                normalised[field] = [
+                    _require_int(value, "source_pages", "chunk row", minimum=1)
+                    for value in values
+                ]
+            else:
+                normalised[field] = [
+                    _require_str(str(value), field, "chunk row", allow_empty=True)
+                    for value in values
+                ]
     if derive_id:
         expected = chunk_id(
             normalised["source_sha256"], block_index, chunk_index, chunker_version
@@ -844,12 +1084,17 @@ def validate_chunk(record, *, derive_id=False):
 
 
 def upgrade_dataset(data, *, sha256_of=None):
-    """Upgrade a legacy ``dataset.json`` (schema 1 / ``version: 1``) to schema 2.
+    """Upgrade a legacy ``dataset.json`` (schema 1/2) to schema 3.
 
     ``sha256_of`` is a callable taking the dataset-relative source path (for
     example ``"original/CXL.pdf"``) and returning the content hash; when it
     returns ``None`` (a file is gone) the source is marked ``new`` with an empty
     hash so a later scan can re-discover it. The upgrade never guesses a hash.
+
+    Schema 3 adds the per-source ``extraction`` block. A legacy dataset was
+    extracted by the old in-process pipeline, which peekseed no longer ships:
+    its sources are marked ``not_extracted`` (and their old chunks are ignored)
+    until a peel is built by peelfeed, which is the honest state after M-1.
     """
     declared = _declared_schema(data, "dataset.json", DATASET_SCHEMA)
     if declared == DATASET_SCHEMA:
@@ -873,6 +1118,12 @@ def upgrade_dataset(data, *, sha256_of=None):
                 sha = str(sha256_of(relpath) or "").lower()
             except OSError:
                 sha = ""
+        status = str(raw.get("status") or "")
+        if status not in FILE_STATUSES:
+            status = "uploaded" if sha else "new"
+        extraction = raw.get("extraction")
+        if not isinstance(extraction, dict):
+            extraction = extraction_default()
         entry = {
             "name": name,
             "path": relpath,
@@ -880,7 +1131,8 @@ def upgrade_dataset(data, *, sha256_of=None):
             "bytes": int(raw.get("bytes") or 0),
             "pages": int(raw.get("pages") or 0),
             "extractor": str(raw.get("extractor") or ""),
-            "status": "indexed" if sha else "new",
+            "status": status,
+            "extraction": extraction,
         }
         sources.append(entry)
     upgraded = {
@@ -892,18 +1144,21 @@ def upgrade_dataset(data, *, sha256_of=None):
         "notes": str(data.get("notes") or ""),
         "sources": sources,
     }
+    for field in ("extractor", "chunker", "status"):
+        if data.get(field) is not None:
+            upgraded[field] = str(data[field])
     if not upgraded["id"] or not upgraded["name"]:
         raise ContractError("dataset.json has no id or name to upgrade")
     return validate_dataset(upgraded)
 
 
 def upgrade_info(data):
-    """Upgrade a legacy ``info.json`` (schema 1) to schema 2.
+    """Upgrade a legacy ``info.json`` (schema 1/2) to schema 3.
 
-    A schema-1 index predates the probe and the provenance records, so the
-    upgraded record carries an empty probe (``has_probe`` is False) and empty
-    extractor. The index stays readable; ``peekseed migrate`` embeds the probe
-    once and writes ``probe.npy`` to make it gateable.
+    A legacy index predates the probe and the peel provenance records, so the
+    upgraded record carries an empty probe (``has_probe`` is False), an empty
+    extractor and no peels. The index stays readable; ``peekseed migrate``
+    embeds the probe once and writes ``probe.npy`` to make it gateable.
     """
     declared = _declared_schema(data, "info.json", INFO_SCHEMA)
     if declared == INFO_SCHEMA:
@@ -919,8 +1174,10 @@ def upgrade_info(data):
     embedding["probe"] = {"text_sha256": "", "file": ""}
     chunker_raw = data.get("chunker") if isinstance(data.get("chunker"), dict) else {}
     chunker = chunker_identity(
-        target_chars=int(chunker_raw.get("target_chars") or 1200),
-        max_chars=int(chunker_raw.get("max_chars") or 2000),
+        target_chars=int(chunker_raw.get("target_chars") or 8000),
+        max_chars=int(chunker_raw.get("max_chars") or 12000),
+        image_cap=int(chunker_raw.get("image_cap") or 3),
+        profile_hash=str(chunker_raw.get("profile_hash") or ""),
     )
     sources = []
     for raw in data.get("sources") or []:
@@ -951,8 +1208,15 @@ def upgrade_info(data):
         "created_at": str(data.get("created_at") or utc_now()),
         "embedding": embedding,
         "chunker": chunker,
-        "extractor": {"name": "", "version": ""},
+        "extractor": {
+            "name": str((data.get("extractor") or {}).get("name") or "")
+            if isinstance(data.get("extractor"), dict) else "",
+            "version": str((data.get("extractor") or {}).get("version") or "")
+            if isinstance(data.get("extractor"), dict) else "",
+        },
         "documents_digest": digest,
+        "corpus_digest": "",
+        "peel": {"peels": []},
         "sources": sources,
     }
     return validate_info(upgraded)

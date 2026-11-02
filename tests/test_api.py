@@ -5,7 +5,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
+from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
 
 
 class ApiTests(unittest.TestCase):
@@ -44,6 +44,10 @@ class ApiTests(unittest.TestCase):
             files=[("files", (filename, data, "application/pdf"))])
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["dataset"]
+
+    def _extract(self, dataset_id, pages=None):
+        """Create a fake peelfeed peel and mark the source extracted."""
+        return make_peel(dataset_id, pages=pages)
 
     def _index(self, client, dataset_id, link_id=None):
         response = client.post("/api/datasets/%s/index" % dataset_id,
@@ -109,6 +113,9 @@ class ApiTests(unittest.TestCase):
                 "Widget installation. The widget is mounted with two screws.",
                 "Widget operation. Press the green button to start it."])
             self.assertIn("manual.pdf", dataset["sources"])
+            self._extract(dataset["id"], pages=[
+                "Widget installation. The widget is mounted with two screws.",
+                "Widget operation. Press the green button to start it."])
             self._index(client, dataset["id"])
             listed = client.get("/api/datasets").json()["datasets"]
             self.assertEqual(listed[0]["chunks"] > 0, True)
@@ -149,6 +156,8 @@ class ApiTests(unittest.TestCase):
                            base_url=fake.openai_base, model="test-answer-model")
             dataset = self._upload(client, pages=[
                 "Widget operation. Press the green button to start the widget."])
+            self._extract(dataset["id"], pages=[
+                "Widget operation. Press the green button to start the widget."])
             self._index(client, dataset["id"])
             fake.set_default_chat([{"content": "Press the green button to start it [1].",
                                     "finish": "stop"}])
@@ -181,6 +190,8 @@ class ApiTests(unittest.TestCase):
             self._add_link(client, role="answer", label="Fake answer",
                            base_url=fake.openai_base, model="test-answer-model")
             dataset = self._upload(client, pages=[
+                "Widget operation. Press the green button to start the widget."])
+            self._extract(dataset["id"], pages=[
                 "Widget operation. Press the green button to start the widget."])
             self._index(client, dataset["id"])
             search = client.post("/api/search", json={
@@ -238,6 +249,40 @@ class ApiTests(unittest.TestCase):
                                            % dataset["id"]).status_code, 404)
 
 
+class IndexGateTests(unittest.TestCase):
+    def _client(self):
+        from fastapi.testclient import TestClient
+        from peekseed import app as app_module
+        app_module.reset_state()
+        return TestClient(app_module.create_app())
+
+    def test_upload_without_extraction_is_stored_and_index_is_409(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            pdf = make_pdf(root / "manual.pdf", pages=["Widget text."])
+            client = self._client()
+            response = client.post(
+                "/api/datasets", data={"name": "Docs"},
+                files=[("files", ("manual.pdf", pdf.read_bytes(),
+                                  "application/pdf"))])
+            self.assertEqual(response.status_code, 201, response.text)
+            dataset = response.json()["dataset"]
+            self.assertEqual(dataset["sources"], ["manual.pdf"])
+            self.assertEqual(dataset["chunks"], 0)
+            sources = client.get("/api/datasets/%s/sources"
+                                 % dataset["id"]).json()["sources"]
+            self.assertEqual(sources[0]["status"], "uploaded")
+            self.assertEqual(sources[0]["extraction"]["state"], "not_extracted")
+            # Upload worked without any peelfeed; indexing is refused clearly.
+            client.post("/api/links", json={
+                "role": "embed", "label": "Fake", "protocol": "openai",
+                "base_url": fake.openai_base, "model": "test-embed",
+                "enabled": True})
+            index = client.post("/api/datasets/%s/index" % dataset["id"], json={})
+            self.assertEqual(index.status_code, 409, index.text)
+            self.assertIn("no_extracted_sources", index.json()["detail"])
+            self.assertIn("manual.pdf", index.json()["detail"])
+
+
 class ProbeQueryGateTests(unittest.TestCase):
     """Query-time probe gate: a swapped embedder must 409, never compare spaces.
 
@@ -268,14 +313,16 @@ class ProbeQueryGateTests(unittest.TestCase):
         return response.json()["link"]
 
     def _upload_and_index(self, client, root):
-        pdf = make_pdf(root / "manual.pdf", pages=[
+        pages = [
             "Widget installation. The widget is mounted with two screws.",
-            "Widget operation. Press the green button to start it."])
+            "Widget operation. Press the green button to start it."]
+        pdf = make_pdf(root / "manual.pdf", pages=pages)
         response = client.post(
             "/api/datasets", data={"name": "Docs"},
             files=[("files", ("manual.pdf", pdf.read_bytes(), "application/pdf"))])
         self.assertEqual(response.status_code, 201, response.text)
         dataset = response.json()["dataset"]
+        make_peel(dataset["id"], pages=pages)
         job = client.post("/api/datasets/%s/index" % dataset["id"],
                           json={}).json()["job"]
         state = {}

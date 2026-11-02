@@ -70,15 +70,30 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(self.project["scripts"],
                          {"peekseed": "peekseed.__main__:main"})
 
-    def test_optional_extras_present(self):
+    def test_optional_extras_are_test_only(self):
+        # M-1 removed the extraction extras: peekseed's dependency set is the
+        # web stack; formats/dependencies belong to the separate peelfeed engine.
         extras = self.project["optional-dependencies"]
-        for extra in ("office", "tables", "ocr", "layout", "pymupdf", "test"):
-            self.assertIn(extra, extras)
+        self.assertEqual(sorted(extras), ["test"])
         self.assertTrue(any(dep.startswith("pytest") for dep in extras["test"]))
+        dependencies = self.project["dependencies"]
+        for removed in ("pypdf", "python-docx", "python-pptx", "openpyxl",
+                        "pytesseract", "Pillow", "pymupdf"):
+            self.assertFalse(
+                any(dep.lower().startswith(removed.lower())
+                    for dep in dependencies),
+                "%s must not be a peekseed dependency" % removed,
+            )
 
     def test_package_data_ships_the_web_ui(self):
         package_data = self.pyproject["tool"]["setuptools"]["package-data"]
         self.assertIn("web/*", package_data["peekseed"])
+
+    def test_editable_layout_supports_same_named_checkout(self):
+        # An explicit common package root makes setuptools use a plain .pth,
+        # not a meta-path finder shadowed by the parent directory's peekseed/.
+        setuptools = self.pyproject["tool"]["setuptools"]
+        self.assertEqual(setuptools["package-dir"], {"": "."})
 
     def test_web_ui_file_exists_and_is_nontrivial(self):
         ui = ROOT / "peekseed" / "web" / "index.html"

@@ -20,7 +20,8 @@ endpoints the user configured.
                                 |
                                 v
                config.py -> contracts.py -> <workspace>/.peekseed
-               workspace.py / scan.py / extract.py -> documents/
+               workspace.py / scan.py -> documents/      (storage-only, no parsing)
+               ingest/ <- peelfeed corpora under <data_root>/peels/
 ```
 
 ## Modules
@@ -29,8 +30,7 @@ endpoints the user configured.
 |---|---|
 | `contracts.py` | Versioned data contracts: manifest/dataset/info/job schemas, content-derived chunk ids, embedding-space identity, probe, atomic JSON, schema upgrades. |
 | `workspace.py` | Resolve and manage the document workspace: `init`, `doctor`, `status`, `move`, gitignore guard. |
-| `scan.py` | Reconcile `documents/` with the manifest: hashing, diffing, extraction cache, staleness, dirty-collection builds. |
-| `extract.py` | Format extraction (PDF, Markdown, HTML, TXT, EPUB, `.eml`; optional extras) with a versioned extractor identity. |
+| `scan.py` | Reconcile `documents/` with the manifest and datasets: hashing, diffing, per-source extraction state, index-state reporting. No extraction, chunking or index build. |
 | `config.py` | Resolve the workspace-derived root and every path under it; settings; bind host/port. |
 | `links.py` | Model-link config store: schema, validation, masking, atomic 0600 write. |
 | `localmodels.py` | Optional machine-local control of local model processes: config, probes, start/stop. |
@@ -40,7 +40,7 @@ endpoints the user configured.
 | `agent.py` | Transport-free research loop: budgets, observation ledger, repetition guard, forced answer. |
 | `tools.py` | Dataset tools the agent calls: list, outline, search, grep, read chunk/section. |
 | `history.py` | Persistent search/dialog history (per-entry JSON + index). |
-| `ingest/` | Chunking, embedding and generation-atomic index writing. |
+| `ingest/` | Storage-only uploads, peelfeed corpus reader/gate, embedding and generation-atomic index writing. Never imports a document parser. |
 | `security.py` | Token + Host/Origin checks for mutating routes, upload limits, URL validation. |
 | `migrate.py` | Explicit schema migration (`peekseed migrate`, dry-run default). |
 | `app.py` | The HTTP layer that wires all of the above together. |
@@ -65,7 +65,8 @@ derived path; `PEEKSEED_DATA` overrides only the derived root
     config/links.json           model endpoints + masked keys (0600)
     config/settings.json        optional UI copy
     datasets/<collection>/      dataset.json, chunks.jsonl, index/<space>/
-    extracted/<sha256>.json     extraction cache
+    peels/<peel_id>/            peelfeed corpora (read-only for peekseed)
+    extracted/<sha256>.json     legacy extraction cache (unused)
     history/                    history entries + index
     jobs/<id>.json              persistent jobs
     uploads/                    upload staging
@@ -99,9 +100,10 @@ search result set is the seed, not the ceiling. Every observation is numbered in
 one ledger and the answer cites those numbers; invented numbers are reported as
 unknown, not rendered as links.
 
-**Index build.** `POST /api/datasets/{id}/index` starts a persisted background job
-(the folder `scan` workflow is a 0.2.0 feature). The worker extracts text (or
-reuses `chunks.jsonl`), chunks it with stable ids, embeds in batches with
+**Index build.** `POST /api/datasets/{id}/index` starts a persisted background job.
+It reads every extracted source's peelfeed corpus (gated on the peel-root
+allowlist, source sha256, conversion id and `validation.errors == 0`), maps the
+corpus chunks to peekseed's contract (stable ids), embeds in batches with
 retry/backoff through the enabled embed link, writes into
 `index/<space>/generations/<uuid>/` and flips `CURRENT` last. The job record under
 `.peekseed/jobs/` is the API's source of truth (`GET /api/jobs`, `DELETE` to
@@ -119,7 +121,7 @@ datasets/<id>/index/<space>/
   generations/<uuid>/
     vectors.npy   float32 [n, dim], unnormalised (normalised at load)
     meta.json     array of chunk metadata, row-aligned with vectors
-    info.json     schema 2: embedding space identity, provenance, probe, sources
+    info.json     schema 3: embedding space identity, peelfeed provenance, probe, sources
     probe.npy     stored probe vector for the query-time space check
 ```
 
