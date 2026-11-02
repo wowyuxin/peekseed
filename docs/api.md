@@ -64,6 +64,8 @@ are not listed.
 | POST | `/api/links` | Create a link |
 | PUT | `/api/links/{id}` | Update a link |
 | DELETE | `/api/links/{id}` | Delete a link |
+| GET | `/api/links/{id}/indexes` | Datasets indexed through this embed link |
+| DELETE | `/api/links/{id}/indexes` | Delete those indexes (to change chunk sizes) |
 | POST | `/api/links/{id}/use` | Enable/disable a link |
 | POST | `/api/links/{id}/test` | Probe a link's endpoint |
 | GET | `/api/links/status` | Reachability of every link |
@@ -331,17 +333,29 @@ Links are the user's own endpoints. Secrets are write-only: responses carry
 ### `GET /api/links`
 
 `{"links": [{"id", "role", "label", "protocol", "base_url", "model",
-"enabled", "api_key_set"}], "path": "…/config/links.json", "seeded": true}`.
+"enabled", "api_key_set", "chunk", "chunk_set"}], "path": "…/config/links.json",
+"seeded": true}`. `chunk` is the embed link's chunk sizes
+(`{"target_chars", "max_chars", "image_cap"}` or `null`); `chunk_set` names the
+peelfeed chunk set they select (`c8000-12000-i3`, `""` when unset).
 
 ### `POST /api/links` / `PUT /api/links/{id}`
 
 Body: `id` (create; generated from the label if omitted), `role`
 (`embed|rerank|answer`), `label`, `protocol`, `base_url`, `api_key`, `model`,
-`enabled`. Validation rejects unknown fields, bad ids, missing labels, bad
+`enabled`, `chunk` (embed links only: `0 < target_chars ≤ max_chars`,
+`1 ≤ image_cap ≤ 3`, or `null`). Validation rejects unknown fields, bad ids, missing labels, bad
 protocols, whitespace/control characters in keys, and **SSRF-unsafe URLs**
 (cloud metadata, link-local, non-http(s), embedded credentials). Loopback,
 RFC1918 and tailnet targets stay allowed. `201 {"link": {…masked…}}` on create;
-`200` on update. `404` for an unknown id, `400` for validation.
+`200` on update. `404` for an unknown id, `400` for validation. Changing the
+`chunk` sizes of a link that already has indexes is `409 chunk_sizes_locked`
+(the indexes were embedded from the old chunk set): delete them first.
+
+### `GET` / `DELETE /api/links/{id}/indexes`
+
+`GET` lists the datasets with an index built through this link
+(`{"link", "space", "datasets": [...]}`); `DELETE` removes those index
+directories (each under its collection lock) and returns `{"removed": [...]}`.
 
 ### `DELETE /api/links/{id}`
 

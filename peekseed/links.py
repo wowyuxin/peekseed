@@ -15,9 +15,14 @@ Schema (version 1):
     {"version": 1, "links": [
         {"id": "my-embed", "role": "embed", "label": "My embedder",
          "protocol": "openai", "base_url": "http://127.0.0.1:11434/v1",
-         "api_key": "", "model": "nomic-embed-text", "enabled": true},
+         "api_key": "", "model": "nomic-embed-text", "enabled": true,
+         "chunk": {"target_chars": 8000, "max_chars": 12000, "image_cap": 3}},
         ...
     ]}
+
+An embed link's ``chunk`` sizes pick the peelfeed chunk set its index is built
+from (``c<target>-<max>-i<cap>``; links with equal sizes share one set). An embed
+link without sizes cannot build an index. Other roles always store ``null``.
 
 Roles and protocols:
 
@@ -64,7 +69,11 @@ MAX_LABEL = 80
 MAX_ID = 40
 VERSION = 1
 FIELDS = ("id", "role", "label", "protocol", "base_url", "api_key", "model",
-          "enabled")
+          "enabled", "chunk")
+CHUNK_KEYS = ("target_chars", "max_chars", "image_cap")
+#: peelfeed's chunk packer never puts more than 3 images in one chunk.
+MAX_CHUNK_IMAGES = 3
+MAX_CHUNK_CHARS = 200000
 
 
 class LinkConfigError(Exception):
@@ -169,7 +178,38 @@ def _blank_link(role, label=""):
         "api_key": "",
         "model": "",
         "enabled": True,
+        "chunk": None,
     }
+
+
+def _chunk_sizes(value, role):
+    """Normalize one submitted ``chunk`` value; returns ``(sizes_or_None, errors)``."""
+    if value is None:
+        return None, []
+    if role != "embed":
+        return None, ["chunk sizes apply to embed links only"]
+    if not isinstance(value, dict) or set(value) != set(CHUNK_KEYS):
+        return None, ["chunk must be an object with target_chars, max_chars and "
+                      "image_cap (or null)"]
+    sizes = {}
+    for key in CHUNK_KEYS:
+        number = value[key]
+        if isinstance(number, bool) or not isinstance(number, int):
+            return None, ["chunk.%s must be an integer" % key]
+        sizes[key] = number
+    if not 0 < sizes["target_chars"] <= sizes["max_chars"] <= MAX_CHUNK_CHARS:
+        return None, ["chunk sizes need 0 < target_chars <= max_chars <= %d"
+                      % MAX_CHUNK_CHARS]
+    if not 1 <= sizes["image_cap"] <= MAX_CHUNK_IMAGES:
+        return None, ["chunk.image_cap must be between 1 and %d" % MAX_CHUNK_IMAGES]
+    return sizes, []
+
+
+def chunk_set_name(sizes):
+    """The peelfeed chunk set for these sizes (``c8000-12000-i3``), or ""."""
+    if not isinstance(sizes, dict):
+        return ""
+    return "c%d-%d-i%d" % tuple(sizes[key] for key in CHUNK_KEYS)
 
 
 def _auto_id(label, role, taken):
@@ -292,6 +332,9 @@ def validate(data, existing=None):
         errors.append("enabled must be true or false")
         enabled = True
 
+    chunk, chunk_errors = _chunk_sizes(given("chunk", None), role)
+    errors.extend(chunk_errors)
+
     link = {
         "id": link_id,
         "role": role if role in ROLES else "",
@@ -301,6 +344,7 @@ def validate(data, existing=None):
         "api_key": api_key,
         "model": model,
         "enabled": enabled,
+        "chunk": chunk,
     }
     return link, errors
 
@@ -523,6 +567,8 @@ def mask(link):
         "api_key_set": bool(link.get("api_key")),
         "model": link.get("model"),
         "enabled": link.get("enabled"),
+        "chunk": copy.deepcopy(link.get("chunk")),
+        "chunk_set": chunk_set_name(link.get("chunk")),
         "capabilities": {
             "models": role == "answer",
         },

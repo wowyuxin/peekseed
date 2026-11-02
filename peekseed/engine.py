@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -402,6 +403,8 @@ class IndexStore:
         self.datasets_dir = str(datasets_dir)
         self.rerank_fn = rerank_fn
         self._indexes: Dict[Tuple[str, str], DatasetIndex] = {}
+        self._reading: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        self._reading_lock = threading.Lock()
 
     def load(self) -> None:
         """(Re)scan the datasets directory, replacing the current index map.
@@ -409,6 +412,8 @@ class IndexStore:
         Replacing rather than merging is what makes a rebuilt or deleted dataset
         show up without a restart: the scan is the whole truth.
         """
+        with self._reading_lock:
+            self._reading = {}
         found: Dict[Tuple[str, str], DatasetIndex] = {}
         try:
             datasets = sorted(os.listdir(self.datasets_dir))
@@ -472,6 +477,57 @@ class IndexStore:
 
     def get(self, dataset: str, space: str) -> Optional[DatasetIndex]:
         return self._indexes.get((dataset, space))
+
+    def reading(self, dataset: str) -> Dict[str, Dict[str, Any]]:
+        """The dataset's canonical ``chunks.jsonl`` keyed by id (the reading layer)."""
+        with self._reading_lock:
+            cached = self._reading.get(dataset)
+        if cached is not None:
+            return cached
+        by_id: Dict[str, Dict[str, Any]] = {}
+        try:
+            with open(os.path.join(self.datasets_dir, dataset, "chunks.jsonl"),
+                      encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(record, dict) and record.get("id"):
+                        by_id[str(record["id"])] = record
+        except OSError:
+            pass
+        with self._reading_lock:
+            self._reading[dataset] = by_id
+        return by_id
+
+    def reading_hits(self, dataset: str, index: DatasetIndex, order: List[int],
+                     scores: List[float], top: int) -> List[Tuple[Dict[str, Any], float]]:
+        """Ranked index rows mapped onto the canonical chunks they cover.
+
+        An index is built from the embed link's chunk set; its rows name the
+        canonical chunks (``reading_ids``) the UI, answers and agent tools read.
+        A row covering several canonical chunks yields them in document order
+        with the row's score; duplicates keep their best rank. Rows without
+        ``reading_ids`` (indexes built from the canonical chunks) map to
+        themselves.
+        """
+        by_id = self.reading(dataset)
+        hits: List[Tuple[Dict[str, Any], float]] = []
+        seen = set()
+        for position, score in zip(order, scores):
+            meta = index.meta[position]
+            for chunk_id in meta.get("reading_ids") or [meta.get("id")]:
+                record = by_id.get(str(chunk_id or ""))
+                if record is None and chunk_id == meta.get("id"):
+                    record = meta
+                if record is None or record.get("id") in seen:
+                    continue
+                seen.add(record.get("id"))
+                hits.append((record, float(score)))
+                if len(hits) >= top:
+                    return hits
+        return hits
 
     def find(self, dataset: str, link_id: str,
              model: Optional[str] = None) -> Optional[DatasetIndex]:

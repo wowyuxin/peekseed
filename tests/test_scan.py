@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.fixtures import FakeModelServer, make_pdf, make_peel
+from tests.fixtures import EMBED_CHUNK, FakeModelServer, make_pdf, make_peel
 
 from peekseed import config, contracts, scan, workspace
 
@@ -69,6 +69,7 @@ def _link(fake):
         "model": "test-embed",
         "api_key": "",
         "enabled": True,
+        "chunk": dict(EMBED_CHUNK),
     }
 
 

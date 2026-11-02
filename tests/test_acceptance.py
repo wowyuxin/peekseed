@@ -22,7 +22,8 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
+                            temp_data_root)
 
 
 def fake_link(fake, model="test-embed", **extra):
@@ -34,6 +35,7 @@ def fake_link(fake, model="test-embed", **extra):
         "base_url": fake.openai_base,
         "model": model,
         "api_key": "",
+        "chunk": dict(EMBED_CHUNK),
         "enabled": True,
     }
     link.update(extra)
@@ -388,7 +390,8 @@ class GateSixTests(unittest.TestCase):
                 saved = links.create({"role": "embed", "label": "Fake",
                                       "protocol": "openai",
                                       "base_url": fake.openai_base,
-                                      "model": "test-embed", "enabled": True})
+                                      "model": "test-embed", "enabled": True,
+                                      "chunk": dict(EMBED_CHUNK)})
                 out = io.StringIO()
                 from peekseed.__main__ import main
                 with contextlib.redirect_stdout(out):

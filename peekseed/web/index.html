@@ -896,6 +896,8 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   border:1px solid var(--line);border-radius:8px;padding:8px 9px;font:inherit;
   font-size:12.5px;font-weight:400;min-width:0;width:100%;}
 .set-wide{grid-column:1/-1;}
+.set-chunk{display:flex;gap:6px;}
+.set-chunk input{flex:1;min-width:0;}
 .set-check{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text);
   grid-column:1/-1;font-weight:400;}
 .set-check input{flex:none;width:auto;min-height:0;}
@@ -1706,6 +1708,14 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
           <label class="set-field" id="setModelField"><span>Model
             <span style="font-weight:400;opacity:.75">(provider model id)</span></span>
             <input id="setModel" type="text" placeholder="model-name"></label>
+          <div class="set-field set-wide" id="setChunkField"><span>Chunk sizes for this embedding model
+            <span style="font-weight:400;opacity:.75">(target chars / max chars / images per chunk, max 3;
+            leave blank and the link cannot build an index; locked while it has indexes)</span></span>
+            <div class="set-chunk">
+              <input id="setChunkTarget" type="number" min="1" step="1" placeholder="target 8000" aria-label="target chars">
+              <input id="setChunkMax" type="number" min="1" step="1" placeholder="max 12000" aria-label="max chars">
+              <input id="setChunkImages" type="number" min="1" max="3" step="1" placeholder="images 3" aria-label="images per chunk">
+            </div></div>
           <label class="set-check" id="setEnabledField">
             <input id="setEnabled" type="checkbox" checked> <span>In use (enabled)</span></label>
         </div>
@@ -4241,6 +4251,10 @@ function settingsRow(link,status){
   const bits=['<span class="mono">'+esc(link.base_url||'')+'</span>'];
   if(link.model) bits.push('<span>model <span class="mono">'+esc(link.model)+'</span></span>');
   else if(role!=='rerank') bits.push('<span>no model set</span>');
+  if(role==='embed') bits.push(link.chunk_set
+    ? '<span>chunks <span class="mono">'+esc(link.chunk.target_chars+'/'+link.chunk.max_chars
+      +' chars, ≤'+link.chunk.image_cap+' img')+'</span></span>'
+    : '<span class="bad">no chunk sizes (cannot index)</span>');
   if(link.api_key_set) bits.push('<span>key set</span>');
   else bits.push('<span>no key</span>');
   return '<div class="set-link-row" data-id="'+escAttr(link.id)+'" data-role="'+escAttr(role)+'">'
@@ -4287,6 +4301,24 @@ function setProtocolOptions(role,selected){
 function setSyncFields(){
   const role=$('#setRole').value;
   setProtocolOptions(role,$('#setProtocol').value);
+  setChunkVisible(role);
+}
+function setChunkVisible(role){
+  const field=$('#setChunkField'); if(field) field.style.display=role==='embed'?'':'none';
+}
+function setChunkValues(chunk){
+  $('#setChunkTarget').value=chunk?chunk.target_chars:'';
+  $('#setChunkMax').value=chunk?chunk.max_chars:'';
+  $('#setChunkImages').value=chunk?chunk.image_cap:'';
+}
+/* undefined = some fields blank (incomplete), null = all blank (no sizes). */
+function setChunkPayload(){
+  const raw=[$('#setChunkTarget').value,$('#setChunkMax').value,$('#setChunkImages').value]
+    .map(v=>String(v||'').trim());
+  if(raw.every(v=>!v)) return null;
+  if(raw.some(v=>!v)) return undefined;
+  const [t,m,c]=raw.map(v=>Number(v));
+  return {target_chars:t,max_chars:m,image_cap:c};
 }
 function setResetForm(){
   const form=$('#settingsForm');
@@ -4299,6 +4331,8 @@ function setResetForm(){
   $('#setKey').placeholder='paste a key';
   $('#setKeyHint').textContent='(write-only; blank = none)';
   $('#setModel').value='';
+  setChunkValues(null);
+  setChunkVisible('embed');
   $('#setEnabled').checked=true;
   $('#settingsFormTitle').textContent='Add a model link';
   $('#setSave').textContent='Add link';
@@ -4314,6 +4348,8 @@ function setStartEdit(link){
   $('#setLabel').value=link.label||'';
   $('#setBase').value=link.base_url||'';
   $('#setModel').value=link.model||'';
+  setChunkValues(link.chunk||null);
+  setChunkVisible(link.role);
   $('#setKey').value='';
   $('#setKey').placeholder=link.api_key_set
     ? 'unchanged — leave blank to keep the current key' : 'no key set — paste one';
@@ -4332,6 +4368,7 @@ function setFormPayload(){
                  model:$('#setModel').value.trim(),
                  enabled:$('#setEnabled').checked};
   if(!editId) payload.role=role;
+  if(role==='embed') payload.chunk=setChunkPayload();
   // Omitted api_key = keep the current key on PUT; "" would clear it, so an
   // empty field is simply left out. The page never receives one.
   const key=$('#setKey').value;
@@ -4356,6 +4393,14 @@ function setFormProblem(built){
     return 'That protocol is not supported for the '+SET_ROLE_LABEL[role]+' role.';
   if(role==='embed'&&!p.model)
     return 'An embedding link needs the model name the endpoint serves; it identifies the vector space.';
+  if(role==='embed'&&p.chunk===undefined)
+    return 'Fill in all three chunk sizes (target, max, images) or leave all three blank.';
+  if(role==='embed'&&p.chunk){
+    const c=p.chunk;
+    if(![c.target_chars,c.max_chars,c.image_cap].every(Number.isInteger)
+       ||c.target_chars<1||c.max_chars<c.target_chars||c.image_cap<1||c.image_cap>3)
+      return 'Chunk sizes need whole numbers with 0 < target ≤ max, and 1–3 images per chunk.';
+  }
   return '';
 }
 async function saveSettingsForm(ev){
@@ -4377,7 +4422,18 @@ async function saveSettingsForm(ev){
     if(saved.id) delete SET_TEST[saved.id];
     setResetForm();
     await loadSettings();
-  }catch(e){ settingsMsg('Could not save the link: '+(e.message||e),true); }
+  }catch(e){
+    const msg=String(e.message||e);
+    if(editId&&msg.indexOf('chunk_sizes_locked')>=0
+       &&confirm('This link already has indexes built with its current chunk sizes. '
+                 +'Delete those indexes and save the new sizes? Each dataset must then be indexed again.')){
+      try{
+        await callJSON('/api/links/'+encodeURIComponent(editId)+'/indexes',{method:'DELETE'});
+        $('#setSave').disabled=false;
+        return saveSettingsForm(ev);
+      }catch(e2){ settingsMsg('Could not delete the indexes: '+(e2.message||e2),true); }
+    } else settingsMsg('Could not save the link: '+msg,true);
+  }
   finally{ $('#setSave').disabled=false; }
 }
 async function settingsAction(linkId,act){
@@ -4501,7 +4557,7 @@ $('#settingsLinks').addEventListener('click',function(ev){
   const row=btn.closest('.set-link-row'); if(!row) return;
   settingsAction(row.getAttribute('data-id'),btn.getAttribute('data-act'));
 });
-$('#setRole').addEventListener('change',()=>{ setProtocolOptions($('#setRole').value,null); });
+$('#setRole').addEventListener('change',()=>{ setProtocolOptions($('#setRole').value,null); setChunkVisible($('#setRole').value); });
 $('#settingsForm').addEventListener('submit',saveSettingsForm);
 $('#setCancel').onclick=()=>{
   const was=!!SET_EDITING;

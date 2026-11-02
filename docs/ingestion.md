@@ -88,8 +88,19 @@ per document `{path, collection, sha256, bytes, pages, status, seen_at}`.
 
 ## Chunk contract (from the peel corpus)
 
-peekseed does not chunk. The canonical unit is the peelfeed corpus chunk; it is
-mapped to peekseed's chunk record per design §4.2:
+peekseed does not chunk. The canonical unit is the peelfeed corpus chunk
+(`chunks.jsonl`, the **reading layer**: UI, answers and agent tools); it is
+mapped to peekseed's chunk record per design §4.2.
+
+The right chunk size depends on the embedding model, so each embed link names
+its `chunk` sizes and an index is embedded from the peel's matching **chunk set**
+(`chunks_all_ver/c<target>-<max>-i<cap>/chunks.jsonl`; links with equal sizes
+share a set). A link without sizes cannot build an index. A peel that lacks the
+set gets it from `peelfeed rebuild --chunk-versions` first (Docling evidence is
+reused; the canonical chunks and conversion id stay the same, so other indexes
+stay fresh); Extract passes the sizes of every embed link. Each embedded row
+records `chunk_set` and `reading_ids` (the canonical chunks it covers), and a
+search hit is returned as those canonical chunks. The record fields:
 
 - required fields unchanged: `id`, `dataset`, `source`, `source_sha256`,
   `page_start`, `page_end`, `section`, `chapter`, `numbering`, `parent`, `path`,
@@ -97,7 +108,7 @@ mapped to peekseed's chunk record per design §4.2:
   `chunker_version`;
 - optional corpus fields carried through: `kind`, `image_paths`, `source_pages`,
   `char_count`, `parts`/`part`, `prev`/`next`, `canonical_ids`, `engine`,
-  `conversion_id`, `peel_id`.
+  `conversion_id`, `peel_id` (+ `chunk_set`, `reading_ids` on index rows).
 
 `doc` keeps the embedding/BM25 semantics: the section path on the first line,
 then the chunk body. `text` is the reader view (page markers, table markdown, row

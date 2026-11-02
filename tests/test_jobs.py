@@ -14,7 +14,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
+                            temp_data_root)
 
 LONG_PAGE = (
     "Widget installation and operation. " * 20
@@ -52,7 +53,7 @@ class JobApiBase(unittest.TestCase):
         response = client.post("/api/links", json={
             "role": "embed", "label": "Fake embed", "protocol": "openai",
             "base_url": fake.openai_base, "model": "test-embed",
-            "enabled": True})
+            "enabled": True, "chunk": dict(EMBED_CHUNK)})
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["link"]
 

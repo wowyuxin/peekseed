@@ -5,7 +5,8 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
+                            temp_data_root)
 
 
 class ApiTests(unittest.TestCase):
@@ -30,8 +31,10 @@ class ApiTests(unittest.TestCase):
     def _add_link(self, client, **overrides):
         payload = {"role": "embed", "label": "Fake embed", "protocol": "openai",
                    "base_url": "http://127.0.0.1:9/v1", "model": "test-embed",
-                   "enabled": True}
+                   "enabled": True, "chunk": dict(EMBED_CHUNK)}
         payload.update(overrides)
+        if payload["role"] != "embed":
+            payload.pop("chunk")
         response = client.post("/api/links", json=payload)
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["link"]
@@ -146,6 +149,36 @@ class ApiTests(unittest.TestCase):
                 "dataset": dataset["id"], "query": "anything"})
             self.assertEqual(response.status_code, 409)
             self.assertIn("embedding link", response.json()["detail"])
+
+    def test_chunk_sizes_gate_indexing_and_are_locked_while_indexed(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            self.root = root
+            client = self._client()
+            link = self._add_link(client, base_url=fake.openai_base, chunk=None)
+            self.assertEqual(link["chunk_set"], "")
+            dataset = self._upload(client)
+            self._extract(dataset["id"])
+            refused = client.post("/api/datasets/%s/index" % dataset["id"], json={})
+            self.assertEqual(refused.status_code, 409, refused.text)
+            self.assertIn("no chunk sizes", refused.json()["detail"])
+            sizes = dict(EMBED_CHUNK)
+            saved = client.put("/api/links/%s" % link["id"], json={"chunk": sizes})
+            self.assertEqual(saved.status_code, 200, saved.text)
+            self.assertEqual(saved.json()["link"]["chunk_set"], "c8000-12000-i3")
+            self._index(client, dataset["id"])
+            indexed = client.get("/api/links/%s/indexes" % link["id"]).json()
+            self.assertEqual(indexed["datasets"], [dataset["id"]])
+            smaller = dict(sizes, target_chars=4000)
+            locked = client.put("/api/links/%s" % link["id"], json={"chunk": smaller})
+            self.assertEqual(locked.status_code, 409, locked.text)
+            self.assertIn("chunk_sizes_locked", locked.json()["detail"])
+            same = client.put("/api/links/%s" % link["id"],
+                              json={"chunk": sizes, "label": "Renamed"})
+            self.assertEqual(same.status_code, 200, same.text)
+            removed = client.delete("/api/links/%s/indexes" % link["id"])
+            self.assertEqual(removed.json()["removed"], [dataset["id"]])
+            changed = client.put("/api/links/%s" % link["id"], json={"chunk": smaller})
+            self.assertEqual(changed.status_code, 200, changed.text)
 
     def test_ask_stream_and_history(self):
         with temp_data_root() as root, FakeModelServer(dim=8) as fake:
@@ -276,7 +309,7 @@ class IndexGateTests(unittest.TestCase):
             client.post("/api/links", json={
                 "role": "embed", "label": "Fake", "protocol": "openai",
                 "base_url": fake.openai_base, "model": "test-embed",
-                "enabled": True})
+                "enabled": True, "chunk": dict(EMBED_CHUNK)})
             index = client.post("/api/datasets/%s/index" % dataset["id"], json={})
             self.assertEqual(index.status_code, 409, index.text)
             self.assertIn("no_extracted_sources", index.json()["detail"])
@@ -308,7 +341,8 @@ class ProbeQueryGateTests(unittest.TestCase):
     def _add_link(self, client, base_url):
         response = client.post("/api/links", json={
             "role": "embed", "label": "Fake embed", "protocol": "openai",
-            "base_url": base_url, "model": "test-embed", "enabled": True})
+            "base_url": base_url, "model": "test-embed", "enabled": True,
+            "chunk": dict(EMBED_CHUNK)})
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["link"]
 
@@ -443,7 +477,7 @@ class LocalModelControlErrorsTests(unittest.TestCase):
         response = client.post("/api/links", json={
             "role": "embed", "label": "Panel embed", "protocol": "custom",
             "base_url": "http://127.0.0.1:9", "model": "fake-model",
-            "enabled": True})
+            "enabled": True, "chunk": dict(EMBED_CHUNK)})
         self.assertEqual(response.status_code, 201, response.text)
         return response.json()["link"]
 
@@ -523,7 +557,7 @@ class LocalModelControlTests(unittest.TestCase):
     def _add_link(self, client, **overrides):
         payload = {"role": "embed", "label": "Fake embed", "protocol": "openai",
                    "base_url": "http://127.0.0.1:9/v1", "model": "test-embed",
-                   "enabled": True}
+                   "enabled": True, "chunk": dict(EMBED_CHUNK)}
         payload.update(overrides)
         response = client.post("/api/links", json=payload)
         self.assertEqual(response.status_code, 201, response.text)

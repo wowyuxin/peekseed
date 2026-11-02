@@ -216,6 +216,62 @@ def _link_url_problem(payload):
     return security.validate_url(url)
 
 
+def _embed_chunk_sizes():
+    """Chunk sizes of every embed link that has them (peelfeed builds one set per size)."""
+    try:
+        sizes = [link["chunk"] for link in links.links("embed") if link.get("chunk")]
+    except links.LinkConfigError:
+        return None
+    return sizes or None
+
+
+def _space_indexed(space):
+    """Dataset ids that have an index directory for one embedding space."""
+    root = config.paths().datasets_dir
+    try:
+        names = sorted(path.name for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return []
+    return [name for name in names if DATASET_ID_RE.match(name)
+            and (root / name / "index" / space).is_dir()]
+
+
+def _existing_link(link_id):
+    try:
+        link = links.get(link_id)
+    except links.LinkConfigError as exc:
+        _link_config_500(exc)
+    if link is None:
+        raise HTTPException(404, "no link with id '%s'" % link_id)
+    return link
+
+
+def _guard_chunk_change(link_id, payload):
+    """409 when an edit changes the chunk sizes of an embed link that has indexes.
+
+    Those indexes were embedded from the old chunk set; they must be deleted
+    (``DELETE /api/links/<id>/indexes``) before the sizes may change.
+    """
+    if not isinstance(payload, dict) or "chunk" not in payload:
+        return
+    try:
+        existing = links.get(link_id)
+    except links.LinkConfigError:
+        return
+    if existing is None or existing.get("role") != "embed":
+        return
+    proposed, errors = links.validate(payload, existing=existing)
+    if errors or proposed.get("chunk") == existing.get("chunk"):
+        return
+    indexed = _space_indexed(links.embed_space_key(existing))
+    if indexed:
+        raise HTTPException(
+            409, "chunk_sizes_locked: link '%s' has indexes built with chunk set %s "
+                 "(datasets: %s); delete them first (DELETE /api/links/%s/indexes)."
+                 % (link_id, links.chunk_set_name(existing.get("chunk")) or "none",
+                    ", ".join(indexed), link_id))
+
+
 def _clip(text, limit):
     text = (text or "").strip()
     if len(text) <= limit:
@@ -265,8 +321,7 @@ def _result_label(meta):
     return head
 
 
-def _result_row(rank, dataset, index, position, score):
-    meta = index.meta[position]
+def _result_row(rank, dataset, index, meta, score):
     return {
         "rank": rank,
         "score": round(float(score), 4),
@@ -700,9 +755,10 @@ def _run_search(req, on_stage=None):
     except ValueError as exc:
         raise HTTPException(409, str(exc))
 
-    results = [_result_row(rank, dataset, index, position, score)
-               for rank, (position, score) in enumerate(
-                   zip(order[:topk], scores[:topk]), start=1)]
+    results = [_result_row(rank, dataset, index, record, score)
+               for rank, (record, score) in enumerate(
+                   store().reading_hits(dataset, index, order, scores, topk),
+                   start=1)]
     timings = dict(timings or {})
     timings["probe_sec"] = round(probe_sec, 4)
     timings["embed_sec"] = round(embed_sec, 4)
@@ -988,11 +1044,11 @@ def _agent_semantic(dataset, query, k):
         if index is None:
             return None
         qvec = _embed_query(link, query)
+        top = max(1, min(int(k or 5), 10))
         order, _reranked, scores, _timings = index.search(
-            qvec, query, max(1, min(int(k or 5), 10)),
+            qvec, query, top,
             rerank_pool=0, rerank_batch=RERANK_BATCH, rerank=False)
-        return [(index.meta[position], float(score))
-                for position, score in zip(order, scores)]
+        return store().reading_hits(dataset, index, order, scores, top)
     except Exception as exc:  # noqa: BLE001 - degrade to keyword ranking
         LOG.warning("agent semantic search failed: %s: %s",
                     type(exc).__name__, exc)
@@ -1483,6 +1539,7 @@ def create_app():
             "profile": body.get("profile") or None,
             "llm_mode": body.get("llm_mode") or cfg["llm_mode"],
             "chunk_profile": body.get("chunk_profile") or cfg["chunk_profile"],
+            "chunk_versions": _embed_chunk_sizes(),
             "force": bool(body.get("force")),
         }
         source_sha = str(entry.get("sha256") or "").lower()
@@ -1513,6 +1570,7 @@ def create_app():
                       profile=request["profile"],
                       llm_mode=request["llm_mode"],
                       chunk_profile=request["chunk_profile"],
+                      chunk_versions=request["chunk_versions"],
                       force=request["force"])),
             name="peel-extract-%s" % source_sha[:8], daemon=True).start()
         return {
@@ -1818,6 +1876,10 @@ def create_app():
                 "Sources: %s" % (dataset_id, names),
             )
         link = _index_link((payload or {}).get("link"))
+        try:
+            ingest.link_chunk_sizes(link)
+        except ingest.NoChunkSizes as exc:
+            raise HTTPException(409, str(exc))
         jobs_dir = config.ensure().jobs_dir
         lock = ingest.CollectionLock(jobs_dir, dataset_id)
         try:
@@ -1974,6 +2036,7 @@ def create_app():
         problem = _link_url_problem(payload)
         if problem:
             raise HTTPException(400, problem)
+        _guard_chunk_change(link_id, payload)
         try:
             link = links.update(link_id, payload or {})
         except KeyError:
@@ -1993,6 +2056,35 @@ def create_app():
         if not deleted:
             raise HTTPException(404, "no link with id '%s'" % link_id)
         return {"deleted": link_id}
+
+    @app.get("/api/links/{link_id}/indexes")
+    def links_indexes(link_id: str):
+        """The datasets that have an index built with this embed link."""
+        link = _existing_link(link_id)
+        return {"link": link_id, "space": links.embed_space_key(link),
+                "datasets": _space_indexed(links.embed_space_key(link))}
+
+    @app.delete("/api/links/{link_id}/indexes")
+    def links_indexes_delete(link_id: str):
+        """Delete every index built with this embed link (e.g. to change its chunk sizes)."""
+        link = _existing_link(link_id)
+        space = links.embed_space_key(link)
+        jobs_dir = config.ensure().jobs_dir
+        removed = []
+        for dataset_id in _space_indexed(space):
+            lock = ingest.CollectionLock(jobs_dir, dataset_id)
+            try:
+                lock.acquire()
+            except ingest.CollectionBusy as exc:
+                raise HTTPException(409, str(exc))
+            try:
+                shutil.rmtree(str(config.paths().datasets_dir / dataset_id / "index"
+                                  / space), ignore_errors=True)
+                removed.append(dataset_id)
+            finally:
+                lock.release()
+        reload_store()
+        return {"link": link_id, "space": space, "removed": removed}
 
     @app.post("/api/links/{link_id}/use")
     def links_use(link_id: str, payload: Optional[dict] = None):

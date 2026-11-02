@@ -366,9 +366,42 @@ def _peel_slug(name):
     return text.strip("-._")[:40] or "peel"
 
 
+#: The chunk sizes test embed links use (peelfeed set ``c8000-12000-i3``).
+EMBED_CHUNK = {"target_chars": 8000, "max_chars": 12000, "image_cap": 3}
+
+
+def write_chunk_sets(corpus, chunks, chunk_sets, conversion_id):
+    """Write ``versions.json`` + ``chunks_all_ver/<set>/chunks.jsonl`` like peelfeed.
+
+    Every set re-packs the canonical chunks one-to-one (enough for the indexer),
+    with set-specific ids and the canonical unit ids in ``canonical_ids``.
+    """
+    corpus = Path(corpus)
+    versions = {}
+    for sizes in chunk_sets:
+        name = "c%d-%d-i%d" % (sizes["target_chars"], sizes["max_chars"],
+                               sizes["image_cap"])
+        versions[name] = {"dir": name,
+                          "chunk_target_chars": sizes["target_chars"],
+                          "chunk_max_chars": sizes["max_chars"],
+                          "rerank_img_cap": sizes["image_cap"],
+                          "conversion_id": conversion_id,
+                          "chunk_count": len(chunks)}
+        rows = [dict(chunk, id="fake-%s-%06d" % (name, number),
+                     canonical_ids=[str(chunk.get("id") or "")])
+                for number, chunk in enumerate(chunks, start=1)]
+        feed = corpus / "chunks_all_ver" / name / "chunks.jsonl"
+        feed.parent.mkdir(parents=True, exist_ok=True)
+        feed.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n"
+                                for row in rows), encoding="utf-8")
+    registry = {"active": next(iter(versions), ""), "versions": versions,
+                "conversion_id": conversion_id}
+    (corpus / "versions.json").write_text(json.dumps(registry), encoding="utf-8")
+
+
 def make_peel(dataset, *, pages=None, source=None, profile="generic",
               validation_errors=None, peel_root=None, engine="peelfeed-test@1",
-              conversion_salt="1", chunks=None):
+              conversion_salt="1", chunks=None, chunk_sets=(EMBED_CHUNK,)):
     """Create a fake peelfeed peel for one dataset source and mark it extracted.
 
     ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. The peel is
@@ -508,6 +541,8 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
         + ("\n" if chunks else ""),
         encoding="utf-8",
     )
+    if chunk_sets:
+        write_chunk_sets(corpus, chunks, chunk_sets, conversion_id)
     entry["status"] = "extracted"
     entry["pages"] = len(pages)
     entry["extraction"] = {

@@ -42,6 +42,30 @@ class LinkStoreTests(unittest.TestCase):
                 with self.assertRaises(links.LinkValidationError, msg=case):
                     links.create(case)
 
+    def test_embed_chunk_sizes_are_validated_and_name_a_chunk_set(self):
+        with temp_data_root():
+            links = self._links()
+            sizes = {"target_chars": 8000, "max_chars": 12000, "image_cap": 3}
+            saved = links.create(self._make(chunk=sizes))
+            self.assertEqual(saved["chunk"], sizes)
+            masked = links.mask(saved)
+            self.assertEqual((masked["chunk"], masked["chunk_set"]), (sizes, "c8000-12000-i3"))
+            plain = links.create(self._make(label="No sizes"))
+            self.assertIsNone(plain["chunk"])
+            self.assertEqual(links.mask(plain)["chunk_set"], "")
+            kept = links.update(saved["id"], {"label": "Renamed"})
+            self.assertEqual(kept["chunk"], sizes)
+            self.assertIsNone(links.update(saved["id"], {"chunk": None})["chunk"])
+            bad = [dict(sizes, target_chars=0), dict(sizes, max_chars=100),
+                   dict(sizes, image_cap=4), dict(sizes, image_cap=True),
+                   {"target_chars": 8000, "max_chars": 12000}, "8000/12000/3"]
+            for chunk in bad:
+                with self.assertRaises(links.LinkValidationError, msg=chunk):
+                    links.create(self._make(label="Bad", chunk=chunk))
+            with self.assertRaises(links.LinkValidationError):
+                links.create({"role": "answer", "label": "Chat", "protocol": "openai",
+                              "base_url": "http://127.0.0.1:8888/v1", "chunk": sizes})
+
     def test_ssrf_guard_rejects_metadata_link_local_and_bad_schemes(self):
         """links.validate() itself enforces the SSRF guard (not just the app)."""
         with temp_data_root():

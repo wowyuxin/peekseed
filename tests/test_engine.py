@@ -4,7 +4,8 @@ from pathlib import Path
 
 import numpy as np
 
-from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
+                            temp_data_root)
 
 
 class DatasetIndexTests(unittest.TestCase):
@@ -106,7 +107,8 @@ class IndexStoreTests(unittest.TestCase):
             make_peel(dataset, pages=["Widget text about buttons."])
             link = {"id": "fake", "role": "embed", "label": "Fake",
                     "protocol": "openai", "base_url": fake.openai_base,
-                    "model": "test-embed", "api_key": "", "enabled": True}
+                    "model": "test-embed", "api_key": "", "enabled": True,
+                    "chunk": dict(EMBED_CHUNK)}
             info = ingest.build_index(dataset["dir"], link)
 
             from peekseed.engine import IndexStore

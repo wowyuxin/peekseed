@@ -11,7 +11,8 @@ import os
 import unittest
 from pathlib import Path
 
-from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
+                            temp_data_root)
 
 
 def embed_link(fake, model="test-embed", **extra):
@@ -19,6 +20,7 @@ def embed_link(fake, model="test-embed", **extra):
         "id": "fake", "role": "embed", "label": "Fake",
         "protocol": "openai", "base_url": fake.openai_base,
         "model": model, "api_key": "", "enabled": True,
+        "chunk": dict(EMBED_CHUNK),
     }
     link.update(extra)
     return link
@@ -281,12 +283,97 @@ class IndexBuildTests(unittest.TestCase):
             make_peel(dataset, pages=["Hello custom embedder."])
             link = {"id": "custom", "role": "embed", "label": "Custom",
                     "protocol": "custom", "base_url": fake.base,
-                    "model": "custom-embed", "api_key": "", "enabled": True}
+                    "model": "custom-embed", "api_key": "", "enabled": True,
+                    "chunk": dict(EMBED_CHUNK)}
             info = ingest.build_index(dataset["dir"], link)
             self.assertEqual(info["protocol"], "custom")
             self.assertEqual(info["dim"], 4)
             paths = [path for path, _body, _headers in fake.requests]
             self.assertIn("/embed", paths)
+
+
+class ChunkSetTests(unittest.TestCase):
+    """An index embeds the chunk set of its link's sizes; hits map to canonical chunks."""
+
+    PAGES = ["Installation. The widget is mounted with two screws.",
+             "Operation. Press the green button to start."]
+
+    def _dataset(self, root, chunk_sets=(EMBED_CHUNK,)):
+        from peekseed import config, ingest
+        dataset = ingest.create_dataset(config.paths(), "Docs")
+        ingest.add_source(dataset, make_pdf(root / "manual.pdf", pages=self.PAGES))
+        peel = make_peel(dataset, pages=self.PAGES, chunk_sets=chunk_sets)
+        return dataset, peel
+
+    def test_a_link_without_chunk_sizes_cannot_build_an_index(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed import ingest
+            dataset, _peel = self._dataset(root)
+            link = embed_link(fake)
+            link.pop("chunk")
+            with self.assertRaises(ingest.NoChunkSizes) as caught:
+                ingest.build_index(dataset["dir"], link)
+            self.assertIn("no chunk sizes", str(caught.exception))
+            self.assertEqual(fake.requests, [])
+
+    def test_index_embeds_the_link_set_and_maps_rows_to_canonical_chunks(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed import ingest
+            small = {"target_chars": 1500, "max_chars": 2000, "image_cap": 1}
+            dataset, _peel = self._dataset(root, chunk_sets=(EMBED_CHUNK, small))
+            info = ingest.build_index(dataset["dir"], embed_link(fake, chunk=small))
+            self.assertEqual((info["chunker"]["target_chars"], info["chunker"]["max_chars"],
+                              info["chunker"]["image_cap"]), (1500, 2000, 1))
+            generation = (Path(dataset["dir"]) / "index" / info["space"] / "generations"
+                          / info["generation"])
+            meta = json.loads((generation / "meta.json").read_text())
+            canonical = ingest.read_chunks(dataset["dir"])
+            self.assertEqual({row["chunk_set"] for row in meta}, {"c1500-2000-i1"})
+            self.assertEqual([row["reading_ids"] for row in meta],
+                             [[chunk["id"]] for chunk in canonical])
+            self.assertFalse({row["id"] for row in meta} & {c["id"] for c in canonical})
+            again = ingest.build_index(dataset["dir"], embed_link(fake, chunk=small))
+            self.assertTrue(again["up_to_date"])
+
+    def test_a_missing_chunk_set_is_built_by_peelfeed_first(self):
+        from unittest import mock
+        from tests.fixtures import write_chunk_sets
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed import ingest, peelfeed
+            dataset, peel = self._dataset(root)
+            small = {"target_chars": 1500, "max_chars": 2000, "image_cap": 1}
+            calls = []
+
+            class Engine:
+                def rebuild(self, peel_id, reasons=None, chunk_versions=None):
+                    calls.append((peel_id, list(chunk_versions)))
+                    corpus = Path(peel["peel_dir"]) / "extract" / "corpus"
+                    chunks = [json.loads(line) for line in
+                              (corpus / "chunks.jsonl").read_text().splitlines()]
+                    write_chunk_sets(corpus, chunks, chunk_versions, peel["conversion_id"])
+                    return {"ok": True}
+
+            with mock.patch.object(peelfeed, "client", return_value=Engine()):
+                info = ingest.build_index(dataset["dir"], embed_link(fake, chunk=small))
+            self.assertEqual(calls, [(peel["peel_id"], [EMBED_CHUNK, small])])
+            self.assertEqual(info["n"], 2)
+
+    def test_search_hits_map_to_the_canonical_chunks_they_cover(self):
+        from peekseed.engine import DatasetIndex, IndexStore
+        with temp_data_root():
+            from peekseed import config, ingest
+            dataset = ingest.create_dataset(config.paths(), "Docs")
+            ids = ["a" * 16, "b" * 16]
+            (Path(dataset["dir"]) / "chunks.jsonl").write_text("".join(
+                json.dumps({"id": chunk_id, "text": chunk_id}) + "\n" for chunk_id in ids))
+            meta = [{"id": "s1", "reading_ids": ids}, {"id": "s2", "reading_ids": ids[:1]},
+                    {"id": ids[1]}]
+            index = DatasetIndex(dataset["id"], "space", meta=meta,
+                                 vectors=[[1.0, 0.0]] * 3)
+            store = IndexStore(config.paths().datasets_dir)
+            hits = store.reading_hits(dataset["id"], index, [1, 0, 2], [0.9, 0.8, 0.7], 5)
+            self.assertEqual([(record["id"], score) for record, score in hits],
+                             [(ids[0], 0.9), (ids[1], 0.8)])
 
     def test_embed_texts_rejects_bad_response_length(self):
         with temp_data_root(), FakeModelServer(dim=8) as fake:
@@ -300,7 +387,8 @@ class IndexBuildTests(unittest.TestCase):
 def embed_link_stub():
     return {"id": "fake", "role": "embed", "label": "Fake",
             "protocol": "openai", "base_url": "http://127.0.0.1:9/v1",
-            "model": "test-embed", "api_key": "", "enabled": True}
+            "model": "test-embed", "api_key": "", "enabled": True,
+            "chunk": dict(EMBED_CHUNK)}
 
 
 if __name__ == "__main__":

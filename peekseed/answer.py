@@ -300,12 +300,16 @@ def _clip(text: str, max_chars: int) -> str:
 
 
 def _chunk_records(store: Any, dataset: str) -> Dict[str, Dict[str, Any]]:
-    """Chunk metadata for a dataset, keyed by chunk id, from every loaded space.
+    """Chunk records for a dataset keyed by id, to recover a chunk's full text.
 
-    All embedding spaces of one dataset describe the same chunks, so the first
-    copy wins; the lookup is only used to recover a chunk's full text.
+    Search results name canonical chunks (``chunks.jsonl``, the reading layer);
+    index rows of every loaded space are a fallback for older results.
     """
     records: Dict[str, Dict[str, Any]] = {}
+    try:
+        records.update(store.reading(dataset) if store is not None else {})
+    except Exception:  # noqa: BLE001 - a lookup must not break the answer
+        pass
     try:
         indexes = store.for_dataset(dataset) if store is not None else []
     except Exception:  # noqa: BLE001 - a lookup must not break the answer

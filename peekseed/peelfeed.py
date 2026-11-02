@@ -738,7 +738,7 @@ class PeelfeedClient(object):
 
     # --- long operations (run in a worker thread by the API) ---
     def ingest(self, source_path, profile=None, llm_mode=None,
-               chunk_profile=None, force=False, timeout=None):
+               chunk_profile=None, force=False, timeout=None, chunk_versions=None):
         args = ["ingest", str(source_path)]
         if profile:
             args.extend(["--profile", str(profile)])
@@ -746,16 +746,21 @@ class PeelfeedClient(object):
             args.extend(["--llm", str(llm_mode)])
         if chunk_profile:
             args.extend(["--chunk-profile", str(chunk_profile)])
+        if chunk_versions:
+            args.extend(["--chunk-versions", json.dumps(list(chunk_versions))])
         if force:
             # The CLI has --rebuild (rebuild the corpus even when it looks
             # fresh) rather than a literal --force; this is the force semantics.
             args.append("--rebuild")
         return self._run(args, timeout=timeout or self.timeout)
 
-    def rebuild(self, peel_id, reasons=None, timeout=None):
+    def rebuild(self, peel_id, reasons=None, timeout=None, chunk_versions=None):
+        """``chunk_versions`` (a list of chunk sizes) replaces the peel's chunk-set table."""
         args = ["rebuild", str(peel_id)]
         for reason in reasons or []:
             args.extend(["--reason", str(reason)])
+        if chunk_versions:
+            args.extend(["--chunk-versions", json.dumps(list(chunk_versions))])
         return self._run(args, timeout=timeout or self.timeout)
 
     # --- short operations ---

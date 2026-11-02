@@ -17,7 +17,7 @@ import os
 import time
 import unittest
 
-from tests.fixtures import (FakeModelServer, FakePeelfeedCli, make_pdf,
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, FakePeelfeedCli, make_pdf,
                             make_peel, temp_data_root)
 
 _PEELFEED_ENV_KEYS = ("PEEKSEED_PEELFEED_CLI", "PEEKSEED_PEELFEED_PYTHON",
@@ -111,7 +111,8 @@ def _wait_job(client, job_id, timeout=20.0):
 def _add_embed_link(client, fake):
     response = client.post("/api/links", json={
         "role": "embed", "label": "Fake embed", "protocol": "openai",
-        "base_url": fake.openai_base, "model": "test-embed", "enabled": True})
+        "base_url": fake.openai_base, "model": "test-embed", "enabled": True,
+        "chunk": dict(EMBED_CHUNK)})
     assert response.status_code == 201, response.text
     return response.json()["link"]
 
@@ -310,7 +311,8 @@ class CliAdapterTests(unittest.TestCase):
                 caps = engine.capabilities()
                 self.assertEqual(caps["engine"], "peelfeed")
                 result = engine.ingest(str(source), llm_mode="off",
-                                       chunk_profile="default")
+                                       chunk_profile="default",
+                                       chunk_versions=[EMBED_CHUNK])
                 self.assertTrue(result["ok"])
                 self.assertEqual(result["peel"]["state"], "ready")
                 self.assertEqual(result["peel"]["source"]["pages"], 2)
@@ -349,6 +351,8 @@ class CliAdapterTests(unittest.TestCase):
                 self.assertIn("--llm", ingest_call["argv"])
                 self.assertIn("off", ingest_call["argv"])
                 self.assertIn("--chunk-profile", ingest_call["argv"])
+                sizes = ingest_call["argv"][ingest_call["argv"].index("--chunk-versions") + 1]
+                self.assertEqual(json.loads(sizes), [EMBED_CHUNK])
                 decide_call = next(call for call in calls
                                    if call["argv"][0] == "decide")
                 self.assertIn("accept", decide_call["argv"])

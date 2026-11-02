@@ -77,12 +77,14 @@ from .errors import IngestError
 __all__ = [
     "IndexCancelled",
     "NeedsReindex",
+    "NoChunkSizes",
     "NoExtractedSources",
     "ProbeMismatch",
     "PROBE_MIN_COSINE",
     "active_job_for",
     "add_source",
     "build_index",
+    "chunk_set_name",
     "create_dataset",
     "dataset_dir",
     "dataset_indexes",
@@ -94,6 +96,7 @@ __all__ = [
     "index_state",
     "job_cancel_requested",
     "job_path",
+    "link_chunk_sizes",
     "list_jobs",
     "load_index",
     "mark_interrupted_jobs",
@@ -192,7 +195,13 @@ _META_PEEL_FIELDS = (
     "engine",
     "conversion_id",
     "peel_id",
+    # Chunk-set rows: the set they belong to and the canonical (reading-layer)
+    # chunk ids in ``chunks.jsonl`` that a search hit maps back to.
+    "chunk_set",
+    "reading_ids",
 )
+#: The embed link's chunk sizes; they select the peelfeed chunk set to index.
+CHUNK_KEYS = ("target_chars", "max_chars", "image_cap")
 _INVALID_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _HTTP_STATUS = re.compile(r"HTTP (\d{3})")
 
@@ -218,6 +227,12 @@ class NoExtractedSources(IngestError):
 
 class ProbeMismatch(IngestError):
     """The live embedder does not reproduce the index's stored probe vector."""
+
+
+class NoChunkSizes(IngestError):
+    """The embed link names no chunk sizes, so there is no chunk set to index."""
+
+    code = "no_chunk_sizes"
 
 
 class IndexCancelled(IngestError):
@@ -1687,16 +1702,18 @@ def mark_interrupted_jobs(jobs_dir):
     return interrupted
 
 
-def _collect_corpus_chunks(dataset_dir, dataset):
+def _collect_corpus_chunks(dataset_dir, dataset, sizes=None):
     """Read every extracted source's peel corpus into one chunk sequence.
 
-    Returns ``(chunks, peels, skipped)`` where ``peels`` names the peels read and
-    ``skipped`` lists every source that could not contribute (with a reason), so
-    callers can report them instead of silently dropping data.
+    Returns ``(chunks, set_chunks, peels, skipped)``: the canonical chunks, the
+    rows of the chunk set for ``sizes`` (empty without sizes), the peels read,
+    and every source that could not contribute (with a reason), so callers can
+    report them instead of silently dropping data.
     """
     dataset_id = str(dataset.get("id") or Path(dataset_dir).name)
     root = peel_root()
     chunks = []
+    set_chunks = []
     peels = []
     skipped = []
     for entry in _source_entries(dataset.get("sources")):
@@ -1711,8 +1728,9 @@ def _collect_corpus_chunks(dataset_dir, dataset):
                 reason = "extraction is %s; re-extract it with peelfeed" % state
             skipped.append({"name": name, "state": state, "reason": reason})
             continue
-        peel = _read_peel(dataset_dir, entry, root, dataset_id)
+        peel = _read_peel(dataset_dir, entry, root, dataset_id, sizes)
         chunks.extend(peel["records"])
+        set_chunks.extend(peel["set_records"])
         peels.append({"name": name, "peel": peel["peel"]})
     if not chunks:
         raise NoExtractedSources(
@@ -1721,7 +1739,14 @@ def _collect_corpus_chunks(dataset_dir, dataset):
             "first." % dataset_id,
             skipped=skipped,
         )
-    return chunks, peels, skipped
+    return chunks, set_chunks, peels, skipped
+
+
+def _same_chunker(recorded, chunker):
+    """Same chunk contract and, when the build names them, the same chunk sizes."""
+    recorded = recorded if isinstance(recorded, dict) else {}
+    keys = ("name", "version") + tuple(key for key in CHUNK_KEYS if key in chunker)
+    return all(recorded.get(key) == chunker.get(key) for key in keys)
 
 
 def _current_info_if_up_to_date(dataset_dir, space, n, digest, corpus, chunker,
@@ -1732,15 +1757,13 @@ def _current_info_if_up_to_date(dataset_dir, space, n, digest, corpus, chunker,
     except NeedsReindex:
         return None
     info = loaded["info"]
-    recorded_chunker = info.get("chunker") if isinstance(info.get("chunker"), dict) else {}
     if int(info.get("n") or 0) != int(n):
         return None
     if str(info.get("documents_digest") or "") != str(digest):
         return None
     if str(info.get("corpus_digest") or "") != str(corpus):
         return None
-    if (recorded_chunker.get("name"), recorded_chunker.get("version")) != (
-            chunker.get("name"), chunker.get("version")):
+    if not _same_chunker(info.get("chunker"), chunker):
         return None
     if (info.get("extractor") or {}) != extractor:
         return None
@@ -1880,6 +1903,111 @@ def _peel_source_file(peel_dir, name):
     return files[0] if len(files) == 1 else None
 
 
+# --- chunk sets ------------------------------------------------------------
+
+_SET_DIR = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$")
+
+
+def link_chunk_sizes(link):
+    """The embed link's chunk sizes; a link that names none cannot build an index."""
+    sizes = (link or {}).get("chunk")
+    if not isinstance(sizes, dict) or any(
+            isinstance(sizes.get(key), bool) or not isinstance(sizes.get(key), int)
+            for key in CHUNK_KEYS):
+        raise NoChunkSizes(
+            "embed link '%s' has no chunk sizes; set target chars, max chars and "
+            "image cap on the link (Settings > Model links) before building an "
+            "index." % str((link or {}).get("id") or ""))
+    return {key: int(sizes[key]) for key in CHUNK_KEYS}
+
+
+def chunk_set_name(sizes):
+    """The peelfeed chunk set for these sizes, e.g. ``c8000-12000-i3``."""
+    return "c%d-%d-i%d" % tuple(int(sizes[key]) for key in CHUNK_KEYS)
+
+
+def _peel_chunk_sets(corpus_dir):
+    """``{set dir: sizes}`` recorded in a corpus' ``versions.json``."""
+    registry = _read_json(Path(corpus_dir) / "versions.json", None)
+    versions = registry.get("versions") if isinstance(registry, dict) else None
+    sets = {}
+    for name, version in (versions.items() if isinstance(versions, dict) else ()):
+        if not isinstance(version, dict):
+            continue
+        directory = str(version.get("dir") or name)
+        if not _SET_DIR.match(directory):
+            continue
+        try:
+            sets[directory] = {"target_chars": int(version["chunk_target_chars"]),
+                               "max_chars": int(version["chunk_max_chars"]),
+                               "image_cap": int(version["rerank_img_cap"])}
+        except (KeyError, TypeError, ValueError):
+            continue
+    return sets
+
+
+def _find_chunk_set(corpus_dir, sizes):
+    """The corpus' chunk-set directory for ``sizes`` (with its feed), or None."""
+    for directory, recorded in _peel_chunk_sets(corpus_dir).items():
+        feed = Path(corpus_dir) / "chunks_all_ver" / directory / "chunks.jsonl"
+        if recorded == sizes and feed.is_file():
+            return directory
+    return None
+
+
+def _ensure_chunk_sets(dataset_dir, dataset, sizes, notify=None):
+    """Have peelfeed add the link's chunk set to every extracted peel lacking it.
+
+    ``peelfeed rebuild`` reuses the Docling evidence, keeps the recorded sets and
+    leaves the canonical chunks (and normally the conversion id) unchanged, so no
+    other index goes stale. Returns the dataset, re-read when a peel was rebuilt.
+    """
+    root = peel_root()
+    name = chunk_set_name(sizes)
+    rebuilt = False
+    for entry in _source_entries(dataset.get("sources")):
+        block = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
+        peel_id = str(block.get("peel_id") or "")
+        if contracts.extraction_state(entry) != "extracted" or not peel_id:
+            continue
+        try:
+            corpus_dir = _resolve_peel_dir(root, peel_id) / "extract" / "corpus"
+        except IngestError:
+            continue  # _read_peel reports the broken peel with its reason
+        if _find_chunk_set(corpus_dir, sizes) is not None:
+            continue
+        table = list(_peel_chunk_sets(corpus_dir).values())
+        if sizes not in table:
+            table.append(sizes)
+        source = str(entry.get("name") or "")
+        if notify is not None:
+            notify(0.01, "Building chunk set %s for %s" % (name, source))
+        try:
+            from .. import peelfeed
+
+            peelfeed.client().rebuild(
+                peel_id, reasons=["chunk set %s for an index build" % name],
+                chunk_versions=table)
+        except Exception as exc:  # noqa: BLE001 - report which source and why
+            detail = getattr(exc, "detail", "") or str(exc)
+            raise IngestError(
+                "source '%s' has no chunk set %s and peelfeed could not build it: %s"
+                % (source, name, detail)) from None
+        manifest = _read_json(corpus_dir / "manifest.json", None)
+        conversion = str((manifest or {}).get("conversion_id") or "") \
+            if isinstance(manifest, dict) else ""
+        if conversion and conversion != str(block.get("conversion_id") or ""):
+            update_source(dataset_dir, str(entry.get("sha256") or ""),
+                          extraction=dict(block, conversion_id=conversion))
+        rebuilt = True
+    return _read_dataset_json(Path(dataset_dir)) if rebuilt else dataset
+
+
+def _set_chunk_id(set_name, chunk_id):
+    """A chunk-set row id: unique across sets, never equal to a canonical id."""
+    return hashlib.sha256(("%s|%s" % (set_name, chunk_id)).encode("utf-8")).hexdigest()[:16]
+
+
 def _corpus_chunk_record(raw, entry, dataset_id, position, ordinal, block_map,
                          manifest, peel_id):
     """Map one peelfeed corpus chunk onto peekseed's chunk contract (§4.2).
@@ -1958,7 +2086,7 @@ def _corpus_chunk_record(raw, entry, dataset_id, position, ordinal, block_map,
     return record
 
 
-def _read_peel(dataset_dir, entry, root, dataset_id):
+def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None):
     """Read one extracted source's corpus, refusing anything that fails a gate.
 
     Gates (design §4.6): the peel dir must resolve under ``peel_root``, the
@@ -1966,6 +2094,10 @@ def _read_peel(dataset_dir, entry, root, dataset_id):
     the recorded ``conversion_id`` must match the manifest, and
     ``validation.errors`` must be 0. A failure names the source and the reason;
     it never falls back to re-extracting the PDF.
+
+    ``records`` are the canonical chunks (the reading layer). With ``sizes`` the
+    matching chunk set is read too: ``set_records`` are what gets embedded, each
+    carrying ``reading_ids`` (the canonical chunk ids it covers).
     """
     name = str(entry.get("name") or "")
     extraction = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
@@ -2084,6 +2216,30 @@ def _read_peel(dataset_dir, entry, root, dataset_id):
     pages = _int(counts.get("pages") or manifest.get("pages") or 0, 0)
     for record in records:
         record["engine"] = engine
+    set_records = []
+    if sizes is not None:
+        directory = _find_chunk_set(corpus_dir, sizes)
+        if directory is None:
+            raise IngestError(
+                "source '%s': peel '%s' has no chunk set %s; rebuild it with peelfeed."
+                % (name, peel_id, chunk_set_name(sizes)))
+        feed_label = "chunks_all_ver/%s/chunks.jsonl" % directory
+        reading = {str(raw.get("id") or ""): record["id"]
+                   for raw, record in zip(chunks, records)}
+        for position, raw in enumerate(_read_jsonl(corpus_dir / feed_label, feed_label)):
+            record = _corpus_chunk_record(
+                raw, entry, dataset_id, position, len(set_records) + 1, block_map,
+                manifest, peel_id,
+            )
+            record["id"] = _set_chunk_id(directory, record["id"])
+            record["engine"] = engine
+            record["chunk_set"] = directory
+            record["reading_ids"] = [reading[unit] for unit in record["canonical_ids"]
+                                     if unit in reading]
+            set_records.append(record)
+        if not set_records:
+            raise IngestError("source '%s': peel '%s' chunk set %s is empty."
+                              % (name, peel_id, directory))
     peel_info = {
         "peel_id": peel_id,
         "conversion_id": manifest_conversion,
@@ -2096,8 +2252,8 @@ def _read_peel(dataset_dir, entry, root, dataset_id):
         "pages": pages,
         "assets": len(assets),
     }
-    return {"records": records, "peel": peel_info, "entry": entry,
-            "manifest": manifest}
+    return {"records": records, "set_records": set_records, "peel": peel_info,
+            "entry": entry, "manifest": manifest}
 
 
 # --- source summaries -----------------------------------------------------
@@ -2215,10 +2371,7 @@ def _find_resumable_generation(space_dir, *, space, digest, chunker, n,
             continue
         if corpus is not None and str(progress.get("corpus_digest") or "") != str(corpus):
             continue
-        recorded_chunker = progress.get("chunker") or {}
-        if (recorded_chunker.get("name"), recorded_chunker.get("version")) != (
-            chunker.get("name"), chunker.get("version")
-        ):
+        if not _same_chunker(progress.get("chunker"), chunker):
             continue
         if int(progress.get("n") or -1) != n:
             continue
@@ -2401,6 +2554,10 @@ def build_index(
     it to 409). There is **no in-process extraction fallback**.
 
     ``chunks.jsonl`` is rewritten from the corpus chunks (the canonical input).
+    The vectors are built from the chunk set matching the link's ``chunk`` sizes
+    (:class:`NoChunkSizes` when the link names none); a peel without that set
+    gets it from ``peelfeed rebuild`` first. Each embedded row records the
+    canonical ``reading_ids`` a search hit maps back to.
     An index already built from the same corpora/chunker/extractor is returned
     unchanged, so a second build makes **zero** embedding calls unless
     ``force=True`` (``reindex`` passes it). Then:
@@ -2430,6 +2587,8 @@ def build_index(
     dataset_id = str(dataset.get("id") or dataset_dir.name)
     target = _link_target(link)
     space = embed_space_key(link)
+    sizes = link_chunk_sizes(link)
+    set_name = chunk_set_name(sizes)
     notify = _progress_function(progress)
 
     try:
@@ -2476,24 +2635,27 @@ def build_index(
 
     try:
         notify(0.0, "Reading peel corpora")
-        chunks, peels, skipped = _collect_corpus_chunks(dataset_dir, dataset)
+        dataset = _ensure_chunk_sets(dataset_dir, dataset, sizes, notify)
+        chunks, embedded, peels, skipped = _collect_corpus_chunks(
+            dataset_dir, dataset, sizes)
         dataset = _refresh_extraction(dataset_dir, dataset, peels)
-        total = len(chunks)
-        notify(0.02, "Read %d chunk(s) from %d peel(s)" % (total, len(peels)))
+        total = len(embedded)
+        notify(0.02, "Read %d chunk(s) of set %s from %d peel(s)"
+               % (total, set_name, len(peels)))
         existing_chunks = read_chunks(dataset_dir)
         if existing_chunks != chunks:
             write_chunks(dataset_dir, chunks)
-            notify(0.05, "Wrote %d chunk(s)" % total)
+            notify(0.05, "Wrote %d chunk(s)" % len(chunks))
         if not total:
             raise IngestError("No chunks to index for dataset '%s'." % dataset_id)
 
         sources = _sources_summary(dataset_dir, dataset)
         digest = _documents_digest(sources)
         corpus = _corpus_digest(sources)
-        chunker = contracts.chunker_identity()
+        chunker = contracts.chunker_identity(**sizes)
         extractor = _peel_extractor([item["peel"] for item in peels])
         peel_list = [item["peel"] for item in peels]
-        texts = [_embedding_text(chunk) for chunk in chunks]
+        texts = [_embedding_text(chunk) for chunk in embedded]
 
         space_dir = _space_dir(dataset_dir, space)
         space_dir.mkdir(parents=True, exist_ok=True)
@@ -2550,7 +2712,7 @@ def build_index(
         notify(0.25, "Writing %d metadata row(s)" % total)
         _write_json_atomic(
             generation_dir / "meta.json",
-            [_meta_record(chunk) for chunk in chunks],
+            [_meta_record(chunk) for chunk in embedded],
         )
         vectors = _open_vectors(generation_dir, total, dim)
 

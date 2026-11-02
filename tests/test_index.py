@@ -16,7 +16,8 @@ from pathlib import Path
 import numpy as np
 
 from peekseed import contracts, ingest
-from tests.fixtures import FakeModelServer, make_pdf, make_peel, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
+                            temp_data_root)
 
 
 def embed_link(fake, model="test-embed", **extra):
@@ -29,6 +30,7 @@ def embed_link(fake, model="test-embed", **extra):
         "model": model,
         "api_key": "",
         "enabled": True,
+        "chunk": dict(EMBED_CHUNK),
     }
     link.update(extra)
     return link
