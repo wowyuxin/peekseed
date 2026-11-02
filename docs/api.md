@@ -181,7 +181,8 @@ line: peekseed runs `peelfeed …` as a subprocess and reads JSON from stdout �
 import of peelfeed's code, no daemon, no base URL, no token. Configuration lives
 in `<data_root>/config/peelfeed.json` (0600), seeded once from
 `PEEKSEED_PEELFEED_{CLI,PYTHON,REPO,ENABLED,TIMEOUT,POLL,LLM_MODE,CHUNK_PROFILE}`
-plus `PEELFEED_ROOT`; environment values win over the file.
+plus `PEELFEED_ROOT`; environment values win over the file. `peekseed doctor`/
+`status` only read it (for the workspace they inspect) and never seed it.
 
 ### `GET /api/peelfeed/status`
 
@@ -190,7 +191,7 @@ plus `PEELFEED_ROOT`; environment values win over the file.
             "repo": "/…/peelfeed", "root": "/…/workspace/.peekseed/peels",
             "enabled": true, "configured": true, "timeout": 7200.0,
             "poll": 2.0, "llm_mode": "off", "chunk_profile": "default",
-            "path": "/…/config/peelfeed.json", "seeded": true},
+            "path": "/…/config/peelfeed.json", "present": true, "seeded": true},
  "handshake": {"available": true, "engine": "peelfeed", "version": "0.1.0",
                "cli_protocol": 1, "corpus_schema": 2, "chunk_contract": 1,
                "chunker_version": 1, "formats": ["pdf"],

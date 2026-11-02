@@ -129,8 +129,10 @@ _LOCK = threading.RLock()
 # --- config store ----------------------------------------------------------
 
 
-def config_path():
-    """The peelfeed config file for the current data root."""
+def config_path(root=None):
+    """The peelfeed config file for ``root`` (default: the current data root)."""
+    if root is not None:
+        return Path(root) / "config" / "peelfeed.json"
     return config.paths().config_dir / "peelfeed.json"
 
 
@@ -235,7 +237,7 @@ def _derive_repo(path):
     return ""
 
 
-def _normalize(raw):
+def _normalize(raw, data_root=None):
     """Validate one peelfeed config document (file or env seed)."""
     if not isinstance(raw, dict):
         raise PeelfeedConfigError("the peelfeed config must be a JSON object.")
@@ -258,7 +260,8 @@ def _normalize(raw):
             root_path = root_path.resolve()
         root = str(root_path)
     else:
-        root = str(config.paths().root / "peels")
+        root = str(Path(data_root) / "peels" if data_root is not None
+                   else config.paths().root / "peels")
     enabled_raw = raw.get("enabled")
     if isinstance(enabled_raw, bool):
         enabled = enabled_raw
@@ -293,29 +296,33 @@ def _normalize(raw):
     }
 
 
-def load(force=False):
+def load(force=False, *, root=None, seed=True):
     """The effective peelfeed config: the file with env values layered on top.
 
     A missing file is seeded from the environment and written once with mode
-    0600. A corrupt file raises :class:`PeelfeedConfigError`; callers report it
-    as "extraction unavailable" rather than crashing the service. Environment
-    values win over the file, so a deploy can override the CLI path or root
-    without rewriting it.
+    0600; with ``seed=False`` (read-only callers such as ``doctor``/``status``)
+    nothing is written and the env-derived config is returned. ``root`` selects
+    another data root than the current one. A corrupt file raises
+    :class:`PeelfeedConfigError`; callers report it as "extraction unavailable"
+    rather than crashing the service. Environment values win over the file, so
+    a deploy can override the CLI path or root without rewriting it.
     """
     global _CACHE, _CACHE_KEY, _SEEDED
-    path = config_path()
+    path = config_path(root)
     overrides = _env_overrides()
     with _LOCK:
         try:
             file_key = _signature(path)
         except OSError:
             file_key = None
-        key = (file_key, tuple(sorted(overrides.items())))
+        key = (str(path), file_key, tuple(sorted(overrides.items())))
         if _CACHE is not None and not force and key == _CACHE_KEY:
             return copy.deepcopy(_CACHE)
         if not path.is_file():
+            cfg = _normalize(_env_raw(), root)
+            if not seed:
+                return cfg
             config.ensure()
-            cfg = _normalize(_env_raw())
             config.write_json_atomic(path, cfg, mode=0o600)
             _SEEDED = True
         else:
@@ -330,7 +337,7 @@ def load(force=False):
                     "the peelfeed config must be a JSON object.")
             merged = dict(raw)
             merged.update(overrides)
-            cfg = _normalize(merged)
+            cfg = _normalize(merged, root)
             _SEEDED = False
         _CACHE = cfg
         _CACHE_KEY = key
@@ -342,9 +349,10 @@ def effective():
     return load()
 
 
-def mask(cfg=None):
+def mask(cfg=None, *, root=None):
     """The config as the API/UI may see it (no secrets exist any more)."""
-    cfg = load() if cfg is None else cfg
+    cfg = load(root=root) if cfg is None else cfg
+    path = config_path(root)
     return {
         "cli": cfg["cli"],
         "python": cfg["python"],
@@ -356,7 +364,8 @@ def mask(cfg=None):
         "poll": cfg["poll"],
         "llm_mode": cfg["llm_mode"],
         "chunk_profile": cfg["chunk_profile"],
-        "path": str(config_path()),
+        "path": str(path),
+        "present": path.is_file(),
         "seeded": seeded(),
     }
 
@@ -398,16 +407,16 @@ def _handshake_key(cfg):
     return (_command(cfg), cfg["root"], cfg["enabled"], cfg["timeout"])
 
 
-def handshake(force=False, timeout=None):
+def handshake(force=False, timeout=None, *, cfg=None):
     """Run ``peelfeed capabilities``, cached for 60 seconds.
 
     Never raises: an unconfigured/unreachable engine returns
     ``{"available": False, "error": …}`` so uploads keep working and the UI can
-    disable Extract with an honest banner.
+    disable Extract with an honest banner. ``cfg`` skips :func:`load`.
     """
     global _HANDSHAKE
     try:
-        cfg = load()
+        cfg = load() if cfg is None else cfg
     except PeelfeedConfigError as exc:
         return {
             "available": False,
@@ -495,27 +504,29 @@ def extraction_available():
     return bool(cfg["enabled"] and _command(cfg) and handshake().get("available"))
 
 
-def status(probe=False, timeout=None):
+def status(probe=False, timeout=None, *, root=None, seed=True):
     """The UI/CLI status: config + handshake/capabilities.
 
     ``probe=True`` forces a fresh ``capabilities`` call (read-only commands such
     as ``peekseed status``/``doctor``); a request path uses the 60 s cache.
+    ``root``/``seed`` are passed to :func:`load` (read-only callers use
+    ``seed=False`` so inspecting a workspace never writes into it).
     """
     try:
-        cfg = load()
+        cfg = load(root=root, seed=seed)
     except PeelfeedConfigError as exc:
         return {
-            "config": {"configured": False, "path": str(config_path()),
+            "config": {"configured": False, "path": str(config_path(root)),
                        "seeded": False, "error": str(exc)},
             "handshake": {"available": False, "configured": False,
                           "error": str(exc), "checked_at": contracts.utc_now()},
         }
     if probe:
         result = handshake(force=True,
-                           timeout=timeout or min(10.0, cfg["timeout"]))
+                           timeout=timeout or min(10.0, cfg["timeout"]), cfg=cfg)
     else:
-        result = handshake()
-    return {"config": mask(cfg), "handshake": result}
+        result = handshake(cfg=cfg)
+    return {"config": mask(cfg, root=root), "handshake": result}
 
 
 # --- peel state mapping ----------------------------------------------------

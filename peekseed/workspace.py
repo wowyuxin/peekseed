@@ -642,19 +642,20 @@ def doctor(explicit=None):
         "issues": issues,
         "git": git,
         "links": links,
-        "peelfeed": _peelfeed_report(probe=True),
+        "peelfeed": _peelfeed_report(ws, probe=True),
         "schemas": schemas,
     }
 
 
-def _peelfeed_report(probe=False):
-    """The peelfeed config (CLI/python/root) and, optionally, CLI reachability."""
+def _peelfeed_report(ws, probe=False):
+    """The peelfeed config (CLI/python/root) of ``ws`` and, optionally, CLI reachability."""
     try:
         from . import peelfeed
     except Exception:  # pragma: no cover - optional module
         return {"configured": False, "error": "peelfeed module is unavailable"}
     try:
-        return peelfeed.status(probe=probe, timeout=2.0)
+        return peelfeed.status(probe=probe, timeout=2.0, root=ws.derived_dir,
+                               seed=False)
     except Exception as exc:  # noqa: BLE001 - doctor must not crash
         return {"configured": False,
                 "error": "peelfeed config is not readable (%s)"
@@ -841,7 +842,7 @@ def status_for(ws):
         "workspace": ws.as_dict(),
         "last_scan": None if manifest_error else manifest.get("last_scan"),
         "collections": collections,
-        "peelfeed": _peelfeed_report(probe=False),
+        "peelfeed": _peelfeed_report(ws, probe=False),
         "counts": {
             "documents": len(entries),
             "missing": sum(1 for entry in entries

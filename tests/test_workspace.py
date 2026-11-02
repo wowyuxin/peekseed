@@ -221,8 +221,7 @@ class GitignoreTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("git"), "git is required for this check")
     def test_custom_named_workspace_really_is_ignored(self):
         """A workspace named ``ws`` must be ignored as ``/ws/``, not /workspace/."""
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env(), \
-                working_directory(tmp):
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
             repo = Path(tmp) / "repo"
             repo.mkdir()
             subprocess.run(["git", "init", "-q", str(repo)], check=True,
@@ -299,9 +298,7 @@ class DoctorTests(unittest.TestCase):
                     self.assertNotIn(str(root), issue)
 
     def test_doctor_detects_an_unignored_git_workspace(self):
-        # doctor's peelfeed report resolves the default data root from the cwd.
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env(), \
-                working_directory(tmp):
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
             (Path(tmp) / ".git").mkdir()
             # A .gitignore without the anchored entry: init would add it, so no init.
             (Path(tmp) / ".gitignore").write_text("*.log\n")
@@ -310,6 +307,29 @@ class DoctorTests(unittest.TestCase):
             self.assertFalse(report["git"]["ignored"])
             self.assertTrue(any("not in .gitignore" in issue
                                 for issue in report["issues"]))
+
+    def test_doctor_and_status_never_write_and_use_the_inspected_workspace(self):
+        def snapshot(path):
+            return sorted(str(item.relative_to(path)) for item in path.rglob("*"))
+
+        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+            cwd = Path(tmp) / "cwd"
+            cwd.mkdir()
+            target = Path(tmp) / "ws"
+            with working_directory(cwd):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    workspace.init(str(target))
+                before = snapshot(Path(tmp))
+                doctor = workspace.doctor(str(target))
+                status = workspace.status(str(target))
+            self.assertEqual(snapshot(Path(tmp)), before)
+            expected = target.resolve() / ".peekseed"
+            for report in (doctor, status):
+                config_report = report["peelfeed"]["config"]
+                self.assertEqual(config_report["path"],
+                                 str(expected / "config" / "peelfeed.json"))
+                self.assertFalse(config_report["present"])
+                self.assertEqual(config_report["root"], str(expected / "peels"))
 
 
 class StatusTests(unittest.TestCase):
