@@ -324,6 +324,39 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(client.delete("/api/datasets/%s"
                                            % dataset["id"]).status_code, 404)
 
+    def test_upload_rollback_releases_the_stored_shared_source(self):
+        """A failing second source must not leak the first one's shared file."""
+        import hashlib
+        from unittest import mock
+        from peekseed import app as app_module
+        from peekseed import config, ingest
+        with temp_data_root() as root:
+            self.root = root
+            client = self._client()
+            first = make_pdf(root / "first.pdf", pages=["First widget page."])
+            second = make_pdf(root / "second.pdf", pages=["Second widget page."])
+            real_add_source = app_module.ingest.add_source
+            calls = {"n": 0}
+
+            def flaky(dataset, source_path):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return real_add_source(dataset, source_path)
+                raise ingest.IngestError("boom")
+
+            with mock.patch.object(app_module.ingest, "add_source",
+                                   side_effect=flaky):
+                response = client.post(
+                    "/api/datasets", data={"name": "Docs"},
+                    files=[("files", ("first.pdf", first.read_bytes(),
+                                      "application/pdf")),
+                           ("files", ("second.pdf", second.read_bytes(),
+                                      "application/pdf"))])
+            self.assertEqual(response.status_code, 400, response.text)
+            sha = hashlib.sha256(first.read_bytes()).hexdigest()
+            self.assertFalse((config.paths().sources_dir / sha).exists())
+            self.assertEqual(list(config.paths().datasets_dir.iterdir()), [])
+
 
 class IndexGateTests(unittest.TestCase):
     def _client(self):

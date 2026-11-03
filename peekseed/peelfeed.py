@@ -144,7 +144,7 @@ def seeded():
 
 
 def reset_cache():
-    """Drop the file/handshake caches (tests point PEEKSEED_DATA elsewhere)."""
+    """Drop the file/handshake caches (tests point PEEKSEED_HOME elsewhere)."""
     global _CACHE, _CACHE_KEY, _SEEDED, _HANDSHAKE
     with _LOCK:
         _CACHE = None

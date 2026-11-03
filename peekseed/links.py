@@ -159,11 +159,19 @@ def _base_error(base):
 
 
 def api_key(link):
-    """The API key for ``link``, read from the environment at call time ("" if none)."""
+    """The API key for ``link``, read from the environment at call time ("" if none).
+
+    A malformed value (whitespace or control characters left after stripping)
+    is treated as missing: it would break the HTTP header and error text can
+    echo it. The UI then shows ``key missing (<env>)``.
+    """
     name = str((link or {}).get("api_key_env") or "")
     if not name or not _KEY_ENV_RE.match(name):
         return ""
-    return os.environ.get(name, "")
+    value = (os.environ.get(name) or "").strip()
+    if any(ch.isspace() or ord(ch) < 32 for ch in value):
+        return ""
+    return value
 
 
 def _blank_link(role, label=""):

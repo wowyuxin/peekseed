@@ -129,6 +129,24 @@ class LinkStoreTests(unittest.TestCase):
                 if saved is not None:
                     os.environ["PEEKSEED_ANSWER_API_KEY"] = saved
 
+    def test_api_key_guard_rejects_malformed_env_values(self):
+        with temp_data_root():
+            links = self._links()
+            link = links.create(self._make(api_key_env="PEEKSEED_ANSWER_API_KEY"))
+            saved = os.environ.pop("PEEKSEED_ANSWER_API_KEY", None)
+            try:
+                for bad in ("key with space", "key\nnewline", "key\tvalue"):
+                    os.environ["PEEKSEED_ANSWER_API_KEY"] = bad
+                    self.assertEqual(links.api_key(link), "", bad)
+                    self.assertFalse(links.mask(link)["api_key_set"], bad)
+                os.environ["PEEKSEED_ANSWER_API_KEY"] = "  secret-key  "
+                self.assertEqual(links.api_key(link), "secret-key")
+                self.assertTrue(links.mask(link)["api_key_set"])
+            finally:
+                os.environ.pop("PEEKSEED_ANSWER_API_KEY", None)
+                if saved is not None:
+                    os.environ["PEEKSEED_ANSWER_API_KEY"] = saved
+
     def test_update_keeps_omitted_env_and_can_clear_it(self):
         with temp_data_root():
             links = self._links()

@@ -150,7 +150,7 @@ def history_store():
 
 
 def reset_state():
-    """Drop cached stores (tests point PEEKSEED_DATA at a temp dir).
+    """Drop cached stores (tests point PEEKSEED_HOME at a temp dir).
 
     Job records deliberately survive this: they live on disk and are the API's
     source of truth; only the in-process caches are dropped.
@@ -532,14 +532,16 @@ async def _store_uploads(name, note, files):
             added.append(ingest.add_source(dataset, temp))
         return dataset
     except HTTPException:
-        _release_added(added)
         if dataset is not None and dataset.get("dir"):
             shutil.rmtree(dataset["dir"], ignore_errors=True)
+        # Release only after the dataset is gone: its dataset.json still lists
+        # the sha, so releasing first would keep the shared file.
+        _release_added(added)
         raise
     except Exception as exc:  # noqa: BLE001 - ingestion errors are user-facing
-        _release_added(added)
         if dataset is not None and dataset.get("dir"):
             shutil.rmtree(dataset["dir"], ignore_errors=True)
+        _release_added(added)
         raise HTTPException(400, _http_detail(exc))
     finally:
         shutil.rmtree(str(staging), ignore_errors=True)
