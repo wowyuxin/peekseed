@@ -12,7 +12,7 @@ from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self._env = {}
-        for key in ("PEEKSEED_AGENT", "PEEKSEED_DATA"):
+        for key in ("PEEKSEED_AGENT", "PEEKSEED_HOME", "PEEKSEED_SHARED_DIR"):
             self._env[key] = os.environ.get(key)
 
     def tearDown(self):
@@ -273,11 +273,16 @@ class ApiTests(unittest.TestCase):
 
     def test_dataset_delete(self):
         with temp_data_root() as root, FakeModelServer() as fake:
+            from peekseed import config
             self.root = root
             client = self._client()
             dataset = self._upload(client)
+            shared = config.paths().sources_dir
+            self.assertEqual(len(list(shared.rglob("*.pdf"))), 1)
             self.assertEqual(client.delete("/api/datasets/%s"
                                            % dataset["id"]).status_code, 200)
+            # The shared copy is released once no dataset references it.
+            self.assertEqual(list(shared.rglob("*.pdf")), [])
             self.assertEqual(client.delete("/api/datasets/%s"
                                            % dataset["id"]).status_code, 404)
 

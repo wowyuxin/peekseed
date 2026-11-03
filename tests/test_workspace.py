@@ -1,8 +1,8 @@
-"""Tests for the workspace layout, resolution and maintenance commands.
+"""Tests for the home/shared layout and maintenance commands.
 
-Every test runs in its own temporary directory (or with explicit paths), with
-``PEEKSEED_*`` variables removed and ``config``'s path cache reset, so a real
-user workspace or data root can never be touched.
+Every test runs with its own temporary home and shared folder, with every
+``PEEKSEED_*`` variable removed and ``config``'s path cache reset, so a real
+deployment can never be touched.
 """
 
 import contextlib
@@ -11,7 +11,6 @@ import json
 import os
 import shutil
 import stat
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,21 +19,10 @@ from peekseed import config, contracts, workspace
 
 
 @contextlib.contextmanager
-def working_directory(path):
-    previous = os.getcwd()
-    os.chdir(str(path))
-    try:
-        yield
-    finally:
-        os.chdir(previous)
-
-
-@contextlib.contextmanager
 def clean_peekseed_env():
     """Remove every PEEKSEED_* variable, then restore the process environment."""
     saved = {key: os.environ.pop(key) for key in list(os.environ)
              if key.startswith("PEEKSEED_")}
-    workspace._WARNED.clear()
     config.reset_cache()
     try:
         yield
@@ -42,306 +30,203 @@ def clean_peekseed_env():
         for key in [key for key in os.environ if key.startswith("PEEKSEED_")]:
             os.environ.pop(key, None)
         os.environ.update(saved)
-        workspace._WARNED.clear()
         config.reset_cache()
+
+
+@contextlib.contextmanager
+def temp_layout():
+    """A temporary home + shared folder with both required env vars set."""
+    with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+        home = Path(tmp) / "home"
+        shared = Path(tmp) / "shared"
+        home.mkdir()
+        shared.mkdir()
+        os.environ["PEEKSEED_HOME"] = str(home)
+        os.environ["PEEKSEED_SHARED_DIR"] = str(shared)
+        config.reset_cache()
+        try:
+            yield home, shared
+        finally:
+            config.reset_cache()
 
 
 def _mode(path):
     return stat.S_IMODE(os.stat(str(path)).st_mode)
 
 
-class ResolutionTests(unittest.TestCase):
-    def test_explicit_argument_wins(self):
+class ConfigPathsTests(unittest.TestCase):
+    def test_missing_home_raises(self):
         with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            explicit = Path(tmp) / "chosen"
-            os.environ["PEEKSEED_WORKSPACE"] = str(Path(tmp) / "from-env")
-            ws = workspace.resolve(explicit)
-            self.assertEqual(ws.root, explicit.resolve())
-            self.assertEqual(ws.derived_dir, explicit.resolve() / ".peekseed")
-            self.assertEqual(ws.documents_dir, explicit.resolve() / "documents")
+            os.environ["PEEKSEED_SHARED_DIR"] = tmp
+            with self.assertRaises(config.ConfigError) as info:
+                config.paths()
+            self.assertIn("PEEKSEED_HOME", str(info.exception))
 
-    def test_environment_workspace_is_used(self):
+    def test_missing_shared_raises(self):
         with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            target = Path(tmp) / "from-env"
-            os.environ["PEEKSEED_WORKSPACE"] = str(target)
-            self.assertEqual(workspace.resolve().root, target.resolve())
+            os.environ["PEEKSEED_HOME"] = tmp
+            with self.assertRaises(config.ConfigError) as info:
+                config.paths()
+            self.assertIn("PEEKSEED_SHARED_DIR", str(info.exception))
 
-    def test_default_is_dot_workspace_in_a_writable_cwd(self):
+    def test_relative_path_raises(self):
         with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                self.assertEqual(workspace.resolve().root,
-                                 (Path(tmp) / "workspace").resolve())
+            os.environ["PEEKSEED_HOME"] = "relative/home"
+            os.environ["PEEKSEED_SHARED_DIR"] = tmp
+            with self.assertRaises(config.ConfigError) as info:
+                config.paths()
+            self.assertIn("absolute", str(info.exception))
 
-    def test_readonly_cwd_falls_back_to_home_with_warning(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            readonly = Path(tmp) / "readonly"
-            readonly.mkdir()
-            os.chmod(str(readonly), 0o555)
-            try:
-                with working_directory(readonly):
-                    buffer = io.StringIO()
-                    with contextlib.redirect_stdout(buffer):
-                        resolved = workspace.resolve()
-                    self.assertEqual(resolved.root,
-                                     (Path.home() / "peekseed").resolve())
-                    self.assertIn("not writable", buffer.getvalue())
-            finally:
-                os.chmod(str(readonly), 0o755)
+    def test_missing_directory_raises(self):
+        with temp_layout() as (home, shared):
+            os.environ["PEEKSEED_HOME"] = str(home / "missing")
+            config.reset_cache()
+            with self.assertRaises(config.ConfigError) as info:
+                config.paths()
+            self.assertIn("does not exist", str(info.exception))
 
-    def test_data_env_overrides_only_the_derived_root(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            root = Path(tmp) / "ws"
-            data = Path(tmp) / "elsewhere"
-            os.environ["PEEKSEED_DATA"] = str(data)
-            ws = workspace.resolve(str(root))
-            self.assertEqual(ws.root, root.resolve())
-            self.assertEqual(ws.derived_dir, data.resolve())
-            self.assertEqual(ws.manifest_file, data.resolve() / "manifest.json")
-
-    def test_legacy_data_root_is_adopted_with_a_hint(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            legacy = Path(tmp) / "data"
-            (legacy / "config").mkdir(parents=True)
-            (legacy / "datasets").mkdir()
-            with working_directory(tmp):
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    ws = workspace.resolve()
-                self.assertEqual(ws.root, (Path(tmp) / "workspace").resolve())
-                self.assertEqual(ws.derived_dir, legacy.resolve())
-                self.assertIn("legacy data root", buffer.getvalue())
-
-    def test_config_paths_default_to_the_workspace_derived_tree(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                paths = config.paths()
-                ws = workspace.resolve()
-                self.assertEqual(paths.root, ws.derived_dir)
-                self.assertEqual(paths.workspace_root, ws.root)
-                self.assertEqual(paths.documents_dir, ws.documents_dir)
-                # Every historical attribute is still present.
-                for name in ("root", "config_dir", "links_file", "settings_file",
-                             "datasets_dir", "history_dir", "uploads_dir"):
-                    self.assertTrue(hasattr(paths, name), name)
-                for name in ("manifest_file", "extracted_dir", "jobs_dir",
-                             "workspace_root", "documents_dir"):
-                    self.assertTrue(hasattr(paths, name), name)
-
-    def test_config_data_env_still_overrides_the_root(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            os.environ["PEEKSEED_DATA"] = str(Path(tmp) / "data")
+    def test_paths_shape(self):
+        with temp_layout() as (home, shared):
             paths = config.ensure()
-            self.assertEqual(paths.root, (Path(tmp) / "data").resolve())
-            self.assertTrue(paths.config_dir.is_dir())
-            self.assertTrue(paths.links_file.parent.is_dir())
+            self.assertEqual(paths.root, home.resolve())
+            self.assertEqual(paths.shared_dir, shared.resolve())
+            self.assertEqual(paths.sources_dir, shared.resolve() / "sources")
+            self.assertEqual(paths.peels_dir, shared.resolve() / "peels")
+            self.assertEqual(set(paths.as_dict()), {
+                "root", "shared_dir", "sources_dir", "peels_dir",
+                "config_dir", "links_file", "settings_file", "datasets_dir",
+                "history_dir", "jobs_dir", "uploads_dir",
+            })
+            for name in ("config_dir", "datasets_dir", "history_dir",
+                         "jobs_dir", "uploads_dir", "sources_dir", "peels_dir"):
+                self.assertTrue(getattr(paths, name).is_dir(), name)
+
+    def test_cache_follows_the_environment(self):
+        with temp_layout() as (home, shared):
+            first = config.paths()
+            other = home.parent / "other-home"
+            other.mkdir()
+            os.environ["PEEKSEED_HOME"] = str(other)
+            config.reset_cache()
+            second = config.paths()
+            self.assertNotEqual(first.root, second.root)
+            self.assertEqual(second.root, other.resolve())
 
 
 class InitTests(unittest.TestCase):
-    def test_init_creates_the_contract_tree_and_is_idempotent(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    report = workspace.init()
-                self.assertIn("workspace:", buffer.getvalue())
-                root = (Path(tmp) / "workspace").resolve()
-                self.assertEqual(report["root"], str(root))
-                self.assertEqual(report["derived_dir"], str(root / ".peekseed"))
-                for name in workspace._DERIVED_CHILDREN:
-                    self.assertTrue((root / ".peekseed" / name).is_dir(), name)
-                self.assertTrue((root / "documents").is_dir())
-                self.assertTrue((root / ".peekseed" / "manifest.json").is_file())
-                self.assertTrue((root / ".peekseed" / "config" / "links.json").is_file())
-                stored_links = json.loads(
-                    (root / ".peekseed" / "config" / "links.json").read_text())
-                self.assertEqual(stored_links, {"version": 1, "links": []})
-                self.assertEqual(_mode(root / ".peekseed"), 0o700)
-                for name in workspace._DERIVED_CHILDREN:
-                    self.assertEqual(_mode(root / ".peekseed" / name), 0o700, name)
-                self.assertEqual(_mode(root / "documents"), 0o755)
-                self.assertEqual(_mode(root / ".peekseed" / "config" / "links.json"),
-                                 0o600)
-                manifest = json.loads(
-                    (root / ".peekseed" / "manifest.json").read_text())
-                self.assertEqual(manifest["schema"], contracts.MANIFEST_SCHEMA)
-                contracts.validate_manifest(manifest)
-                # Idempotent: nothing is overwritten and no entry is duplicated.
-                manifest["created_at"] = "2020-01-01T00:00:00Z"
-                (root / ".peekseed" / "manifest.json").write_text(
-                    json.dumps(manifest))
-                with contextlib.redirect_stdout(io.StringIO()):
-                    again = workspace.init()
-                self.assertEqual(again["root"], str(root))
-                self.assertEqual(
-                    json.loads((root / ".peekseed" / "manifest.json")
-                               .read_text())["created_at"],
-                    "2020-01-01T00:00:00Z",
-                )
-                gitignore = (Path(tmp) / ".gitignore").read_text()
-                self.assertEqual(gitignore.count("/workspace/"), 1)
-
-    def test_init_is_idempotent_in_a_git_checkout(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            checkout = Path(tmp)
-            (checkout / ".git").mkdir()
-            (checkout / ".gitignore").write_text("# existing\n*.log\n")
+    def test_init_creates_the_tree_and_is_idempotent(self):
+        with temp_layout() as (home, shared):
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                report = workspace.init()
+            self.assertIn("home:", buffer.getvalue())
+            self.assertEqual(report["home"], str(home.resolve()))
+            self.assertEqual(report["shared_dir"], str(shared.resolve()))
+            for directory in (home / "config", home / "datasets",
+                              home / "history", home / "jobs", home / "uploads",
+                              shared / "sources", shared / "peels"):
+                self.assertTrue(directory.is_dir(), directory)
+                self.assertEqual(_mode(directory), 0o700, directory)
+            self.assertEqual(_mode(home), 0o700)
+            self.assertEqual(_mode(shared), 0o700)
+            links = home / "config" / "links.json"
+            self.assertTrue(links.is_file())
+            self.assertEqual(_mode(links), 0o600)
+            self.assertEqual(json.loads(links.read_text()),
+                             {"version": 1, "links": []})
+            # Idempotent: an existing link store is never overwritten.
+            links.write_text('{"version": 1, "links": [{"id": "keep"}]}')
             with contextlib.redirect_stdout(io.StringIO()):
-                report = workspace.init(str(checkout / "workspace"))
-            self.assertEqual(report["gitignore"]["git_root"], str(checkout.resolve()))
-            content = (checkout / ".gitignore").read_text()
-            self.assertIn("/workspace/\n", content)
-            self.assertIn("*.log", content)
-            # A second init does not append the entry twice.
+                again = workspace.init()
+            self.assertEqual(again["home"], str(home.resolve()))
+            self.assertEqual(json.loads(links.read_text())["links"][0]["id"], "keep")
+
+    def test_init_does_not_touch_other_files(self):
+        with temp_layout() as (home, shared):
+            marker = home / "datasets" / "keep.txt"
+            marker.parent.mkdir(parents=True)
+            marker.write_text("user data")
             with contextlib.redirect_stdout(io.StringIO()):
-                workspace.init(str(checkout / "workspace"))
-            self.assertEqual((checkout / ".gitignore").read_text().count("/workspace/"), 1)
-
-    def test_init_never_overwrites_documents(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                document = Path(tmp) / "workspace" / "documents" / "keep.txt"
-                document.write_text("user data")
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                self.assertEqual(document.read_text(), "user data")
-
-
-class GitignoreTests(unittest.TestCase):
-    def test_default_workspace_uses_the_anchored_plan_entry(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    report = workspace.init()
-            self.assertEqual(report["gitignore"]["entry"], "/workspace/")
-            self.assertEqual(
-                (Path(tmp) / ".gitignore").read_text().count("/workspace/"), 1)
-
-    @unittest.skipUnless(shutil.which("git"), "git is required for this check")
-    def test_custom_named_workspace_really_is_ignored(self):
-        """A workspace named ``ws`` must be ignored as ``/ws/``, not /workspace/."""
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
-            subprocess.run(["git", "init", "-q", str(repo)], check=True,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            with contextlib.redirect_stdout(io.StringIO()):
-                report = workspace.init(str(repo / "ws"))
-            self.assertEqual(report["gitignore"]["entry"], "/ws/")
-            content = (repo / ".gitignore").read_text()
-            self.assertIn("/ws/\n", content)
-            ignored = subprocess.run(
-                ["git", "-C", str(repo), "check-ignore", "-q", "ws"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            self.assertEqual(ignored.returncode, 0, "git does not ignore the workspace")
-            doctor = workspace.doctor(str(repo / "ws"))
-            self.assertFalse(
-                any("not in .gitignore" in issue for issue in doctor["issues"]),
-                doctor["issues"],
-            )
-            self.assertEqual(doctor["git"]["entry"], "/ws/")
-            # Re-running init must not append a second entry.
-            with contextlib.redirect_stdout(io.StringIO()):
-                workspace.init(str(repo / "ws"))
-            self.assertEqual((repo / ".gitignore").read_text().count("/ws/"), 1)
+                workspace.init()
+            self.assertEqual(marker.read_text(), "user data")
 
 
 class DoctorTests(unittest.TestCase):
-    def test_doctor_reports_a_clean_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                report = workspace.doctor()
-                self.assertEqual(report["issues"], [])
-                self.assertEqual(report["paths"]["root"],
-                                 str((Path(tmp) / "workspace").resolve()))
-                self.assertIn("manifest", report["schemas"])
-                self.assertTrue(report["links"]["ok"])
+    def test_doctor_reports_a_clean_layout(self):
+        with temp_layout() as (home, shared):
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init()
+            report = workspace.doctor()
+            self.assertEqual(report["issues"], [])
+            self.assertEqual(report["paths"]["root"], str(home.resolve()))
+            self.assertEqual(report["paths"]["shared_dir"], str(shared.resolve()))
+            self.assertTrue(report["links"]["ok"])
 
-    def test_doctor_detects_a_missing_manifest_and_links(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                root = Path(tmp) / "workspace"
-                (root / ".peekseed" / "manifest.json").unlink()
-                (root / ".peekseed" / "config" / "links.json").unlink()
-                report = workspace.doctor()
-                joined = "\n".join(report["issues"])
-                self.assertIn("manifest.json is missing", joined)
-                self.assertIn("model link store is missing", joined)
+    def test_doctor_detects_missing_links_and_folders(self):
+        with temp_layout() as (home, shared):
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init()
+            (home / "config" / "links.json").unlink()
+            shutil.rmtree(str(shared / "peels"))
+            report = workspace.doctor()
+            joined = "\n".join(report["issues"])
+            self.assertIn("model link store is missing", joined)
+            self.assertIn("peels folder is missing", joined)
 
-    def test_doctor_detects_corrupt_json_and_legacy_schemas(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                root = Path(tmp) / "workspace"
-                (root / ".peekseed" / "manifest.json").write_text("{not json")
-                dataset_dir = root / ".peekseed" / "datasets" / "legacy"
-                dataset_dir.mkdir()
-                (dataset_dir / "dataset.json").write_text(json.dumps({
-                    "version": 1, "id": "legacy", "name": "Legacy",
-                    "created_at": "2020-01-01T00:00:00Z",
-                    "sources": [{"name": "a.pdf"}],
-                }))
+    def test_doctor_detects_world_writable_folder(self):
+        with temp_layout() as (home, shared):
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init()
+            os.chmod(str(home), 0o775)
+            try:
                 report = workspace.doctor()
-                joined = "\n".join(report["issues"])
-                self.assertIn("manifest.json is unreadable", joined)
-                self.assertIn("dataset 'legacy' uses schema 1", joined)
-                self.assertIn("peekseed migrate", joined)
-                # No full machine paths leak into user-facing issue strings.
-                for issue in report["issues"]:
-                    self.assertNotIn(str(root), issue)
-
-    def test_doctor_detects_an_unignored_git_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            (Path(tmp) / ".git").mkdir()
-            # A .gitignore without the anchored entry: init would add it, so no init.
-            (Path(tmp) / ".gitignore").write_text("*.log\n")
-            report = workspace.doctor(str(Path(tmp) / "workspace"))
-            self.assertEqual(report["git"]["root"], str(Path(tmp).resolve()))
-            self.assertFalse(report["git"]["ignored"])
-            self.assertTrue(any("not in .gitignore" in issue
+            finally:
+                os.chmod(str(home), 0o700)
+            self.assertTrue(any("group- or other-writable" in issue
                                 for issue in report["issues"]))
 
-    def test_doctor_and_status_never_write_and_use_the_inspected_workspace(self):
+    def test_doctor_detects_corrupt_json_and_legacy_schemas(self):
+        with temp_layout() as (home, shared):
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init()
+            dataset_dir = home / "datasets" / "legacy"
+            dataset_dir.mkdir()
+            (dataset_dir / "dataset.json").write_text(json.dumps({
+                "version": 1, "id": "legacy", "name": "Legacy",
+                "created_at": "2020-01-01T00:00:00Z",
+                "sources": [{"name": "a.pdf"}],
+            }))
+            report = workspace.doctor()
+            joined = "\n".join(report["issues"])
+            self.assertIn("dataset 'legacy' uses schema 1", joined)
+            self.assertIn("peekseed migrate", joined)
+            for issue in report["issues"]:
+                self.assertNotIn(str(home), issue)
+
+    def test_doctor_and_status_never_write(self):
         def snapshot(path):
             return sorted(str(item.relative_to(path)) for item in path.rglob("*"))
 
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            cwd = Path(tmp) / "cwd"
-            cwd.mkdir()
-            target = Path(tmp) / "ws"
-            with working_directory(cwd):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init(str(target))
-                before = snapshot(Path(tmp))
-                doctor = workspace.doctor(str(target))
-                status = workspace.status(str(target))
-            self.assertEqual(snapshot(Path(tmp)), before)
-            expected = target.resolve() / ".peekseed"
-            for report in (doctor, status):
-                config_report = report["peelfeed"]["config"]
-                self.assertEqual(config_report["path"],
-                                 str(expected / "config" / "peelfeed.json"))
-                self.assertFalse(config_report["present"])
-                self.assertEqual(config_report["root"], str(expected / "peels"))
+        with temp_layout() as (home, shared):
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init()
+            before = snapshot(home)
+            workspace.doctor()
+            workspace.status()
+            self.assertEqual(snapshot(home), before)
 
 
 class StatusTests(unittest.TestCase):
-    def _write_dataset(self, root, collection="cxl", status="chunked", chunks=2):
-        dataset_dir = root / ".peekseed" / "datasets" / collection
+    def _write_dataset(self, home, dataset="cxl", status="chunked", chunks=2):
+        dataset_dir = home / "datasets" / dataset
         dataset_dir.mkdir(parents=True, exist_ok=True)
-        dataset = {
+        data = {
             "schema": contracts.DATASET_SCHEMA,
-            "id": collection,
+            "id": dataset,
             "name": "CXL docs",
             "created_at": "2020-01-01T00:00:00Z",
-            "sources": [{"name": "a.pdf", "path": "cxl/a.pdf",
+            "sources": [{"name": "a.pdf",
+                         "path": "sources/" + "a" * 64 + "/a.pdf",
                          "sha256": "a" * 64, "bytes": 10, "pages": 1,
                          "extractor": "pypdf@1.0", "status": "chunked"}],
             "chunker": contracts.chunker_label(),
@@ -349,29 +234,20 @@ class StatusTests(unittest.TestCase):
             "status": status,
         }
         contracts.write_json_atomic(dataset_dir / "dataset.json",
-                                    contracts.validate_dataset(dataset))
+                                    contracts.validate_dataset(data))
         (dataset_dir / "chunks.jsonl").write_text(
             "\n".join(json.dumps({"id": "x%d" % index}) for index in range(chunks))
             + "\n")
         return dataset_dir
 
     def test_status_shape(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-            root = Path(tmp) / "workspace"
-            self._write_dataset(root)
-            manifest = json.loads((root / ".peekseed" / "manifest.json").read_text())
-            manifest["last_scan"] = "2024-01-02T03:04:05Z"
-            contracts.write_json_atomic(root / ".peekseed" / "manifest.json", manifest)
-            with working_directory(tmp):
-                report = workspace.status()
-            self.assertEqual(report["last_scan"], "2024-01-02T03:04:05Z")
-            self.assertEqual(set(report["workspace"]), {
-                "root", "documents_dir", "derived_dir", "manifest_file",
+        with temp_layout() as (home, shared):
+            self._write_dataset(home)
+            report = workspace.status()
+            self.assertEqual(set(report["paths"]), {
+                "root", "shared_dir", "sources_dir", "peels_dir",
                 "config_dir", "links_file", "settings_file", "datasets_dir",
-                "extracted_dir", "history_dir", "jobs_dir", "uploads_dir",
+                "history_dir", "jobs_dir", "uploads_dir",
             })
             collection = report["collections"]["cxl"]
             self.assertEqual(collection["status"], "chunked")
@@ -379,52 +255,33 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(collection["chunks"], 2)
             self.assertEqual(report["counts"]["collections"], 1)
             self.assertEqual(report["counts"]["chunks"], 2)
+            self.assertIn("links", report)
+            self.assertIn("peelfeed", report)
+            self.assertNotIn("last_scan", report)
+            self.assertNotIn("manifest", report)
 
     def test_status_derives_a_collection_without_a_status_field(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-            root = Path(tmp) / "workspace"
-            dataset_dir = self._write_dataset(root)
+        with temp_layout() as (home, shared):
+            dataset_dir = self._write_dataset(home)
             data = json.loads((dataset_dir / "dataset.json").read_text())
             data.pop("status")
             contracts.write_json_atomic(dataset_dir / "dataset.json",
                                         contracts.validate_dataset(data))
-            with working_directory(tmp):
-                report = workspace.status()
+            report = workspace.status()
             self.assertEqual(report["collections"]["cxl"]["status"], "not_indexed")
 
 
-class MoveTests(unittest.TestCase):
-    def test_move_moves_the_whole_tree(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                document = Path(tmp) / "workspace" / "documents" / "a.txt"
-                document.write_text("hello")
-                target = Path(tmp) / "elsewhere" / "new-workspace"
-                moved = workspace.move(str(target))
-                self.assertEqual(moved["root"], str(target.resolve()))
-                self.assertFalse((Path(tmp) / "workspace").exists())
-                new_root = target.resolve()
-                self.assertEqual((new_root / "documents" / "a.txt").read_text(),
-                                 "hello")
-                self.assertTrue((new_root / ".peekseed" / "manifest.json").is_file())
-                self.assertEqual(workspace.resolve(str(target)).root, new_root)
-
-    def test_move_refuses_an_occupied_target(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            with working_directory(tmp):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    workspace.init()
-                occupied = Path(tmp) / "occupied"
-                occupied.mkdir()
-                (occupied / "file.txt").write_text("not empty")
-                with self.assertRaises(ValueError):
-                    workspace.move(str(occupied))
-                self.assertTrue((Path(tmp) / "workspace").is_dir())
+class PeelfeedReportTests(unittest.TestCase):
+    def test_peelfeed_config_points_at_the_home_and_shared_peels(self):
+        with temp_layout() as (home, shared):
+            with contextlib.redirect_stdout(io.StringIO()):
+                workspace.init()
+            report = workspace.doctor()
+            cfg = report["peelfeed"]["config"]
+            self.assertEqual(cfg["path"],
+                             str(home.resolve() / "config" / "peelfeed.json"))
+            self.assertFalse(cfg["present"])
+            self.assertEqual(cfg["root"], str(shared.resolve() / "peels"))
 
 
 if __name__ == "__main__":

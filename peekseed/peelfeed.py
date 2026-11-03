@@ -10,9 +10,9 @@ This module is the whole seam:
 
 * ``config/peelfeed.json`` (0600) is seeded once from
   ``PEEKSEED_PEELFEED_{CLI,PYTHON,REPO,ENABLED,TIMEOUT,POLL,LLM_MODE,
-  CHUNK_PROFILE}`` plus ``PEELFEED_ROOT`` (legacy ``PEEKSEED_PEELFEED_ROOT`` is
-  accepted as a fallback). Environment values win over the file, so a deploy can
-  point at a different engine without rewriting the config.
+  CHUNK_PROFILE}``. Environment values win over the file, so a deploy can point
+  at a different engine without rewriting the config. The peel root is always
+  ``$PEELFEED_SHARED_DIR/peels`` (see :mod:`peekseed.config`).
 * :class:`PeelfeedClient` runs ``capabilities``/``status``/``ingest``/``review``/
   ``decide``/``rebuild``/``event``/``archive`` with ``--root`` and
   ``--json``, a timeout, and typed errors (:class:`PeelfeedUnavailable` when the
@@ -68,8 +68,6 @@ __all__ = [
 
 VERSION = 1
 ENV_PREFIX = "PEEKSEED_PEELFEED_"
-PEEL_ROOT_ENV = "PEELFEED_ROOT"
-LEGACY_PEEL_ROOT_ENV = "PEEKSEED_PEELFEED_ROOT"
 #: Long operations (ingest/rebuild) may run for the whole Docling conversion.
 DEFAULT_TIMEOUT = 7200.0
 #: Short operations (capabilities/status/review/decide/event/archive) get a
@@ -167,12 +165,6 @@ def _env(name):
     return (os.environ.get(ENV_PREFIX + name) or "").strip()
 
 
-def _env_root():
-    """The shared peel root: ``PEELFEED_ROOT`` wins, legacy name is a fallback."""
-    return ((os.environ.get(PEEL_ROOT_ENV) or "").strip()
-            or (os.environ.get(LEGACY_PEEL_ROOT_ENV) or "").strip())
-
-
 def _env_raw():
     """The raw config a first run seeds from environment values."""
     return {
@@ -180,7 +172,6 @@ def _env_raw():
         "cli": _env("CLI"),
         "python": _env("PYTHON"),
         "repo": _env("REPO"),
-        "root": _env_root(),
         "enabled": _env("ENABLED"),
         "timeout": _env("TIMEOUT"),
         "poll": _env("POLL"),
@@ -237,7 +228,7 @@ def _derive_repo(path):
     return ""
 
 
-def _normalize(raw, data_root=None):
+def _normalize(raw):
     """Validate one peelfeed config document (file or env seed)."""
     if not isinstance(raw, dict):
         raise PeelfeedConfigError("the peelfeed config must be a JSON object.")
@@ -251,17 +242,7 @@ def _normalize(raw, data_root=None):
     repo = _absolute(raw.get("repo"), "PEEKSEED_PEELFEED_REPO")
     if not repo:
         repo = _derive_repo(python) or _derive_repo(cli)
-    root = str(raw.get("root") or "").strip()
-    if root:
-        root_path = Path(root).expanduser()
-        # A relative PEELFEED_ROOT would be resolved against each subprocess'
-        # cwd; make it absolute here so every command sees the same tree.
-        if not root_path.is_absolute():
-            root_path = root_path.resolve()
-        root = str(root_path)
-    else:
-        root = str(Path(data_root) / "peels" if data_root is not None
-                   else config.paths().root / "peels")
+    root = str(config.paths().peels_dir)
     enabled_raw = raw.get("enabled")
     if isinstance(enabled_raw, bool):
         enabled = enabled_raw
@@ -319,7 +300,7 @@ def load(force=False, *, root=None, seed=True):
         if _CACHE is not None and not force and key == _CACHE_KEY:
             return copy.deepcopy(_CACHE)
         if not path.is_file():
-            cfg = _normalize(_env_raw(), root)
+            cfg = _normalize(_env_raw())
             if not seed:
                 return cfg
             config.ensure()
@@ -337,7 +318,7 @@ def load(force=False, *, root=None, seed=True):
                     "the peelfeed config must be a JSON object.")
             merged = dict(raw)
             merged.update(overrides)
-            cfg = _normalize(merged, root)
+            cfg = _normalize(merged)
             _SEEDED = False
         _CACHE = cfg
         _CACHE_KEY = key
@@ -640,7 +621,7 @@ class PeelfeedClient(object):
 
     def _environment(self):
         env = dict(os.environ)
-        env[PEEL_ROOT_ENV] = self.cfg["root"]
+        env["PEELFEED_SHARED_DIR"] = str(config.paths().shared_dir)
         if self.cfg.get("python") and not self.cfg.get("cli"):
             repo = self.cfg.get("repo") or ""
             if repo:

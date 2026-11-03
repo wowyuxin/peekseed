@@ -29,6 +29,25 @@ def clean_peekseed_env():
         os.environ.update(saved)
 
 
+@contextlib.contextmanager
+def temp_layout():
+    """A temporary home + shared folder with both required env vars set."""
+    with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
+        base = Path(tmp)
+        home = base / "home"
+        shared = base / "shared"
+        home.mkdir()
+        shared.mkdir()
+        os.environ["PEEKSEED_HOME"] = str(home)
+        os.environ["PEEKSEED_SHARED_DIR"] = str(shared)
+        from peekseed import config
+        config.reset_cache()
+        try:
+            yield base, home, shared
+        finally:
+            config.reset_cache()
+
+
 class CliTests(unittest.TestCase):
     def test_version(self):
         from peekseed.__main__ import main
@@ -40,16 +59,20 @@ class CliTests(unittest.TestCase):
     def test_env_file_provides_defaults(self):
         with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
             project = Path(tmp)
+            (project / "home").mkdir()
+            (project / "shared").mkdir()
             (project / ".env").write_text(
-                "PEEKSEED_DATA=./from-env\nPEEKSEED_PORT=9123\n"
-                "# a comment\nexport PEEKSEED_HOST=0.0.0.0\n")
+                "PEEKSEED_HOME=%s\nPEEKSEED_SHARED_DIR=%s\n"
+                "PEEKSEED_PORT=9123\n"
+                "# a comment\nexport PEEKSEED_HOST=0.0.0.0\n"
+                % (project / "home", project / "shared"))
             with working_directory(project):
                 from peekseed import config
                 config.reset_cache()
                 config.load_env_file()
                 try:
                     self.assertEqual(config.data_root(),
-                                     (project / "from-env").resolve())
+                                     (project / "home").resolve())
                     self.assertEqual(config.port(), 9123)
                     self.assertEqual(config.host(), "0.0.0.0")
                     # a real environment variable wins over the file
@@ -58,46 +81,39 @@ class CliTests(unittest.TestCase):
                 finally:
                     config.reset_cache()
 
-    def test_init_creates_the_data_root(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            project = Path(tmp)
-            (project / ".env").write_text("PEEKSEED_DATA=./data\n")
-            with working_directory(project):
-                from peekseed.__main__ import main
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    self.assertEqual(main(["init"]), 0)
-                # PEEKSEED_DATA pins the derived root; the workspace tree still
-                # lands in ./workspace (documents are never derived data).
-                self.assertTrue((project / "data" / "config" / "links.json").is_file())
-                self.assertTrue((project / "workspace" / "documents").is_dir())
-                self.assertIn("workspace:", buffer.getvalue())
+    def test_init_creates_the_home_and_shared_tree(self):
+        with temp_layout() as (base, home, shared):
+            from peekseed.__main__ import main
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(main(["init"]), 0)
+            self.assertTrue((home / "config" / "links.json").is_file())
+            self.assertTrue((home / "datasets").is_dir())
+            self.assertTrue((shared / "sources").is_dir())
+            self.assertTrue((shared / "peels").is_dir())
+            self.assertIn("home:", buffer.getvalue())
+            self.assertFalse((home / "documents").exists())
 
-    def test_init_creates_the_workspace_and_gitignore_guard(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            project = Path(tmp)
-            with working_directory(project):
-                from peekseed.__main__ import main
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    self.assertEqual(main(["init"]), 0)
-                self.assertTrue((project / "workspace" / "documents").is_dir())
-                self.assertTrue((project / "workspace" / ".peekseed" / "manifest.json").is_file())
-                self.assertTrue(
-                    (project / "workspace" / ".peekseed" / "config" / "links.json").is_file())
-                self.assertIn("/workspace/",
-                              (project / ".gitignore").read_text(encoding="utf-8"))
+    def test_missing_settings_exit_2_and_version_still_works(self):
+        with clean_peekseed_env():
+            from peekseed.__main__ import main
+            buffer = io.StringIO()
+            with contextlib.redirect_stderr(buffer):
+                self.assertEqual(main(["status"]), 2)
+            self.assertIn("PEEKSEED_HOME", buffer.getvalue())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(main(["version"]), 0)
+            self.assertIn("peekseed 0.1.0", out.getvalue())
 
-    def test_workspace_path_prints_the_absolute_root(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            project = Path(tmp)
-            with working_directory(project):
-                from peekseed.__main__ import main
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    self.assertEqual(main(["workspace", "path"]), 0)
-                self.assertEqual(buffer.getvalue().strip(),
-                                 str((project / "workspace").resolve()))
+    def test_removed_commands_are_not_in_help(self):
+        from peekseed.__main__ import build_parser
+        text = build_parser().format_help()
+        self.assertNotIn("scan", text)
+        self.assertNotIn("workspace", text)
+        for command in ("init", "status", "doctor", "reindex", "migrate",
+                        "serve", "index", "version"):
+            self.assertIn(command, text)
 
     def test_help_has_no_import_command(self):
         from peekseed.__main__ import build_parser
@@ -111,27 +127,27 @@ class CliTests(unittest.TestCase):
 
     def test_index_stores_without_extraction(self):
         from tests.fixtures import make_pdf
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            project = Path(tmp)
-            make_pdf(project / "a.pdf", pages=["Widget page."])
-            with working_directory(project):
-                from peekseed.__main__ import main
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    self.assertEqual(main(["index", "--name", "My docs",
-                                           "--file", "a.pdf"]), 0)
-                text = buffer.getvalue()
-                self.assertIn("status=uploaded", text)
-                self.assertIn("peelfeed", text)
-                dataset_dir = (project / "workspace" / ".peekseed"
-                               / "datasets" / "my-docs")
-                self.assertTrue((dataset_dir / "original" / "a.pdf").is_file())
-                self.assertFalse((dataset_dir / "chunks.jsonl").exists())
+        with temp_layout() as (base, home, shared):
+            make_pdf(base / "a.pdf", pages=["Widget page."])
+            from peekseed.__main__ import main
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(main(["index", "--name", "My docs",
+                                       "--file", str(base / "a.pdf")]), 0)
+            text = buffer.getvalue()
+            self.assertIn("status=uploaded", text)
+            self.assertIn("peelfeed", text)
+            dataset_dir = home / "datasets" / "my-docs"
+            self.assertTrue((dataset_dir / "dataset.json").is_file())
+            self.assertFalse((dataset_dir / "original").exists())
+            stored = list((shared / "sources").rglob("*.pdf"))
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].name, "a.pdf")
+            self.assertFalse((dataset_dir / "chunks.jsonl").exists())
 
     def test_migrate_is_dry_run_by_default(self):
-        with tempfile.TemporaryDirectory() as tmp, clean_peekseed_env():
-            project = Path(tmp)
-            dataset_dir = project / "workspace" / ".peekseed" / "datasets" / "docs"
+        with temp_layout() as (base, home, shared):
+            dataset_dir = home / "datasets" / "docs"
             original = dataset_dir / "original"
             original.mkdir(parents=True)
             (original / "a.pdf").write_bytes(b"%PDF-1.4\nfake")
@@ -140,15 +156,15 @@ class CliTests(unittest.TestCase):
                 '"created_at": "2026-01-01T00:00:00Z", '
                 '"sources": [{"name": "a.pdf", "path": "original/a.pdf", '
                 '"bytes": 12, "pages": 1}]}', encoding="utf-8")
-            with working_directory(project):
-                from peekseed.__main__ import main
-                buffer = io.StringIO()
-                with contextlib.redirect_stdout(buffer):
-                    self.assertEqual(main(["migrate"]), 0)
-                text = buffer.getvalue()
-                self.assertIn("dry-run (nothing written)", text)
-                self.assertIn("schema 1 -> 3", text)
-                self.assertIn('"version": 1', (dataset_dir / "dataset.json").read_text())
+            from peekseed.__main__ import main
+            buffer = io.StringIO()
+            with contextlib.redirect_stdout(buffer):
+                self.assertEqual(main(["migrate"]), 0)
+            text = buffer.getvalue()
+            self.assertIn("dry-run (nothing written)", text)
+            self.assertIn("schema 1 -> 3", text)
+            self.assertIn('"version": 1',
+                          (dataset_dir / "dataset.json").read_text())
 
 
 if __name__ == "__main__":

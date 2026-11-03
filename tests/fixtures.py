@@ -288,27 +288,41 @@ def make_pdf(path, pages=None):
 
 @contextlib.contextmanager
 def temp_data_root():
-    """Point peekseed at a throwaway data root and reset every cached path."""
+    """Point peekseed at a throwaway home + shared folder and reset every cache.
+
+    Yields the home directory (``<tmp>/home``); the shared folder is
+    ``<tmp>/shared`` (``config.paths().shared_dir``).
+    """
     from peekseed import app as app_module
     from peekseed import config, links
 
-    previous = os.environ.get("PEEKSEED_DATA")
-    root = Path(tempfile.mkdtemp(prefix="peekseed-test-"))
-    os.environ["PEEKSEED_DATA"] = str(root)
+    previous_home = os.environ.get("PEEKSEED_HOME")
+    previous_shared = os.environ.get("PEEKSEED_SHARED_DIR")
+    base = Path(tempfile.mkdtemp(prefix="peekseed-test-"))
+    home = base / "home"
+    shared = base / "shared"
+    home.mkdir()
+    shared.mkdir()
+    os.environ["PEEKSEED_HOME"] = str(home)
+    os.environ["PEEKSEED_SHARED_DIR"] = str(shared)
     config.reset_cache()
     links.reset_cache()
     app_module.reset_state()
     try:
-        yield root
+        yield home
     finally:
         app_module.reset_state()
         config.reset_cache()
         links.reset_cache()
-        if previous is None:
-            os.environ.pop("PEEKSEED_DATA", None)
+        if previous_home is None:
+            os.environ.pop("PEEKSEED_HOME", None)
         else:
-            os.environ["PEEKSEED_DATA"] = previous
-        shutil.rmtree(str(root), ignore_errors=True)
+            os.environ["PEEKSEED_HOME"] = previous_home
+        if previous_shared is None:
+            os.environ.pop("PEEKSEED_SHARED_DIR", None)
+        else:
+            os.environ["PEEKSEED_SHARED_DIR"] = previous_shared
+        shutil.rmtree(str(base), ignore_errors=True)
 
 
 def make_dataset(name="Docs", pages=None, note=""):
@@ -316,9 +330,12 @@ def make_dataset(name="Docs", pages=None, note=""):
     from peekseed import config, ingest
 
     dataset = ingest.create_dataset(config.paths(), name, note=note)
-    directory = Path(dataset["dir"])
-    pdf = make_pdf(directory / "original" / "manual.pdf", pages=pages)
-    ingest.add_source(dataset, pdf)
+    scratch = Path(tempfile.mkdtemp(prefix="peekseed-pdf-"))
+    try:
+        pdf = make_pdf(scratch / "manual.pdf", pages=pages)
+        ingest.add_source(dataset, pdf)
+    finally:
+        shutil.rmtree(str(scratch), ignore_errors=True)
     return dataset
 
 
@@ -405,8 +422,7 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     """Create a fake peelfeed peel for one dataset source and mark it extracted.
 
     ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. The peel is
-    written under ``PEELFEED_ROOT`` (legacy ``PEEKSEED_PEELFEED_ROOT`` accepted,
-    else ``<data_root>/peels``) with the files
+    written under ``config.paths().peels_dir`` with the files
     :func:`peekseed.ingest.build_index` consumes: ``manifest.json``,
     ``chunks.jsonl``, ``blocks.jsonl``, ``assets.jsonl``, ``validation.json``,
     ``review_queue.json`` and a copy of the source under ``source/``. The dataset
@@ -414,7 +430,7 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
 
     Returns ``{"peel_id", "peel_dir", "conversion_id"}``.
     """
-    from peekseed import config, contracts
+    from peekseed import config, contracts, ingest
 
     if isinstance(dataset, dict):
         dataset_dir = Path(dataset["dir"])
@@ -435,25 +451,12 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
         raise AssertionError("no source with a sha256 in %s" % dataset_dir)
     sha = str(entry["sha256"]).lower()
     name = str(entry["name"])
-    relative = str(entry.get("path") or ("original/" + name))
-    candidates = [dataset_dir / relative, dataset_dir / "original" / name]
-    # Workspace-scan sources live under documents/, not in the dataset copy.
-    try:
-        from peekseed import workspace as workspace_module
-        candidates.append(Path(config.paths().workspace_root) / "documents"
-                          / relative)
-        candidates.append(Path(config.paths().documents_dir) / relative)
-        candidates.append(workspace_module.resolve().documents_dir / relative)
-    except Exception:
-        pass
-    source_file = next((path for path in candidates if path.is_file()), None)
+    source_file = ingest.stored_source_path(dataset_dir, entry)
     if source_file is None:
-        raise AssertionError("no stored source file for %s (tried %s)"
-                             % (name, ", ".join(str(path) for path in candidates)))
+        raise AssertionError("no stored source file for %s in %s"
+                             % (name, dataset_dir))
     if peel_root is None:
-        peel_root = Path(os.environ.get("PEELFEED_ROOT")
-                         or os.environ.get("PEEKSEED_PEELFEED_ROOT")
-                         or (config.paths().root / "peels"))
+        peel_root = config.paths().peels_dir
     peel_root = Path(peel_root)
     peel_id = "%s-%s" % (_peel_slug(Path(name).stem), sha[:8])
     peel_dir = peel_root / peel_id
@@ -685,7 +688,7 @@ def main():
     with open(LOG, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({
             "argv": argv,
-            "peel_root": os.environ.get("PEELFEED_ROOT"),
+            "peel_shared_dir": os.environ.get("PEELFEED_SHARED_DIR"),
             "pythonpath": os.environ.get("PYTHONPATH"),
         }) + "\n")
     if not argv:
@@ -702,7 +705,9 @@ def main():
             return fail("capabilities failed")
         payload = dict(DEFAULT_CAPABILITIES)
         payload.update(state.get("capabilities") or {})
-        payload["peel_root"] = root or os.environ.get("PEELFEED_ROOT") or ""
+        shared = os.environ.get("PEELFEED_SHARED_DIR") or ""
+        payload["peel_root"] = root or ((shared.rstrip("/") + "/peels")
+                                        if shared else "")
         return emit(payload)
 
     peels = state.get("peels") or {}
@@ -866,8 +871,8 @@ class FakePeelfeedCli:
     """A fake ``peelfeed`` executable for tests (no daemon, no HTTP).
 
     Writes a small Python script to a temp directory, records every invocation
-    (argv + the ``PEELFEED_ROOT`` it was given) to a JSON Lines log, and answers
-    from a JSON state file the test controls. The script can simulate slow
+    (argv + the ``PEELFEED_SHARED_DIR`` it was given) to a JSON Lines log, and
+    answers from a JSON state file the test controls. The script can simulate slow
     ``capabilities``, a failing ``ingest``, gate errors and rebuild timing.
     """
 

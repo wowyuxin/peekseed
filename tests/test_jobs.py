@@ -27,7 +27,7 @@ LONG_PAGE = (
 class JobApiBase(unittest.TestCase):
     def setUp(self):
         self._env = {}
-        for key in ("PEEKSEED_DATA", "PEEKSEED_AGENT"):
+        for key in ("PEEKSEED_HOME", "PEEKSEED_SHARED_DIR", "PEEKSEED_AGENT"):
             self._env[key] = os.environ.get(key)
 
     def tearDown(self):
@@ -234,10 +234,13 @@ class WorkspaceApiTests(JobApiBase):
 
             report = client.get("/api/workspace").json()
             served = Path(root).resolve()
-            self.assertEqual(report["workspace"]["root"], str(served))
-            self.assertEqual(report["workspace"]["documents_dir"],
-                             str(served / "documents"))
-            self.assertEqual(report["workspace"]["derived_dir"], str(served))
+            shared = (Path(root).parent / "shared").resolve()
+            self.assertEqual(report["paths"]["root"], str(served))
+            self.assertEqual(report["paths"]["shared_dir"], str(shared))
+            self.assertEqual(report["paths"]["sources_dir"],
+                             str(shared / "sources"))
+            self.assertEqual(report["paths"]["peels_dir"],
+                             str(shared / "peels"))
             collection = report["collections"][dataset["id"]]
             self.assertEqual(collection["status"], "indexed", collection)
             self.assertEqual(collection["chunks"] > 0, True, collection)
@@ -257,7 +260,7 @@ class WorkspaceApiTests(JobApiBase):
             self.assertEqual(len(row["sha256"]), 64)
             self.assertEqual(
                 row["path"],
-                str(served / "datasets" / dataset["id"] / "original" / "manual.pdf"))
+                str(shared / "sources" / row["sha256"] / "manual.pdf"))
             self.assertEqual(
                 client.get("/api/datasets/nope/sources").status_code, 404)
 

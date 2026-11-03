@@ -18,8 +18,8 @@ from pathlib import Path
 
 from tests.fixtures import FakeModelServer, make_pdf, temp_data_root
 
-ENV_KEYS = ("PEEKSEED_DATA", "PEEKSEED_TOKEN", "PEEKSEED_ALLOWED_HOSTS",
-            "PEEKSEED_HOST", "PEEKSEED_AGENT")
+ENV_KEYS = ("PEEKSEED_HOME", "PEEKSEED_SHARED_DIR", "PEEKSEED_TOKEN",
+            "PEEKSEED_ALLOWED_HOSTS", "PEEKSEED_HOST", "PEEKSEED_AGENT")
 CONFIGURED_KEYS = ("PEEKSEED_TOKEN", "PEEKSEED_ALLOWED_HOSTS", "PEEKSEED_HOST",
                    "PEEKSEED_AGENT")
 
@@ -105,21 +105,39 @@ class PdfServingTests(SecurityTestCase):
                               (bad, response.status_code))
                 self.assertNotIn(b"%PDF-", response.content, bad)
 
-    def test_pdf_symlink_escaping_the_dataset_is_rejected(self):
+    def test_pdf_symlink_escaping_the_shared_sources_is_rejected(self):
         with temp_data_root() as root, FakeModelServer() as fake:
+            from peekseed import config, contracts
             self.root = root
             client = self._client()
             dataset = self._upload(client)
             dataset_dir = Path(root) / "datasets" / dataset["id"]
-            original = dataset_dir / "original"
+            raw = contracts.read_json(dataset_dir / "dataset.json")
+            sha = raw["sources"][0]["sha256"]
+            folder = config.paths().sources_dir / sha
             outside = make_pdf(Path(root) / "outside.pdf")
-            os.symlink(str(outside), str(original / "escape.pdf"))
+            os.symlink(str(outside), str(folder / "escape.pdf"))
+            raw["sources"].append({
+                "name": "escape.pdf",
+                "path": "sources/%s/escape.pdf" % sha,
+                "sha256": sha, "bytes": 10, "status": "uploaded",
+                "extraction": contracts.extraction_default(),
+            })
+            contracts.write_json_atomic(dataset_dir / "dataset.json",
+                                        contracts.validate_dataset(raw))
             response = client.get("/pdf/%s/escape.pdf" % dataset["id"])
             self.assertIn(response.status_code, (400, 404), response.status_code)
-            # A symlink that stays inside the dataset but outside original/ is
-            # still not a served source.
-            os.symlink(str(dataset_dir / "dataset.json"),
-                       str(original / "metadata.pdf"))
+            # A symlink pointing outside the shared pool is never served, even
+            # when the dataset declares an entry for it.
+            os.symlink(str(dataset_dir / "dataset.json"), str(folder / "metadata.pdf"))
+            raw["sources"].append({
+                "name": "metadata.pdf",
+                "path": "sources/%s/metadata.pdf" % sha,
+                "sha256": sha, "bytes": 10, "status": "uploaded",
+                "extraction": contracts.extraction_default(),
+            })
+            contracts.write_json_atomic(dataset_dir / "dataset.json",
+                                        contracts.validate_dataset(raw))
             response = client.get("/pdf/%s/metadata.pdf" % dataset["id"])
             self.assertIn(response.status_code, (400, 404), response.status_code)
 
@@ -127,14 +145,18 @@ class PdfServingTests(SecurityTestCase):
 class UploadPathSafetyTests(SecurityTestCase):
     def test_zip_slip_filename_is_sanitized_before_directory_creation(self):
         with temp_data_root() as root, FakeModelServer() as fake:
+            from peekseed import config
             self.root = root
             client = self._client()
             dataset = self._upload(client, filename="../../evil.pdf")
             dataset_dir = Path(root) / "datasets" / dataset["id"]
-            stored = sorted(entry.name for entry in (dataset_dir / "original").iterdir())
+            self.assertFalse((dataset_dir / "original").exists())
+            shared = config.paths().sources_dir
+            stored = sorted(path.name for path in shared.rglob("evil.pdf"))
             self.assertEqual(stored, ["evil.pdf"])
-            matches = sorted(str(path) for path in Path(root).rglob("evil.pdf"))
-            self.assertEqual(matches, [str(dataset_dir / "original" / "evil.pdf")])
+            matches = sorted(str(path) for path in Path(root).parent.rglob("evil.pdf"))
+            self.assertEqual(len(matches), 1)
+            self.assertTrue(Path(matches[0]).resolve().is_relative_to(shared))
             self.assertFalse((Path(root) / "evil.pdf").exists())
             self.assertFalse((Path(root).parent / "evil.pdf").exists())
             self.assertEqual(Path(dataset_dir).parent, Path(root) / "datasets")
@@ -366,7 +388,8 @@ class UploadLimitTests(SecurityTestCase):
                           response.json()["detail"])
             self.assertEqual(self._dataset_entries(root), [])
             self.assertEqual(self._staging_leftovers(root), [])
-            at_limit = [("files", ("doc-%02d.pdf" % index, pdf,
+            at_limit = [("files", ("doc-%02d.pdf" % index,
+                                   self._pdf_bytes(pages=["Doc %d." % index]),
                                    "application/pdf")) for index in range(50)]
             accepted = client.post("/api/datasets", data={"name": "At limit"},
                                    files=at_limit)
@@ -571,11 +594,12 @@ class SsrfTests(SecurityTestCase):
 
 
 class DataModeTests(SecurityTestCase):
-    def test_derived_dirs_and_history_files_are_owner_only(self):
+    def test_home_and_shared_dirs_and_history_files_are_owner_only(self):
         from fastapi.testclient import TestClient
         from peekseed import app as app_module
 
         with temp_data_root() as root:
+            from peekseed import config
             self.root = root
             history_dir = Path(root) / "history"
             history_dir.mkdir(parents=True, exist_ok=True)
@@ -593,13 +617,17 @@ class DataModeTests(SecurityTestCase):
                     self.assertTrue(path.is_dir(), name)
                     self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode),
                                      0o700, name)
+                shared = config.paths().shared_dir
+                self.assertEqual(stat.S_IMODE(os.stat(str(shared)).st_mode), 0o700)
+                for name in ("sources", "peels"):
+                    path = shared / name
+                    self.assertTrue(path.is_dir(), name)
+                    self.assertEqual(stat.S_IMODE(os.stat(str(path)).st_mode),
+                                     0o700, name)
                 self.assertEqual(stat.S_IMODE(os.stat(str(stale)).st_mode), 0o600)
                 dataset_dir = Path(root) / "datasets" / dataset["id"]
                 self.assertEqual(stat.S_IMODE(os.stat(str(dataset_dir)).st_mode),
                                  0o700)
-                self.assertEqual(
-                    stat.S_IMODE(os.stat(str(dataset_dir / "original")).st_mode),
-                    0o700)
 
 
 if __name__ == "__main__":

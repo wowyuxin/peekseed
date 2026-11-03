@@ -7,21 +7,20 @@ that protect them and the content-derived identifiers that make incremental
 ingestion safe. The rest of the package imports the rules from here instead of
 re-deriving them, so a schema change happens in exactly one place.
 
-Layout (owned by :mod:`peekseed.workspace`; recorded here so the derived tree is
-defined in the same place as the files that live in it)::
+Layout (owned by :mod:`peekseed.config`/:mod:`peekseed.workspace`; recorded here
+so the runtime folders are defined in the same place as the files in them)::
 
-    <workspace>/
-        documents/                       user-owned sources; peekseed never writes here
-        .peekseed/                       derived, rebuildable, safe to delete
-            manifest.json                scan state                     schema 1
-            config/links.json            model links; 0600
-            datasets/<collection>/       dataset.json                   schema 2
-                                         chunks.jsonl                   chunk rows
-                                         index/<space>/                 vectors + info.json
-            extracted/<sha256>.json      extraction cache
-            history/
-            jobs/<id>.json               job record                     schema 1
-        .gitignore                       `init` ensures /workspace/ is ignored
+    $PEEKSEED_HOME/                     private runtime data
+        config/links.json               model links; 0600
+        datasets/<dataset>/             dataset.json                   schema 3
+                                        chunks.jsonl                   chunk rows
+                                        index/<space>/                 vectors + info.json
+        history/
+        jobs/<id>.json                  job record                     schema 1
+        uploads/                        upload staging
+    $PEEKSEED_SHARED_DIR/               shared with peelfeed
+        sources/<sha256>/<name>.pdf     the one stored copy of each upload
+        peels/<peel_id>/                peelfeed corpora (read-only here)
 
 Version rules
 -------------
@@ -68,7 +67,6 @@ __all__ = [
     "INFO_SCHEMA",
     "JOB_SCHEMA",
     "JOB_STATES",
-    "MANIFEST_SCHEMA",
     "PEEL_CHUNKER_VERSION",
     "PROBE_TEXT",
     "SchemaTooNew",
@@ -85,7 +83,6 @@ __all__ = [
     "file_status",
     "has_probe",
     "new_job",
-    "new_manifest",
     "probe_sha256",
     "read_json",
     "sha256_bytes",
@@ -98,7 +95,6 @@ __all__ = [
     "validate_dataset",
     "validate_info",
     "validate_job",
-    "validate_manifest",
     "write_json_atomic",
     "upgrade_dataset",
     "upgrade_info",
@@ -106,7 +102,6 @@ __all__ = [
 
 # --- contract versions -----------------------------------------------------
 
-MANIFEST_SCHEMA = 1
 # Schema 3 adds per-source ``extraction`` state (peelfeed peel identity) and the
 # ``peel``/``corpus_digest`` provenance blocks to index metadata.
 DATASET_SCHEMA = 3
@@ -177,7 +172,7 @@ COLLECTION_STATUSES = (
 )
 
 JOB_STATES = ("queued", "running", "interrupted", "cancelled", "failed", "succeeded")
-JOB_KINDS = ("scan", "index", "reindex", "import", "extract")
+JOB_KINDS = ("index", "reindex", "import", "extract")
 
 # A fixed probe text is embedded at index time and re-embedded at query time.
 # The cosine between the two proves the live server is the same embedding space
@@ -609,19 +604,6 @@ def file_status(record):
 # --- constructors ----------------------------------------------------------
 
 
-def new_manifest(created_at=None):
-    """An empty ``manifest.json`` at the current schema."""
-    now = created_at or utc_now()
-    return {
-        "schema": MANIFEST_SCHEMA,
-        "created_at": now,
-        "last_scan": None,
-        "extractor": "",
-        "chunker": chunker_label(),
-        "documents": [],
-    }
-
-
 def new_job(kind, *, collection=None, job_id=None, created_at=None):
     """A new persisted job record (``.peekseed/jobs/<id>.json``)."""
     if kind not in JOB_KINDS:
@@ -743,61 +725,6 @@ def _validate_peel_entry(raw):
                                          "validation.review_items", "peel entry"),
         },
     }
-
-
-def validate_manifest(data):
-    """Validate a ``manifest.json`` document; returns a normalised copy."""
-    _gate(data, "manifest.json", MANIFEST_SCHEMA)
-    created_at = _require_str(data.get("created_at"), "created_at", "manifest.json")
-    last_scan = data.get("last_scan")
-    if last_scan is not None:
-        _require_str(last_scan, "last_scan", "manifest.json")
-    documents = data.get("documents")
-    if not isinstance(documents, list):
-        raise ContractError("manifest.json field 'documents' must be a list.")
-    entries = []
-    seen_paths = set()
-    for raw in documents:
-        raw = _require_dict(raw, "manifest.json document entry")
-        path = _require_str(raw.get("path"), "path", "manifest.json")
-        collection = _require_str(raw.get("collection"), "collection", "manifest.json")
-        sha = _require_sha256(
-            raw.get("sha256") or "",
-            "sha256",
-            "manifest.json",
-            allow_empty=file_status(raw) in ("new", "skipped", "error"),
-        )
-        entry = {
-            "path": path,
-            "collection": collection,
-            "sha256": sha,
-            "bytes": _require_int(raw.get("bytes"), "bytes", "manifest.json"),
-            "pages": _require_int(raw.get("pages"), "pages", "manifest.json"),
-            "status": _require_status(
-                raw.get("status"), "status", "manifest.json", FILE_STATUSES
-            ),
-            "seen_at": _require_str(raw.get("seen_at"), "seen_at", "manifest.json"),
-        }
-        if path in seen_paths:
-            raise ContractError(
-                "manifest.json lists '%s' more than once." % path
-            )
-        seen_paths.add(path)
-        for field in ("mtime", "error", "extractor"):
-            if raw.get(field) is not None:
-                entry[field] = raw[field]
-        if entry.get("error") is not None:
-            _require_str(entry["error"], "error", "manifest.json", allow_empty=True)
-        entries.append(entry)
-    normalised = {
-        "schema": MANIFEST_SCHEMA,
-        "created_at": created_at,
-        "last_scan": last_scan,
-        "extractor": str(data.get("extractor") or ""),
-        "chunker": str(data.get("chunker") or ""),
-        "documents": entries,
-    }
-    return normalised
 
 
 def validate_dataset(data):
@@ -1089,7 +1016,7 @@ def upgrade_dataset(data, *, sha256_of=None):
     ``sha256_of`` is a callable taking the dataset-relative source path (for
     example ``"original/CXL.pdf"``) and returning the content hash; when it
     returns ``None`` (a file is gone) the source is marked ``new`` with an empty
-    hash so a later scan can re-discover it. The upgrade never guesses a hash.
+    hash so a later read can re-discover it. The upgrade never guesses a hash.
 
     Schema 3 adds the per-source ``extraction`` block. A legacy dataset was
     extracted by the old in-process pipeline, which peekseed no longer ships:
@@ -1229,8 +1156,6 @@ def ensure_current(data, kind):
     in memory (never on disk -- use :func:`upgrade_dataset`/:func:`upgrade_info`
     and write the result for a real migration).
     """
-    if kind == "manifest.json":
-        return validate_manifest(data)
     if kind == "dataset.json":
         return upgrade_dataset(data)
     if kind == "info.json":

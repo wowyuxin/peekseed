@@ -1598,8 +1598,8 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   </div>
 </div>
 
-<!-- Workspace: absolute paths, last scan, collection state, job controls and a
-     minimal first-run checklist. Read-mostly: Build/Rebuild starts an index job,
+<!-- Workspace: absolute paths, dataset state, job controls and a minimal
+     first-run checklist. Read-mostly: Build/Rebuild starts an index job,
      Cancel/Resume acts on one; model processes stay owned by launchd. -->
 <div class="hist-overlay" id="workspaceModal" hidden>
   <div class="hist-dialog settings-dialog" role="dialog" aria-modal="true"
@@ -4956,11 +4956,12 @@ $('#reviewModal').addEventListener('click',function(ev){
 });
 
 /* ---- workspace dialog ----------------------------------------------------
-   Read-mostly: GET /api/workspace gives the served absolute paths, last scan and
-   per-collection state; GET /api/jobs gives the persisted job records. Build and
-   Rebuild start an index job, Cancel latches a between-batch cancel, Resume
-   continues an interrupted/cancelled/failed record. The model links themselves
-   stay in Settings and are status-only here (launchd owns the processes). */
+   Read-mostly: GET /api/workspace gives the served absolute paths (home, shared,
+   sources, peels) and per-dataset state; GET /api/jobs gives the persisted job
+   records. Build and Rebuild start an index job, Cancel latches a between-batch
+   cancel, Resume continues an interrupted/cancelled/failed record. The model
+   links themselves stay in Settings and are status-only here (launchd owns the
+   processes). */
 let WS_TIMER=null;
 function workspaceOpen(){ const m=$('#workspaceModal'); return !!(m&&!m.hidden); }
 function workspaceMsg(text,isError){
@@ -5002,7 +5003,7 @@ function paintWorkspace(){
   const box=$('#workspacePanel'); if(!box) return;
   if(!WS){ box.innerHTML='<span class="ws-empty">Workspace not loaded.</span>'; return; }
   const e=embedLink();
-  const paths=(WS&&WS.workspace)||{};
+  const paths=(WS&&WS.paths)||{};
   const cols=COLS||[], jobs=JOBS||[];
   let html='';
 
@@ -5018,11 +5019,11 @@ function paintWorkspace(){
   }
   html+=wsSection('Embedding', emb);
 
-  const pathRows=wsPathRow('workspace',paths.root)+wsPathRow('documents',paths.documents_dir)
-    +wsPathRow('derived',paths.derived_dir);
+  const pathRows=wsPathRow('home',paths.root)+wsPathRow('shared',paths.shared_dir)
+    +wsPathRow('sources',paths.sources_dir)+wsPathRow('peels',paths.peels_dir);
   html+=wsSection('Paths', pathRows
-    +'<p class="ws-empty">Back up the workspace directory only; derived data is rebuildable. '
-    +'Scanning a documents/ folder is a 0.2.0 workflow.</p>');
+    +'<p class="ws-empty">Backups cover home (config, datasets, history) and '
+    +'shared/sources. Peels are rebuilt by extracting again.</p>');
 
   let colHtml;
   if(!cols.length){
@@ -5079,8 +5080,7 @@ function paintWorkspace(){
       +needs.map(step=>'<li>'+step+'</li>').join('')+'</ol>');
   }
   box.innerHTML=html;
-  workspaceMsg(WS.last_scan?('Last scan: '+WS.last_scan)
-    :'No scan recorded yet (scan is a 0.2.0 workflow; uploads and imports work in 0.1.0).');
+  workspaceMsg('');
 }
 async function loadWorkspace(){
   const [ws,cols,jobs]=await Promise.all([

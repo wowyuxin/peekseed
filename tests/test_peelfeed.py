@@ -2,7 +2,7 @@
 
 No real extraction happens here: :class:`tests.fixtures.FakePeelfeedCli` is a
 small executable that prints the JSON the real peelfeed CLI prints, records every
-invocation (argv + ``PEELFEED_ROOT``/``PYTHONPATH``) and can simulate failures,
+invocation (argv + ``PEELFEED_SHARED_DIR``/``PYTHONPATH``) and can simulate failures,
 timeouts and slow ingests. Peel corpora used by index builds are created by
 ``tests.fixtures.make_peel``. The real engine is exercised by the end-to-end
 verification, not by this suite.
@@ -24,13 +24,12 @@ _PEELFEED_ENV_KEYS = ("PEEKSEED_PEELFEED_CLI", "PEEKSEED_PEELFEED_PYTHON",
                       "PEEKSEED_PEELFEED_REPO", "PEEKSEED_PEELFEED_ENABLED",
                       "PEEKSEED_PEELFEED_TIMEOUT", "PEEKSEED_PEELFEED_POLL",
                       "PEEKSEED_PEELFEED_LLM_MODE",
-                      "PEEKSEED_PEELFEED_CHUNK_PROFILE",
-                      "PEEKSEED_PEELFEED_ROOT", "PEELFEED_ROOT")
+                      "PEEKSEED_PEELFEED_CHUNK_PROFILE")
 
 
 def _clear_peelfeed_env():
     for key in list(os.environ):
-        if key.startswith("PEEKSEED_PEELFEED_") or key == "PEELFEED_ROOT":
+        if key.startswith("PEEKSEED_PEELFEED_"):
             os.environ.pop(key, None)
 
 
@@ -38,17 +37,15 @@ def _clear_peelfeed_env():
 def peelfeed_env(**values):
     """Set the peelfeed env for one test and reset the config/handshake caches.
 
-    ``ROOT`` maps to the shared ``PEELFEED_ROOT``; every other key is prefixed
-    with ``PEEKSEED_PEELFEED_``. Empty values are left unset.
+    Every key is prefixed with ``PEEKSEED_PEELFEED_``. Empty values are left
+    unset. The peel root is always ``config.paths().peels_dir``.
     """
     saved = {key: os.environ.get(key) for key in _PEELFEED_ENV_KEYS}
     _clear_peelfeed_env()
     for name, value in values.items():
         if value is None or value == "":
             continue
-        env_name = ("PEELFEED_ROOT" if name == "ROOT"
-                    else "PEEKSEED_PEELFEED_" + name)
-        os.environ[env_name] = str(value)
+        os.environ["PEEKSEED_PEELFEED_" + name] = str(value)
     from peekseed import peelfeed
     peelfeed.reset_cache()
     try:
@@ -59,6 +56,11 @@ def peelfeed_env(**values):
             if value is not None:
                 os.environ[key] = value
         peelfeed.reset_cache()
+
+
+def _shared(root):
+    """The shared folder of a ``temp_data_root`` home (resolved)."""
+    return (root.parent / "shared").resolve()
 
 
 def _client():
@@ -132,8 +134,7 @@ class ConfigTests(unittest.TestCase):
     def test_env_seeds_a_0600_config_file_without_secrets(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              LLM_MODE="review", CHUNK_PROFILE="large",
+            with peelfeed_env(CLI=str(cli.path), LLM_MODE="review", CHUNK_PROFILE="large",
                               TIMEOUT="12", POLL="1.5"):
                 from peekseed import peelfeed
                 cfg = peelfeed.load()
@@ -141,7 +142,7 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(path.is_file())
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
                 self.assertEqual(cfg["cli"], str(cli.path))
-                self.assertEqual(cfg["root"], str(root / "peels"))
+                self.assertEqual(cfg["root"], str(_shared(root) / "peels"))
                 self.assertEqual(cfg["llm_mode"], "review")
                 self.assertEqual(cfg["chunk_profile"], "large")
                 self.assertEqual(cfg["timeout"], 12.0)
@@ -198,16 +199,6 @@ class ConfigTests(unittest.TestCase):
                 with self.assertRaises(peelfeed.PeelfeedConfigError):
                     peelfeed.load()
 
-    def test_legacy_root_env_is_still_accepted(self):
-        with temp_data_root() as root:
-            cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path)):
-                os.environ["PEEKSEED_PEELFEED_ROOT"] = str(root / "legacy-peels")
-                from peekseed import peelfeed
-                peelfeed.reset_cache()
-                self.assertEqual(peelfeed.load()["root"],
-                                 str(root / "legacy-peels"))
-
     def test_python_fallback_derives_the_repo_and_sets_pythonpath(self):
         with temp_data_root() as root:
             repo = root / "peelfeed"
@@ -218,7 +209,7 @@ class ConfigTests(unittest.TestCase):
             python.write_text(cli.path.read_text(encoding="utf-8"),
                               encoding="utf-8")
             python.chmod(0o755)
-            with peelfeed_env(PYTHON=str(python), ROOT=str(root / "peels")):
+            with peelfeed_env(PYTHON=str(python)):
                 from peekseed import peelfeed
                 cfg = peelfeed.load()
                 self.assertEqual(cfg["repo"], str(repo))
@@ -228,14 +219,14 @@ class ConfigTests(unittest.TestCase):
                 self.assertTrue(result["available"], result)
                 call = cli.calls()[-1]
                 self.assertTrue((call["pythonpath"] or "").startswith(str(repo)))
-                self.assertEqual(call["peel_root"], str(root / "peels"))
+                self.assertEqual(call["peel_shared_dir"], str(_shared(root)))
 
 
 class HandshakeTests(unittest.TestCase):
     def test_handshake_reports_capabilities_and_is_cached_60s(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(cli.path)):
                 from peekseed import peelfeed
                 first = peelfeed.handshake()
                 self.assertTrue(first["available"], first)
@@ -246,7 +237,7 @@ class HandshakeTests(unittest.TestCase):
                 self.assertEqual(first["chunk_contract"], 1)
                 self.assertEqual(first["formats"], ["pdf"])
                 self.assertIn("generic", first["profiles"])
-                self.assertEqual(first["peel_root"], str(root / "peels"))
+                self.assertEqual(first["peel_root"], str(_shared(root) / "peels"))
                 self.assertEqual(cli.commands(), ["capabilities"])
                 second = peelfeed.handshake()
                 self.assertTrue(second["available"])
@@ -258,8 +249,7 @@ class HandshakeTests(unittest.TestCase):
 
     def test_missing_cli_is_unavailable_not_a_crash(self):
         with temp_data_root() as root:
-            with peelfeed_env(CLI=str(root / "does-not-exist"),
-                              ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(root / "does-not-exist")):
                 from peekseed import peelfeed
                 result = peelfeed.handshake()
                 self.assertFalse(result["available"])
@@ -270,8 +260,7 @@ class HandshakeTests(unittest.TestCase):
     def test_capabilities_timeout_is_unavailable(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake", {"capabilities_delay": 5})
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              TIMEOUT="0.3"):
+            with peelfeed_env(CLI=str(cli.path), TIMEOUT="0.3"):
                 from peekseed import peelfeed
                 result = peelfeed.handshake()
                 self.assertFalse(result["available"])
@@ -289,7 +278,7 @@ class HandshakeTests(unittest.TestCase):
     def test_status_has_no_http_fields(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(cli.path)):
                 from peekseed import peelfeed
                 payload = peelfeed.status(probe=True)
                 self.assertTrue(payload["handshake"]["available"])
@@ -305,7 +294,7 @@ class CliAdapterTests(unittest.TestCase):
             cli = FakePeelfeedCli(root / "fake", {"ingest_pages": 2,
                                                   "ingest_review_items": 3})
             source = make_pdf(root / "manual.pdf")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(cli.path)):
                 from peekseed import peelfeed
                 engine = peelfeed.client()
                 caps = engine.capabilities()
@@ -342,7 +331,7 @@ class CliAdapterTests(unittest.TestCase):
                                 "decide", "rebuild", "event", "archive"):
                     self.assertIn(command, commands)
                 for call in calls:
-                    self.assertEqual(call["peel_root"], str(root / "peels"))
+                    self.assertEqual(call["peel_shared_dir"], str(_shared(root)))
                     if call["argv"][0] != "capabilities":
                         self.assertIn("--json", call["argv"])
                         self.assertIn("--root", call["argv"])
@@ -367,7 +356,7 @@ class CliAdapterTests(unittest.TestCase):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake", {"ingest_fail": True})
             source = make_pdf(root / "manual.pdf")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(cli.path)):
                 from peekseed import peelfeed
                 with self.assertRaises(peelfeed.PeelfeedError) as caught:
                     peelfeed.client().ingest(str(source))
@@ -378,7 +367,7 @@ class CliAdapterTests(unittest.TestCase):
     def test_unknown_peel_maps_to_404(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(cli.path)):
                 from peekseed import peelfeed
                 with self.assertRaises(peelfeed.PeelfeedError) as caught:
                     peelfeed.client().status("nope")
@@ -387,8 +376,7 @@ class CliAdapterTests(unittest.TestCase):
 
     def test_missing_executable_is_unavailable(self):
         with temp_data_root() as root:
-            with peelfeed_env(CLI=str(root / "missing"),
-                              ROOT=str(root / "peels")):
+            with peelfeed_env(CLI=str(root / "missing")):
                 from peekseed import peelfeed
                 with self.assertRaises(peelfeed.PeelfeedUnavailable):
                     peelfeed.client().capabilities()
@@ -429,8 +417,7 @@ class PeelfeedApiTests(unittest.TestCase):
             cli = FakePeelfeedCli(root / "fake", {"ingest_seconds": 1.0,
                                                   "ingest_pages": 2,
                                                   "ingest_review_items": 4})
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              POLL="0.05"):
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
                 client = _client()
                 dataset, _pdf = _upload(client, root)
                 sha = _sources(client, dataset["id"])[0]["sha256"]
@@ -474,8 +461,7 @@ class PeelfeedApiTests(unittest.TestCase):
     def test_extract_reuses_an_existing_peel_by_the_sha8_suffix(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              POLL="0.05"):
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
                 client = _client()
                 dataset, pdf = _upload(client, root)
                 sha = hashlib.sha256(pdf.read_bytes()).hexdigest()
@@ -504,8 +490,7 @@ class PeelfeedApiTests(unittest.TestCase):
     def test_ingest_failure_marks_the_source_failed_with_a_readable_error(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake", {"ingest_fail": True})
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              POLL="0.05"):
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
                 client = _client()
                 dataset, _pdf = _upload(client, root)
                 sha = _sources(client, dataset["id"])[0]["sha256"]
@@ -523,7 +508,7 @@ class PeelfeedApiTests(unittest.TestCase):
     def test_extract_unavailable_marks_the_source_failed_and_keeps_uploads(self):
         with temp_data_root() as root:
             with peelfeed_env(CLI=str(root / "missing"),
-                              ROOT=str(root / "peels"), TIMEOUT="1"):
+                              TIMEOUT="1"):
                 client = _client()
                 dataset, _pdf = _upload(client, root)
                 sha = _sources(client, dataset["id"])[0]["sha256"]
@@ -541,9 +526,8 @@ class PeelfeedApiTests(unittest.TestCase):
             cli = FakePeelfeedCli(root / "fake", {"ingest_pages": 2,
                                                   "ingest_review_items": 2,
                                                   "rebuild_seconds": 0.2})
-            peel_root = root / "peels"
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(peel_root),
-                              POLL="0.05"):
+            peel_root = _shared(root) / "peels"
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
                 client = _client()
                 dataset, _pdf = _upload(client, root)
                 sha = _sources(client, dataset["id"])[0]["sha256"]
@@ -627,8 +611,7 @@ class PeelfeedApiTests(unittest.TestCase):
     def test_delete_keeps_the_peel_by_default(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              POLL="0.05"):
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
                 client = _client()
                 dataset, _pdf = _upload(client, root)
                 sha = _sources(client, dataset["id"])[0]["sha256"]
@@ -643,8 +626,7 @@ class PeelfeedApiTests(unittest.TestCase):
     def test_status_reports_config_capabilities_and_queue(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
-            with peelfeed_env(CLI=str(cli.path), ROOT=str(root / "peels"),
-                              POLL="0.05"):
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
                 client = _client()
                 dataset, _pdf = _upload(client, root)
                 sha = _sources(client, dataset["id"])[0]["sha256"]
@@ -717,7 +699,7 @@ class NoHttpContractTests(unittest.TestCase):
         from peekseed import peelfeed
         source = inspect.getsource(peelfeed)
         for marker in ("httpx", "base_url", "Authorization", "Bearer",
-                       "/peels", "PEEKSEED_PEELFEED_TOKEN"):
+                       "/peels/", "PEEKSEED_PEELFEED_TOKEN"):
             self.assertNotIn(marker, source)
 
     def test_the_config_has_no_base_url_or_token_keys(self):

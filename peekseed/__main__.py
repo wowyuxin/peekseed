@@ -1,19 +1,19 @@
 """Command-line entry point for peekseed.
 
-    python -m peekseed init [--workspace PATH]
-    python -m peekseed scan [--prune] [--link ID]
+    python -m peekseed init
     python -m peekseed status | doctor
-    python -m peekseed workspace path | move PATH
     python -m peekseed reindex --all --link ID [--dry-run] [--gc]
     python -m peekseed migrate [--apply]
     python -m peekseed serve [--host H] [--port P]
     python -m peekseed index --name "My docs" --file a.pdf   # storage-only upload
+    python -m peekseed version
 
-`serve` is what most people want; the workspace commands exist so a headless
-machine can scan/store and repair a workspace without opening a browser. Both the
-CLI and the API call the same modules, so the two can never drift apart.
-Extraction is a peelfeed job (triggered from the UI/API), never a peekseed CLI
-step: uploads are storage only.
+`serve` is what most people want; `init`/`status`/`doctor` exist so a headless
+machine can prepare and repair the data folders without opening a browser. Both
+the CLI and the API call the same modules, so the two can never drift apart.
+Uploads are storage only; extraction is a peelfeed job triggered from the
+UI/API. Both ``PEEKSEED_HOME`` and ``PEEKSEED_SHARED_DIR`` are required and a
+missing one stops the command with a clean error (exit 2).
 """
 
 import argparse
@@ -24,38 +24,14 @@ import sys
 def _print_paths():
     from . import config
     paths = config.ensure()
-    print("data root: %s" % paths.root)
-    for label, value in (("workspace", paths.workspace_root),
-                         ("documents", paths.documents_dir),
+    print("home: %s" % paths.root)
+    for label, value in (("shared", paths.shared_dir),
+                         ("sources", paths.sources_dir),
+                         ("peels", paths.peels_dir),
                          ("config", paths.config_dir),
                          ("datasets", paths.datasets_dir),
                          ("history", paths.history_dir)):
         print("  %-9s %s" % (label + ":", value))
-
-
-def _progress_printer():
-    def report(fraction, message):
-        print("  [%3d%%] %s" % (int(max(0.0, min(1.0, fraction)) * 100), message),
-              flush=True)
-    return report
-
-
-def _apply_workspace_argument(args):
-    """Make ``--workspace`` win over the environment for this process."""
-    value = getattr(args, "workspace", None)
-    if not value:
-        return
-    os.environ["PEEKSEED_WORKSPACE"] = str(value)
-    try:
-        from . import config
-        config.reset_cache()
-    except Exception:  # pragma: no cover - config is always importable
-        pass
-    try:
-        from . import links
-        links.reset_cache()
-    except Exception:  # pragma: no cover
-        pass
 
 
 def _active_embed_link(links, link_id=None):
@@ -81,49 +57,24 @@ def _active_embed_link(links, link_id=None):
 
 def cmd_init(args):
     from . import workspace
-    _apply_workspace_argument(args)
-    report = workspace.init(args.workspace)
-    print("peekseed is initialized; put documents in %s" % report["documents_dir"])
-    print("then run `python -m peekseed scan`.")
+    report = workspace.init()
+    print("peekseed is initialized: home %s, shared %s"
+          % (report["home"], report["shared_dir"]))
+    print("then run `python -m peekseed serve` and upload PDFs in the UI.")
     return 0
-
-
-def cmd_scan(args):
-    from . import scan
-    _apply_workspace_argument(args)
-    if args.link:
-        print("note: scan no longer builds indexes; --link is ignored "
-              "(extract with peelfeed, then build the index).")
-    report = scan.scan(args.workspace, prune=args.prune,
-                       progress=_progress_printer() if not args.quiet else None)
-    counts = report.get("counts") or {}
-    print("scanned %d file(s): %d new, %d changed, %d unchanged, %d missing, "
-          "%d error(s)"
-          % (report.get("scanned", sum(counts.values())),
-             counts.get("new", 0), counts.get("changed", 0),
-             counts.get("unchanged", 0), counts.get("missing", 0),
-             counts.get("errors", 0)))
-    for name, state in sorted((report.get("collections") or {}).items()):
-        print("  %-20s %-12s %s source(s), %s chunk(s)%s"
-              % (name, state.get("status", "?"), state.get("sources", 0),
-                 state.get("chunks", 0),
-                 (" - " + "; ".join(state.get("reasons") or []))
-                 if state.get("reasons") else ""))
-    return 0 if not counts.get("errors") else 1
 
 
 def cmd_status(args):
     from . import workspace
-    _apply_workspace_argument(args)
-    report = workspace.status(args.workspace)
-    paths = report.get("workspace") or {}
-    print("workspace: %s" % (paths.get("root") or paths.get("workspace_root")))
-    print("  documents: %s" % paths.get("documents_dir"))
-    print("  derived:   %s" % paths.get("derived_dir"))
-    print("  last scan: %s" % (report.get("last_scan") or "never"))
+    report = workspace.status()
+    paths = report.get("paths") or {}
+    print("home:   %s" % paths.get("root"))
+    print("  shared:  %s" % paths.get("shared_dir"))
+    print("  sources: %s" % paths.get("sources_dir"))
+    print("  peels:   %s" % paths.get("peels_dir"))
     collections = report.get("collections") or {}
     if not collections:
-        print("  no collections yet; put documents in documents/ and run `scan`")
+        print("  no datasets yet; upload PDFs in the UI")
     for name, state in sorted(collections.items()):
         print("  %-20s %-12s %2d source(s) %4d chunk(s)%s"
               % (name, state.get("status", "?"), state.get("sources", 0),
@@ -151,19 +102,15 @@ def cmd_status(args):
         else:
             print("peelfeed: not configured (uploads and file management work; "
                   "extraction is disabled)")
-    errors = report.get("errors") or []
-    for error in errors:
-        print("  error: %s" % error, file=sys.stderr)
     return 0
 
 
 def cmd_doctor(args):
     from . import workspace
-    _apply_workspace_argument(args)
-    report = workspace.doctor(args.workspace)
+    report = workspace.doctor()
     paths = report.get("paths") or {}
-    print("workspace: %s" % (paths.get("root") or paths.get("workspace_root")))
-    for label in ("documents_dir", "derived_dir", "links_file"):
+    print("home:   %s" % paths.get("root"))
+    for label in ("shared_dir", "sources_dir", "peels_dir", "links_file"):
         if paths.get(label):
             print("  %-12s %s" % (label + ":", paths[label]))
     peelfeed = report.get("peelfeed") or {}
@@ -188,35 +135,15 @@ def cmd_doctor(args):
     return 0 if not issues else 1
 
 
-def cmd_workspace(args):
-    from . import workspace
-    _apply_workspace_argument(args)
-    if args.action == "path":
-        ws = workspace.resolve(args.workspace)
-        print(str(ws.root))
-        return 0
-    if args.action == "move":
-        if not args.target:
-            print("`workspace move` needs a destination directory", file=sys.stderr)
-            return 2
-        report = workspace.move(args.target, explicit=args.workspace)
-        print("workspace moved to %s" % report["root"])
-        return 0
-    print("unknown workspace action %r" % args.action, file=sys.stderr)
-    return 2
-
-
 def cmd_reindex(args):
-    from . import config, ingest, links, workspace
-    _apply_workspace_argument(args)
+    from . import config, ingest, links
     link = _active_embed_link(links, args.link)
     if link is None:
         print("reindex needs an enabled embed link (--link ID)", file=sys.stderr)
         return 2
-    ws = workspace.resolve(args.workspace)
-    datasets_dir = ws.datasets_dir
+    datasets_dir = config.paths().datasets_dir
     if not datasets_dir.is_dir():
-        print("no datasets in this workspace; run `scan` first", file=sys.stderr)
+        print("no datasets in this home; upload PDFs in the UI first", file=sys.stderr)
         return 2
     directories = sorted(path for path in datasets_dir.iterdir() if path.is_dir())
     if args.collection:
@@ -249,7 +176,6 @@ def cmd_reindex(args):
 def cmd_index(args):
     """Explicit upload path: create a dataset and store files (no extraction)."""
     from . import config, ingest
-    _apply_workspace_argument(args)
     config.ensure()
     if not args.file:
         print("at least one --file is required", file=sys.stderr)
@@ -270,20 +196,15 @@ def cmd_index(args):
 
 
 def cmd_migrate(args):
-    from . import migrate as migrate_module, workspace
-    _apply_workspace_argument(args)
-    ws = workspace.resolve(args.workspace)
-    report = migrate_module.migrate(ws.derived_dir, workspace_root=ws.root,
-                                    dry_run=not args.apply)
+    from . import config, migrate as migrate_module
+    report = migrate_module.migrate(config.paths().root, dry_run=not args.apply)
     print(migrate_module.format_report(report))
     return 0 if not report["errors"] else 1
 
 
 def cmd_serve(args):
-    from . import config, workspace
-    _apply_workspace_argument(args)
+    from . import config
     config.ensure()
-    ws = workspace.resolve(args.workspace)
     try:
         import uvicorn
     except ImportError:
@@ -292,8 +213,8 @@ def cmd_serve(args):
     from .app import create_app
     host = args.host or config.host()
     port = args.port or config.port()
-    print("peekseed: http://%s:%d/  (workspace: %s)" % (host, port, ws.root),
-          flush=True)
+    print("peekseed: http://%s:%d/  (home: %s)"
+          % (host, port, config.paths().root), flush=True)
     uvicorn.run(create_app(), host=host, port=port, log_level="info")
     return 0
 
@@ -304,49 +225,24 @@ def cmd_version(args):
     return 0
 
 
-def _add_workspace_argument(parser):
-    parser.add_argument("--workspace", default=None, metavar="PATH",
-                        help="workspace root (default: $PEEKSEED_WORKSPACE or ./workspace)")
-
-
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="peekseed",
         description="A local-first AI research framework over your own documents.")
     sub = parser.add_subparsers(dest="command")
 
-    p = sub.add_parser("init", help="create the workspace tree and gitignore guard")
-    _add_workspace_argument(p)
+    p = sub.add_parser("init", help="create the home and shared tree")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("scan", help="reconcile documents/ with the manifest")
-    _add_workspace_argument(p)
-    p.add_argument("--prune", action="store_true",
-                   help="remove missing sources and their chunks (data loss)")
-    p.add_argument("--link", default=None, help="embed link id (default: active)")
-    p.add_argument("--quiet", action="store_true", help="no per-stage progress lines")
-    p.set_defaults(func=cmd_scan)
-
-    p = sub.add_parser("status", help="workspace, collections and last scan")
-    _add_workspace_argument(p)
+    p = sub.add_parser("status", help="data paths, datasets and peelfeed")
     p.set_defaults(func=cmd_status)
 
-    p = sub.add_parser("doctor", help="paths, gitignore/checkout, links, schemas")
-    _add_workspace_argument(p)
+    p = sub.add_parser("doctor", help="paths, permissions, links, schemas")
     p.set_defaults(func=cmd_doctor)
 
-    p = sub.add_parser("workspace", help="inspect or move the workspace")
-    _add_workspace_argument(p)
-    actions = p.add_subparsers(dest="action")
-    actions.add_parser("path", help="print the resolved absolute workspace root")
-    move = actions.add_parser("move", help="move the whole workspace tree")
-    move.add_argument("target", help="new workspace directory")
-    p.set_defaults(func=cmd_workspace)
-
     p = sub.add_parser("reindex", help="rebuild an index in a new embedding space")
-    _add_workspace_argument(p)
-    p.add_argument("--all", action="store_true", help="every collection")
-    p.add_argument("--collection", default=None, help="one collection id")
+    p.add_argument("--all", action="store_true", help="every dataset")
+    p.add_argument("--collection", default=None, help="one dataset id")
     p.add_argument("--link", default=None, help="embed link id (default: active)")
     p.add_argument("--dry-run", action="store_true",
                    help="print the scope and write nothing")
@@ -355,18 +251,15 @@ def build_parser():
     p.set_defaults(func=cmd_reindex)
 
     p = sub.add_parser("migrate", help="upgrade older data schemas (dry-run default)")
-    _add_workspace_argument(p)
     p.add_argument("--apply", action="store_true", help="write the upgrades")
     p.set_defaults(func=cmd_migrate)
 
     p = sub.add_parser("serve", help="run the local web server")
-    _add_workspace_argument(p)
     p.add_argument("--host", default=None, help="bind host (default 127.0.0.1)")
     p.add_argument("--port", type=int, default=None, help="bind port (default 8030)")
     p.set_defaults(func=cmd_serve)
 
     p = sub.add_parser("index", help="store files as a dataset (no extraction)")
-    _add_workspace_argument(p)
     p.add_argument("--name", required=True, help="display name for the dataset")
     p.add_argument("--file", action="append", default=[], help="PDF to store (repeatable)")
     p.add_argument("--note", default="", help="optional note")
@@ -387,7 +280,11 @@ def main(argv=None):
     if not getattr(args, "func", None):
         parser.print_help()
         return 0
-    return args.func(args)
+    try:
+        return args.func(args)
+    except config.ConfigError as exc:
+        print("peekseed: %s" % exc, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

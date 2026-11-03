@@ -8,6 +8,7 @@ reporting are the contract this file pins.
 
 import json
 import os
+import stat
 import unittest
 from pathlib import Path
 
@@ -27,57 +28,80 @@ def embed_link(fake, model="test-embed", **extra):
 
 
 class StorageUploadTests(unittest.TestCase):
+    def _shared_files(self):
+        from peekseed import config
+        root = config.paths().sources_dir
+        if not root.is_dir():
+            return []
+        return [path for path in root.rglob("*") if path.is_file()]
+
     def test_create_dataset_and_add_source(self):
-        with temp_data_root() as root:
+        with temp_data_root() as home:
             from peekseed import config, ingest
             dataset = ingest.create_dataset(config.paths(), "Product Docs")
             self.assertEqual(dataset["id"], "product-docs")
-            pdf = make_pdf(root / "a.pdf", pages=["hello"])
+            pdf = make_pdf(home / "a.pdf", pages=["hello"])
             entry = ingest.add_source(dataset, pdf)
             self.assertEqual(entry["name"], "a.pdf")
             self.assertEqual(entry["status"], "uploaded")
             self.assertEqual(entry["pages"], 0)
             self.assertEqual(entry["extraction"]["state"], "not_extracted")
-            self.assertTrue((Path(dataset["dir"]) / "original" / "a.pdf").is_file())
+            stored = config.paths().sources_dir / entry["sha256"] / "a.pdf"
+            self.assertEqual(entry["path"],
+                             "sources/%s/a.pdf" % entry["sha256"])
+            self.assertTrue(stored.is_file())
+            self.assertEqual(stat.S_IMODE(stored.stat().st_mode), 0o600)
+            self.assertFalse((Path(dataset["dir"]) / "original").exists())
             # same file again is idempotent, not duplicated
             again = ingest.add_source(dataset, pdf)
             self.assertEqual(again["name"], "a.pdf")
             info = ingest.dataset_info(dataset["dir"])
             self.assertEqual(info["id"], "product-docs")
             self.assertEqual(len(info["sources"]), 1)
+            self.assertEqual(len(self._shared_files()), 1)
 
     def test_reuploading_the_same_file_is_idempotent(self):
-        with temp_data_root() as root:
+        with temp_data_root() as home:
             from peekseed import config, ingest
             dataset = ingest.create_dataset(config.paths(), "Docs")
-            one = make_pdf(root / "one" / "same.pdf", pages=["first"])
+            one = make_pdf(home / "one" / "same.pdf", pages=["first"])
             first = ingest.add_source(dataset, one)
             second = ingest.add_source(dataset, one)
             self.assertEqual(first["sha256"], second["sha256"])
             self.assertEqual(first["name"], second["name"])
-            originals = list((Path(dataset["dir"]) / "original").iterdir())
-            self.assertEqual(len(originals), 1)
+            self.assertEqual(len(self._shared_files()), 1)
 
-    def test_same_bytes_under_another_name_is_a_second_source(self):
-        with temp_data_root() as root:
+    def test_same_pdf_in_two_datasets_is_one_stored_file(self):
+        with temp_data_root() as home:
+            from peekseed import config, ingest
+            first_dataset = ingest.create_dataset(config.paths(), "One")
+            second_dataset = ingest.create_dataset(config.paths(), "Two")
+            pdf = make_pdf(home / "same.pdf", pages=["first"])
+            first = ingest.add_source(first_dataset, pdf)
+            second = ingest.add_source(second_dataset, pdf)
+            self.assertEqual(first["sha256"], second["sha256"])
+            self.assertEqual(first["path"], second["path"])
+            self.assertEqual(len(self._shared_files()), 1)
+
+    def test_same_bytes_under_another_name_is_the_same_source(self):
+        with temp_data_root() as home:
             from peekseed import config, ingest
             dataset = ingest.create_dataset(config.paths(), "Docs")
-            one = make_pdf(root / "one" / "same.pdf", pages=["first"])
-            two = make_pdf(root / "two" / "other-name.pdf", pages=["first"])
+            one = make_pdf(home / "one" / "same.pdf", pages=["first"])
+            two = make_pdf(home / "two" / "other-name.pdf", pages=["first"])
             first = ingest.add_source(dataset, one)
             second = ingest.add_source(dataset, two)
-            # Same content hash, distinct stored copies/entries (the pre-M-1
-            # duplicate-name semantics; peelfeed reuses one peel by sha256).
+            # Content, not path, is identity: the re-upload returns the entry.
             self.assertEqual(first["sha256"], second["sha256"])
-            self.assertNotEqual(first["name"], second["name"])
-            self.assertEqual(len(list((Path(dataset["dir"]) / "original").iterdir())), 2)
+            self.assertEqual(first["name"], second["name"])
+            self.assertEqual(len(self._shared_files()), 1)
 
     def test_duplicate_names_are_uniquified(self):
-        with temp_data_root() as root:
+        with temp_data_root() as home:
             from peekseed import config, ingest
             dataset = ingest.create_dataset(config.paths(), "Docs")
-            one = make_pdf(root / "one" / "same.pdf", pages=["first"])
-            two = make_pdf(root / "two" / "same.pdf", pages=["second"])
+            one = make_pdf(home / "one" / "same.pdf", pages=["first"])
+            two = make_pdf(home / "two" / "same.pdf", pages=["second"])
             self.assertEqual(ingest.add_source(dataset, one)["name"], "same.pdf")
             self.assertEqual(ingest.add_source(dataset, two)["name"], "same-2.pdf")
 
@@ -89,25 +113,46 @@ class StorageUploadTests(unittest.TestCase):
             self.assertNotEqual(first["id"], second["id"])
 
     def test_non_pdf_upload_is_refused_with_a_clear_message(self):
-        with temp_data_root() as root:
+        with temp_data_root() as home:
             from peekseed import config, ingest
             dataset = ingest.create_dataset(config.paths(), "Docs")
-            notes = root / "notes.txt"
+            notes = home / "notes.txt"
             notes.write_text("not a pdf", encoding="utf-8")
             with self.assertRaises(ingest.IngestError) as caught:
                 ingest.add_source(dataset, notes)
             self.assertIn("Unsupported file type", str(caught.exception))
-            self.assertFalse((Path(dataset["dir"]) / "original" / "notes.txt").exists())
+            self.assertEqual(self._shared_files(), [])
 
     def test_corrupt_pdf_bytes_are_refused_before_storage(self):
-        with temp_data_root() as root:
+        with temp_data_root() as home:
             from peekseed import config, ingest
             dataset = ingest.create_dataset(config.paths(), "Docs")
-            broken = root / "broken.pdf"
+            broken = home / "broken.pdf"
             broken.write_bytes(b"not a pdf at all")
             with self.assertRaises(ingest.IngestError) as caught:
                 ingest.add_source(dataset, broken)
             self.assertIn("not a PDF", str(caught.exception))
+
+    def test_source_file_rejects_a_path_outside_the_shared_pool(self):
+        with temp_data_root():
+            from peekseed.ingest.index import _source_file
+            self.assertIsNone(_source_file(
+                Path("/nonexistent-dataset"),
+                {"name": "passwd", "path": "sources/../../etc/passwd"}))
+
+    def test_removing_the_last_reference_deletes_the_shared_file(self):
+        with temp_data_root() as home:
+            from peekseed import config, ingest
+            first_dataset = ingest.create_dataset(config.paths(), "One")
+            second_dataset = ingest.create_dataset(config.paths(), "Two")
+            pdf = make_pdf(home / "same.pdf", pages=["first"])
+            entry = ingest.add_source(first_dataset, pdf)
+            ingest.add_source(second_dataset, pdf)
+            folder = config.paths().sources_dir / entry["sha256"]
+            ingest.remove_source(first_dataset["dir"], entry["sha256"])
+            self.assertTrue(folder.is_dir())       # still used by dataset Two
+            ingest.remove_source(second_dataset["dir"], entry["sha256"])
+            self.assertFalse(folder.exists())      # now unreferenced
 
 
 class IndexBuildTests(unittest.TestCase):
@@ -267,8 +312,7 @@ class IndexBuildTests(unittest.TestCase):
             peel = make_peel(dataset, peel_root=outside)
             # A symlink inside the allowlisted peel root pointing outside must be
             # refused by the realpath gate, not followed.
-            default_root = Path(os.environ.get("PEEKSEED_PEELFEED_ROOT")
-                                or (config.paths().root / "peels"))
+            default_root = config.paths().peels_dir
             default_root.mkdir(parents=True, exist_ok=True)
             os.symlink(peel["peel_dir"], str(default_root / peel["peel_id"]))
             with self.assertRaises(ingest.IngestError) as caught:

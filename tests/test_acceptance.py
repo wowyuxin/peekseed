@@ -1,20 +1,21 @@
 """End-to-end acceptance tests for audit §6.10 gates 1-6 and 9-11.
 
-These exercise the workspace + ingestion core the way a user does: a real
-workspace tree, real PDFs from ``tests.fixtures``, a fake model server, a fake
-peelfeed peel corpus, and the CLI/app entry points. Unit coverage for each module
-lives beside it (``test_workspace``/``test_scan``/``test_index``/
+These exercise the storage + ingestion core the way a user does: a real home and
+shared folder, real PDFs from ``tests.fixtures``, a fake model server, a fake
+peelfeed peel corpus and the CLI/app entry points. Unit coverage for each module
+lives beside it (``test_workspace``/``test_ingest``/``test_index``/
 ``test_security``); this file is the gate evidence that they compose.
 
-Since M-1 the scan is storage-only and extraction is a peelfeed job: the gates
-that used to say "scan → indexed" now say "scan → uploaded; extract (fake peel)
-→ build index → indexed".
+Uploads are storage-only (one copy in ``shared/sources``); extraction is a
+peelfeed job. A gate therefore reads "upload -> fake peel -> build index ->
+indexed".
 """
 
 import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import tracemalloc
 import unittest
@@ -43,48 +44,12 @@ def fake_link(fake, model="test-embed", **extra):
 
 
 @contextlib.contextmanager
-def isolated_workspace(tmp):
-    """A real project checkout with a workspace inside it, and PEEKSEED_* pinned."""
-    project = Path(tmp) / "project"
-    project.mkdir()
-    # A real checkout, so the gitignore guard and `git check-ignore` behave as
-    # they do for a user (an empty .git directory makes git exit 128).
-    import subprocess
-    subprocess.run(["git", "init", "-q", str(project)], check=True)
-    workspace_root = project / "ws"
-    saved = {key: os.environ.pop(key) for key in list(os.environ)
-             if key.startswith("PEEKSEED_")}
-    previous_cwd = os.getcwd()
-    os.environ["PEEKSEED_WORKSPACE"] = str(workspace_root)
-    os.environ["PEEKSEED_DATA"] = str(workspace_root / ".peekseed")
-    os.chdir(project)
-    from peekseed import app as app_module, config, links, workspace
-    config.reset_cache()
-    links.reset_cache()
-    app_module.reset_state()
+def scratch_dir():
+    path = Path(tempfile.mkdtemp(prefix="peekseed-acc-"))
     try:
-        workspace.init(str(workspace_root))
-        yield project, workspace_root, workspace_root / ".peekseed"
+        yield path
     finally:
-        app_module.reset_state()
-        config.reset_cache()
-        links.reset_cache()
-        os.chdir(previous_cwd)
-        for key in [key for key in os.environ if key.startswith("PEEKSEED_")]:
-            os.environ.pop(key, None)
-        os.environ.update(saved)
-
-
-def document_snapshot(documents_dir):
-    """Every document's content hash, byte size and mtime (for "unchanged" checks)."""
-    from peekseed import contracts
-    rows = {}
-    for path in sorted(Path(documents_dir).rglob("*")):
-        if path.is_file():
-            stat = path.stat()
-            rows[str(path)] = (contracts.sha256_file(path), stat.st_size,
-                               stat.st_mtime_ns)
-    return rows
+        shutil.rmtree(str(path), ignore_errors=True)
 
 
 def current_generation_dir(dataset_dir):
@@ -112,139 +77,99 @@ def dataset_sources(dataset_dir):
         contracts.read_json(Path(dataset_dir) / "dataset.json"))["sources"]
 
 
+def _dataset_with_source(name, pages, filename="a.pdf"):
+    """Create a dataset and store one real PDF in the shared sources pool."""
+    from peekseed import config, ingest
+    dataset = ingest.create_dataset(config.paths(), name)
+    with scratch_dir() as scratch:
+        pdf = make_pdf(scratch / filename, pages=pages)
+        ingest.add_source(dataset, pdf)
+    return dataset
+
+
 class GateOneTests(unittest.TestCase):
-    """1. init creates the tree + anchored gitignore; scan leaves documents untouched."""
+    """1. init creates the home/shared tree; upload stores one shared copy."""
 
-    def test_init_and_scan_do_not_touch_documents(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (project, ws, derived):
-            from peekseed.__main__ import main
-            from peekseed import scan
-
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                self.assertEqual(main(["init", "--workspace", str(ws)]), 0)
-            self.assertTrue((ws / "documents").is_dir())
-            self.assertTrue((derived / "manifest.json").is_file())
-            self.assertTrue((derived / "config" / "links.json").is_file())
-            gitignore = (project / ".gitignore").read_text(encoding="utf-8")
-            # The anchored entry names the actual workspace path: the default
-            # ./workspace gives "/workspace/", any other location gives its own
-            # relative pattern (this fixture uses "ws").
-            self.assertIn("\n/ws/\n", "\n" + gitignore.strip() + "\n")
-            import subprocess
-            ignored = subprocess.run(
-                ["git", "-C", str(project), "check-ignore", "-q", "ws"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.assertEqual(ignored.returncode, 0)
-
-            make_pdf(ws / "documents" / "manual.pdf",
-                     pages=["The widget is mounted with two screws."])
-            before = document_snapshot(ws / "documents")
-            report = scan.scan(str(ws))
-            self.assertEqual(report["counts"]["new"], 1)
-            self.assertEqual(report["counts"]["errors"], 0)
-            collection = collection_state(report, "default")
-            self.assertEqual(collection["status"], "uploaded")
-            self.assertEqual(collection["chunks"], 0)
-            # Storage only: the file is recorded, never parsed.
-            sources = dataset_sources(derived / "datasets" / "default")
+    def test_init_and_upload_leave_one_shared_copy(self):
+        with temp_data_root() as home:
+            from peekseed import config, workspace
+            with contextlib.redirect_stdout(io.StringIO()):
+                report = workspace.init()
+            self.assertEqual(report["home"], str(home.resolve()))
+            shared = config.paths().shared_dir
+            self.assertTrue((home / "config" / "links.json").is_file())
+            self.assertTrue((shared / "sources").is_dir())
+            self.assertTrue((shared / "peels").is_dir())
+            dataset = _dataset_with_source("Docs", ["Widget text."])
+            stored = list((shared / "sources").rglob("*.pdf"))
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0].read_bytes()[:4], b"%PDF")
+            self.assertFalse((Path(dataset["dir"]) / "original").exists())
+            sources = dataset_sources(dataset["dir"])
             self.assertEqual(sources[0]["status"], "uploaded")
             self.assertEqual(sources[0]["extraction"]["state"], "not_extracted")
-            # Not one byte, size or mtime changed in the user's tree.
-            self.assertEqual(document_snapshot(ws / "documents"), before)
 
 
 class GateTwoTests(unittest.TestCase):
-    """2. Drop A -> scan stores it; scan again -> 0 new, 0 changed, 0 embed calls.
+    """2. Upload A -> one stored copy; build twice -> the second is free."""
 
-    Extraction + build then make it searchable; a second build is free.
-    """
-
-    def test_scan_is_incremental_and_a_second_index_is_free(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
-                FakeModelServer(dim=8) as fake:
-            from peekseed import ingest, scan
+    def test_upload_is_incremental_and_a_second_index_is_free(self):
+        with temp_data_root() as home, FakeModelServer(dim=8) as fake:
+            from peekseed import config, ingest
             link = fake_link(fake)
-            ws.mkdir(parents=True, exist_ok=True)
-            scan.scan(str(ws), link=None)      # create the tree
-            make_pdf(ws / "documents" / "cxl" / "a.pdf",
-                     pages=["Alpha. The widget is mounted with two screws. " * 20,
-                            "Beta. Press the green button to start the widget. " * 20])
-
-            first = scan.scan(str(ws), link=link)
-            self.assertEqual(first["counts"]["new"], 1)
-            self.assertEqual(collection_state(first, "cxl")["status"], "uploaded")
-            self.assertEqual(first["embed_calls"], 0)
-            self.assertEqual(len(fake.requests), 0)
-
-            second = scan.scan(str(ws), link=link)
-            self.assertEqual(second["counts"]["new"], 0)
-            self.assertEqual(second["counts"]["changed"], 0)
-            self.assertEqual(second["counts"]["unchanged"], 1)
-            self.assertEqual(second["embed_calls"], 0)
-            self.assertEqual(len(fake.requests), 0)
-
-            dataset_dir = derived / "datasets" / "cxl"
-            make_peel("cxl", pages=[
-                "Alpha. The widget is mounted with two screws. " * 20,
-                "Beta. Press the green button to start the widget. " * 20,
-            ], source="a.pdf")
-            info = ingest.build_index(dataset_dir, link)
+            pages = ["Alpha. The widget is mounted with two screws. " * 20,
+                     "Beta. Press the green button to start the widget. " * 20]
+            dataset = _dataset_with_source("cxl", pages)
+            self.assertEqual(len(list(config.paths().sources_dir.rglob("*.pdf"))), 1)
+            make_peel(dataset, pages=pages, source="a.pdf")
+            info = ingest.build_index(dataset["dir"], link)
             self.assertGreater(info["n"], 0)
             requests_after_build = len(fake.requests)
             self.assertGreater(requests_after_build, 0)
-            chunks = (dataset_dir / "chunks.jsonl").read_text().splitlines()
+            chunks = (Path(dataset["dir"]) / "chunks.jsonl").read_text().splitlines()
             self.assertGreaterEqual(len(chunks), 1)
             record = json.loads(chunks[0])
             self.assertEqual(len(record["source_sha256"]), 64)
             self.assertEqual(len(record["id"]), 16)
 
-            again = ingest.build_index(dataset_dir, link)
+            again = ingest.build_index(dataset["dir"], link)
             self.assertTrue(again.get("up_to_date"))
             self.assertEqual(len(fake.requests), requests_after_build)
-            self.assertEqual(collection_state(scan.scan(str(ws), link=link),
-                                              "cxl")["status"], "indexed")
+            from peekseed import workspace
+            self.assertEqual(
+                collection_state(workspace.status(), "cxl")["status"], "indexed")
 
 
 class GateThreeTests(unittest.TestCase):
     """3. Add PDF B, extract it, build -> B searchable; A's ids stable."""
 
     def test_adding_a_file_makes_it_searchable_without_renumbering_others(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
-                FakeModelServer(dim=8) as fake:
-            from peekseed import engine, ingest, scan
+        with temp_data_root() as home, FakeModelServer(dim=8) as fake:
+            from peekseed import config, engine, ingest
             link = fake_link(fake)
-            scan.scan(str(ws), link=None)
-            make_pdf(ws / "documents" / "cxl" / "a.pdf",
-                     pages=["Alpha. The widget is mounted with two screws. " * 20])
-            scan.scan(str(ws), link=link)
-            dataset_dir = derived / "datasets" / "cxl"
-            make_peel("cxl", pages=["Alpha. The widget is mounted with two screws. " * 20],
-                      source="a.pdf")
-            ingest.build_index(dataset_dir, link)
+            alpha = ["Alpha. The widget is mounted with two screws. " * 20]
+            dataset = _dataset_with_source("cxl", alpha, filename="a.pdf")
+            make_peel(dataset, pages=alpha, source="a.pdf")
+            ingest.build_index(dataset["dir"], link)
+            dataset_dir = Path(dataset["dir"])
             a_ids = sorted(row["id"] for row in ingest.read_chunks(dataset_dir)
                            if row.get("source") == "a.pdf")
             self.assertGreaterEqual(len(a_ids), 1)
 
-            make_pdf(ws / "documents" / "cxl" / "b.pdf",
-                     pages=["Sprocket calibration. Turn the sprocket clockwise. " * 20])
-            report = scan.scan(str(ws), link=link)
-            self.assertEqual(report["counts"]["new"], 1)
-            self.assertIn(collection_state(report, "cxl")["status"],
-                          ("extracted", "stale"))
-            make_peel("cxl", pages=["Sprocket calibration. Turn the sprocket clockwise. " * 20],
-                      source="b.pdf")
-            ingest.build_index(dataset_dir, link)
+            sprocket = ["Sprocket calibration. Turn the sprocket clockwise. " * 20]
+            with scratch_dir() as scratch:
+                ingest.add_source(dataset,
+                                  make_pdf(scratch / "b.pdf", pages=sprocket))
+            make_peel(dataset, pages=sprocket, source="b.pdf")
+            ingest.build_index(dataset["dir"], link)
 
-            # A's content-derived ids did not move when B was added.
             after_ids = sorted(row["id"] for row in ingest.read_chunks(dataset_dir)
                                if row.get("source") == "a.pdf")
             self.assertEqual(a_ids, after_ids)
 
-            # B is in the index and ranks first for its own vocabulary.
             query = "sprocket calibration"
             qvec = ingest.embed_query(link, query)
-            store = engine.IndexStore(str(derived / "datasets"))
+            store = engine.IndexStore(str(config.paths().datasets_dir))
             store.load()
             index = store.find("cxl", "fake", "test-embed")
             self.assertIsNotNone(index, "no index loaded for the collection")
@@ -257,26 +182,22 @@ class GateFourTests(unittest.TestCase):
     """4. A cancelled/failed build leaves the previous index serving; restart resumes."""
 
     def test_interrupted_build_keeps_the_previous_index_and_resumes(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
-                FakeModelServer(dim=8) as fake:
-            from peekseed import ingest, scan
+        with temp_data_root() as home, FakeModelServer(dim=8) as fake:
+            from peekseed import config, contracts, ingest
             link = fake_link(fake)
-            scan.scan(str(ws), link=None)
-            pages = []
-            for index in range(3):
-                pages.append("Widget paragraph %d. " % index * 20)
-                make_pdf(ws / "documents" / "cxl" / ("doc%d.pdf" % index),
-                         pages=[pages[-1], "Another widget paragraph %d. " % index * 20])
-            scan.scan(str(ws), link=link)
-            dataset_dir = derived / "datasets" / "cxl"
-            for index in range(3):
-                make_peel("cxl", pages=[
-                    "Widget paragraph %d. " % index * 20,
-                    "Another widget paragraph %d. " % index * 20,
-                ], source="doc%d.pdf" % index)
+            dataset = ingest.create_dataset(config.paths(), "cxl")
+            pages_by_source = {}
+            with scratch_dir() as scratch:
+                for index in range(3):
+                    pages = ["Widget paragraph %d. " % index * 20,
+                             "Another widget paragraph %d. " % index * 20]
+                    name = "doc%d.pdf" % index
+                    pages_by_source[name] = pages
+                    ingest.add_source(dataset, make_pdf(scratch / name, pages=pages))
+            dataset_dir = Path(dataset["dir"])
+            for name, pages in pages_by_source.items():
+                make_peel(dataset, pages=pages, source=name)
             first = ingest.build_index(dataset_dir, link, batch_size=2)
-            self.assertEqual(collection_state(scan.scan(str(ws), link=link),
-                                              "cxl")["status"], "indexed")
             generation_dir = current_generation_dir(dataset_dir)
             committed = (generation_dir.parent.parent / "CURRENT").read_text().strip()
             info = ingest.dataset_indexes(dataset_dir)[0]
@@ -301,9 +222,8 @@ class GateFourTests(unittest.TestCase):
 
             # A process death leaves `running` records; they are marked interrupted
             # (resumable), never converted into a false failure.
-            jobs_dir = derived / "jobs"
+            jobs_dir = config.paths().jobs_dir
             jobs_dir.mkdir(parents=True, exist_ok=True)
-            from peekseed import contracts
             job = contracts.new_job("index", collection="cxl", job_id="job-crash")
             job["state"] = "running"
             contracts.write_json_atomic(jobs_dir / "job-crash.json", job)
@@ -326,28 +246,20 @@ class GateFiveTests(unittest.TestCase):
     """5. Corrupt vectors.npy -> collection needs_reindex, never silently vanished."""
 
     def test_corrupt_vectors_are_reported(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
-                FakeModelServer(dim=8) as fake:
-            from peekseed import ingest, scan, workspace
+        with temp_data_root() as home, FakeModelServer(dim=8) as fake:
+            from peekseed import ingest, workspace
             link = fake_link(fake)
-            scan.scan(str(ws), link=None)
-            make_pdf(ws / "documents" / "cxl" / "a.pdf",
-                     pages=["Widget text about buttons and screws. " * 20])
-            scan.scan(str(ws), link=link)
-            dataset_dir = derived / "datasets" / "cxl"
-            make_peel("cxl", pages=["Widget text about buttons and screws. " * 20],
-                      source="a.pdf")
+            pages = ["Widget text about buttons and screws. " * 20]
+            dataset = _dataset_with_source("cxl", pages)
+            make_peel(dataset, pages=pages, source="a.pdf")
+            dataset_dir = Path(dataset["dir"])
             ingest.build_index(dataset_dir, link)
             generation_dir = current_generation_dir(dataset_dir)
             (generation_dir / "vectors.npy").write_bytes(b"corrupt")
 
-            state = workspace.status(str(ws))
-            collection = collection_state(state, "cxl")
+            collection = collection_state(workspace.status(), "cxl")
             self.assertEqual(collection["status"], "needs_reindex")
             self.assertTrue(collection["reasons"])
-
-            report = scan.scan(str(ws), link=None)
-            self.assertEqual(collection_state(report, "cxl")["status"], "needs_reindex")
 
             info = ingest.dataset_indexes(dataset_dir)[0]
             with self.assertRaises(ingest.NeedsReindex):
@@ -360,17 +272,13 @@ class GateSixTests(unittest.TestCase):
     """6. Change chunker version -> collection stale; reindex --dry-run prints scope."""
 
     def test_chunker_change_is_stale_and_dry_run_prints_the_scope(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, derived), \
-                FakeModelServer(dim=8) as fake:
-            from peekseed import contracts, ingest, scan, workspace
+        with temp_data_root() as home, FakeModelServer(dim=8) as fake:
+            from peekseed import config, contracts, ingest, links, workspace
             link = fake_link(fake)
-            scan.scan(str(ws), link=None)
-            make_pdf(ws / "documents" / "cxl" / "a.pdf",
-                     pages=["Widget text about buttons and screws. " * 20])
-            scan.scan(str(ws), link=link)
-            dataset_dir = derived / "datasets" / "cxl"
-            make_peel("cxl", pages=["Widget text about buttons and screws. " * 20],
-                      source="a.pdf")
+            pages = ["Widget text about buttons and screws. " * 20]
+            dataset = _dataset_with_source("cxl", pages)
+            make_peel(dataset, pages=pages, source="a.pdf")
+            dataset_dir = Path(dataset["dir"])
             ingest.build_index(dataset_dir, link)
             info = ingest.dataset_indexes(dataset_dir)[0]
             space_dir = dataset_dir / "index" / info["space"]
@@ -379,14 +287,12 @@ class GateSixTests(unittest.TestCase):
             original = contracts.CHUNKER_VERSION
             contracts.CHUNKER_VERSION = original + 1
             try:
-                state = workspace.status(str(ws))
-                collection = collection_state(state, "cxl")
+                collection = collection_state(workspace.status(), "cxl")
                 self.assertEqual(collection["status"], "stale")
                 self.assertTrue(any("chunker" in reason
                                     for reason in collection["reasons"]))
 
                 # reindex --dry-run prints the exact scope and writes nothing.
-                from peekseed import links
                 saved = links.create({"role": "embed", "label": "Fake",
                                       "protocol": "openai",
                                       "base_url": fake.openai_base,
@@ -396,8 +302,7 @@ class GateSixTests(unittest.TestCase):
                 from peekseed.__main__ import main
                 with contextlib.redirect_stdout(out):
                     self.assertEqual(main(["reindex", "--all", "--link",
-                                           saved["id"], "--dry-run",
-                                           "--workspace", str(ws)]), 0)
+                                           saved["id"], "--dry-run"]), 0)
                 text = out.getvalue()
                 self.assertIn("dry-run:", text)
                 self.assertIn("cxl", text)
@@ -418,14 +323,16 @@ class GateNineTests(unittest.TestCase):
     """9. Traversal/symlink escapes and zip-slip rejected; /pdf is inline."""
 
     def test_pdf_is_inline_and_escapes_are_rejected(self):
-        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
-            from peekseed import config, ingest
+        with temp_data_root() as home, FakeModelServer(dim=8) as fake:
+            from peekseed import config, contracts, ingest
             from peekseed.app import create_app
             from fastapi.testclient import TestClient
 
             dataset = ingest.create_dataset(config.paths(), "Docs")
-            pdf = make_pdf(root / "doc.pdf", pages=["Widget text."])
-            ingest.add_source(dataset, pdf)
+            with scratch_dir() as scratch:
+                pdf = make_pdf(scratch / "doc.pdf", pages=["Widget text."])
+                ingest.add_source(dataset, pdf)
+                pdf_bytes = pdf.read_bytes()
             client = TestClient(create_app())
 
             response = client.get("/pdf/%s/doc.pdf" % dataset["id"])
@@ -438,34 +345,41 @@ class GateNineTests(unittest.TestCase):
                 response = client.get("/pdf/%s/%s" % (dataset["id"], name))
                 self.assertIn(response.status_code, (400, 404), name)
 
-            outside = root / "secret.pdf"
+            dataset_dir = Path(dataset["dir"])
+            raw = contracts.read_json(dataset_dir / "dataset.json")
+            sha = raw["sources"][0]["sha256"]
+            folder = config.paths().sources_dir / sha
+            outside = home / "secret.pdf"
             outside.write_bytes(b"%PDF-1.4\nsecret")
-            (Path(dataset["dir"]) / "original" / "escape.pdf").symlink_to(outside)
+            os.symlink(str(outside), str(folder / "escape.pdf"))
+            raw["sources"].append({
+                "name": "escape.pdf",
+                "path": "sources/%s/escape.pdf" % sha,
+                "sha256": sha, "bytes": 10, "status": "uploaded",
+                "extraction": contracts.extraction_default(),
+            })
+            contracts.write_json_atomic(dataset_dir / "dataset.json",
+                                        contracts.validate_dataset(raw))
             response = client.get("/pdf/%s/escape.pdf" % dataset["id"])
             self.assertIn(response.status_code, (400, 404))
 
-            # Upload filename zip-slip: the stored source can never escape original/.
-            files = {"files": ("../../evil.pdf", pdf.read_bytes(), "application/pdf")}
+            # Upload filename zip-slip: the stored source can never escape the
+            # shared sources pool (the same bytes reuse the existing copy).
+            files = {"files": ("../../evil.pdf", pdf_bytes, "application/pdf")}
             response = client.post("/api/datasets", data={"name": "Slip"}, files=files)
             self.assertEqual(response.status_code, 201, response.text)
             created = response.json()["dataset"]["id"]
-            original = Path(config.paths().datasets_dir) / created / "original"
-            names = [path.name for path in original.iterdir()]
-            self.assertEqual(names, ["evil.pdf"])
-
-    def test_scan_rejects_a_symlink_that_escapes_the_workspace(self):
-        with tempfile.TemporaryDirectory() as tmp, isolated_workspace(tmp) as (_project, ws, _derived):
-            from peekseed import scan
-            outside = Path(tmp) / "outside.pdf"
-            make_pdf(outside, pages=["outside the workspace"])
-            scan.scan(str(ws), link=None)
-            (ws / "documents" / "escape.pdf").symlink_to(outside)
-            report = scan.scan(str(ws), link=None)
-            self.assertEqual(report["counts"]["errors"], 1)
-            entry = next(row for row in report["files"]
-                         if str(row.get("path") or "").endswith("escape.pdf")
-                         or str(row.get("name") or "").endswith("escape.pdf"))
-            self.assertIn("symlink escapes", str(entry.get("error") or entry.get("reason") or ""))
+            self.assertFalse((config.paths().datasets_dir / created / "original").exists())
+            self.assertFalse((home / "evil.pdf").exists())
+            self.assertFalse((home.parent / "evil.pdf").exists())
+            self.assertEqual(
+                len([path for path in config.paths().sources_dir.rglob("*.pdf")
+                     if not path.is_symlink()]), 1)
+            row = client.get("/api/datasets/%s/sources"
+                             % created).json()["sources"][0]
+            self.assertTrue(row["present"])
+            self.assertTrue(Path(row["path"]).resolve().is_relative_to(
+                config.paths().sources_dir))
 
 
 class GateTenTests(unittest.TestCase):

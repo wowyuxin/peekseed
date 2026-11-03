@@ -1,12 +1,13 @@
 """Dataset storage, generation-atomic vector indexes and job records.
 
-Uploads are **storage only**: a file is copied into ``original/`` with its
-sha256/bytes recorded and ``status="uploaded"``; peekseed never parses a
-document. Extraction is owned by the peelfeed engine (a separate process/venv),
-which writes one peel directory per source under ``peel_root``::
+Uploads are **storage only**: a file is stored once in the shared pool
+(``$PEEKSEED_SHARED_DIR/sources/<sha256>/<name>.pdf``) with its sha256/bytes
+recorded and ``status="uploaded"``; peekseed never parses a document.
+Extraction is owned by the peelfeed engine (a separate process/venv), which
+writes one peel directory per source under ``$PEEKSEED_SHARED_DIR/peels``::
 
-    <peel_root>/<slug>-<sha256[:8]>/
-        source/<original.pdf>
+    <shared>/peels/<slug>-<sha256[:8]>/
+        source/<original.pdf>     hardlink to the shared sources/ copy
         extract/corpus/{manifest.json,chunks.jsonl,assets.jsonl,
                         validation.json,review_queue.json,blocks.jsonl,...}
         .peel
@@ -18,13 +19,13 @@ maps the corpus chunks onto peekseed's chunk contract, embeds them through the
 configured link and writes the same generation-atomic numpy index as before.
 There is deliberately **no in-process extraction fallback**.
 
-A dataset directory owns the uploaded files, the canonical ``chunks.jsonl`` and
-one index per embedding space::
+A dataset directory owns its metadata, the canonical ``chunks.jsonl`` and one
+index per embedding space; the uploaded bytes live once in the shared pool::
 
-    <dataset>/dataset.json
-    <dataset>/original/...                    uploaded copies served by /pdf
-    <dataset>/chunks.jsonl
-    <dataset>/index/<space_key>/
+    <shared>/sources/<sha256>/<name>.pdf      the one stored copy, served by /pdf
+    <home>/datasets/<dataset>/dataset.json
+    <home>/datasets/<dataset>/chunks.jsonl
+    <home>/datasets/<dataset>/index/<space_key>/
         CURRENT                               one line: the live generation uuid
         generations/<uuid>/
             vectors.npy  meta.json  info.json  probe.npy  progress.json
@@ -62,6 +63,7 @@ import random
 import re
 import shutil
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
@@ -103,11 +105,13 @@ __all__ = [
     "peel_root",
     "probe_cosine",
     "read_chunks",
+    "release_shared_source",
     "remove_source",
     "read_job",
     "reindex",
     "request_cancel",
     "sanitize_filename",
+    "store_shared_source",
     "stored_source_path",
     "update_source",
     "verify_probe",
@@ -121,11 +125,6 @@ EMBED_TIMEOUT = 120.0
 MAX_DATASET_ID = 64
 MAX_FILENAME_LENGTH = 120
 
-#: Env override for the peelfeed ``peel_root`` (the only tree peekseed may read).
-#: ``PEELFEED_ROOT`` is the shared deploy name; the historical
-#: ``PEEKSEED_PEELFEED_ROOT`` is still accepted as a fallback.
-PEEL_ROOT_ENV = "PEELFEED_ROOT"
-LEGACY_PEEL_ROOT_ENV = "PEEKSEED_PEELFEED_ROOT"
 #: Corpus files peekseed consumes from one peel (design §2.1/§4.3).
 PEEL_CORPUS_FILES = ("manifest.json", "chunks.jsonl", "assets.jsonl",
                      "validation.json", "review_queue.json")
@@ -135,6 +134,9 @@ SUPPORTED_CORPUS_SCHEMA = 2
 PEEL_CHUNKER_VERSION = contracts.PEEL_CHUNKER_VERSION
 #: A PDF must start with this magic; storage-only uploads still validate it.
 PDF_MAGIC = b"%PDF-"
+#: Serialises the shared-source store/release paths (two requests may store or
+#: delete the same content at once).
+_SOURCES_LOCK = threading.RLock()
 
 #: Retry policy for transient embed failures (429/5xx/timeouts/connect errors).
 RETRY_ATTEMPTS = 3
@@ -445,10 +447,10 @@ def sanitize_filename(name):
 def create_dataset(paths, name, note=""):
     """Create one dataset directory and return its metadata dictionary.
 
-    The caller copies uploaded files into the returned ``dir`` ``/original``
-    directory (using :func:`sanitize_filename` for the basenames) and records
-    their names in ``dataset.json`` ``sources``. The ``dir`` key is a convenience
-    for the caller and is not written to ``dataset.json``.
+    Uploaded files are stored once in the shared sources pool by
+    :func:`add_source`; a dataset keeps only ``dataset.json``, ``chunks.jsonl``
+    and its indexes. The ``dir`` key is a convenience for the caller and is not
+    written to ``dataset.json``.
     """
     display = _collapse_text(name)
     if not display:
@@ -458,7 +460,6 @@ def create_dataset(paths, name, note=""):
     datasets_dir.mkdir(parents=True, exist_ok=True)
     dataset_id = _unique_dataset_id(datasets_dir, display)
     dataset_dir = datasets_dir / dataset_id
-    (dataset_dir / "original").mkdir(parents=True, exist_ok=True)
     dataset = {
         "schema": contracts.DATASET_SCHEMA,
         "id": dataset_id,
@@ -613,16 +614,6 @@ def _file_digest(path):
     return digest.hexdigest()
 
 
-def _same_file_content(left, right):
-    """True when two paths hold byte-identical content (used to avoid re-copies)."""
-    try:
-        if _size(left) != _size(right):
-            return False
-        return _file_digest(left) == _file_digest(right)
-    except OSError:
-        return False
-
-
 def _split_name(name):
     """Split ``name`` into ``(stem, ".ext")`` while keeping extension-less names."""
     stem, dot, suffix = str(name).rpartition(".")
@@ -644,21 +635,74 @@ def _dataset_root(dataset):
     raise IngestError("A dataset dictionary or dataset directory is required.")
 
 
+def store_shared_source(source, digest):
+    """Store ``source`` once at ``<shared>/sources/<digest>/<name>``; reuse an existing copy."""
+    from .. import config
+
+    folder = config.paths().sources_dir / digest
+    if folder.is_dir():
+        for existing in sorted(folder.iterdir()):
+            if existing.is_file() and not existing.name.endswith(".part"):
+                return existing
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = folder / sanitize_filename(Path(source).name)
+    partial = target.with_name(target.name + ".part")
+    try:
+        shutil.copyfile(str(source), str(partial))
+        os.chmod(str(partial), 0o600)
+        if _file_digest(partial) != digest:
+            raise IngestError("Stored copy of '%s' does not match its hash." % target.name)
+        os.replace(str(partial), str(target))
+    finally:
+        if partial.exists():
+            partial.unlink()
+    return target
+
+
+def release_shared_source(sha):
+    """Delete ``<shared>/sources/<sha>/`` when no dataset.json references it any more."""
+    from .. import config
+
+    sha = str(sha or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha):
+        return False
+    with _SOURCES_LOCK:
+        p = config.paths()
+        if p.datasets_dir.is_dir():
+            for dataset_dir in p.datasets_dir.iterdir():
+                if not (dataset_dir / "dataset.json").is_file():
+                    continue
+                try:
+                    metadata = _read_dataset_json(dataset_dir)
+                except IngestError:
+                    return False   # unreadable dataset: keep the file (safe side)
+                for entry in _source_entries(metadata.get("sources")):
+                    if str(entry.get("sha256") or "").lower() == sha:
+                        return False
+        folder = p.sources_dir / sha
+        if not folder.is_dir():
+            return False
+        for child in folder.iterdir():
+            child.unlink()
+        folder.rmdir()
+        return True
+
+
 def add_source(dataset, source_path):
-    """Store one uploaded file in a dataset's ``original/`` directory.
+    """Store one uploaded file once in the shared sources pool.
 
     Upload is deliberately **storage only**: the file's magic/extension is
-    checked, the bytes are copied (atomically enough: a same-content file is
-    reused, a different file with the same name gets a numbered suffix), its
-    sha256/bytes are recorded and the source is marked ``status="uploaded"``
-    with ``extraction.state="not_extracted"``. No page count, extraction or
-    chunking happens here -- extraction is a separate, user-triggered peelfeed
-    job (design §4.5).
+    checked, the bytes are stored once at ``<shared>/sources/<sha256>/<name>``
+    (0600) and its sha256/bytes are recorded with ``status="uploaded"`` and
+    ``extraction.state="not_extracted"``. No page count, extraction or chunking
+    happens here -- extraction is a separate, user-triggered peelfeed job
+    (design §4.5).
 
     ``dataset`` is the metadata dictionary returned by :func:`create_dataset`
     (it must carry the dataset directory under ``dir``); a dataset directory
     path is also accepted. Adding the same content twice is idempotent and
-    returns the existing entry (content, not path, is identity).
+    returns the existing entry (content, not path, is identity); a second
+    dataset gets its own entry pointing at the same one stored file.
     """
     dataset_dir_path = _dataset_root(dataset)
     source = Path(source_path)
@@ -677,67 +721,45 @@ def add_source(dataset, source_path):
     except OSError as exc:
         raise IngestError("Could not read '%s': %s." % (source.name, exc)) from None
 
-    metadata = _read_dataset_json(dataset_dir_path)
-    original = dataset_dir_path / "original"
-    original.mkdir(parents=True, exist_ok=True)
     digest = _file_digest(source)
-
-    sources = _source_entries(metadata.get("sources"))
-    base_name = sanitize_filename(source.name)
-    name = base_name
-    target = original / name
-    counter = 2
-    while target.exists() and not _same_file_content(target, source):
-        stem, suffix = _split_name(base_name)
-        name = "%s-%d%s" % (stem, counter, suffix)
-        target = original / name
-        counter += 1
-    existing = next(
-        (entry for entry in sources if str(entry.get("name") or "") == name),
-        None,
-    )
-    if existing is not None and target.is_file():
-        # Re-uploading the same file is idempotent: one stored copy, one entry.
-        if str(existing.get("sha256") or "").lower() != digest:
-            existing["sha256"] = digest
-            existing["bytes"] = _size(target)
-            metadata["sources"] = sources
-            _write_json_atomic(dataset_dir_path / "dataset.json", metadata,
-                               indent=2)
-        if isinstance(dataset, dict):
-            dataset["sources"] = _source_entries(sources)
-        return dict(existing)
-    if not target.exists():
-        try:
-            shutil.copyfile(str(source), str(target))
-        except OSError as exc:
-            raise IngestError(
-                "Could not store '%s' in the dataset: %s." % (base_name, exc)
-            ) from None
-
-    entry = {
-        "name": name,
-        "path": "original/" + name,
-        "sha256": digest,
-        "bytes": _size(target),
-        "pages": 0,
-        "extractor": "",
-        "status": "uploaded",
-        "extraction": contracts.extraction_default(),
-    }
-    for index, existing in enumerate(sources):
-        if str(existing.get("name") or "") == name:
-            sources[index] = {**dict(existing), **entry}
-            break
-    else:
+    with _SOURCES_LOCK:
+        metadata = _read_dataset_json(dataset_dir_path)
+        sources = _source_entries(metadata.get("sources"))
+        for existing in sources:
+            if (str(existing.get("sha256") or "").lower() == digest
+                    and _source_file(dataset_dir_path, existing) is not None):
+                # Re-uploading the same content is idempotent: one stored copy,
+                # one entry (content, not path, is identity).
+                if isinstance(dataset, dict):
+                    dataset["sources"] = _source_entries(sources)
+                return dict(existing)
+        stored = store_shared_source(source, digest)
+        base_name = sanitize_filename(source.name)
+        used = {str(entry.get("name") or "") for entry in sources}
+        name = base_name
+        counter = 2
+        while name in used:
+            stem, suffix = _split_name(base_name)
+            name = "%s-%d%s" % (stem, counter, suffix)
+            counter += 1
+        entry = {
+            "name": name,
+            "path": "sources/%s/%s" % (digest, stored.name),
+            "sha256": digest,
+            "bytes": _size(stored),
+            "pages": 0,
+            "extractor": "",
+            "status": "uploaded",
+            "extraction": contracts.extraction_default(),
+        }
         sources.append(entry)
-    metadata["schema"] = contracts.DATASET_SCHEMA
-    metadata["sources"] = sources
-    metadata.setdefault("updated_at", _now())
-    _write_json_atomic(dataset_dir_path / "dataset.json", metadata, indent=2)
-    if isinstance(dataset, dict):
-        dataset["sources"] = [dict(item) for item in sources]
-    return entry
+        metadata["schema"] = contracts.DATASET_SCHEMA
+        metadata["sources"] = sources
+        metadata.setdefault("updated_at", _now())
+        _write_json_atomic(dataset_dir_path / "dataset.json", metadata, indent=2)
+        if isinstance(dataset, dict):
+            dataset["sources"] = [dict(item) for item in sources]
+        return entry
 
 
 def _entries_by_sha(dataset_dir):
@@ -799,12 +821,14 @@ def update_source(dataset_dir, sha, *, status=None, extraction=None,
 
 
 def remove_source(dataset_dir, sha, *, delete_file=True):
-    """Remove one source entry (and optionally its stored file).
+    """Remove one source entry (and optionally release its shared copy).
 
-    The peel itself is owned by peelfeed; ``DELETE /api/datasets/{id}/sources/
-    {sha}?peel=keep|delete`` decides separately whether to archive it. Removing
-    the source leaves the index/chunks stale until the next build, which the
-    normal staleness gate reports.
+    The stored PDF lives once in the shared pool, so the file is deleted only
+    when no other dataset still references that sha256. The peel itself is
+    owned by peelfeed; ``DELETE /api/datasets/{id}/sources/{sha}?peel=keep|delete``
+    decides separately whether to archive it. Removing the source leaves the
+    index/chunks stale until the next build, which the normal staleness gate
+    reports.
     """
     dataset_dir = Path(dataset_dir)
     metadata = _read_dataset_json(dataset_dir)
@@ -819,18 +843,13 @@ def remove_source(dataset_dir, sha, *, delete_file=True):
         kept.append(entry)
     if removed is None:
         return None
-    if delete_file:
-        stored = _source_file(dataset_dir, removed)
-        if stored is not None:
-            try:
-                stored.unlink()
-            except OSError:
-                pass
     metadata["schema"] = contracts.DATASET_SCHEMA
     metadata["sources"] = kept
     metadata["updated_at"] = _now()
     _write_json_atomic(dataset_dir / "dataset.json",
                        contracts.validate_dataset(metadata), indent=2)
+    if delete_file:
+        release_shared_source(sha)
     return removed
 
 
@@ -1780,17 +1799,32 @@ def _source_file(dataset_dir, entry):
     dataset_dir = Path(dataset_dir)
     name = str(entry.get("name") or "")
     raw_path = str(entry.get("path") or "")
+    if raw_path.startswith("sources/"):
+        from .. import config
+
+        p = config.paths()
+        sources_dir = p.sources_dir.resolve()
+        try:
+            candidate = (p.shared_dir / raw_path).resolve()
+            candidate.relative_to(sources_dir)
+        except (OSError, ValueError):
+            return None
+        return candidate if candidate.is_file() else None
+    # Legacy datasets (pre-livefield, original/ copies): read-only support.
+    original = (dataset_dir / "original").resolve()
     candidates = []
     if raw_path:
         candidates.append(dataset_dir / raw_path)
     if name:
-        candidates.append(dataset_dir / "original" / name)
+        candidates.append(original / name)
     for candidate in candidates:
         try:
-            if candidate.is_file():
-                return candidate
-        except OSError:
+            resolved = candidate.resolve()
+            resolved.relative_to(original)
+        except (OSError, ValueError):
             continue
+        if resolved.is_file():
+            return resolved
     return None
 
 
@@ -1800,23 +1834,13 @@ def _source_file(dataset_dir, entry):
 def peel_root():
     """The only tree peekseed may read a peel corpus from.
 
-    ``PEELFEED_ROOT`` wins (shared deploy name); the historical
-    ``PEEKSEED_PEELFEED_ROOT`` is accepted as a fallback. Otherwise the default
-    is ``<data_root>/peels`` (design §1.7). Every read is realpath-checked
-    against this root, so a symlink or a hand-written ``peel_id`` cannot escape it.
+    ``$PEEKSEED_SHARED_DIR/peels`` (peelfeed writes it). Every read is
+    realpath-checked against this root, so a symlink or a hand-written
+    ``peel_id`` cannot escape it.
     """
-    raw = os.environ.get(PEEL_ROOT_ENV) or os.environ.get(LEGACY_PEEL_ROOT_ENV)
-    if raw:
-        return Path(raw).expanduser().resolve()
-    try:
-        from .. import config
+    from .. import config
 
-        return (config.paths().root / "peels").resolve()
-    except Exception as exc:
-        raise IngestError(
-            "Could not resolve the peel root (%s); set %s."
-            % (type(exc).__name__, PEEL_ROOT_ENV)
-        ) from None
+    return config.paths().peels_dir.resolve()
 
 
 def _resolve_peel_dir(root, peel_id):

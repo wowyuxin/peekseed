@@ -83,19 +83,6 @@ def sample_dataset(**overrides):
     return data
 
 
-def sample_manifest(**overrides):
-    data = contracts.new_manifest("2026-10-20T20:00:00Z")
-    data["last_scan"] = "2026-10-20T20:05:00Z"
-    data["extractor"] = "pypdf@6.21.1"
-    data["documents"] = [
-        {"path": "documents/cxl/a.pdf", "collection": "cxl", "sha256": SHA_A,
-         "bytes": 10, "pages": 2, "status": "indexed",
-         "seen_at": "2026-10-20T20:05:00Z"},
-    ]
-    data.update(overrides)
-    return data
-
-
 def sample_chunk(**overrides):
     source_sha = SHA_A
     chunk_id = contracts.chunk_id(source_sha, 3, 7)
@@ -188,36 +175,6 @@ class IdentifierTests(unittest.TestCase):
         })))
 
 
-class ManifestTests(unittest.TestCase):
-    def test_new_manifest_is_valid(self):
-        manifest = contracts.new_manifest("2026-10-20T20:00:00Z")
-        self.assertEqual(contracts.validate_manifest(manifest)["schema"], 1)
-        self.assertEqual(manifest["documents"], [])
-
-    def test_manifest_round_trips_and_normalises(self):
-        validated = contracts.validate_manifest(sample_manifest())
-        self.assertEqual(validated["documents"][0]["status"], "indexed")
-        self.assertEqual(validated["documents"][0]["path"], "documents/cxl/a.pdf")
-
-    def test_manifest_rejects_duplicate_paths(self):
-        data = sample_manifest()
-        data["documents"].append(dict(data["documents"][0]))
-        with self.assertRaises(contracts.ContractError):
-            contracts.validate_manifest(data)
-
-    def test_manifest_rejects_unknown_status(self):
-        data = sample_manifest()
-        data["documents"][0]["status"] = "wat"
-        with self.assertRaises(contracts.ContractError):
-            contracts.validate_manifest(data)
-
-    def test_manifest_refuses_a_newer_schema(self):
-        data = sample_manifest()
-        data["schema"] = 2
-        with self.assertRaises(contracts.SchemaTooNew):
-            contracts.validate_manifest(data)
-
-
 class DatasetTests(unittest.TestCase):
     def test_dataset_validates(self):
         validated = contracts.validate_dataset(sample_dataset())
@@ -232,7 +189,8 @@ class DatasetTests(unittest.TestCase):
 
     def test_dataset_accepts_an_uploaded_source_with_no_extraction(self):
         data = sample_dataset()
-        data["sources"] = [{"name": "a.pdf", "path": "original/a.pdf",
+        data["sources"] = [{"name": "a.pdf",
+                            "path": "sources/%s/a.pdf" % SHA_A,
                             "sha256": SHA_A, "bytes": 10, "status": "uploaded",
                             "extraction": {"state": "not_extracted"}}]
         validated = contracts.validate_dataset(data)
@@ -368,13 +326,13 @@ class JobTests(unittest.TestCase):
     def test_job_rejects_unknown_kind_and_state(self):
         with self.assertRaises(contracts.ContractError):
             contracts.new_job("explode")
-        job = contracts.new_job("scan")
+        job = contracts.new_job("index")
         job["state"] = "finished"
         with self.assertRaises(contracts.ContractError):
             contracts.validate_job(job)
 
     def test_job_refuses_a_newer_schema(self):
-        job = contracts.new_job("scan", job_id="job-x")
+        job = contracts.new_job("index", job_id="job-x")
         job["schema"] = 2
         with self.assertRaises(contracts.SchemaTooNew):
             contracts.validate_job(job)
@@ -427,7 +385,7 @@ class ChunkRowTests(unittest.TestCase):
 class JsonIOTests(unittest.TestCase):
     def test_write_and_read_round_trip(self):
         with tempfile.TemporaryDirectory() as root:
-            path = Path(root) / "nested" / "manifest.json"
+            path = Path(root) / "nested" / "sample.json"
             contracts.write_json_atomic(path, {"schema": 1, "a": 1})
             self.assertEqual(contracts.read_json(path), {"schema": 1, "a": 1})
             self.assertIsNone(contracts.read_json(Path(root) / "missing.json"))

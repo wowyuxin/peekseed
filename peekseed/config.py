@@ -1,33 +1,33 @@
-"""peekseed configuration: one data root owns every mutable path.
+"""peekseed configuration: one home and one shared folder own every mutable path.
 
 The framework is meant to be shared and run on someone else's machine, so no
-path, host, model or document name is baked into the code. Everything the user
-creates at runtime -- model links, datasets, indexes, search history -- lives
-under ONE configurable root:
+path, host, model or document name is baked into the code. Two required
+environment variables name the only writable locations:
 
-    PEEKSEED_DATA   (default: <workspace>/.peekseed)
+    PEEKSEED_HOME         the private data home (config, datasets, history, jobs,
+                          uploads, logs, env)
+    PEEKSEED_SHARED_DIR   the folder shared with peelfeed:
+                          ``sources/<sha256>/<name>.pdf`` (the one stored copy of
+                          each uploaded PDF) and ``peels/<peel_id>/`` (peelfeed
+                          output)
 
-The default is derived rather than relative: :mod:`peekseed.workspace` resolves
-the user's workspace directory (``./workspace`` by default) and the derived tree
-lives in its hidden ``.peekseed`` child, so one directory can be backed up. The
-environment variable still overrides the derived root on its own, which keeps
-older deployments and tests working unchanged.
+Both must be absolute, existing directories. There are no fallbacks: a missing
+setting raises :class:`ConfigError` and the program stops with a clear message.
 
-Layout under that root (created on first use):
+Layout:
 
-    <root>/manifest.json           scan state; schema 1
-    <root>/config/links.json       model links; 0600; keys masked in responses
-    <root>/config/settings.json    optional UI title/tagline/examples
-    <root>/datasets/<id>/          uploaded sources, chunks.jsonl, index/<space>/
-    <root>/peels/<peel>/           peelfeed corpora (read-only; extraction owner)
-    <root>/extracted/              legacy extraction cache (unused since M-1)
-    <root>/history/                search + dialog history
-    <root>/jobs/<id>.json          persisted job records
-    <root>/uploads/                temporary staging for an upload in progress
+    <home>/config/links.json       model links; 0600; keys masked in responses
+    <home>/config/settings.json    optional UI title/tagline/examples
+    <home>/datasets/<id>/          dataset.json, chunks.jsonl, index/<space>/
+    <home>/history/                search + dialog history
+    <home>/jobs/<id>.json          persisted job records
+    <home>/uploads/                temporary staging for an upload in progress
+    <shared>/sources/<sha256>/<name>   uploaded PDFs, stored once
+    <shared>/peels/<peel_id>/      peelfeed corpora (read-only for peekseed)
 
-Keeping the data root separate from the code is what makes updates safe: a new
-checkout of peekseed never touches a user's datasets, and a user's data can be
-backed up or moved as one directory.
+Keeping runtime data separate from the code is what makes updates safe: a new
+checkout of peekseed never touches a user's datasets, and the data can be backed
+up as one folder.
 """
 
 import json
@@ -38,7 +38,28 @@ from pathlib import Path
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8030
-DATA_ENV = "PEEKSEED_DATA"
+HOME_ENV = "PEEKSEED_HOME"
+SHARED_ENV = "PEEKSEED_SHARED_DIR"
+
+
+class ConfigError(RuntimeError):
+    """A required setting (environment variable) is missing or invalid."""
+
+
+def _required_dir(name):
+    value = (os.environ.get(name) or "").strip()
+    if not value:
+        raise ConfigError(
+            "%s is not set. Set it to an absolute, existing directory "
+            "(the service sets it in deploy/env/peekseed.env)." % name)
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        raise ConfigError("%s must be an absolute path, got %r." % (name, value))
+    if not path.is_dir():
+        raise ConfigError("%s=%s does not exist or is not a directory." % (name, value))
+    return path.resolve()
+
+
 HOST_ENV = "PEEKSEED_HOST"
 PORT_ENV = "PEEKSEED_PORT"
 
@@ -54,34 +75,28 @@ DEFAULT_SETTINGS = {
 
 
 class Paths(object):
-    """Resolved paths for one data root. Immutable for a given process.
+    """Resolved paths for one home + shared folder. Immutable for a process.
 
-    ``root`` is the derived tree (``<workspace>/.peekseed`` by default or the
-    ``PEEKSEED_DATA`` override). ``workspace_root``/``documents_dir`` name the
-    user-owned side so callers never have to re-derive them.
+    ``root`` is ``$PEEKSEED_HOME``; ``shared_dir`` is ``$PEEKSEED_SHARED_DIR``.
+    ``sources_dir``/``peels_dir`` live under the shared folder so peekseed and
+    peelfeed address the same files.
     """
 
-    __slots__ = ("root", "workspace_root", "documents_dir", "config_dir",
-                 "links_file", "settings_file", "datasets_dir", "extracted_dir",
-                 "manifest_file", "history_dir", "jobs_dir", "uploads_dir")
+    __slots__ = ("root", "shared_dir", "sources_dir", "peels_dir",
+                 "config_dir", "links_file", "settings_file", "datasets_dir",
+                 "history_dir", "jobs_dir", "uploads_dir")
 
-    def __init__(self, root, workspace_root=None, documents_dir=None):
+    def __init__(self, root, shared_dir):
         root = Path(root)
+        shared_dir = Path(shared_dir)
         self.root = root
-        self.workspace_root = Path(workspace_root) if workspace_root else root
-        self.documents_dir = (
-            Path(documents_dir)
-            if documents_dir
-            else self.workspace_root / "documents"
-        )
+        self.shared_dir = shared_dir
+        self.sources_dir = shared_dir / "sources"
+        self.peels_dir = shared_dir / "peels"
         self.config_dir = root / "config"
         self.links_file = self.config_dir / "links.json"
         self.settings_file = self.config_dir / "settings.json"
         self.datasets_dir = root / "datasets"
-        # Legacy extraction-cache path; nothing writes it any more (peelfeed
-        # owns extraction and its peel directories are the cache).
-        self.extracted_dir = root / "extracted"
-        self.manifest_file = root / "manifest.json"
         self.history_dir = root / "history"
         self.jobs_dir = root / "jobs"
         self.uploads_dir = root / "uploads"
@@ -89,14 +104,13 @@ class Paths(object):
     def as_dict(self):
         return {
             "root": str(self.root),
-            "workspace_root": str(self.workspace_root),
-            "documents_dir": str(self.documents_dir),
+            "shared_dir": str(self.shared_dir),
+            "sources_dir": str(self.sources_dir),
+            "peels_dir": str(self.peels_dir),
             "config_dir": str(self.config_dir),
             "links_file": str(self.links_file),
             "settings_file": str(self.settings_file),
             "datasets_dir": str(self.datasets_dir),
-            "extracted_dir": str(self.extracted_dir),
-            "manifest_file": str(self.manifest_file),
             "history_dir": str(self.history_dir),
             "jobs_dir": str(self.jobs_dir),
             "uploads_dir": str(self.uploads_dir),
@@ -109,45 +123,26 @@ _CACHE_LOCK = threading.RLock()
 
 
 def data_root():
-    """The configured data root (the derived tree), resolved absolute.
-
-    A relative ``PEEKSEED_DATA`` is resolved against the current working
-    directory, which is what a user typing ``PEEKSEED_DATA=./data peekseed
-    serve`` expects. Without it the root follows the resolved workspace.
-    """
-    raw = os.environ.get(DATA_ENV)
-    if raw:
-        return Path(raw).expanduser().resolve()
-    from . import workspace
-
-    return workspace.resolve().derived_dir
+    """The configured home directory (``$PEEKSEED_HOME``), resolved absolute."""
+    return paths().root
 
 
 def paths():
-    """Paths for the current data root (cached until the root changes)."""
+    """Paths for the current home + shared folder (cached until they change)."""
     global _CACHE, _CACHE_ROOT
-    raw = os.environ.get(DATA_ENV)
-    if raw:
-        root = Path(raw).expanduser().resolve()
-        workspace_root = root
-        documents_dir = root / "documents"
-    else:
-        from . import workspace
-
-        resolved = workspace.resolve()
-        root = resolved.derived_dir
-        workspace_root = resolved.root
-        documents_dir = resolved.documents_dir
+    root = _required_dir(HOME_ENV)
+    shared = _required_dir(SHARED_ENV)
+    key = (root, shared)
     with _CACHE_LOCK:
-        if _CACHE is None or _CACHE_ROOT != root:
-            _CACHE = Paths(root, workspace_root=workspace_root,
-                           documents_dir=documents_dir)
-            _CACHE_ROOT = root
+        if _CACHE is None or _CACHE_ROOT != key:
+            _CACHE = Paths(root, shared)
+            _CACHE_ROOT = key
         return _CACHE
 
 
 def reset_cache():
-    """Drop the cached paths. Tests call this after changing PEEKSEED_DATA."""
+    """Drop the cached paths. Tests call this after changing PEEKSEED_HOME or
+    PEEKSEED_SHARED_DIR."""
     global _CACHE, _CACHE_ROOT
     with _CACHE_LOCK:
         _CACHE = None
@@ -155,16 +150,14 @@ def reset_cache():
 
 
 def ensure():
-    """Create the data root layout if needed and return its paths.
+    """Create the home and shared layout if needed and return its paths.
 
     Called by the server at startup and by every write path that might run
     before the server does (the CLI). mkdir is idempotent, so this is cheap.
-    ``documents/`` is user-owned and created by :func:`peekseed.workspace.init`,
-    not here.
     """
     p = paths()
     for directory in (p.config_dir, p.datasets_dir, p.history_dir,
-                      p.extracted_dir, p.jobs_dir, p.uploads_dir):
+                      p.jobs_dir, p.uploads_dir, p.sources_dir, p.peels_dir):
         directory.mkdir(parents=True, exist_ok=True)
     return p
 

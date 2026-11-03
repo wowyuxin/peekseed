@@ -407,7 +407,7 @@ def _workspace_report():
     different workspace than the one whose dataset directories just answered.
     """
     paths = config.ensure()
-    return workspace.status_for(workspace.Workspace(paths.workspace_root, paths.root))
+    return workspace.status_for(paths)
 
 
 def _indexed_shas(dataset_dir):
@@ -445,15 +445,13 @@ def _source_rows(dataset_dir):
         if not isinstance(entry, dict):
             continue
         name = str(entry.get("name") or "")
-        relative = str(entry.get("path") or "")
-        candidate = Path(dataset_dir) / relative if relative else \
-            Path(dataset_dir) / "original" / name
+        stored = ingest.stored_source_path(Path(dataset_dir), entry)
         extraction = entry.get("extraction")
         if not isinstance(extraction, dict):
             extraction = contracts.extraction_default()
         rows.append({
             "name": name,
-            "path": str(candidate),
+            "path": str(stored) if stored is not None else "",
             "sha256": str(entry.get("sha256") or ""),
             "bytes": entry.get("bytes"),
             "pages": entry.get("pages"),
@@ -461,9 +459,20 @@ def _source_rows(dataset_dir):
             "status": str(entry.get("status") or ""),
             "extraction": dict(extraction),
             "indexed": str(entry.get("sha256") or "").lower() in indexed,
-            "present": candidate.is_file(),
+            "present": stored is not None,
         })
     return rows
+
+
+def _release_added(entries):
+    """Release shared sources added to a dataset that is being rolled back."""
+    for entry in entries or []:
+        sha = str((entry or {}).get("sha256") or "")
+        if sha:
+            try:
+                ingest.release_shared_source(sha)
+            except Exception:  # noqa: BLE001 - rollback must not mask the error
+                pass
 
 
 async def _store_uploads(name, note, files):
@@ -492,6 +501,7 @@ async def _store_uploads(name, note, files):
                             % security.MAX_UPLOAD_FILES)
     staging = config.ensure().uploads_dir / ("upload-" + uuid.uuid4().hex)
     dataset = None
+    added = []
     try:
         staging.mkdir(parents=True, exist_ok=True)
         security.harden_dir(staging)
@@ -517,14 +527,17 @@ async def _store_uploads(name, note, files):
             prepared.append(temp)
         dataset = ingest.create_dataset(config.paths(), name, note=note)
         security.harden_dataset_dir(dataset.get("dir"))
+        added = []
         for temp in prepared:
-            ingest.add_source(dataset, temp)
+            added.append(ingest.add_source(dataset, temp))
         return dataset
     except HTTPException:
+        _release_added(added)
         if dataset is not None and dataset.get("dir"):
             shutil.rmtree(dataset["dir"], ignore_errors=True)
         raise
     except Exception as exc:  # noqa: BLE001 - ingestion errors are user-facing
+        _release_added(added)
         if dataset is not None and dataset.get("dir"):
             shutil.rmtree(dataset["dir"], ignore_errors=True)
         raise HTTPException(400, _http_detail(exc))
@@ -1144,7 +1157,7 @@ def create_app():
     # --- workspace / collections -----------------------------------------
     @app.get("/api/workspace")
     def workspace_get():
-        """Absolute workspace paths, last scan and per-collection state."""
+        """Absolute data paths and per-dataset state."""
         return _workspace_report()
 
     @app.get("/api/collections")
@@ -1156,7 +1169,6 @@ def create_app():
             row["id"] = name
             rows.append(row)
         return {"collections": rows,
-                "last_scan": report.get("last_scan"),
                 "counts": report.get("counts")}
 
     # --- datasets ---------------------------------------------------------
@@ -1792,8 +1804,19 @@ def create_app():
     @app.delete("/api/datasets/{dataset_id}")
     def datasets_delete(dataset_id: str):
         directory = _dataset_dir(dataset_id)
+        shas = []
+        try:
+            raw = contracts.read_json(Path(directory) / "dataset.json")
+        except contracts.ContractError:
+            raw = None
+        if isinstance(raw, dict):
+            for entry in raw.get("sources") or []:
+                if isinstance(entry, dict) and entry.get("sha256"):
+                    shas.append(str(entry["sha256"]).lower())
         shutil.rmtree(str(directory), ignore_errors=True)
         reload_store()
+        for sha in shas:
+            ingest.release_shared_source(sha)
         return {"ok": True, "deleted": dataset_id}
 
     # --- index jobs -------------------------------------------------------
@@ -1988,24 +2011,27 @@ def create_app():
             raise HTTPException(400, "invalid file name")
         if "/" in name or "\\" in name or "\x00" in name:
             raise HTTPException(400, "invalid file name")
-        original = (directory / "original").resolve()
-        candidate = original / name
         try:
-            resolved = candidate.resolve(strict=True)
-        except OSError:
+            raw = contracts.read_json(Path(directory) / "dataset.json")
+        except contracts.ContractError as exc:
+            raise HTTPException(500, _http_detail(exc))
+        if not isinstance(raw, dict):
+            raise HTTPException(500, "dataset.json is not readable")
+        entry = None
+        for item in raw.get("sources") or []:
+            if isinstance(item, str):
+                item = {"name": item}
+            if isinstance(item, dict) and str(item.get("name") or "") == name:
+                entry = item
+                break
+        if entry is None:
             raise HTTPException(404, "no such file")
-        # A symlink inside original/ that resolves outside the dataset (or any
-        # absolute traversal) must never be served, even though the name itself
-        # looks safe. Compare resolved paths, not just parent membership.
-        try:
-            resolved.relative_to(original)
-        except ValueError:
-            raise HTTPException(400, "invalid file name")
-        if not resolved.is_file():
+        stored = ingest.stored_source_path(Path(directory), entry)
+        if stored is None or not stored.is_file():
             raise HTTPException(404, "no such file")
         # Inline so a browser opens its PDF viewer directly; #page=N then jumps
         # to the chunk's page.
-        return FileResponse(str(resolved), media_type="application/pdf",
+        return FileResponse(str(stored), media_type="application/pdf",
                             content_disposition_type="inline", filename=name)
 
     # --- model links ------------------------------------------------------

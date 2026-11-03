@@ -562,14 +562,13 @@ def harden_file(file_path):
 
 
 def harden_dataset_dir(dataset_dir):
-    """Tighten a dataset directory and its ``original/`` copies to 0700."""
+    """Tighten a dataset directory to 0700."""
     if not dataset_dir:
         return
     directory = Path(str(dataset_dir))
     if not directory.is_dir():
         return
     harden_dir(directory)
-    harden_dir(directory / "original")
 
 
 def harden_history_dir(history_dir):
@@ -592,16 +591,17 @@ def harden_history_dir(history_dir):
 
 
 def harden_data_root(paths):
-    """Tighten the derived data root after :func:`peekseed.config.ensure`.
+    """Tighten the home and shared folders after :func:`peekseed.config.ensure`.
 
-    Derived directories are owner-only (0700), history files are 0600 and the
-    link store (which can hold API keys) is 0600. Idempotent and never fatal:
-    a read-only or foreign-owned data root must not stop the server from booting.
+    Every folder is owner-only (0700), history files are 0600 and the link store
+    is 0600. Idempotent and never fatal: a read-only or foreign-owned folder
+    must not stop the server from booting.
     """
     if paths is None:
         return
     for directory in (paths.root, paths.config_dir, paths.datasets_dir,
-                      paths.history_dir, paths.uploads_dir):
+                      paths.history_dir, paths.uploads_dir,
+                      paths.shared_dir, paths.sources_dir, paths.peels_dir):
         harden_dir(directory)
     harden_history_dir(paths.history_dir)
     harden_file(paths.links_file)
