@@ -7,10 +7,10 @@ include so issues can be resolved quickly.
 
 Most questions are answered by the docs in this repository:
 
-- [README.md](README.md) — install, quick start, workspace model and scope.
+- [README.md](README.md) — install, quick start, data folders and scope.
 - [docs/api.md](docs/api.md) — HTTP API, stream events and job records.
-- [docs/workspace.md](docs/workspace.md) — workspace layout, manifests and
-  migrations.
+- [docs/workspace.md](docs/workspace.md) — data-folder layout, modes and
+  invariants.
 - [docs/model-links.md](docs/model-links.md) — endpoint contracts for
   embeddings, rerankers and chat models.
 - [docs/ingestion.md](docs/ingestion.md) and [docs/formats.md](docs/formats.md)
@@ -38,8 +38,8 @@ include a minimal reproduction are handled first.
 ## Before opening an issue
 
 1. Check you are on a supported version (`peekseed version`) and Python 3.11+.
-2. Read [docs/workspace.md](docs/workspace.md) and make sure the workspace is
-   the one you think it is (`peekseed status`, `peekseed doctor`).
+2. Read [docs/workspace.md](docs/workspace.md) and make sure the data folders
+   are the ones you think they are (`peekseed status`, `peekseed doctor`).
 3. Re-run the failing path with `PEEKSEED_*` secrets removed from the output.
 4. Reproduce with the minimum configuration, and note whether a model endpoint
    was involved (the test suite runs fully offline with fake endpoints; most
@@ -51,10 +51,11 @@ include a minimal reproduction are handled first.
 - Python version, operating system and whether the server was loopback-only;
 - the exact commands / UI steps and the observed result;
 - relevant logs with API keys, tokens and document contents redacted;
-- the workspace state: `peekseed status` and `peekseed doctor` output (paths
-  can be redacted, but note whether `documents/` and `.peekseed/` are tracked);
+- the data-folder state: `peekseed status` and `peekseed doctor` output (paths
+  can be redacted, but note whether `PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR` are
+  inside a git checkout);
 - the embedding link id/model if search/index is involved (never the key).
 
-Do **not** attach real documents, API keys, `.peekseed/config/links.json`
+Do **not** attach real documents, API keys, `$PEEKSEED_HOME/config/links.json`
 contents or `PEEKSEED_TOKEN` values. A synthetic PDF that reproduces the
 problem is ideal.

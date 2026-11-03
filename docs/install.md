@@ -1,8 +1,8 @@
 # Install and first run
 
 This page takes a clean machine to a working peekseed: install the package,
-create a workspace, connect your model endpoints, run the local server and
-ingest your first PDFs. It is written for a single-user local install. If the
+create its two data folders, connect your model endpoints, run the local server
+and ingest your first PDFs. It is written for a single-user local install. If the
 machine will stay on and serve other devices, continue with
 [deploy.md](deploy.md).
 
@@ -20,7 +20,8 @@ machine will stay on and serve other devices, continue with
 | Embedding endpoint | OpenAI-compatible `POST {base}/embeddings` or custom `POST {base}/embed` |
 | Chat endpoint | OpenAI-compatible streaming `POST {base}/chat/completions`; needed for Ask and Research |
 | Reranker endpoint | optional custom `POST {base}/rerank` |
-| Disk | your documents plus the derived index; no database server |
+| Disk | your PDFs stored once in the shared sources pool, plus the derived index; no database server |
+| Data folders | two absolute, existing directories named by `PEEKSEED_HOME` and `PEEKSEED_SHARED_DIR` |
 | Extraction engine | optional: **peelfeed** CLI (separate repo/venv; see [formats.md](formats.md)). Without it uploads/file management still work, Extract is disabled |
 
 peekseed bundles no models. You point its **links** at endpoints you already
@@ -62,57 +63,53 @@ pip install -e '.[test]'   # developer install with pytest
 python -m pytest -q
 ```
 
-## Create a workspace
+## Create the data folders
 
-A workspace is one directory with two halves: `documents/` (your files) and
-`.peekseed/` (derived state: datasets, indexes, history and model links).
-Keeping everything under one directory is what makes backup and restore a
-single copy.
+peekseed keeps every changeable runtime file under **two required folders**:
 
-```bash
-peekseed init            # creates ./workspace
-peekseed workspace path  # prints the resolved absolute path
-peekseed doctor          # paths, gitignore guard, links, schemas
+- `PEEKSEED_HOME` — private state: `config/` (links, settings, peelfeed config),
+  `datasets/`, `history/`, `jobs/`, `uploads/` and `logs/`.
+- `PEEKSEED_SHARED_DIR` — the folder shared with peelfeed: `sources/<sha256>/`
+  holds the one stored copy of each uploaded PDF and `peels/<peel_id>/` holds
+  peelfeed's output.
+
+Both must be absolute paths that already exist. There are no fallbacks
+(`./workspace`, `~/peekseed` or a sibling folder): a missing setting stops the
+program with a clear error. A deployment sets them in an env file (mode 0600),
+for example `deploy/env/peekseed.env`:
+
+```dotenv
+PEEKSEED_HOME=<ROOT>/livefield/.peekseed
+PEEKSEED_SHARED_DIR=<ROOT>/livefield/shared
 ```
 
-Resolution order is `--workspace PATH` or `PEEKSEED_WORKSPACE`, then
-`./workspace`, then `~/peekseed` only when the current directory is not
-writable (printed with a warning). `init` prints every resolved absolute path,
-writes an empty 0600 link store, initialises the manifest, and adds an anchored
-`.gitignore` guard (`/workspace/`) to the enclosing checkout so documents cannot
-be committed by accident.
-
-A custom location:
+For a first local run, export them and create the directories:
 
 ```bash
-peekseed init --workspace ~/research
+export PEEKSEED_HOME="$HOME/peekseed-data/home"
+export PEEKSEED_SHARED_DIR="$HOME/peekseed-data/shared"
+mkdir -p "$PEEKSEED_HOME" "$PEEKSEED_SHARED_DIR"
+peekseed init      # create the subfolders, chmod 0700, write an empty 0600 link store
+peekseed doctor    # paths, permissions, link store, schemas, peelfeed
 ```
 
-Do not use a path that a git checkout tracks: `init` writes the anchored
-`.gitignore` guard, and `doctor` warns when workspace files are already tracked
-by git. The full contract is in [workspace.md](workspace.md).
+`peekseed init` never overwrites an existing link store or dataset. Both folders
+must be on local disk, outside any code checkout and not on a synced or network
+filesystem. The full contract is in [workspace.md](workspace.md).
 
 ## Connect model endpoints
 
 The normal path is the UI. Start the server (next section), open **Settings**,
-and add an embedding link and a chat link; a reranker is optional. API keys are
-stored in `<workspace>/.peekseed/config/links.json` (mode 0600), are never sent
-back to the browser, and a link's `base_url` is SSRF-checked when saved.
+and add an embedding link and a chat link; a reranker is optional. A link never
+stores an API key: it names the environment variable that holds one
+(`api_key_env`, for example `PEEKSEED_ANSWER_API_KEY`), and the key itself lives
+only in the env file (mode 0600) that starts the service. The UI cannot enter a
+key; it only shows the variable name and whether the key is set. A link's
+`base_url` is SSRF-checked when saved.
 
-For a headless first run, links can also be seeded from environment variables
-(one link per role, applied on first start):
-
-| Role | Variables |
-|---|---|
-| Embedding (OpenAI-compatible) | `PEEKSEED_EMBED_BASE`, `PEEKSEED_EMBED_PROTOCOL=openai`, `PEEKSEED_EMBED_MODEL`, `PEEKSEED_EMBED_API_KEY` |
-| Embedding (custom) | `PEEKSEED_EMBED_BASE`, `PEEKSEED_EMBED_PROTOCOL=custom`, `PEEKSEED_EMBED_MODEL`, `PEEKSEED_EMBED_API_KEY` |
-| Reranker (custom) | `PEEKSEED_RERANK_BASE`, `PEEKSEED_RERANK_MODEL`, `PEEKSEED_RERANK_API_KEY` |
-| Answer (OpenAI-compatible) | `PEEKSEED_ANSWER_BASE`, `PEEKSEED_ANSWER_MODEL`, `PEEKSEED_ANSWER_API_KEY` |
-
-The commented template is [`.env.example`](../.env.example); copy it to `.env`.
-A real environment variable always wins over the file. The CLI reads `.env`
-from the current directory and then from the project root, or from
-`PEEKSEED_ENV_FILE` when that is set.
+The env file is read by the CLI as defaults (a real environment variable always
+wins). The CLI loads `.env` from the current directory, then from the project
+root, or from `PEEKSEED_ENV_FILE` when that is set.
 
 An **index belongs to one embedding space** (the embed link id and its model).
 Changing either requires rebuilding the dataset's index; search and ask
@@ -124,29 +121,32 @@ silently comparing vectors from different spaces.
 
 ```bash
 peekseed serve
-# peekseed: http://127.0.0.1:8030/  (workspace: /…/workspace)
+# peekseed: http://127.0.0.1:8030/  (home: /…/peekseed-data/home)
 ```
 
-`peekseed serve --host H --port P --workspace PATH` overrides the defaults.
-The server binds loopback and serves plain HTTP; it is not meant to be exposed
-to an untrusted network as-is (see [Security](#security) below).
+`peekseed serve --host H --port P` overrides the bind defaults; the data folders
+come from the environment. The server binds loopback and serves plain HTTP; it
+is not meant to be exposed to an untrusted network as-is (see [Security](#security)
+below).
 
 Open <http://127.0.0.1:8030>. Environment variables that matter here:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `PEEKSEED_WORKSPACE` | `./workspace` | documents plus derived state |
-| `PEEKSEED_DATA` | `<workspace>/.peekseed` | advanced override of the derived root only |
+| `PEEKSEED_HOME` | **required** | private runtime data: config, datasets, history, jobs, uploads, logs |
+| `PEEKSEED_SHARED_DIR` | **required** | shared folder with peelfeed: `sources/` and `peels/` |
 | `PEEKSEED_HOST` | `127.0.0.1` | bind address |
 | `PEEKSEED_PORT` | `8030` | bind port |
 | `PEEKSEED_TOKEN` | unset | shared secret required on mutating `/api/*` calls |
 | `PEEKSEED_ALLOWED_HOSTS` | unset | comma-separated `host[:port]` allowlist for `Host`/`Origin` |
 | `PEEKSEED_ENV_FILE` | unset | explicit dotenv file (otherwise `cwd/.env`, then project root) |
 | `PEEKSEED_AGENT` | off | enables the Research mode (`POST /api/agent/stream`) |
+| `PEEKSEED_LOCAL_MODELS_FILE` | unset | optional local-model control config; a deployment keeps it at `deploy/env/local_models.json` |
 | `PEEKSEED_PEELFEED_CLI` | unset | absolute path to the peelfeed console script (preferred); unset disables extraction unless a Python path is set |
 | `PEEKSEED_PEELFEED_PYTHON` | unset | absolute path to the peelfeed venv interpreter; fallback invocation is `python -m peelfeed.cli` |
 | `PEEKSEED_PEELFEED_REPO` | derived | peelfeed repo root for `PYTHONPATH` (derived from the CLI/python path when unset) |
-| `PEELFEED_ROOT` | `<data_root>/peels` | shared peel root; filesystem allowlist: peekseed only reads corpora under this prefix (legacy `PEEKSEED_PEELFEED_ROOT` accepted) |
+| `PEELFEED_HOME` | **required by peelfeed** | peelfeed's own home: venvs, Docling/`torch` caches |
+| `PEELFEED_SHARED_DIR` | **required by peelfeed** | the same folder as `PEEKSEED_SHARED_DIR`; peekseed forces it when it calls peelfeed |
 | `PEEKSEED_PEELFEED_ENABLED` | auto | `0` explicitly disables extraction even when a CLI/python path is set |
 | `PEEKSEED_PEELFEED_TIMEOUT` | `7200` | seconds; ingest/rebuild may run for the whole Docling conversion |
 | `PEEKSEED_PEELFEED_POLL` | `2` | seconds; how often the UI/worker polls `peelfeed status` |
@@ -156,10 +156,13 @@ Open <http://127.0.0.1:8030>. Environment variables that matter here:
 Extraction runs the **peelfeed CLI** as a subprocess; there is no daemon, base
 URL or token. Point `PEEKSEED_PEELFEED_CLI` at the console script, or
 `PEEKSEED_PEELFEED_PYTHON` at the peelfeed venv interpreter (peekseed then runs
-`python -m peelfeed.cli` with `PYTHONPATH` set to the repo). The first run seeds
-`<data_root>/config/peelfeed.json` (0600) from these values; environment values
-win over the file. `peekseed status`/`doctor` print the CLI path and whether it
-answers `capabilities`.
+`python -m peelfeed.cli` with `PYTHONPATH` set to the repo). peelfeed itself
+requires `PEELFEED_HOME` and `PEELFEED_SHARED_DIR`, and the latter must equal
+`PEEKSEED_SHARED_DIR` so both sides see the same `sources/` and `peels/`. The
+first run seeds `$PEEKSEED_HOME/config/peelfeed.json` (0600) from these values;
+environment values win over the file, and the peel root is always
+`$PEEKSEED_SHARED_DIR/peels`. `peekseed status`/`doctor` print the CLI path and
+whether it answers `capabilities`.
 
 Answer limits and agent budgets (`PEEKSEED_ASK_*`, `PEEKSEED_RERANK_*`,
 `PEEKSEED_AGENT_*`) are listed in [`.env.example`](../.env.example).
@@ -169,8 +172,9 @@ Answer limits and agent budgets (`PEEKSEED_ASK_*`, `PEEKSEED_RERANK_*`,
 1. **Settings** — add and enable an embedding link; add a chat link if you want
    Ask/Research. Use *Test* to check reachability before continuing.
 2. **Datasets** — name a dataset, choose one or more PDFs, click *Add dataset*.
-   The originals are copied under the workspace; the upload limits (50 MB per
-   file, 50 files, 200 MB per request) are enforced before the body is parsed.
+   Each PDF is stored once in the shared sources pool
+   (`$PEEKSEED_SHARED_DIR/sources/<sha256>/`); the upload limits (50 MB per file,
+   50 files, 200 MB per request) are enforced before the body is parsed.
 3. If peelfeed is configured, click **Extract** on the file row (the state chip
    moves `not_extracted → queued → running → extracted`; Review is available for
    extracted peels). Then click **Build index**: peekseed reads the peel corpus,
@@ -191,16 +195,15 @@ The full HTTP contract (routes, stream events, persisted job record) is in
 
 ## Headless and bulk workflows
 
-Everything the UI does on the upload path is available without a browser:
+Everything the UI does on the upload path is available without a browser. The
+CLI reads the same env file, so export `PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR` (or
+set `PEEKSEED_ENV_FILE`) first:
 
 ```bash
 # Store PDFs as a dataset (storage only; no extraction, no embedding).
 peekseed index --name "My docs" --file a.pdf --file b.pdf
 
-# Reconcile documents/ with datasets/manifest (storage-only scan).
-peekseed scan
-
-# Inspect the workspace and the last scan.
+# Inspect the data folders and the datasets.
 peekseed status
 peekseed doctor
 
@@ -208,49 +211,49 @@ peekseed doctor
 peekseed reindex --collection my-docs --link embed-local --dry-run
 peekseed reindex --collection my-docs --link embed-local
 peekseed reindex --all --gc          # drop generations older than CURRENT
-
-# Move the whole workspace as one unit.
-peekseed workspace move ~/new-workspace
 ```
 
 Extraction is a per-file peelfeed job triggered from the UI/API; there is no
 `peekseed import` command any more. `peekseed reindex` needs an enabled embed
 link; `--dry-run` prints the scope and writes nothing.
 
-## The workspace
+## The data folders
 
 ```
-<workspace>/documents/                      user-owned sources
-<workspace>/.peekseed/config/links.json     model endpoints and keys (0600)
-<workspace>/.peekseed/config/settings.json  optional UI title/tagline/examples
-<workspace>/.peekseed/manifest.json         scan state
-<workspace>/.peekseed/datasets/<id>/        originals, chunks.jsonl, index/<space>/
-<workspace>/.peekseed/peels/<peel_id>/      peelfeed corpora (read-only for peekseed)
-<workspace>/.peekseed/extracted/            legacy extraction cache (unused)
-<workspace>/.peekseed/history/              saved search/ask/research history
-<workspace>/.peekseed/jobs/                 persisted job records
-<workspace>/.peekseed/uploads/              temporary upload staging
+$PEEKSEED_HOME/config/links.json         model endpoints; api_key_env names only (0600)
+$PEEKSEED_HOME/config/settings.json      optional UI title/tagline/examples
+$PEEKSEED_HOME/config/peelfeed.json      peelfeed CLI config (0600, seeded once)
+$PEEKSEED_HOME/datasets/<id>/            dataset.json, chunks.jsonl, index/<space>/
+$PEEKSEED_HOME/history/                  saved search/ask/research history
+$PEEKSEED_HOME/jobs/                     persisted job records
+$PEEKSEED_HOME/uploads/                  temporary upload staging
+$PEEKSEED_HOME/logs/                     serve.log, serve.pid (deploy scripts)
+$PEEKSEED_SHARED_DIR/sources/<sha256>/   the one stored copy of each uploaded PDF
+$PEEKSEED_SHARED_DIR/peels/<peel_id>/    peelfeed corpora (source, extract/corpus, .peel)
 ```
 
-- **Back up the workspace as one directory** (`tar`, restic, Time Machine, …).
-  The derived half is rebuildable; `config/links.json` (API keys) is the one
-  derived file worth keeping, and documents are user-owned.
-- **Deleting `.peekseed/`** loses indexes, history, jobs and links but no
-  documents. You must re-add link keys before rebuilding indexes.
-- Datasets are copies: deleting a dataset deletes the stored PDFs too.
-- Directories are private (0700); history files and the link store are 0600.
+- **Back up** `$PEEKSEED_HOME` (except `env/venv`, `env/uv-cache`, `logs/` and
+  `uploads/`) and `$PEEKSEED_SHARED_DIR/sources`. Peels are rebuildable by
+  extracting again. See [deploy.md](deploy.md) for the backup script.
+- **Deleting the home** loses indexes, history, jobs and links but no uploaded
+  bytes (they live in the shared sources). You must re-create links before
+  rebuilding indexes.
+- A dataset is a set of source entries: deleting it removes its entries and
+  releases the stored PDF when no other dataset references it.
+- Directories are private (0700); history files, the link store and stored PDFs
+  are 0600. API keys live in the env file, never in `links.json`.
 
 ## Upgrade, migrate, uninstall
 
 ```bash
 pip install --upgrade peekseed
 peekseed migrate            # dry-run: report any data-schema upgrades
-peekseed migrate --apply    # write them (back up the workspace first)
+peekseed migrate --apply    # write them (back up the data folders first)
 peekseed version            # confirm the version the server will report
 ```
 
 Restart the server after an upgrade. Schema changes are **forward-only**: there
-is no cross-schema downgrade by code alone. To roll back, restore the workspace
+is no cross-schema downgrade by code alone. To roll back, restore the data-folder
 backup you took before the upgrade (see the upgrade and rollback section of
 [deploy.md](deploy.md)).
 
@@ -258,8 +261,8 @@ Uninstalling the package does not delete your data:
 
 ```bash
 pip uninstall peekseed
-# the workspace directory is left in place; remove it yourself when you no
-# longer need the documents, after taking a backup.
+# the data folders are left in place; remove them yourself when you no longer
+# need the uploads, after taking a backup.
 ```
 
 ## Troubleshooting
@@ -270,9 +273,9 @@ pip uninstall peekseed
 | `403` on a mutating request | Host or Origin mismatch. Add the name you browse through (`host[:port]`) to `PEEKSEED_ALLOWED_HOSTS`; loopback names and the bind host are always accepted. |
 | `409` from search/ask | The embed link changed, the endpoint no longer reproduces the probe, or the index has no probe. Rebuild the index (`Build index` or `peekseed reindex`) with the same embed link/model. |
 | `409` from Build index | Another build holds the collection's writer lock. Wait for it, cancel it, or resume an interrupted job; stale locks are detected and do not block. |
-| File is `not_extracted` / Build index 409 | Configure the peelfeed CLI (`PEEKSEED_PEELFEED_CLI`, or `PEEKSEED_PEELFEED_PYTHON`) and click Extract on the file row; extraction is not a peekseed feature. |
-| `peekseed init` refuses | The workspace path is tracked by a git checkout. Choose a path outside the checkout or one the checkout ignores. |
-| Port already in use | `peekseed serve --port 8031` (or set `PEEKSEED_PORT`); only one app process may use a workspace. |
+| File is `not_extracted` / Build index 409 | Configure the peelfeed CLI (`PEEKSEED_PEELFEED_CLI`, or `PEEKSEED_PEELFEED_PYTHON`) with `PEELFEED_HOME`/`PEELFEED_SHARED_DIR` and click Extract on the file row; extraction is not a peekseed feature. |
+| `PEEKSEED_HOME is not set` (or the same for `PEEKSEED_SHARED_DIR`) | Export both variables, or point `PEEKSEED_ENV_FILE` at the env file, before `peekseed init`/`serve`/`status`. They must be absolute and already exist. |
+| Port already in use | `peekseed serve --port 8031` (or set `PEEKSEED_PORT`); only one app process may use the same home/shared folders. |
 | Browser shows stale UI | Reload; the UI is served `no-cache` with an ETag. A hard reload clears a stale bundle. |
 | Model endpoint unreachable | Check the endpoint and key, use **Test** in Settings or `GET /api/links/status`; loopback, RFC1918 and tailnet addresses are allowed, cloud-metadata addresses are rejected. |
 | Jobs stuck after a restart | Records left `running` become `interrupted`; resume with `POST /api/jobs/{id}/resume` or the UI's Resume action. |

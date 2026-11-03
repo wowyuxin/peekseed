@@ -9,7 +9,7 @@ point it at the embedding and chat endpoints you already run or subscribe to.
 Documents and indexes stay on your machine unless a configured model endpoint
 receives text you send it deliberately.
 
-> **Status: 0.1.0.** The 0.1.0 API, workspace layout and data schemas are
+> **Status: 0.1.0.** The 0.1.0 API, data-folder layout and data schemas are
 > frozen for the release; folder scanning and OCR are 0.2.0 features. See
 > [CHANGELOG.md](CHANGELOG.md) and [docs/release.md](docs/release.md).
 
@@ -19,7 +19,7 @@ receives text you send it deliberately.
 - [Requirements](#requirements)
 - [Install and quick start](#install-and-quick-start)
 - [The 0.1.0 workflow](#the-010-workflow)
-- [The workspace model](#the-workspace-model)
+- [The data folders](#the-data-folders)
 - [Model links](#model-links)
 - [0.1.0 vs 0.2.0](#010-vs-020)
 - [Known limitations](#known-limitations)
@@ -32,12 +32,14 @@ receives text you send it deliberately.
 peekseed has three moving parts:
 
 1. **Model links** — the embedder, an optional reranker, and one or more chat
-   models, all configured in the browser (Settings) or seeded from environment
-   variables. No model is bundled and no key is ever baked into the code.
+   models, all configured in the browser (Settings). No model is bundled, no key
+   is ever baked into the code, and a link names the environment variable that
+   holds its key instead of storing it.
 2. **Datasets** — PDFs you upload (stored only). Extraction is provided by the
    optional **peelfeed** engine, one peel per file; a Build-index job reads those
    corpora, embeds each canonical chunk with the enabled embedder and writes a
-   compact vector index. Everything is derived from one workspace root.
+   compact vector index. Everything is derived from two required data folders
+   (`PEEKSEED_HOME` and `PEEKSEED_SHARED_DIR`).
 3. **Work modes** — keyword+vector search, one-shot grounded answers, and an
    optional research agent that uses tools to read the dataset itself.
 
@@ -71,13 +73,19 @@ Extraction formats/dependencies belong to peelfeed, not peekseed (see
 python -m venv .venv && . .venv/bin/activate   # optional but recommended
 pip install peekseed
 
-peekseed init      # create ./workspace (documents/ + .peekseed/)
+export PEEKSEED_HOME="$HOME/peekseed-data/home"
+export PEEKSEED_SHARED_DIR="$HOME/peekseed-data/shared"
+mkdir -p "$PEEKSEED_HOME" "$PEEKSEED_SHARED_DIR"
+peekseed init      # create the home/shared tree and print the paths
 peekseed serve     # http://127.0.0.1:8030
 ```
 
-`peekseed init` prints the resolved absolute paths and refuses to treat a
-tracked checkout as a safe workspace. `peekseed serve` binds loopback by
-default. Open <http://127.0.0.1:8030>, then:
+Both variables are **required** and must be absolute, existing directories; there
+are no fallbacks. A deployment sets them in an env file (mode 0600), for example
+`deploy/env/peekseed.env`. `peekseed init` creates the subfolders, chmods them
+0700 and writes an empty 0600 link store; a missing setting stops the command
+with a clear error. `peekseed serve` binds loopback by default. Open
+<http://127.0.0.1:8030>, then:
 
 1. **Settings** → add an embedding link and a chat link (an OpenAI-compatible
    or custom `/embed` endpoint; a reranker is optional).
@@ -100,15 +108,15 @@ python -m pytest -q
 For headless machines, `peekseed index --name "My docs" --file a.pdf` stores a
 dataset without a browser (extraction is triggered through the API/UI once
 peelfeed is configured), and `peekseed status` / `peekseed doctor` inspect the
-workspace.
+data folders.
 
 ## The 0.1.0 workflow
 
 The core loop is **upload → (Extract) → index → search → ask → research**:
 
-1. **Upload.** POST a PDF to `POST /api/datasets` (the UI does this); the
-   original file is stored once under
-   `<workspace>/.peekseed/datasets/<id>/original/`.
+1. **Upload.** POST a PDF to `POST /api/datasets` (the UI does this); the file is
+   stored once in the shared sources pool at
+   `$PEEKSEED_SHARED_DIR/sources/<sha256>/<name>.pdf`.
 2. **Extract (optional engine).** `POST /api/datasets/{id}/sources/{sha}/extract`
    asks peelfeed to build a peel for that file; the UI polls the per-source state
    until `extracted`/`failed` and offers Review + Apply & rebuild. With no
@@ -123,7 +131,7 @@ The core loop is **upload → (Extract) → index → search → ask → researc
    between batches and `POST /api/jobs/{id}/resume` continues the same record.
 4. **Search.** `POST /api/search` fuses keyword and vector retrieval, then
    optionally reranks the pool. Results carry dataset, file, page range and
-   excerpt so the UI can open the original PDF at the right page.
+   excerpt so the UI can open the stored PDF at the right page.
 5. **Ask.** `POST /api/ask/stream` retrieves a bounded set of excerpts and
    streams a grounded answer from the configured chat model. The answer cites
    excerpts as `[n]`; the numbered chips beside it are the authoritative links
@@ -138,43 +146,48 @@ model, the UI tells you to rebuild instead of silently degrading. Every
 `/api/*` response is `Cache-Control: no-store`. The full route list and the
 persisted job record are in [docs/api.md](docs/api.md).
 
-## The workspace model
+## The data folders
 
-Every mutable path derives from one workspace root (default `./workspace`):
+Every mutable path derives from two required folders — there are no defaults and
+no fallbacks (`./workspace`, `~/peekseed` or a sibling folder):
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `PEEKSEED_WORKSPACE` | `./workspace` | documents/, derived `.peekseed/` data, history, link config |
-| `PEEKSEED_DATA` | `<workspace>/.peekseed` | advanced override for the derived root only |
-| `PEEKSEED_HOST` | `127.0.0.1` | bind address (loopback by default) |
-| `PEEKSEED_PORT` | `8030` | bind port |
-| `PEEKSEED_TOKEN` | unset | shared secret required on mutating `/api/*` calls |
-| `PEEKSEED_ALLOWED_HOSTS` | unset | comma-separated Host/Origin names the server may answer |
-| `PEEKSEED_ENV_FILE` | `./.env` | alternative dotenv file for defaults |
+| Variable | Meaning |
+|---|---|
+| `PEEKSEED_HOME` | **required** — private state: config (links, settings, peelfeed), datasets, history, jobs, uploads, logs |
+| `PEEKSEED_SHARED_DIR` | **required** — shared with peelfeed: `sources/<sha256>/<name>.pdf` and `peels/<peel_id>/` |
+| `PEEKSEED_HOST` | bind address (loopback by default) |
+| `PEEKSEED_PORT` | bind port (`8030`) |
+| `PEEKSEED_TOKEN` | shared secret required on mutating `/api/*` calls |
+| `PEEKSEED_ALLOWED_HOSTS` | comma-separated Host/Origin names the server may answer |
+| `PEEKSEED_ENV_FILE` | explicit dotenv file for defaults |
 
-A `.env` in the working directory (template: `.env.example`) is read by
-`peekseed` as defaults; a real environment variable always wins.
+The env file (e.g. `deploy/env/peekseed.env`, mode 0600) sets them; a real
+environment variable always wins over the file.
 
 ```
-<workspace>/documents/                      user-owned; one top-level folder = one collection
-<workspace>/.peekseed/config/links.json     model endpoints; keys mode 0600, masked in the API
-<workspace>/.peekseed/datasets/<id>/        original PDFs, chunks.jsonl, index/<space>/
-<workspace>/.peekseed/peels/<peel_id>/      peelfeed corpora (source, extract/corpus, .peel)
-<workspace>/.peekseed/jobs/                 persisted, cancellable job records
-<workspace>/.peekseed/history/              saved ask/research history
+$PEEKSEED_HOME/config/links.json         model endpoints; api_key_env names only (0600)
+$PEEKSEED_HOME/config/settings.json      optional UI copy
+$PEEKSEED_HOME/config/peelfeed.json      peelfeed CLI config (0600, seeded once)
+$PEEKSEED_HOME/datasets/<id>/            dataset.json, chunks.jsonl, index/<space>/
+$PEEKSEED_HOME/jobs/                     persisted, cancellable job records
+$PEEKSEED_HOME/history/                  saved ask/research history
+$PEEKSEED_HOME/logs/                     serve.log, serve.pid (deploy scripts)
+$PEEKSEED_SHARED_DIR/sources/<sha256>/   the one stored copy of each uploaded PDF
+$PEEKSEED_SHARED_DIR/peels/<peel_id>/    peelfeed corpora (source, extract/corpus, .peel)
 ```
 
-The workspace is the one directory to back up. `.peekseed/` is derived and
-rebuildable; `peekseed workspace move PATH` moves the whole tree. See
-[docs/workspace.md](docs/workspace.md) for manifest and migration details.
+Back up `$PEEKSEED_HOME` (minus venvs/caches, logs and upload staging) and
+`$PEEKSEED_SHARED_DIR/sources`; peels are rebuildable by extracting again. See
+[docs/workspace.md](docs/workspace.md) for the folder contract, modes and
+invariants.
 
 ## Model links
 
-A **link** is one configured endpoint, stored in
-`<workspace>/.peekseed/config/links.json`. There are no bundled models: run
-your own server and point a link at it. The UI is the normal way to create
-links; the same links can be seeded headlessly with `PEEKSEED_EMBED_*`,
-`PEEKSEED_RERANK_*` and `PEEKSEED_ANSWER_*` variables (see `.env.example`).
+A **link** is one configured endpoint, stored in `$PEEKSEED_HOME/config/links.json`.
+There are no bundled models: run your own server and point a link at it. A link
+never stores an API key: it names the environment variable that holds one
+(`api_key_env`), and the key itself lives only in the env file; the UI cannot
+enter keys. The UI is the normal way to create links.
 A deployment that runs its models as local processes can optionally start and
 stop them from the panel ([docs/local-models.md](docs/local-models.md)).
 
@@ -201,12 +214,13 @@ when no index exists for the active space.
 
 **0.1.0 (this release)** — the upload-driven product:
 
-- Workspace init/status/doctor/workspace move, versioned data schemas
-  (`dataset.json`/`info.json` schema 3, manifest/job schema 1) with
-  `peekseed migrate` upgrades.
+- Data-folder init/status/doctor, versioned data schemas
+  (`dataset.json`/`info.json` schema 3, job schema 1) with `peekseed migrate`
+  upgrades.
 - PDF upload via UI/API or `peekseed index` — **storage only** (no pypdf/docling
-  in peekseed). Extraction is a peelfeed job; with no engine configured uploads,
-  file management and deletes still work and Extract is disabled.
+  in peekseed; each PDF is stored once in the shared sources pool). Extraction is
+  a peelfeed job; with no engine configured uploads, file management and deletes
+  still work and Extract is disabled.
 - Background index jobs: persisted records, cancel, resume, writer lock;
   embedding-space identity and reindex with dry-run/GC.
 - Hybrid keyword+vector search, optional rerank, streaming ask with citations,
@@ -216,11 +230,10 @@ when no index exists for the active space.
 
 **0.2.0 (planned)** — folder-driven ingestion:
 
-- A `documents/` folder scan workflow on top of the storage-only scan
-  (`peekseed scan` already discovers/hashes/reconciles; watching and automatic
-  extraction jobs are planned).
+- A folder-scan workflow (`POST /api/scan` and a CLI scan UX; watching and
+  automatic extraction jobs are planned).
 - Broader peelfeed profiles/formats and multimodal embedding on top of the same
-  workspace + corpus contract.
+  data-folder + corpus contract.
 
 ## Known limitations
 
@@ -232,14 +245,14 @@ when no index exists for the active space.
 - **Extraction is external.** peekseed does not parse documents; without a
   configured peelfeed engine there is no extraction, Review or search over new
   files (upload/list/delete still work).
-- **Scan is discovery-only.** `peekseed scan` reconciles `documents/` and
-  `dataset.json`; it does not build indexes.
+- **Uploads only.** Folder scanning (`POST /api/scan`, a CLI scan UX) and OCR are
+  0.2.0 features; PDFs enter through upload in 0.1.0.
 - **No bundled models** and no model lifecycle management: answer quality and
   embedding compatibility are the configured endpoints' responsibility.
 - **Index rebuilds are required** when the embedding link's id or model
   changes; there is no cross-space search.
 - **PDF viewer is the browser's**, not a vendored PDF.js; page citations open
-  the original file served by the local API.
+  the stored file served by the local API.
 - **Not tested on Windows**: the test suite and helper script assume a POSIX
   environment.
 
@@ -247,14 +260,14 @@ when no index exists for the active space.
 
 New here? Start with [docs/install.md](docs/install.md).
 
-- [docs/install.md](docs/install.md) — install, first workspace, model links,
+- [docs/install.md](docs/install.md) — install, the data folders, model links,
   the first dataset and troubleshooting.
 - [docs/deploy.md](docs/deploy.md) — run it as a single-user service: exposure,
   smoke checks, backups, upgrades and rollback.
 - [docs/api.md](docs/api.md) — HTTP routes, request/response shapes, stream
   events and the persisted job record (new in 0.1.0).
-- [docs/workspace.md](docs/workspace.md) — workspace layout, manifest,
-  collections and migrations.
+- [docs/workspace.md](docs/workspace.md) — the data-folder layout, modes and
+  invariants.
 - [docs/model-links.md](docs/model-links.md) — link schema and endpoint
   contracts.
 - [docs/local-models.md](docs/local-models.md) — optional start/stop control
@@ -276,10 +289,10 @@ peekseed is designed to run **locally, for one user**. It binds to loopback by
 default and must not be exposed to an untrusted network as-is. Optional guards:
 `PEEKSEED_TOKEN` requires a shared secret on mutating `/api/*` calls, and
 `PEEKSEED_ALLOWED_HOSTS` pins the Host/Origin names the service may answer.
-API keys live only in `<workspace>/.peekseed/config/links.json` (mode 0600),
-are never returned to the browser (the UI only learns `api_key_set`), and
-model links are SSRF-checked when saved. Uploads are size/type/name checked;
-`/pdf` is inline and read-only.
+API keys live only in the 0600 env file; `links.json` stores the variable name
+(`api_key_env`), never a key, and the browser only learns `api_key_env` and
+`api_key_set`. Model links are SSRF-checked when saved. Uploads are
+size/type/name checked; `/pdf` is inline and read-only.
 
 See [docs/security.md](docs/security.md) for the threat model and
 [SECURITY.md](SECURITY.md) for how to report a vulnerability.

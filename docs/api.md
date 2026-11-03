@@ -1,8 +1,9 @@
 # HTTP API (0.1.0)
 
-The server is one FastAPI app over the workspace's derived data root. It is meant
-to run **loopback, single user**; the optional token and Host/Origin allowlist are
-the deliberate-exposure guard (see [security](security.md)). Every route below is
+The server is one FastAPI app over the two required data folders
+(`PEEKSEED_HOME` and `PEEKSEED_SHARED_DIR`). It is meant to run **loopback,
+single user**; the optional token and Host/Origin allowlist are the
+deliberate-exposure guard (see [security](security.md)). Every route below is
 part of the 0.1.0 contract; `POST /api/scan` and the scanning UX are **0.2.0** and
 are not listed.
 
@@ -30,8 +31,8 @@ are not listed.
 - **Dataset ids** — `^[a-z0-9][a-z0-9._-]{0,63}$`; an invalid id is `400`, a
   missing one `404`.
 - **Job records** — the API's job is the persisted record in
-  `.peekseed/jobs/<id>.json`; `GET /api/jobs/{id}` reads that file, not memory.
-  See [Jobs](#jobs).
+  `$PEEKSEED_HOME/jobs/<id>.json`; `GET /api/jobs/{id}` reads that file, not
+  memory. See [Jobs](#jobs).
 
 ## Route index
 
@@ -39,8 +40,8 @@ are not listed.
 |---|---|---|
 | GET | `/` | Web UI (single HTML file) |
 | GET | `/health` | Liveness + dataset count |
-| GET | `/api/workspace` | Served absolute paths, last scan, collection state |
-| GET | `/api/collections` | Collection list with status/staleness |
+| GET | `/api/workspace` | Served absolute paths and dataset state |
+| GET | `/api/collections` | Dataset list with status/staleness |
 | GET | `/api/datasets` | Dataset list |
 | GET | `/api/datasets/{id}/sources` | Per-source storage + extraction/index state (refreshes queued/running peels) |
 | POST | `/api/datasets` | Upload PDFs (storage only), create a dataset |
@@ -53,13 +54,13 @@ are not listed.
 | GET | `/api/datasets/{id}/sources/{sha}/assets/{path}` | Proxy one peel/corpus asset (crop, page image, table) |
 | DELETE | `/api/datasets/{id}/sources/{sha}` | Remove a source; `?peel=keep|delete` |
 | GET | `/api/peelfeed/status` | peelfeed CLI config, capabilities handshake, queue counts |
-| DELETE | `/api/datasets/{id}` | Delete a dataset and its derived data |
+| DELETE | `/api/datasets/{id}` | Delete a dataset and release its stored sources |
 | POST | `/api/datasets/{id}/index` | Start an index build job (409 `no_extracted_sources` when none extracted) |
 | GET | `/api/jobs` | List job records (newest first) |
 | GET | `/api/jobs/{id}` | One job record |
 | DELETE | `/api/jobs/{id}` | Request cancellation between batches |
 | POST | `/api/jobs/{id}/resume` | Resume an interrupted/cancelled/failed build |
-| GET | `/pdf/{dataset}/{filename}` | Serve the original PDF inline |
+| GET | `/pdf/{dataset}/{filename}` | Serve the stored PDF inline from the shared sources pool |
 | GET | `/api/links` | Model links (masked) |
 | POST | `/api/links` | Create a link |
 | PUT | `/api/links/{id}` | Update a link |
@@ -89,20 +90,19 @@ are not listed.
 
 ### `GET /api/workspace`
 
-Describes the workspace **this server actually serves** (resolved from
-`PEEKSEED_WORKSPACE`/`PEEKSEED_DATA` at startup, not from the request's cwd):
+Describes the data folders **this server actually serves** (resolved from
+`PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR` at startup, not from the request's cwd):
 
 ```json
 {
-  "workspace": {
-    "root": "/Users/me/peekseed-workspace",
-    "documents_dir": "/Users/me/peekseed-workspace/documents",
-    "derived_dir": "/Users/me/peekseed-workspace/.peekseed",
-    "manifest_file": "…", "config_dir": "…", "links_file": "…",
-    "settings_file": "…", "datasets_dir": "…", "extracted_dir": "…",
-    "history_dir": "…", "jobs_dir": "…", "uploads_dir": "…"
+  "paths": {
+    "root": "/…/livefield/.peekseed",
+    "shared_dir": "/…/livefield/shared",
+    "sources_dir": "/…/livefield/shared/sources",
+    "peels_dir": "/…/livefield/shared/peels",
+    "config_dir": "…", "links_file": "…", "settings_file": "…",
+    "datasets_dir": "…", "history_dir": "…", "jobs_dir": "…", "uploads_dir": "…"
   },
-  "last_scan": "2026-10-20T20:05:00Z" ,
   "collections": {
     "cxl": {
       "name": "CXL", "status": "indexed", "scan_status": null,
@@ -111,19 +111,21 @@ Describes the workspace **this server actually serves** (resolved from
       "reasons": []
     }
   },
-  "counts": {"documents": 42, "missing": 0, "collections": 3, "chunks": 12345},
-  "manifest": {"present": true, "error": null, "documents": 42}
+  "links": {"path": "links.json", "present": true, "ok": true,
+            "count": 2, "error": null},
+  "peelfeed": {"config": {…}, "handshake": {…}},
+  "counts": {"collections": 3, "chunks": 12345}
 }
 ```
 
 `status` is the live index verdict (`indexed`, `stale`, `needs_reindex`,
-`not_indexed`, `chunked`, `error`, `missing`); `reasons` names why. `last_scan`
-is `null` until the 0.2.0 scan workflow runs. All paths are absolute.
+`not_indexed`, `chunked`, `error`, `missing`); `reasons` names why. All paths are
+absolute.
 
 ### `GET /api/collections`
 
-`{"collections": [{...collection row..., "id": "cxl"}], "last_scan": …,
-"counts": {…}}` — the same rows as `/api/workspace`, sorted by id.
+`{"collections": [{...collection row..., "id": "cxl"}], "counts": {…}}` — the
+same rows as `/api/workspace`, sorted by id.
 
 ## Datasets
 
@@ -141,7 +143,7 @@ on disk:
 ```json
 {"dataset": "cxl",
  "sources": [{"name": "CXL_spec.pdf",
-              "path": "/…/datasets/cxl/original/CXL_spec.pdf",
+              "path": "/…/livefield/shared/sources/<sha256>/CXL_spec.pdf",
               "sha256": "a6694b69…", "bytes": 12400000, "pages": 0,
               "extractor": "", "status": "uploaded",
               "extraction": {"state": "not_extracted", "peel_id": "",
@@ -152,6 +154,8 @@ on disk:
               "present": true}]}
 ```
 
+`path` is the stored copy in the shared sources pool (`sources/<sha256>/<name>`
+under `PEEKSEED_SHARED_DIR`); `present` says whether that file is still on disk.
 `status`/`extraction.state` is one of `uploaded|not_extracted|queued|running|
 extracted|failed|stale` (the per-source chip). Extraction is a peelfeed job;
 uploading never parses the file.
@@ -166,34 +170,41 @@ passes. Returns `201 {"dataset": {…}}` (same shape as the list row).
 
 ### `DELETE /api/datasets/{id}`
 
-Removes the dataset directory (documents included — uploads are copies).
-Returns `{"ok": true, "deleted": "<id>"}`.
+Removes the dataset directory. Stored PDFs are released from the shared sources
+pool when no other dataset references them. Returns
+`{"ok": true, "deleted": "<id>"}`.
 
 ### `GET /pdf/{dataset}/{filename}`
 
-Serves the stored original **inline** (`Content-Disposition: inline`,
-`application/pdf`) so the browser's own viewer opens it and `#page=N` jumps to a
-chunk's page. The name is basename-checked and the resolved file must stay inside
-the dataset's `original/`; traversal and symlink escapes are `400`.
+Serves the stored PDF **inline** (`Content-Disposition: inline`,
+`application/pdf`) from the shared sources pool so the browser's own viewer opens
+it and `#page=N` jumps to a chunk's page. The name is basename-checked and the
+resolved file must stay inside `$PEEKSEED_SHARED_DIR/sources`; traversal and
+symlink escapes are `400`.
 
 ## peelfeed (extraction engine, CLI only)
 
 peekseed stores uploads; **peelfeed** extracts. The seam is the peelfeed command
 line: peekseed runs `peelfeed …` as a subprocess and reads JSON from stdout — no
 import of peelfeed's code, no daemon, no base URL, no token. Configuration lives
-in `<data_root>/config/peelfeed.json` (0600), seeded once from
-`PEEKSEED_PEELFEED_{CLI,PYTHON,REPO,ENABLED,TIMEOUT,POLL,LLM_MODE,CHUNK_PROFILE}`
-plus `PEELFEED_ROOT`; environment values win over the file. `peekseed doctor`/
-`status` only read it (for the workspace they inspect) and never seed it.
+in `$PEEKSEED_HOME/config/peelfeed.json` (0600), seeded once from
+`PEEKSEED_PEELFEED_{CLI,PYTHON,REPO,ENABLED,TIMEOUT,POLL,LLM_MODE,CHUNK_PROFILE}`;
+environment values win over the file, and the peel root is always
+`$PEEKSEED_SHARED_DIR/peels`. The subprocess gets an allowlisted environment
+(`PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR` and
+every `PEELFEED_*` variable), so the service token and API keys never reach it.
+`peekseed doctor`/`status` only read the config (for the folders they inspect)
+and never seed it.
 
 ### `GET /api/peelfeed/status`
 
 ```json
 {"config": {"cli": "/…/peelfeed/.venv/bin/peelfeed", "python": "",
-            "repo": "/…/peelfeed", "root": "/…/workspace/.peekseed/peels",
+            "repo": "/…/peelfeed", "root": "/…/livefield/shared/peels",
             "enabled": true, "configured": true, "timeout": 7200.0,
             "poll": 2.0, "llm_mode": "off", "chunk_profile": "default",
-            "path": "/…/config/peelfeed.json", "present": true, "seeded": true},
+            "path": "/…/livefield/.peekseed/config/peelfeed.json",
+            "present": true, "seeded": true},
  "handshake": {"available": true, "engine": "peelfeed", "version": "0.1.0",
                "cli_protocol": 1, "corpus_schema": 2, "chunk_contract": 1,
                "chunker_version": 1, "formats": ["pdf"],
@@ -202,15 +213,18 @@ plus `PEELFEED_ROOT`; environment values win over the file. `peekseed doctor`/
                "llm_modes": ["off", "review", "aggressive"],
                "docling": {"python": "…", "python_present": true,
                            "models_present": true},
-               "peel_root": "/…/peels", "error": null, "checked_at": "…"},
+               "peel_root": "/…/livefield/shared/peels", "error": null,
+               "checked_at": "…"},
  "queue": {"count": 3, "states": {"extracted": 2, "not_extracted": 1}}}
 ```
 
-The handshake runs `peelfeed capabilities` and is cached 60 s. When unconfigured
-or the CLI cannot start the response says `available: false` with a short
-reason; uploads, listing, opening the original PDF and deletion keep working,
-and Extract is disabled (HTTP 503). `queue` counts every stored source by its
-`extraction.state`.
+`seeded` is true while `config/peelfeed.json` has not been written yet and the
+effective config comes from `PEEKSEED_PEELFEED_*`; the file is still seeded once
+on first use (only *model-link* env seeding was removed). The handshake runs
+`peelfeed capabilities` and is cached 60 s. When unconfigured or the CLI cannot
+start the response says `available: false` with a short reason; uploads, listing,
+opening the stored PDF and deletion keep working, and Extract is disabled (HTTP
+503). `queue` counts every stored source by its `extraction.state`.
 
 ### `POST /api/datasets/{id}/sources/{sha}/extract`
 
@@ -242,10 +256,11 @@ CLI-related error so Retry is honest); 409 when the stored file is missing.
 
 ### `DELETE /api/datasets/{id}/sources/{sha}?peel=keep|delete`
 
-Removes the source entry (and its stored copy) from the dataset. The default
-`peel=keep` leaves the peel for audit/rollback; `peel=delete` runs `peelfeed
-archive` best-effort. The index/chunks are not rewritten: the next build reports
-the source-set change as staleness.
+Removes the source entry and releases its stored copy from the shared sources
+pool when no other dataset references it. The default `peel=keep` leaves the peel
+for audit/rollback; `peel=delete` runs `peelfeed archive` best-effort. The
+index/chunks are not rewritten: the next build reports the source-set change as
+staleness.
 
 ### Per-source extraction state
 
@@ -327,29 +342,33 @@ restart does not re-embed committed rows. `202 {"job": "<id>", "resumed": true,
 
 ## Model links
 
-Links are the user's own endpoints. Secrets are write-only: responses carry
-`api_key_set`, never the key.
+Links are the user's own endpoints. A link never stores an API key: it names the
+environment variable that holds one (`api_key_env`). Responses carry
+`api_key_env` and `api_key_set`, never the key.
 
 ### `GET /api/links`
 
-`{"links": [{"id", "role", "label", "protocol", "base_url", "model",
-"enabled", "api_key_set", "chunk", "chunk_set"}], "path": "…/config/links.json",
-"seeded": true}`. `chunk` is the embed link's chunk sizes
+`{"links": [{"id", "role", "label", "protocol", "base_url", "api_key_env",
+"api_key_set", "model", "enabled", "chunk", "chunk_set"}],
+"path": "…/config/links.json"}`. `chunk` is the embed link's chunk sizes
 (`{"target_chars", "max_chars", "image_cap"}` or `null`); `chunk_set` names the
 peelfeed chunk set they select (`c8000-12000-i3`, `""` when unset).
 
 ### `POST /api/links` / `PUT /api/links/{id}`
 
 Body: `id` (create; generated from the label if omitted), `role`
-(`embed|rerank|answer`), `label`, `protocol`, `base_url`, `api_key`, `model`,
+(`embed|rerank|answer`), `label`, `protocol`, `base_url`, `api_key_env`, `model`,
 `enabled`, `chunk` (embed links only: `0 < target_chars ≤ max_chars`,
 `1 ≤ image_cap ≤ 3`, or `null`). Validation rejects unknown fields, bad ids, missing labels, bad
-protocols, whitespace/control characters in keys, and **SSRF-unsafe URLs**
-(cloud metadata, link-local, non-http(s), embedded credentials). Loopback,
-RFC1918 and tailnet targets stay allowed. `201 {"link": {…masked…}}` on create;
-`200` on update. `404` for an unknown id, `400` for validation. Changing the
-`chunk` sizes of a link that already has indexes is `409 chunk_sizes_locked`
-(the indexes were embedded from the old chunk set): delete them first.
+protocols, an `api_key_env` that does not match
+`^PEEKSEED_[A-Z0-9_]+_API_KEY$`, and **SSRF-unsafe URLs** (cloud metadata,
+link-local, non-http(s), embedded credentials). Loopback, RFC1918 and tailnet
+targets stay allowed. A non-empty `api_key` in the body is rejected with `400`
+that says to put the key in the env file and use `api_key_env`; keys are never
+accepted or stored here. `201 {"link": {…masked…}}` on create; `200` on update.
+`404` for an unknown id, `400` for validation. Changing the `chunk` sizes of a
+link that already has indexes is `409 chunk_sizes_locked` (the indexes were
+embedded from the old chunk set): delete them first.
 
 ### `GET` / `DELETE /api/links/{id}/indexes`
 
@@ -383,13 +402,12 @@ One poll for a local control panel:
 `{"service", "models": [{"model", "label"}], "stages": {"embed": {...},
 "rerank": {...}}, "links": [...], "answer": {"configured", "default_provider"}}`.
 Each stage entry is `{running, model, label, detail, link_id, base_url, enabled,
-capabilities: {"start_stop", "models"}}`. `start_stop` is true only when
-`config/local_models.json` configures that role and the link points at the same
-`capabilities: {"start_stop", "models"}}`. `start_stop` is true only when
-`config/local_models.json` configures that role and the link points at the same
-loopback port; a missing config file is the supported "no local models" state.
-A config file that cannot be trusted does NOT fail this poll: the stage entries
-carry `start_stop: false` and the reason in `detail`.
+capabilities: {"start_stop", "models"}}`. `start_stop` is true only when the file
+named by `PEEKSEED_LOCAL_MODELS_FILE` (a deployment keeps it at
+`deploy/env/local_models.json`) configures that role and the link points at the
+same loopback port; a missing config file is the supported "no local models"
+state. A config file that cannot be trusted does NOT fail this poll: the stage
+entries carry `start_stop: false` and the reason in `detail`.
 
 ### `POST /api/links/{id}/start` / `POST /api/links/{id}/stop`
 

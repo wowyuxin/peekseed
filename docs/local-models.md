@@ -14,11 +14,18 @@ endpoint below behaves as "no local models on this machine".
 Machine-local, read-only, never committed and never written by the API:
 
 ```
-<data_root>/config/local_models.json        # 0600
+<ROOT>/deploy/env/local_models.json        # 0600
 ```
 
-`PEEKSEED_LOCAL_MODELS_FILE` overrides the path. The data root is the same one
-that owns `links.json` (see [workspace.md](workspace.md)). A missing file is a
+`PEEKSEED_LOCAL_MODELS_FILE` names the path. The deployment sets it in
+`deploy/env/peekseed.env`:
+
+```bash
+PEEKSEED_LOCAL_MODELS_FILE=<ROOT>/deploy/env/local_models.json
+```
+
+It lives next to the env file (not under `$PEEKSEED_HOME`) because it describes
+machine-local launch scripts rather than user data. A missing file is a
 supported state; a malformed one is reported as HTTP 500 rather than silently
 ignored.
 
@@ -104,8 +111,6 @@ Both POSTs are mutating `/api/*` requests, so they need the service token when
 `PEEKSEED_TOKEN` is set (see [security.md](security.md)). Only scripts named in
 the config file are ever invoked, always as an argument vector -- never through
 a shell -- so link data cannot become a command. The child gets a minimal
-environment (PATH/HOME/LANG/TMPDIR plus the port), never the service's own
-variables, so script output cannot echo service secrets into an API error. The child gets a minimal
 environment (PATH/HOME/LANG/TMPDIR plus the port), never the service's own
 variables, so script output cannot echo service secrets into an API error.
 

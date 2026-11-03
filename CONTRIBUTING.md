@@ -54,8 +54,8 @@ python -m pytest tests/test_packaging.py -q   # fast packaging-only slice
 Rules that the existing tests enforce and new code must keep:
 
 - tests never open a real network connection and never require an API key;
-- tests use temporary workspaces and clean up `PEEKSEED_*` environment
-  variables (see `tests/fixtures.py`);
+- tests use temporary homes/shared folders and clean up `PEEKSEED_*`
+  environment variables (see `tests/fixtures.py`);
 - the public contracts in [docs/contracts.md](docs/contracts.md) have tests; if
   you change a contract, change the doc and the test in the same PR;
 - the packaging tests (`tests/test_packaging.py`) assert the metadata and CI
@@ -86,12 +86,13 @@ copyleft terms (for example PyMuPDF) must stay opt-in and documented in
 - Add or update tests for every behaviour change; a bug fix should fail before
   the fix and pass after it.
 - Update the docs when a user-visible behaviour, API route, environment
-  variable or workspace layout changes. [docs/api.md](docs/api.md) is the API
+  variable or data-folder layout changes. [docs/api.md](docs/api.md) is the API
   contract; [CHANGELOG.md](CHANGELOG.md) is updated at release time by the
   release manager, not per PR.
-- **Never commit** a workspace (`documents/`, `.peekseed/`), API keys, tokens,
-  model output containing private documents, or generated build artifacts.
-  `PEEKSEED_*` secrets belong in `.env` (untracked) or the environment.
+- **Never commit** runtime data (`PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR`), API
+  keys, tokens, model output containing private documents, or generated build
+  artifacts. `PEEKSEED_*` secrets belong in `.env` (untracked) or the
+  environment.
 - **Do not bump the version or create tags** in a normal PR. Version bumps and
   tags happen only in the release process described in
   [docs/release.md](docs/release.md).

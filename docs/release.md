@@ -180,8 +180,11 @@ fresh venv and smoke-test exactly what users will get:
 python3 -m venv /tmp/peekseed-pypi
 /tmp/peekseed-pypi/bin/pip install 'peekseed==X.Y.Z'
 /tmp/peekseed-pypi/bin/peekseed version
-/tmp/peekseed-pypi/bin/peekseed init --workspace /tmp/peekseed-pypi/ws
-/tmp/peekseed-pypi/bin/peekseed serve --workspace /tmp/peekseed-pypi/ws --port 8031 &
+export PEEKSEED_HOME=/tmp/peekseed-pypi/home
+export PEEKSEED_SHARED_DIR=/tmp/peekseed-pypi/shared
+mkdir -p "$PEEKSEED_HOME" "$PEEKSEED_SHARED_DIR"
+/tmp/peekseed-pypi/bin/peekseed init
+/tmp/peekseed-pypi/bin/peekseed serve --port 8031 &
 curl -fsS http://127.0.0.1:8031/health
 ```
 

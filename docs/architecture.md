@@ -1,6 +1,6 @@
 # Architecture
 
-peekseed is one Python package and one configurable data directory. There is no
+peekseed is one Python package and two required data folders. There is no
 database, no message broker and no external service: a single FastAPI process
 serves the UI and the API, reads datasets from disk, and calls whatever model
 endpoints the user configured.
@@ -19,19 +19,18 @@ endpoints the user configured.
         +---------+---------+----------+---------+----> httpx --> user models
                                 |
                                 v
-               config.py -> contracts.py -> <workspace>/.peekseed
-               workspace.py / scan.py -> documents/      (storage-only, no parsing)
-               ingest/ <- peelfeed corpora under <data_root>/peels/
+               config.py -> contracts.py -> $PEEKSEED_HOME/
+               workspace.py -> init/status/doctor over home + shared
+               ingest/ <- shared sources/ (upload) and peels/ (peelfeed output)
 ```
 
 ## Modules
 
 | Module | Responsibility |
 |---|---|
-| `contracts.py` | Versioned data contracts: manifest/dataset/info/job schemas, content-derived chunk ids, embedding-space identity, probe, atomic JSON, schema upgrades. |
-| `workspace.py` | Resolve and manage the document workspace: `init`, `doctor`, `status`, `move`, gitignore guard. |
-| `scan.py` | Reconcile `documents/` with the manifest and datasets: hashing, diffing, per-source extraction state, index-state reporting. No extraction, chunking or index build. |
-| `config.py` | Resolve the workspace-derived root and every path under it; settings; bind host/port. |
+| `contracts.py` | Versioned data contracts: dataset/info/job schemas, content-derived chunk ids, embedding-space identity, probe, atomic JSON, schema upgrades. |
+| `config.py` | Required `PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR` and every path under them (`Paths`); settings; bind host/port. |
+| `workspace.py` | `init`, `doctor`, `status` over `config.Paths`: create the home/shared tree and report paths, permissions, links and schemas. |
 | `links.py` | Model-link config store: schema, validation, masking, atomic 0600 write. |
 | `localmodels.py` | Optional machine-local control of local model processes: config, probes, start/stop. |
 | `engine.py` | Pure retrieval: tokenizer, BM25, cosine, reciprocal-rank fusion, optional rerank hook, `DatasetIndex`/`IndexStore`. |
@@ -40,41 +39,47 @@ endpoints the user configured.
 | `agent.py` | Transport-free research loop: budgets, observation ledger, repetition guard, forced answer. |
 | `tools.py` | Dataset tools the agent calls: list, outline, search, grep, read chunk/section. |
 | `history.py` | Persistent search/dialog history (per-entry JSON + index). |
-| `ingest/` | Storage-only uploads, peelfeed corpus reader/gate, embedding and generation-atomic index writing. Never imports a document parser. |
+| `ingest/` | Storage-only uploads into the shared sources pool, peelfeed corpus reader/gate, embedding and generation-atomic index writing. Never imports a document parser. |
 | `security.py` | Token + Host/Origin checks for mutating routes, upload limits, URL validation. |
 | `migrate.py` | Explicit schema migration (`peekseed migrate`, dry-run default). |
 | `app.py` | The HTTP layer that wires all of the above together. |
 | `web/index.html` | The single-file UI. |
 
 The dependency direction is intentionally acyclic: `app.py` imports everything;
-`engine.py`, `agent.py`, `tools.py`, `history.py`, `scan.py` and `ingest/` import
+`engine.py`, `agent.py`, `tools.py`, `history.py` and `ingest/` import
 no web framework and no config, so they can be tested with plain files and fakes.
 `links.py`, `config.py`, `contracts.py` and `migrate.py` are small stdlib-only
 stores.
 
-## One workspace
+## One livefield
 
-`PEEKSEED_WORKSPACE` (default `./workspace`) owns the user's documents and every
-derived path; `PEEKSEED_DATA` overrides only the derived root
-(`<workspace>/.peekseed`) for advanced layouts:
+Every mutable file lives under two required folders: `PEEKSEED_HOME`
+(`livefield/.peekseed` in the local deployment) and `PEEKSEED_SHARED_DIR`
+(`livefield/shared`, which peelfeed also uses as `PEELFEED_SHARED_DIR`):
 
 ```
-<workspace>/documents/          user-owned sources; never written by peekseed
-<workspace>/.peekseed/
-    manifest.json               scan state
-    config/links.json           model endpoints + masked keys (0600)
+$PEEKSEED_HOME/
+    config/links.json           model endpoints; 0600; api_key_env names only
     config/settings.json        optional UI copy
-    datasets/<collection>/      dataset.json, chunks.jsonl, index/<space>/
-    peels/<peel_id>/            peelfeed corpora (read-only for peekseed)
-    extracted/<sha256>.json     legacy extraction cache (unused)
+    config/peelfeed.json        peelfeed CLI config; seeded once
+    datasets/<dataset>/         dataset.json, chunks.jsonl, index/<space>/
     history/                    history entries + index
     jobs/<id>.json              persistent jobs
     uploads/                    upload staging
+    logs/                       serve.log, serve.pid (deploy scripts)
+    env/                        venv/, uv-cache/, requirements.lock/freeze
+$PEEKSEED_SHARED_DIR/
+    sources/<sha256>/<name>.pdf the one stored copy of each uploaded PDF
+    peels/<peel_id>/            peelfeed corpora (read-only for peekseed)
 ```
 
-Nothing outside the workspace is written at runtime (except the `init` gitignore
-guard). Code updates, a new clone, or `pip install --upgrade` cannot touch user
-data. See [workspace](workspace.md) for resolution rules and invariants.
+Both folders are required, absolute and must already exist; a missing setting
+stops the program with a clear error, and there are no fallbacks to
+`./workspace`, `~/peekseed` or a sibling folder. An uploaded PDF is stored once
+in `sources/`; peelfeed hardlinks that file into the peel's `source/`. Nothing
+outside these folders is written at runtime (the deploy scripts add their own
+`deploy/env/`). Code updates, a new clone, or `pip install --upgrade` cannot
+touch user data. See [workspace](workspace.md) for the folders and invariants.
 
 ## Request lifecycle
 
@@ -106,7 +111,7 @@ allowlist, source sha256, conversion id and `validation.errors == 0`), maps the
 corpus chunks to peekseed's contract (stable ids), embeds in batches with
 retry/backoff through the enabled embed link, writes into
 `index/<space>/generations/<uuid>/` and flips `CURRENT` last. The job record under
-`.peekseed/jobs/` is the API's source of truth (`GET /api/jobs`, `DELETE` to
+`$PEEKSEED_HOME/jobs/` is the API's source of truth (`GET /api/jobs`, `DELETE` to
 cancel between batches, `POST …/resume`); the index store is reloaded when the
 job finishes, so a new dataset becomes searchable without restarting the process,
 and a failed or cancelled build leaves the previous generation serving.
@@ -137,10 +142,15 @@ row/dimension validation, is reported as `needs_reindex`, never served.
 - Per-install bearer token (`PEEKSEED_TOKEN`) and Host/Origin allowlist
   (`PEEKSEED_ALLOWED_HOSTS`) required for mutating routes when enabled; reads
   stay open on loopback.
-- Keys live only in `.peekseed/config/links.json`, mode 0600, masked in every
-  response; derived data is 0700.
+- API keys live only in the environment file (`deploy/env/peekseed.env`).
+  `config/links.json` stores the name of the variable (`api_key_env`), never the
+  key, and every response masks it.
+- The peelfeed subprocess gets an allowlisted environment (`PATH`, `HOME`,
+  `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`, `TMPDIR` and `PEELFEED_*`);
+  peekseed's token and API keys never reach it.
 - Uploads stream to disk with per-file, file-count and total-size limits enforced
-  while reading; filenames are sanitized before any directory is created.
-- `/pdf` serves only the dataset's own `original/` copies, inline, with traversal
-  and symlink escapes rejected.
+  while reading; filenames are sanitized before any directory is created, and
+  the bytes are stored once in the shared `sources/<sha256>/` pool.
+- `/pdf` serves only from the shared `sources/` pool, inline, with traversal and
+  symlink escapes rejected.
 - The server never executes shell scripts or starts model processes.

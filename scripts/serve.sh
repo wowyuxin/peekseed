@@ -4,9 +4,10 @@
 #
 #   ./scripts/serve.sh start | stop | restart | status | logs
 #
-# Configuration: PEEKSEED_DATA, PEEKSEED_HOST, PEEKSEED_PORT, PY.
-# A .env file at the project root (next to this script's parent) is loaded as
-# defaults, so the same checkout runs on any machine without edits.
+# Configuration: PEEKSEED_HOME, PEEKSEED_SHARED_DIR, PEEKSEED_HOST,
+# PEEKSEED_PORT, PY. A .env file at the project root (next to this script's
+# parent) is loaded as defaults, so the same checkout runs on any machine
+# without edits.
 
 set -euo pipefail
 
@@ -36,12 +37,18 @@ load_dotenv() {
 }
 load_dotenv
 
+if [ -z "${PEEKSEED_HOME:-}" ]; then
+  echo "PEEKSEED_HOME is not set" >&2
+  exit 1
+fi
+
 PY="${PY:-$ROOT/.venv/bin/python}"
 [ -x "$PY" ] || PY="$(command -v python3)"
 PORT="${PEEKSEED_PORT:-8030}"
 HOST="${PEEKSEED_HOST:-127.0.0.1}"
-PIDFILE="$ROOT/peekseed.pid"
-LOGFILE="$ROOT/peekseed.log"
+mkdir -p "$PEEKSEED_HOME/logs"
+PIDFILE="$PEEKSEED_HOME/logs/peekseed.pid"
+LOGFILE="$PEEKSEED_HOME/logs/peekseed.log"
 
 log() { printf '[peekseed] %s\n' "$*"; }
 

@@ -7,13 +7,14 @@ peekseed **stores** files; it does not parse them. Uploading a file (UI or
 
 1. check the file is a PDF (`%PDF-` magic + `.pdf` extension) — the upload
    format is fixed for now;
-2. copy the bytes into `<dataset>/original/<name>` (content-addressed by sha256;
-   the same bytes are never stored twice);
+2. store the bytes **once** at `<shared>/sources/<sha256>/<name>.pdf` (0600;
+   the same bytes are never stored twice, and two datasets share the one file);
 3. record `{name, path, sha256, bytes, status:"uploaded"}` in `dataset.json`,
-   with `extraction.state = "not_extracted"`.
+   with `path = sources/<sha256>/<name>` and
+   `extraction.state = "not_extracted"`.
 
 No page count, no text extraction, no chunking and no embedding happen at upload
-time. The file list, open-original-PDF, rename and delete operations work with
+time. The file list, open-stored-PDF, rename and delete operations work with
 **no extraction engine configured**.
 
 Extraction is provided by the separate **peelfeed** engine (its own repo and
@@ -22,8 +23,9 @@ venv, `docling` + `torch`), one peel per source file. peekseed invokes it
 is configured, the UI/API can trigger Extract on a file:
 
 ```
-peekseed upload → peelfeed ingest <file> --root <peel_root> → <peel_root>/<slug>-<sha8>/
-    source/<original.pdf>
+peekseed upload → peelfeed ingest <file> --root $PEEKSEED_SHARED_DIR/peels
+    → <shared>/peels/<slug>-<sha8>/
+    source/<name>.pdf          hardlink to the stored sources/ copy
     extract/corpus/{manifest.json,chunks.jsonl,assets.jsonl,validation.json,review_queue.json,...}
     .peel
 ```
@@ -49,7 +51,7 @@ No peelfeed CLI configured (or the command fails) is a supported state:
 | Feature | No peelfeed | With peelfeed |
 |---|---|---|
 | Upload (store + sha256 + list) | ✅ | ✅ |
-| File management (list, open original PDF, delete) | ✅ | ✅ |
+| File management (list, open stored PDF, delete) | ✅ | ✅ |
 | Trigger extraction (Extract button / API) | ❌ disabled, API 503 with a clear reason | ✅ |
 | Extraction status / validation / review | ❌ shows "not extracted" | ✅ |
 | Search / ask / research | only for datasets with an extracted + indexed corpus; otherwise a clear empty/409 state | ✅ |
@@ -61,11 +63,11 @@ the CLI is configured and answers `capabilities`.
 
 ## Corpus gate before indexing
 
-`build_index` reads `<peel_root>/<peel_id>/extract/corpus/…` and refuses a
+`build_index` reads `<shared>/peels/<peel_id>/extract/corpus/…` and refuses a
 source (with a per-source reason) unless:
 
-* the peel directory resolves under `PEELFEED_ROOT` (default
-  `<data_root>/peels`) after `realpath`;
+* the peel directory resolves under `$PEEKSEED_SHARED_DIR/peels` after
+  `realpath`;
 * `manifest.source_sha256` equals the stored source's sha256;
 * `manifest.conversion_id` equals the `conversion_id` recorded in
   `dataset.json` for that source;

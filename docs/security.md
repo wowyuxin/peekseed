@@ -22,7 +22,7 @@ Defended:
   reached by.
 * **Hostile uploads** — zip-slip filenames, traversal and symlinked `/pdf`
   reads, oversized or too-many files, and wrong file types are rejected before
-  they can write outside `original/` or consume RAM.
+  they can write outside the shared sources pool or consume RAM.
 * **Model links as an SSRF path** — a user-supplied `base_url` may not point at
   cloud metadata endpoints, link-local addresses or non-http(s) schemes.
 * **Accidental disclosure of provider responses** — a failed link probe reports
@@ -31,7 +31,8 @@ Defended:
 Not defended (out of scope for a single-user local tool):
 
 * Multiple users, per-user permissions, and audit logging.
-* A compromised local account or a process that can already read the data root.
+* A compromised local account or a process that can already read the data
+  folders (`PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR`).
 * TLS termination: bind to loopback or put the server behind a reverse proxy if
   it must leave the machine.
 * DNS rebinding that resolves a hostname *after* validation; see the SSRF note.
@@ -43,8 +44,15 @@ Not defended (out of scope for a single-user local tool):
 | `PEEKSEED_TOKEN` | Shared secret required on mutating `/api/*` requests | unset = auth off |
 | `PEEKSEED_ALLOWED_HOSTS` | Comma-separated `host[:port]` allowlist for `Host`/`Origin` | unset = Host check off |
 | `PEEKSEED_HOST` | Bind host; always accepted for mutating requests | `127.0.0.1` |
-| `PEEKSEED_WORKSPACE` | Workspace root: `documents/` plus derived `.peekseed/` | `./workspace` |
-| `PEEKSEED_DATA` | Override for the derived data root only (created 0700) | `<workspace>/.peekseed` |
+| `PEEKSEED_HOME` | Private runtime data (config, datasets, history, jobs, uploads) | **required** |
+| `PEEKSEED_SHARED_DIR` | Shared sources + peels folder (`0700`) | **required** |
+
+The app does not seed links from environment variables. A link names the
+environment variable that holds its key (`api_key_env`); the key itself lives
+only in `deploy/env/peekseed.env` and is read at request time. The links file
+stores the variable name, never the value. `api_key_env` must match
+`^PEEKSEED_[A-Z0-9_]+_API_KEY$`, so a UI user cannot point a link at another
+secret (for example `PEEKSEED_TOKEN`) and send it to a URL they control.
 
 With **both** `PEEKSEED_TOKEN` and `PEEKSEED_ALLOWED_HOSTS` unset, behaviour is
 the plain local single-user loopback server: reads and writes are open, and only
@@ -93,26 +101,35 @@ counted as they arrive (`400` for wrong magic/empty, `413` when a limit is hit);
 the partial file and the staging directory are removed on every path. Filenames
 are sanitised before any path is built (zip-slip safe), the extension and `%PDF-`
 magic are checked before more data is stored, and the dataset directory is
-created only after every file passed validation.
+created only after every file passed validation. Each file is then stored once at
+`$PEEKSEED_SHARED_DIR/sources/<sha256>/<name>.pdf` with mode 0600.
 
 ## `/pdf` is inline and read-only
 
-`GET /pdf/<dataset>/<file>` serves the dataset's own copy from `original/`
-inline (`Content-Disposition: inline`) so a browser opens its PDF viewer and
-`#page=N` jumps to the chunk's page. Names containing path separators, `..`,
-absolute paths, encoded traversal or NUL are rejected; the resolved path must
-stay inside `original/` (`Path.relative_to` on resolved paths), so a symlink that
-escapes the dataset is never served. Reads are not gated by the token.
+`GET /pdf/<dataset>/<file>` serves the dataset's stored source from the shared
+`sources/<sha256>/` pool inline (`Content-Disposition: inline`) so a browser
+opens its PDF viewer and `#page=N` jumps to the chunk's page. Names containing
+path separators, `..`, absolute paths, encoded traversal or NUL are rejected;
+the resolved path must stay inside `$PEEKSEED_SHARED_DIR/sources`
+(`Path.relative_to` on resolved paths), so a symlink that escapes the pool is
+never served. Reads are not gated by the token.
 
 ## File modes
 
-`config.ensure()` creates the derived tree; startup then tightens it
-(idempotently, best-effort): the data root and its derived directories
-(`config/`, `datasets/`, `history/`, `uploads/`) are `0700`, history files are
-`0600`, and the link store (which can hold API keys) is `0600`. Dataset
-directories are created by an upload with `0700` for the dataset and its
-`original/` copies. A failed chmod is logged nowhere and never stops boot: a
-read-only data root must not take the UI down.
+`config.ensure()` creates the home/shared tree; startup then tightens it
+(idempotently, best-effort): `$PEEKSEED_HOME`, `$PEEKSEED_SHARED_DIR`, `sources/`,
+`peels/` and the home's subdirectories (`config/`, `datasets/`, `history/`,
+`jobs/`, `uploads/`) are `0700`, history files are `0600`, the link store is
+`0600` and every stored source PDF is `0600`. A failed chmod is logged nowhere
+and never stops boot: a read-only folder must not take the UI down.
+
+## peelfeed subprocess environment
+
+peekseed invokes the peelfeed CLI as a subprocess with an **allowlisted**
+environment: `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`,
+`TMPDIR` and every `PEELFEED_*` variable, plus `PEELFEED_SHARED_DIR` and (for the
+`-m peelfeed.cli` form) `PYTHONPATH=<peelfeed repo>`. peekseed's service token
+and every API key are never passed to it.
 
 ## SSRF note for model links
 
@@ -125,7 +142,5 @@ allowed — a model server next to the app is the local-first default.
 
 Hostnames are not resolved during validation (that would need the network), so a
 name that resolves to a metadata address later is not caught here. `peekseed.links`
-still owns URL syntax validation; two follow-ups belong there rather than in the
-app: (1) apply `validate_url` to links seeded from `PEEKSEED_*` environment
-variables at first-run, and (2) re-check the resolved address at connect time to
-close the DNS-rebinding gap.
+still owns URL syntax validation; one follow-up belongs there rather than in the
+app: re-check the resolved address at connect time to close the DNS-rebinding gap.

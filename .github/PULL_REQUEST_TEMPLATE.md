@@ -29,7 +29,7 @@ Output / counts:
 
 ## Release / compatibility notes
 
-<!-- Does this touch a documented contract, workspace schema, env var or API route?
+<!-- Does this touch a documented contract, data schema, env var or API route?
      Add a CHANGELOG entry only if the release manager asks for one. -->
 
 -
@@ -46,8 +46,8 @@ Output / counts:
       console script entry point is unchanged (see `tests/test_packaging.py`).
 - [ ] Documentation is updated for user-visible changes (`docs/api.md` for API
       changes, `docs/security.md` for security posture changes).
-- [ ] No secrets, API keys, workspace data (`documents/`, `.peekseed/`) or
-      build artifacts are included.
+- [ ] No secrets, API keys, runtime data (`PEEKSEED_HOME`/`PEEKSEED_SHARED_DIR`)
+      or build artifacts are included.
 - [ ] No version bump, tag or publishing step in this PR (the release manager
       owns the process in `docs/release.md`).
 - [ ] The change respects the [Code of Conduct](CODE_OF_CONDUCT.md).

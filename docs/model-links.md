@@ -1,8 +1,9 @@
 # Model links
 
 peekseed ships no model. A *link* is one configured endpoint. Links are stored
-in `<data root>/config/links.json`, edited from **Settings** in the UI (or seeded
-from `PEEKSEED_*` environment variables on first run).
+in `$PEEKSEED_HOME/config/links.json` and edited from **Settings** in the UI.
+A link never stores an API key: it names the environment variable that holds one
+(`api_key_env`), and the key itself lives only in `deploy/env/peekseed.env`.
 
 ## Schema
 
@@ -16,7 +17,7 @@ from `PEEKSEED_*` environment variables on first run).
       "label": "My embedder",
       "protocol": "openai",
       "base_url": "http://127.0.0.1:11434/v1",
-      "api_key": "",
+      "api_key_env": "",
       "model": "nomic-embed-text",
       "enabled": true
     }
@@ -32,19 +33,28 @@ from `PEEKSEED_*` environment variables on first run).
 - `model` is required for `embed` links because it identifies the vector space.
   For `answer` it is an optional default; the UI can also pick a model from the
   provider's `/models` list per question.
+- `api_key_env` is optional. When set it must match
+  `^PEEKSEED_[A-Z0-9_]+_API_KEY$`; anything else (for example `PEEKSEED_TOKEN`
+  or `HOME`) is rejected.
 - At most one `embed` link and one `rerank` link can be enabled. Any number of
   `answer` links can be enabled; the UI treats them as a picker.
 
-Validation is strict on purpose: a bad base URL, a key containing whitespace or
-control characters, an unknown field, or a duplicate id is rejected before it is
-written. A corrupt file is reported (HTTP 500) and the service treats "no model"
-as the normal off state instead of falling back to a guess.
+Validation is strict on purpose: a bad base URL, a non-matching `api_key_env`,
+an unknown field, or a duplicate id is rejected before it is written. A corrupt
+file is reported (HTTP 500) and the service treats "no model" as the normal off
+state instead of falling back to a guess.
 
 ## API keys
 
-Keys are write-only. `GET /api/links` returns `api_key_set: true|false` and never
-the value. `PUT /api/links/{id}` with the key omitted keeps the stored key; an
-empty string clears it. The file is written atomically with mode 0600.
+Keys are never stored in `links.json` and never entered in the UI. Put the key
+in `deploy/env/peekseed.env` as `PEEKSEED_<NAME>_API_KEY` and set the link's
+`api_key_env` to that name. The key is read from the environment at request
+time, so rotating it only needs a service restart.
+
+`GET /api/links` returns `api_key_env` and `api_key_set: true|false`, never the
+value. `POST`/`PUT /api/links` with a non-empty `api_key` is rejected with a
+400 that says to use the env file. The links file is written atomically with
+mode 0600.
 
 ## Endpoint contracts
 
@@ -99,24 +109,3 @@ The client understands standard OpenAI SSE (`choices[0].delta.content`), optiona
 `reasoning_content`, tool-call deltas and a final usage chunk. Any mistakes are
 reported as a short, non-secret detail string.
 
-## Seeding from the environment
-
-Optional, for headless setups; the UI is the normal path.
-
-```bash
-PEEKSEED_EMBED_BASE=http://host:port/v1
-PEEKSEED_EMBED_PROTOCOL=openai          # openai | custom
-PEEKSEED_EMBED_MODEL=nomic-embed-text
-PEEKSEED_EMBED_API_KEY=...
-
-PEEKSEED_RERANK_BASE=http://host:port   # protocol is always custom
-PEEKSEED_RERANK_MODEL=
-PEEKSEED_RERANK_API_KEY=...
-
-PEEKSEED_ANSWER_BASE=http://host:port/v1
-PEEKSEED_ANSWER_MODEL=llama3.1
-PEEKSEED_ANSWER_API_KEY=...
-```
-
-Bad values are not written: the server logs a warning and starts with no seeded
-link for that role, so the user can fix it in Settings.

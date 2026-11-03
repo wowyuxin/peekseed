@@ -6,6 +6,28 @@ All notable changes to peekseed are recorded here. The format follows
 published as `0.1.0rcN`; see [docs/release.md](docs/release.md) for the
 version/tag policy.
 
+## Unreleased
+
+### Breaking
+
+- `PEEKSEED_HOME` and `PEEKSEED_SHARED_DIR` are required.
+- `PEEKSEED_DATA`, `PEEKSEED_WORKSPACE`, `--workspace`, and the `./workspace` and
+  `~/peekseed` fallbacks are removed.
+- `peekseed scan`, `peekseed workspace path|move`, `documents/` and
+  `manifest.json` are removed.
+- Uploaded PDFs are stored once in `$PEEKSEED_SHARED_DIR/sources/<sha256>/`;
+  datasets have no `original/`.
+- Peels are read from `$PEEKSEED_SHARED_DIR/peels`; `PEELFEED_ROOT` and
+  `PEEKSEED_PEELFEED_ROOT` are not read.
+- `links.json` stores `api_key_env` instead of keys. The API rejects `api_key`,
+  and a `links.json` that still holds a key fails to load until it is migrated.
+- Env seeding (`PEEKSEED_EMBED_*`, `PEEKSEED_ANSWER_BASE`, `_PROTOCOL`, `_MODEL`,
+  `PEEKSEED_RERANK_BASE`) is removed.
+
+### Security
+
+- The peelfeed subprocess gets an allowlisted environment.
+
 ## 0.1.0 - 2026-10-23
 
 First public release: local-first AI research over your own documents. This
