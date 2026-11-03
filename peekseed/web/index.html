@@ -1701,10 +1701,10 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
             <select id="setProtocol"><option value="openai">OpenAI-compatible</option></select></label>
           <label class="set-field set-wide"><span>Base URL</span>
             <input id="setBase" type="url" required placeholder="http://127.0.0.1:11434/v1"></label>
-          <label class="set-field" id="setKeyField"><span>API key
-            <span style="font-weight:400;opacity:.75" id="setKeyHint">(write-only; blank = none)</span></span>
-            <input id="setKey" type="password" autocomplete="new-password"
-                   placeholder="paste a key"></label>
+          <label class="set-field" id="setKeyField"><span>API key variable
+            <span style="font-weight:400;opacity:.75" id="setKeyHint">Name of a variable in deploy/env/peekseed.env (PEEKSEED_&lt;NAME&gt;_API_KEY). Keys are never entered here.</span></span>
+            <input id="setKeyEnv" type="text" autocomplete="off"
+                   placeholder="PEEKSEED_ANSWER_API_KEY"></label>
           <label class="set-field" id="setModelField"><span>Model
             <span style="font-weight:400;opacity:.75">(provider model id)</span></span>
             <input id="setModel" type="text" placeholder="model-name"></label>
@@ -4255,8 +4255,9 @@ function settingsRow(link,status){
     ? '<span>chunks <span class="mono">'+esc(link.chunk.target_chars+'/'+link.chunk.max_chars
       +' chars, ≤'+link.chunk.image_cap+' img')+'</span></span>'
     : '<span class="bad">no chunk sizes (cannot index)</span>');
+  const envName=link.api_key_env||'';
   if(link.api_key_set) bits.push('<span>key set</span>');
-  else bits.push('<span>no key</span>');
+  else if(envName) bits.push('<span class="bad">key missing ('+esc(envName)+')</span>');
   return '<div class="set-link-row" data-id="'+escAttr(link.id)+'" data-role="'+escAttr(role)+'">'
     +'<div class="set-link-main">'
     +'<div class="set-link-title"><span class="set-link-label">'+esc(link.label||link.id)+'</span>'
@@ -4327,9 +4328,8 @@ function setResetForm(){
   $('#setRole').disabled=false;
   $('#setRole').value='embed';
   setProtocolOptions('embed','openai');
-  $('#setKey').value='';
-  $('#setKey').placeholder='paste a key';
-  $('#setKeyHint').textContent='(write-only; blank = none)';
+  $('#setKeyEnv').value='';
+  $('#setKeyHint').textContent='Name of a variable in deploy/env/peekseed.env (PEEKSEED_<NAME>_API_KEY). Keys are never entered here.';
   $('#setModel').value='';
   setChunkValues(null);
   setChunkVisible('embed');
@@ -4350,10 +4350,7 @@ function setStartEdit(link){
   $('#setModel').value=link.model||'';
   setChunkValues(link.chunk||null);
   setChunkVisible(link.role);
-  $('#setKey').value='';
-  $('#setKey').placeholder=link.api_key_set
-    ? 'unchanged — leave blank to keep the current key' : 'no key set — paste one';
-  $('#setKeyHint').textContent=link.api_key_set?'(key set; write-only)':'(write-only; blank = none)';
+  $('#setKeyEnv').value=link.api_key_env||'';
   $('#setEnabled').checked=!!link.enabled;
   settingsMsg('Editing "'+(link.label||link.id)+'" — changes are not saved until you press Save.');
   try{ $('#setLabel').focus({preventScroll:true}); }catch(e){ $('#setLabel').focus(); }
@@ -4369,10 +4366,8 @@ function setFormPayload(){
                  enabled:$('#setEnabled').checked};
   if(!editId) payload.role=role;
   if(role==='embed') payload.chunk=setChunkPayload();
-  // Omitted api_key = keep the current key on PUT; "" would clear it, so an
-  // empty field is simply left out. The page never receives one.
-  const key=$('#setKey').value;
-  if(key) payload.api_key=key;
+  // The UI names the env variable; it never sends or receives a key.
+  payload.api_key_env=$('#setKeyEnv').value.trim();
   return {editId:editId,role:role,protocol:protocol,payload:payload};
 }
 /* Validation mirrors the model-link rules: a label, an http(s) base URL, a role,

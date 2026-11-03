@@ -20,7 +20,7 @@ def embed_link(fake, model="test-embed", **extra):
     link = {
         "id": "fake", "role": "embed", "label": "Fake",
         "protocol": "openai", "base_url": fake.openai_base,
-        "model": model, "api_key": "", "enabled": True,
+        "model": model, "api_key_env": "", "enabled": True,
         "chunk": dict(EMBED_CHUNK),
     }
     link.update(extra)
@@ -327,7 +327,7 @@ class IndexBuildTests(unittest.TestCase):
             make_peel(dataset, pages=["Hello custom embedder."])
             link = {"id": "custom", "role": "embed", "label": "Custom",
                     "protocol": "custom", "base_url": fake.base,
-                    "model": "custom-embed", "api_key": "", "enabled": True,
+                    "model": "custom-embed", "api_key_env": "", "enabled": True,
                     "chunk": dict(EMBED_CHUNK)}
             info = ingest.build_index(dataset["dir"], link)
             self.assertEqual(info["protocol"], "custom")
@@ -431,7 +431,7 @@ class ChunkSetTests(unittest.TestCase):
 def embed_link_stub():
     return {"id": "fake", "role": "embed", "label": "Fake",
             "protocol": "openai", "base_url": "http://127.0.0.1:9/v1",
-            "model": "test-embed", "api_key": "", "enabled": True,
+            "model": "test-embed", "api_key_env": "", "enabled": True,
             "chunk": dict(EMBED_CHUNK)}
 
 

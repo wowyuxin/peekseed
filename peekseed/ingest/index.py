@@ -1017,11 +1017,13 @@ def _link_target(link):
             "Unsupported embedding protocol '%s'; expected 'openai' or 'custom'."
             % protocol
         )
+    from .. import links as links_module
+
     return (
         protocol,
         base_url,
         str(link.get("model") or ""),
-        str(link.get("api_key") or ""),
+        links_module.api_key(link),
     )
 
 

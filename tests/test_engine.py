@@ -107,7 +107,7 @@ class IndexStoreTests(unittest.TestCase):
             make_peel(dataset, pages=["Widget text about buttons."])
             link = {"id": "fake", "role": "embed", "label": "Fake",
                     "protocol": "openai", "base_url": fake.openai_base,
-                    "model": "test-embed", "api_key": "", "enabled": True,
+                    "model": "test-embed", "api_key_env": "", "enabled": True,
                     "chunk": dict(EMBED_CHUNK)}
             info = ingest.build_index(dataset["dir"], link)
 

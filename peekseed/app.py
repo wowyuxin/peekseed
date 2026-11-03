@@ -188,7 +188,7 @@ def _link_config_500(exc):
 
 def _auth_headers(link):
     headers = {"Content-Type": "application/json"}
-    key = (link or {}).get("api_key") or ""
+    key = links.api_key(link)
     if key:
         headers["Authorization"] = "Bearer " + key
     return headers
@@ -554,7 +554,7 @@ def _probe_link(link):
     base = link.get("base_url") or ""
     try:
         if role == "answer":
-            client = answer_mod.ChatClient(base, link.get("api_key") or "",
+            client = answer_mod.ChatClient(base, links.api_key(link),
                                            link.get("model") or "")
             models = client.models()
             return {"ok": True, "models": models,
@@ -841,7 +841,7 @@ def _answer_choice(req):
             409, "link '%s' is not an enabled answer link" % (req.link or link.get("id")))
     model = (req.model or link.get("model") or "").strip()
     client = answer_mod.ChatClient(link.get("base_url") or "",
-                                   link.get("api_key") or "", model)
+                                   links.api_key(link), model)
     if not model:
         models = [m for m in client.models() if m]
         if not models:
@@ -849,7 +849,7 @@ def _answer_choice(req):
                 409, "the answer link advertises no models; set one in Settings")
         model = models[0]
         client = answer_mod.ChatClient(link.get("base_url") or "",
-                                       link.get("api_key") or "", model)
+                                       links.api_key(link), model)
     return link, client
 
 
@@ -2040,7 +2040,7 @@ def create_app():
         try:
             all_links = links.links()
             return {"links": [links.mask(link) for link in all_links],
-                    "path": str(links.config_path()), "seeded": links.seeded()}
+                    "path": str(links.config_path())}
         except links.LinkConfigError as exc:
             _link_config_500(exc)
 

@@ -222,6 +222,35 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(call["peel_shared_dir"], str(_shared(root)))
 
 
+class SubprocessEnvironmentTests(unittest.TestCase):
+    def test_the_peelfeed_subprocess_gets_an_allowlisted_environment(self):
+        with temp_data_root() as home:
+            cli = FakePeelfeedCli(home / "fake")
+            saved = {key: os.environ.get(key) for key in
+                     ("PEEKSEED_TOKEN", "PEEKSEED_ANSWER_API_KEY", "FOO",
+                      "PEELFEED_HOME")}
+            os.environ["PEEKSEED_TOKEN"] = "secret-token"
+            os.environ["PEEKSEED_ANSWER_API_KEY"] = "k"
+            os.environ["FOO"] = "bar"
+            os.environ["PEELFEED_HOME"] = str(home / "pf-home")
+            try:
+                with peelfeed_env(CLI=str(cli.path)):
+                    from peekseed import config, peelfeed
+                    env = peelfeed.client()._environment()
+                    for name in ("PEEKSEED_TOKEN", "PEEKSEED_ANSWER_API_KEY",
+                                 "FOO"):
+                        self.assertNotIn(name, env)
+                    self.assertIn("PEELFEED_HOME", env)
+                    self.assertEqual(env["PEELFEED_SHARED_DIR"],
+                                     str(config.paths().shared_dir))
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+
 class HandshakeTests(unittest.TestCase):
     def test_handshake_reports_capabilities_and_is_cached_60s(self):
         with temp_data_root() as root:

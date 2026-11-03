@@ -78,6 +78,10 @@ DEFAULT_LLM_MODE = "off"
 DEFAULT_CHUNK_PROFILE = "default"
 LLM_MODES = ("off", "review", "aggressive")
 HANDSHAKE_TTL = 60.0
+#: Only these variables (plus every PEELFEED_*) reach the peelfeed subprocess;
+#: peekseed's token and API keys never do.
+_PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
+             "TMPDIR")
 #: Peel state machine -> peekseed's per-source ``extraction.state``.
 STATE_MAP = {
     "queued": "queued",
@@ -620,14 +624,13 @@ class PeelfeedClient(object):
         return argv
 
     def _environment(self):
-        env = dict(os.environ)
+        env = {key: value for key, value in os.environ.items()
+               if key in _PASS_ENV or key.startswith("PEELFEED_")}
         env["PEELFEED_SHARED_DIR"] = str(config.paths().shared_dir)
         if self.cfg.get("python") and not self.cfg.get("cli"):
             repo = self.cfg.get("repo") or ""
             if repo:
-                existing = env.get("PYTHONPATH") or ""
-                env["PYTHONPATH"] = (
-                    repo + (os.pathsep + existing if existing else ""))
+                env["PYTHONPATH"] = repo
         return env
 
     def _run(self, args, *, timeout=None, root=True, json_flag=True):

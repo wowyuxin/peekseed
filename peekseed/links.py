@@ -6,19 +6,26 @@ answer models. The link store is a pure config module -- it owns the file, the
 schema, validation and the enabled-link normalization; it never imports the web
 app or talks to the network.
 
-File location comes from the data root (config/links.json). It can contain API
-keys, so it is written atomically with mode 0600 and every response goes through
-mask(): the browser only learns whether a key is set, never the key itself.
+File location comes from the data root (config/links.json). It never stores an
+API key: a link names the environment variable that holds one (``api_key_env``,
+e.g. ``PEEKSEED_ANSWER_API_KEY``), so keys live only in
+``deploy/env/peekseed.env``. The file is written atomically with mode 0600 and
+every response goes through mask(): the browser learns the variable name and
+whether the key is set, never the key itself.
 
 Schema (version 1):
 
     {"version": 1, "links": [
         {"id": "my-embed", "role": "embed", "label": "My embedder",
          "protocol": "openai", "base_url": "http://127.0.0.1:11434/v1",
-         "api_key": "", "model": "nomic-embed-text", "enabled": true,
+         "api_key_env": "", "model": "nomic-embed-text", "enabled": true,
          "chunk": {"target_chars": 8000, "max_chars": 12000, "image_cap": 3}},
         ...
     ]}
+
+``api_key_env`` is optional; when set it must match
+``^PEEKSEED_[A-Z0-9_]+_API_KEY$`` so a UI user cannot point a link at another
+secret (for example ``PEEKSEED_TOKEN``) and send it to a URL they control.
 
 An embed link's ``chunk`` sizes pick the peelfeed chunk set its index is built
 from (``c<target>-<max>-i<cap>``; links with equal sizes share one set). An embed
@@ -35,9 +42,9 @@ At most one embed link and one rerank link may be enabled at a time; any number
 of answer links may be enabled (the UI shows a per-question picker). Enabling a
 stage link disables its siblings, which is why the link just enabled wins.
 
-First run writes an empty config unless generic PEEKSEED_* environment values
-are present. There are no baked-in default endpoints, models or keys: a missing
-or corrupt model must never be mistaken for a working default.
+First run writes an empty config. There are no baked-in default endpoints,
+models or keys: a missing or corrupt model must never be mistaken for a working
+default.
 """
 
 import copy
@@ -57,18 +64,13 @@ PROTOCOLS = {
     "answer": ("openai",),
 }
 DEFAULT_PROTOCOL = {"embed": "openai", "rerank": "custom", "answer": "openai"}
-# Labels are only invented when seeding from the environment; the UI always
-# sends one.
-DEFAULT_LABELS = {
-    "embed": "Embedding model",
-    "rerank": "Reranker",
-    "answer": "Answer model",
-}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
+#: The only variable names a link may read its key from (a security rule).
+_KEY_ENV_RE = re.compile(r"^PEEKSEED_[A-Z0-9_]+_API_KEY$")
 MAX_LABEL = 80
 MAX_ID = 40
 VERSION = 1
-FIELDS = ("id", "role", "label", "protocol", "base_url", "api_key", "model",
+FIELDS = ("id", "role", "label", "protocol", "base_url", "api_key_env", "model",
           "enabled", "chunk")
 CHUNK_KEYS = ("target_chars", "max_chars", "image_cap")
 #: peelfeed's chunk packer never puts more than 3 images in one chunk.
@@ -102,7 +104,6 @@ class LinkValidationError(ValueError):
 # writes are atomic (os.replace swaps the file) and may keep the same size.
 _CACHE = None
 _CACHE_KEY = None
-_SEEDED = False
 # One write lock per process: FastAPI runs these sync handlers in a threadpool,
 # so two tabs can issue read-modify-write cycles at once. Atomic replace stops
 # a corrupt file, not a lost update.
@@ -114,22 +115,11 @@ def config_path():
     return config.paths().links_file
 
 
-def seeded():
-    """Whether THIS process created the links file by seeding it from env.
-
-    The UI can show a one-time "created from environment -- review it" note
-    until the file changes. A process that only reads an existing file never
-    reports it.
-    """
-    return _SEEDED
-
-
 def reset_cache():
-    """Drop the file cache and seeded flag (tests point PEEKSEED_DATA elsewhere)."""
-    global _CACHE, _CACHE_KEY, _SEEDED
+    """Drop the file cache (tests point PEEKSEED_HOME elsewhere)."""
+    global _CACHE, _CACHE_KEY
     _CACHE = None
     _CACHE_KEY = None
-    _SEEDED = False
 
 
 def _signature(path):
@@ -146,7 +136,7 @@ def _base_error(base):
 
     The syntax checks are local and precise; the SSRF checks are delegated to
     :func:`peekseed.security.validate_url`, so every path that can create a link
-    (API, CLI, environment seeding, a hand-edited links.json) gets the same
+    (API, CLI, a hand-edited links.json) gets the same
     metadata/link-local/non-http(s) guard.
     """
     if not base:
@@ -168,6 +158,14 @@ def _base_error(base):
     return security.validate_url(base)
 
 
+def api_key(link):
+    """The API key for ``link``, read from the environment at call time ("" if none)."""
+    name = str((link or {}).get("api_key_env") or "")
+    if not name or not _KEY_ENV_RE.match(name):
+        return ""
+    return os.environ.get(name, "")
+
+
 def _blank_link(role, label=""):
     return {
         "id": "",
@@ -175,7 +173,7 @@ def _blank_link(role, label=""):
         "label": label,
         "protocol": DEFAULT_PROTOCOL.get(role, ""),
         "base_url": "",
-        "api_key": "",
+        "api_key_env": "",
         "model": "",
         "enabled": True,
         "chunk": None,
@@ -241,7 +239,7 @@ def validate(data, existing=None):
         return {}, ["link fields must be a JSON object"]
     errors = []
     for key in data:
-        if key not in FIELDS:
+        if key not in FIELDS and key != "api_key":
             errors.append("unknown field '%s'" % key)
 
     link = copy.deepcopy(existing) if isinstance(existing, dict) else {}
@@ -295,22 +293,22 @@ def validate(data, existing=None):
                       + (" for %s links" % role if allowed else ""))
         protocol = DEFAULT_PROTOCOL.get(role, "")
 
-    # api_key: any role may need one (hosted embedders/rerankers exist, not only
-    # chat APIs). Omitted on update keeps the stored key; "" clears it. The value
-    # is never validated against anything or echoed, so no error can leak it.
-    if "api_key" in data and data["api_key"] is not None:
-        api_key = data["api_key"]
-        if not isinstance(api_key, str):
-            errors.append("api_key must be a string")
-            api_key = ""
+    # API keys are never stored here: a link names the env variable that holds
+    # one. The name pattern is a security rule (see _KEY_ENV_RE).
+    if str(data.get("api_key") or "").strip():
+        errors.append(
+            "api_key is no longer stored in links.json; put the key in "
+            "deploy/env/peekseed.env and set api_key_env to its variable name")
+    api_key_env = given("api_key_env", "")
+    if api_key_env is None:
+        api_key_env = ""
+    if not isinstance(api_key_env, str):
+        errors.append("api_key_env must be a string")
+        api_key_env = ""
     else:
-        api_key = link.get("api_key") or ""
-    # A trailing newline from `cat keyfile` would make HTTP header construction
-    # fail and can echo the header value in the client's error. Reject at the
-    # door so no API error ever contains key text.
-    if api_key and any(ch.isspace() or ord(ch) < 32 for ch in api_key):
-        errors.append("api_key must not contain whitespace or control characters")
-        api_key = ""
+        api_key_env = api_key_env.strip()
+        if api_key_env and not _KEY_ENV_RE.match(api_key_env):
+            errors.append("api_key_env must look like PEEKSEED_<NAME>_API_KEY")
 
     model = given("model", "")
     if model is None:
@@ -341,7 +339,7 @@ def validate(data, existing=None):
         "label": label,
         "protocol": protocol,
         "base_url": base_url,
-        "api_key": api_key,
+        "api_key_env": api_key_env,
         "model": model,
         "enabled": enabled,
         "chunk": chunk,
@@ -367,49 +365,6 @@ def _normalize_enabled(cfg, keep_id=None):
         for link in enabled:
             if link["id"] != winner:
                 link["enabled"] = False
-
-
-def _env_link(role):
-    """Build a link from generic PEEKSEED_<ROLE>_* env values, or None.
-
-    Seeding exists only so a headless setup can be configured from the shell.
-    The UI is the normal path. Nothing is invented when the base is absent.
-    """
-    prefix = "PEEKSEED_%s_" % role.upper()
-    base = _normalize_base(os.environ.get(prefix + "BASE") or "")
-    if not base:
-        return None
-    link = _blank_link(role, DEFAULT_LABELS[role])
-    link["id"] = role
-    link["base_url"] = base
-    link["protocol"] = (os.environ.get(prefix + "PROTOCOL")
-                        or DEFAULT_PROTOCOL[role]).strip()
-    link["model"] = (os.environ.get(prefix + "MODEL") or "").strip()
-    key = (os.environ.get(prefix + "API_KEY") or "").strip()
-    if any(ch.isspace() or ord(ch) < 32 for ch in key):
-        print("[peekseed.links] %sAPI_KEY contains whitespace/control "
-              "characters; not seeding it (enter the key in the UI instead)"
-              % prefix, flush=True)
-        key = ""
-    link["api_key"] = key
-    normalized, errors = validate(link)
-    if errors:
-        # A bad env value must not poison the file: warn and let the user fix it
-        # in Settings. The service still starts.
-        print("[peekseed.links] not seeding %s link: %s"
-              % (role, "; ".join(errors)), flush=True)
-        return None
-    return normalized
-
-
-def seed_from_env():
-    """The config a first run starts with: empty, or generic env links."""
-    links = []
-    for role in ROLES:
-        link = _env_link(role)
-        if link is not None:
-            links.append(link)
-    return {"version": VERSION, "links": links}
 
 
 def _validated_config(raw, path):
@@ -452,7 +407,7 @@ def _write(cfg, path):
 
 def _save(cfg):
     """Persist ``cfg`` and make it the cache (a read right after sees it)."""
-    global _CACHE, _CACHE_KEY, _SEEDED
+    global _CACHE, _CACHE_KEY
     path = config_path()
     try:
         _write(cfg, path)
@@ -461,17 +416,16 @@ def _save(cfg):
                               % (path, e))
     _CACHE = cfg
     _CACHE_KEY = _signature(path)
-    _SEEDED = False
 
 
 def load(force=False):
     """The whole config, cached until the file's mtime/size/inode changes.
 
-    A missing file is seeded from the environment and written once; a corrupt
-    file raises LinkConfigError instead of crashing the service (callers fall
-    back to "no model configured", which is a supported state).
+    A missing file is written once as an empty config; a corrupt file raises
+    LinkConfigError instead of crashing the service (callers fall back to "no
+    model configured", which is a supported state).
     """
-    global _CACHE, _CACHE_KEY, _SEEDED
+    global _CACHE, _CACHE_KEY
     path = config_path()
     if _CACHE is not None and not force:
         try:
@@ -483,10 +437,9 @@ def load(force=False):
 
     if not os.path.isfile(path):
         config.ensure()
-        cfg = _validated_config(seed_from_env(), path)
+        cfg = {"version": VERSION, "links": []}
         _normalize_enabled(cfg)
         _write(cfg, path)
-        _SEEDED = True
     else:
         try:
             with open(path, encoding="utf-8") as f:
@@ -496,7 +449,6 @@ def load(force=False):
                 "cannot read model links config %s: %s" % (path, e))
         cfg = _validated_config(raw, path)
         _normalize_enabled(cfg)
-        _SEEDED = False
     _CACHE = cfg
     _CACHE_KEY = _signature(path)
     return _CACHE
@@ -564,7 +516,8 @@ def mask(link):
         "label": link.get("label"),
         "protocol": link.get("protocol"),
         "base_url": link.get("base_url"),
-        "api_key_set": bool(link.get("api_key")),
+        "api_key_env": link.get("api_key_env") or "",
+        "api_key_set": bool(api_key(link)),
         "model": link.get("model"),
         "enabled": link.get("enabled"),
         "chunk": copy.deepcopy(link.get("chunk")),
@@ -599,7 +552,7 @@ def create(data):
 
 
 def update(link_id, data):
-    """Edit one link: omitted fields keep their value, api_key omitted = keep."""
+    """Edit one link: omitted fields keep their value."""
     with _WRITE_LOCK:
         cfg = load()
         existing = _find(cfg, link_id)

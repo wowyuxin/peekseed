@@ -90,22 +90,60 @@ class ApiTests(unittest.TestCase):
         with temp_data_root() as root, FakeModelServer() as fake:
             self.root = root
             client = self._client()
-            link = self._add_link(client, base_url=fake.openai_base,
-                                  api_key="top-secret")
-            self.assertTrue(link["api_key_set"])
-            self.assertNotIn("top-secret", json.dumps(link))
-            listed = client.get("/api/links").json()
-            self.assertEqual(len(listed["links"]), 1)
-            updated = client.put("/api/links/%s" % link["id"],
-                                 json={"label": "Renamed"})
-            self.assertEqual(updated.status_code, 200)
-            self.assertEqual(updated.json()["link"]["label"], "Renamed")
-            tested = client.post("/api/links/%s/test" % link["id"]).json()
-            self.assertTrue(tested["ok"], tested)
-            status = client.get("/api/links/status").json()
-            self.assertTrue(status["links"][link["id"]]["ok"])
-            self.assertEqual(client.delete("/api/links/%s" % link["id"]).status_code, 200)
-            self.assertEqual(client.delete("/api/links/%s" % link["id"]).status_code, 404)
+            saved = os.environ.pop("PEEKSEED_ANSWER_API_KEY", None)
+            os.environ["PEEKSEED_ANSWER_API_KEY"] = "top-secret"
+            try:
+                link = self._add_link(client, base_url=fake.openai_base,
+                                      api_key_env="PEEKSEED_ANSWER_API_KEY")
+                self.assertEqual(link["api_key_env"],
+                                 "PEEKSEED_ANSWER_API_KEY")
+                self.assertTrue(link["api_key_set"])
+                self.assertNotIn("top-secret", json.dumps(link))
+                self.assertNotIn("api_key", link)
+                listed = client.get("/api/links").json()
+                self.assertEqual(len(listed["links"]), 1)
+                self.assertEqual(listed["links"][0]["api_key_env"],
+                                 "PEEKSEED_ANSWER_API_KEY")
+                self.assertNotIn("seeded", listed)
+                updated = client.put("/api/links/%s" % link["id"],
+                                     json={"label": "Renamed"})
+                self.assertEqual(updated.status_code, 200)
+                self.assertEqual(updated.json()["link"]["label"], "Renamed")
+                tested = client.post("/api/links/%s/test" % link["id"]).json()
+                self.assertTrue(tested["ok"], tested)
+                status = client.get("/api/links/status").json()
+                self.assertTrue(status["links"][link["id"]]["ok"])
+                self.assertEqual(client.delete("/api/links/%s"
+                                               % link["id"]).status_code, 200)
+                self.assertEqual(client.delete("/api/links/%s"
+                                               % link["id"]).status_code, 404)
+            finally:
+                os.environ.pop("PEEKSEED_ANSWER_API_KEY", None)
+                if saved is not None:
+                    os.environ["PEEKSEED_ANSWER_API_KEY"] = saved
+
+    def test_api_rejects_a_stored_api_key(self):
+        with temp_data_root():
+            client = self._client()
+            rejected = client.post("/api/links", json={
+                "role": "answer", "label": "Chat", "protocol": "openai",
+                "base_url": "http://127.0.0.1:8888/v1", "api_key": "nope"})
+            self.assertEqual(rejected.status_code, 400, rejected.text)
+            self.assertIn("api_key is no longer stored",
+                          rejected.json()["detail"])
+            link = self._add_link(client, label="Embed")
+            rejected_put = client.put("/api/links/%s" % link["id"],
+                                      json={"api_key": "nope"})
+            self.assertEqual(rejected_put.status_code, 400, rejected_put.text)
+            self.assertIn("api_key is no longer stored",
+                          rejected_put.json()["detail"])
+            bad_env = client.post("/api/links", json={
+                "role": "answer", "label": "Chat", "protocol": "openai",
+                "base_url": "http://127.0.0.1:8888/v1",
+                "api_key_env": "PEEKSEED_TOKEN"})
+            self.assertEqual(bad_env.status_code, 400, bad_env.text)
+            self.assertIn("api_key_env must look like",
+                          bad_env.json()["detail"])
 
     def test_upload_index_and_search(self):
         with temp_data_root() as root, FakeModelServer(dim=8) as fake:

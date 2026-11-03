@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import unittest
@@ -23,7 +24,8 @@ class LinkStoreTests(unittest.TestCase):
             links.reset_cache()
             self.assertEqual(links.links(), [])
             self.assertTrue(links.config_path().is_file())
-            self.assertTrue(links.seeded())
+            self.assertEqual(
+                stat.S_IMODE(os.stat(links.config_path()).st_mode), 0o600)
 
     def test_validation_rejects_bad_values(self):
         with temp_data_root():
@@ -35,7 +37,10 @@ class LinkStoreTests(unittest.TestCase):
                 self._make(protocol="banana"),
                 self._make(model=""),
                 self._make(label=""),
-                self._make(api_key="a\nb"),
+                self._make(api_key="a-key"),
+                self._make(api_key_env="PEEKSEED_TOKEN"),
+                self._make(api_key_env="HOME"),
+                self._make(api_key_env="PEEKSEED_X_KEY"),
                 self._make(unknown="x"),
             ]
             for case in cases:
@@ -84,29 +89,70 @@ class LinkStoreTests(unittest.TestCase):
             # Loopback and RFC1918 stay allowed: local-first model servers.
             links.create(self._make(label="Loopback", base_url="http://127.0.0.1:9/v1"))
 
+    def test_api_key_env_pattern_is_accepted(self):
+        with temp_data_root():
+            links = self._links()
+            link = links.create(self._make(api_key_env="PEEKSEED_ANSWER_API_KEY"))
+            self.assertEqual(link["api_key_env"], "PEEKSEED_ANSWER_API_KEY")
+            self.assertNotIn("api_key", link)
+
     def test_create_mask_and_key_never_returned(self):
         with temp_data_root():
             links = self._links()
-            link = links.create(self._make(api_key="secret-key"))
-            self.assertEqual(link["api_key"], "secret-key")
+            link = links.create(self._make(api_key_env="PEEKSEED_ANSWER_API_KEY"))
+            self.assertEqual(link["api_key_env"], "PEEKSEED_ANSWER_API_KEY")
             masked = links.mask(links.get(link["id"]))
-            self.assertTrue(masked["api_key_set"])
+            self.assertEqual(masked["api_key_env"], "PEEKSEED_ANSWER_API_KEY")
+            self.assertFalse(masked["api_key_set"])
             self.assertNotIn("api_key", masked)
-            self.assertNotIn("secret-key", str(masked))
             raw = links.config_path().read_text()
-            self.assertIn("secret-key", raw)
+            self.assertIn("PEEKSEED_ANSWER_API_KEY", raw)
+            self.assertNotIn("api_key\":", raw)
             mode = stat.S_IMODE(os.stat(links.config_path()).st_mode)
             self.assertEqual(mode, 0o600)
 
-    def test_update_keeps_omitted_key_and_can_clear_it(self):
+    def test_api_key_reads_the_env_at_call_time(self):
         with temp_data_root():
             links = self._links()
-            link = links.create(self._make(api_key="secret-key"))
+            link = links.create(self._make(api_key_env="PEEKSEED_ANSWER_API_KEY"))
+            saved = os.environ.pop("PEEKSEED_ANSWER_API_KEY", None)
+            try:
+                self.assertEqual(links.api_key(link), "")
+                self.assertFalse(links.mask(link)["api_key_set"])
+                os.environ["PEEKSEED_ANSWER_API_KEY"] = "secret-key"
+                self.assertEqual(links.api_key(link), "secret-key")
+                masked = links.mask(link)
+                self.assertTrue(masked["api_key_set"])
+                self.assertNotIn("secret-key", str(masked))
+            finally:
+                os.environ.pop("PEEKSEED_ANSWER_API_KEY", None)
+                if saved is not None:
+                    os.environ["PEEKSEED_ANSWER_API_KEY"] = saved
+
+    def test_update_keeps_omitted_env_and_can_clear_it(self):
+        with temp_data_root():
+            links = self._links()
+            link = links.create(self._make(api_key_env="PEEKSEED_ANSWER_API_KEY"))
             updated = links.update(link["id"], {"label": "Renamed"})
-            self.assertEqual(updated["api_key"], "secret-key")
-            cleared = links.update(link["id"], {"api_key": ""})
-            self.assertEqual(cleared["api_key"], "")
-            self.assertFalse(links.mask(cleared)["api_key_set"])
+            self.assertEqual(updated["api_key_env"], "PEEKSEED_ANSWER_API_KEY")
+            cleared = links.update(link["id"], {"api_key_env": ""})
+            self.assertEqual(cleared["api_key_env"], "")
+
+    def test_loading_a_file_with_a_stored_key_is_a_config_error(self):
+        with temp_data_root():
+            links = self._links()
+            links.reset_cache()
+            path = links.config_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "version": 1,
+                "links": [self._make(api_key="secret-key")],
+            }))
+            links.reset_cache()
+            with self.assertRaises(links.LinkConfigError) as info:
+                links.links()
+            self.assertIn("api_key is no longer stored", str(info.exception))
+            self.assertNotIn("secret-key", str(info.exception))
 
     def test_one_enabled_link_per_stage_role(self):
         with temp_data_root():

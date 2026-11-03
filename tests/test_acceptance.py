@@ -35,7 +35,7 @@ def fake_link(fake, model="test-embed", **extra):
         "protocol": "openai",
         "base_url": fake.openai_base,
         "model": model,
-        "api_key": "",
+        "api_key_env": "",
         "chunk": dict(EMBED_CHUNK),
         "enabled": True,
     }
