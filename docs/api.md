@@ -270,7 +270,10 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   and `items`. Reading the list never calls an LLM. `group=cluster` (the
   default) groups item ids by merged cluster, `group=code` by warning code;
   `status=` filters items and the clusters' `states`; an invalid `group` is
-  `400`.
+  `400`. `derived_from.converter_code_hash` is a **diagnostic** hash of the
+  converter code (`sha256(canonical converter_hashes)[:16]`); it is not
+  `normalize.engine_fingerprint()` and is never used for stale/CAS decisions
+  (contract v1.3 §2/§13.8).
 - `GET …/review/items/{item_id}` runs `peelfeed review <peel_id> --item …` and
   returns `{"peel_id","review_schema","item": {…}}` — one item with evidence,
   current state, candidates, applicable strategies, its plan `entry` and any
@@ -286,7 +289,13 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   `base_plan_version` is required on every action and must come from the latest
   plan payload; a stale value is `409` (optimistic concurrency). The response is
   the complete new plan: `plan_version`, `entries`, the changed `entry` and any
-  R0 `resolution` (a defer writes one).
+  R0 `resolution` (a defer writes one). Selecting a resolution strategy
+  (`confirm_no_header`, `keep_visual_fallback`, `keep_original_figure`) creates
+  an `action.type="resolution"` entry; `confirm` writes the resolution and moves
+  the entry straight to `status="applied"` (no batch build and no corpus
+  change). Operation selections (`use_first_row_header`, `inherit_parent_header`,
+  …) confirm to `confirmed` and wait for a future ApplyBatch, so the summary's
+  `counts.confirmed` ("已确认待发布") counts operation entries only.
 - `POST …/review/reports` with optional `{item_ids?, cluster_ids?}` generates
   the deterministic rule report and returns the ready/partial payload
   (`status`, `report_path`, `report`, `counts`). CP1 runs it synchronously with

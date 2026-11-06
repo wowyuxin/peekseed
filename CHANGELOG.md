@@ -51,6 +51,20 @@ version/tag policy.
 - `capabilities`/handshake now expose `review_schema`, `operations`,
   `resolutions` and `strategies` (frozen strategy catalog).
 
+### Fixed
+
+- **CP1.1 review-contract sync.** An R0 plan entry (selecting
+  `confirm_no_header`, `keep_visual_fallback` or `keep_original_figure`) is now
+  `applied` once confirmed (the R0 resolution is written immediately, no corpus
+  change) instead of `confirmed`; "已确认待发布" (`counts.confirmed`) counts
+  operation entries only. The review payload's diagnostic
+  `derived_from.engine_fingerprint` is renamed to
+  `derived_from.converter_code_hash` — a converter-code hash that is **not**
+  `normalize.engine_fingerprint()` and is never used for stale/CAS. Inherit
+  (`inherit_parent_header`) suggestions stay `needs_decision` and no longer
+  count as ready suggestions (peelfeed side); locked entries reject
+  select/defer with `conflict`.
+
 ### Security
 
 - The peelfeed subprocess gets an allowlisted environment.

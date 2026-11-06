@@ -110,6 +110,16 @@ def _wait_job(client, job_id, timeout=20.0):
     raise AssertionError("job %s did not finish: %r" % (job_id, state))
 
 
+def _extracted_review_source(client, root):
+    """Upload, extract and return the ``/api/datasets/<id>/sources/<sha>`` base."""
+    dataset, _pdf = _upload(client, root)
+    sha = _sources(client, dataset["id"])[0]["sha256"]
+    client.post("/api/datasets/%s/sources/%s/extract" % (dataset["id"], sha),
+                json={})
+    _wait_source(client, dataset["id"], sha)
+    return "/api/datasets/%s/sources/%s" % (dataset["id"], sha)
+
+
 def _add_embed_link(client, fake):
     response = client.post("/api/links", json={
         "role": "embed", "label": "Fake embed", "protocol": "openai",
@@ -821,6 +831,158 @@ class PeelfeedApiTests(unittest.TestCase):
                 self.assertEqual(body["resolution"]["reason_code"],
                                  "not_relevant")
                 self.assertEqual(cli.state()["resolutions"][-1]["name"], "defer")
+
+    def test_review_plan_r0_confirm_applies_a_resolution(self):
+        """CP1.1: an R0 resolution strategy is applied on confirm (not confirmed)."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "confirm_no_header",
+                                           "version": 1}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                plan = selected.json()
+                entry = plan["entry"]
+                self.assertEqual(entry["action"], {
+                    "type": "resolution", "name": "confirm_headerless"})
+                self.assertEqual(entry["status"], "draft")
+                self.assertIsNone(plan["resolution"])
+
+                confirmed = client.post(route, json={
+                    "base_plan_version": plan["plan_version"],
+                    "action": "confirm", "entry_id": entry["entry_id"]})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                body = confirmed.json()
+                self.assertEqual(body["entry"]["status"], "applied")
+                resolution = body["resolution"]
+                self.assertEqual(resolution["name"], "confirm_headerless")
+                self.assertEqual(resolution["item_id"],
+                                 "it-3f9c2a4b6d8e0f1a")
+                self.assertEqual(resolution["change"], "add")
+                state = cli.state()
+                self.assertEqual(state["plan"]["entries"][0]["status"],
+                                 "applied")
+                self.assertEqual(state["resolutions"][-1]["name"],
+                                 "confirm_headerless")
+
+    def test_review_plan_operation_confirm_waits_for_a_batch(self):
+        """A corpus operation stays ``confirmed``; it is not applied immediately."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry = selected.json()["entry"]
+                self.assertEqual(entry["action"]["type"], "operation")
+                self.assertEqual(entry["action"]["name"], "set_header_rows")
+                confirmed = client.post(route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry["entry_id"]})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                self.assertEqual(confirmed.json()["entry"]["status"],
+                                 "confirmed")
+                self.assertIsNone(confirmed.json()["resolution"])
+                self.assertFalse(cli.state().get("resolutions"))
+
+    def test_review_plan_locked_entry_defer_is_a_conflict(self):
+        """CP1.1 A3: deferring a locked entry is a 409 and keeps the entry."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                locked = client.post(route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "lock", "entry_id": entry_id})
+                self.assertEqual(locked.status_code, 200, locked.text)
+                locked_version = locked.json()["plan_version"]
+                deferred = client.post(route, json={
+                    "base_plan_version": locked_version, "action": "defer",
+                    "item_id": "it-3f9c2a4b6d8e0f1a",
+                    "reason_code": "not_relevant"})
+                self.assertEqual(deferred.status_code, 409, deferred.text)
+                self.assertIn("conflict", deferred.json()["detail"])
+                self.assertFalse(cli.state().get("resolutions"))
+                # The entry is still there; unlock returns the full plan.
+                unlocked = client.post(route, json={
+                    "base_plan_version": locked_version, "action": "unlock",
+                    "entry_id": entry_id})
+                self.assertEqual(unlocked.status_code, 200, unlocked.text)
+                self.assertIn(entry_id,
+                              [row["entry_id"]
+                               for row in unlocked.json()["entries"]])
+                self.assertFalse(unlocked.json()["entry"]["locked"])
+
+    def test_review_payload_exposes_converter_code_hash_only(self):
+        """CP1.1: derived_from names the diagnostic converter hash, not the engine."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                review = client.get(base + "/review")
+                self.assertEqual(review.status_code, 200, review.text)
+                derived = review.json()["derived_from"]
+                self.assertEqual(derived["converter_code_hash"],
+                                 "d6ef5d97b7865966")
+                self.assertNotIn("engine_fingerprint", derived)
+                self.assertEqual(derived["derivation_version"], 1)
+
+    def test_review_plan_inherit_select_keeps_strategy_and_parent_params(self):
+        """CP1.1: inherit select passes strategy.id and fixed parent params through."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                params = {
+                    "parent_asset_id": "table-p1041-01",
+                    "parent_header_rows": [0],
+                    "parent_header_cells": [["Bits", "Variable"]],
+                    "parent_source_refs": [{
+                        "segment": "table-p1041-01",
+                        "source_row": 0,
+                        "cells": ["Bits", "Variable"],
+                        "evidence_hash": "ev-p1041"},
+                    ],
+                    "parent_header_source": "native",
+                }
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "inherit_parent_header",
+                                           "version": 1},
+                              "params": params}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry = selected.json()["entry"]
+                self.assertEqual(entry["strategy"],
+                                 {"id": "inherit_parent_header", "version": 1})
+                self.assertEqual(entry["action"], {
+                    "type": "operation", "name": "inherit_header_from",
+                    "params": params})
 
     def test_review_plan_error_mapping(self):
         with temp_data_root() as root:

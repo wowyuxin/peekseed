@@ -74,6 +74,20 @@ state itself is owned by peelfeed under `<peel>/extract/review/`; peekseed never
 stores it, only proxies the CLI (see `peekseed/peelfeed.py` below). Review calls
 require peelfeed `capabilities.review_schema == 2` and otherwise return `409`.
 
+### Review plan entries and resolutions (CP1.1, contract v1.3)
+
+A `POST …/review/plan` `select` of an R0 resolution strategy
+(`confirm_no_header`, `keep_visual_fallback`, `keep_original_figure`) creates an
+entry whose `action.type` is `resolution`. Its `confirm` writes the R0
+resolution (the same shape as a defer) and sets the entry status directly to
+`applied`: no batch build, no corpus change, no reindex. Operation entries
+(`use_first_row_header`, `inherit_parent_header`, …) confirm to `confirmed` and
+wait for an ApplyBatch. The review summary's `counts.confirmed`
+("已确认待发布") therefore counts operation entries only; applied R0 entries are
+`counts.applied`. The review payload's `derived_from.converter_code_hash` is a
+diagnostic converter-code hash (`sha256(canonical converter_hashes)[:16]`), not
+`normalize.engine_fingerprint()`, and is never used for stale/CAS.
+
 ## Module interfaces
 
 ### `peekseed.config`
@@ -178,7 +192,9 @@ it.
 M2 review calls: `review(peel_id, group=…, status=…, item=…, limit=…)` proxies
 the structured schema-2 view; `plan(peel_id, payload)` runs
 `plan <peel_id> <select|confirm|lock|unlock|defer> [--input -] [--entry … --base-plan-version …]`
-and returns the complete ReviewPlan; `review_report(peel_id, item_ids=…,
+and returns the complete ReviewPlan. A resolution entry becomes `applied` on
+confirm while an operation entry becomes `confirmed`; a locked entry rejects
+select/defer with `conflict` (409). `review_report(peel_id, item_ids=…,
 cluster_ids=…)` runs the synchronous CP1 `review-report`. The old `decide()`
 method was **removed**. A failed command's error is parsed from the stdout
 `{"error": {"code", "message", "detail"}}` and/or the stderr

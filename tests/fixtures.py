@@ -731,9 +731,14 @@ DEFAULT_REVIEW = {
     "review_schema": 2,
     "generated_at": "2026-11-05T00:00:00Z",
     "profile": "generic",
+    # ``converter_code_hash`` is a diagnostic hash of the converter code
+    # (``sha256(canonical converter_hashes)[:16]``). It is NOT
+    # ``normalize.engine_fingerprint()`` and must never drive stale/CAS
+    # decisions (contract v1.3 §2/§13.8; renamed from ``engine_fingerprint``
+    # in CP1.1). The real CXL value is d6ef5d97b7865966.
     "derived_from": {
         "uncorrected_identity": "55959d86" + "0" * 56,
-        "engine_fingerprint": "23999f428fa6d365",
+        "converter_code_hash": "d6ef5d97b7865966",
         "derivation_version": 1,
     },
     "capabilities": {"review_schema": 2, "native_lines": True, "ocr": False,
@@ -831,6 +836,47 @@ def read_stdin_json():
         return json.loads(sys.stdin.read() or "null")
     except ValueError:
         return None
+
+
+# CP1.1 (contract v1.3 §11.1): selecting an R0 strategy creates a
+# ``type=resolution`` action instead of a corpus operation; confirming that
+# entry writes the resolution and applies it immediately. Operation strategies
+# still produce ``type=operation`` entries that wait for a future ApplyBatch.
+RESOLUTION_STRATEGIES = {
+    "confirm_no_header": "confirm_headerless",
+    "keep_visual_fallback": "keep_visual_fallback",
+    "keep_original_figure": "keep_original_figure",
+}
+OPERATION_STRATEGIES = {
+    "use_first_row_header": "set_header_rows",
+    "use_first_two_rows_header": "set_header_rows",
+    "use_header_rows": "set_header_rows",
+    "inherit_parent_header": "inherit_header_from",
+    "use_ocr_labels": "set_asset_labels_from_ocr",
+}
+
+
+def resolution_record(item_id, name, entry_id=None, revision=0,
+                      reason_code=None, reason=None, evidence_hash=None):
+    """A resolutions.jsonl row (contract §11.6), the shape ``plan defer`` uses."""
+    material = "|".join([str(item_id), str(name), str(entry_id or ""),
+                         str(int(revision or 0))])
+    return {
+        "schema_version": 1,
+        "resolution_id": "r-" + hashlib.sha256(
+            material.encode("utf-8")).hexdigest()[:16],
+        "change": "add",
+        "supersedes": None,
+        "idempotency_key": hashlib.sha256(
+            (material + "|add").encode("utf-8")).hexdigest(),
+        "item_id": str(item_id),
+        "name": str(name),
+        "reason_code": reason_code,
+        "reason": reason,
+        "evidence_hash": evidence_hash,
+        "source": "user",
+        "recorded_at": "2026-11-05T00:00:00Z",
+    }
 
 
 def option(rest, name):
@@ -1046,10 +1092,34 @@ def main():
                 return fail("plan item_id is required", 2, "validation")
             if action == "select":
                 strategy = request.get("strategy") or {}
+                strategy_id = str(strategy.get("id") or "")
                 entry_id = "e-" + hashlib.sha256(
                     str(item_id).encode("utf-8")).hexdigest()[:16]
                 match = next((candidate for candidate in entries
                               if candidate.get("entry_id") == entry_id), None)
+                # Locked entries are read-only: select is conflict, never a
+                # silent replacement (contract v1.3 §11.1; CP1.1 A3).
+                if match is not None and match.get("locked"):
+                    return fail("entry " + entry_id + " is locked; unlock it "
+                                "first", 2, "conflict")
+                params = request.get("params") or {}
+                if strategy_id in RESOLUTION_STRATEGIES:
+                    created_action = {
+                        "type": "resolution",
+                        "name": RESOLUTION_STRATEGIES[strategy_id],
+                    }
+                elif strategy_id in OPERATION_STRATEGIES:
+                    name = OPERATION_STRATEGIES[strategy_id]
+                    if name == "set_header_rows" and not params:
+                        params = {"rows": [0]}
+                    # Strategy id and params are passed through verbatim; for
+                    # inherit_header_from that keeps the fixed parent header
+                    # evidence the caller selected.
+                    created_action = {"type": "operation", "name": name,
+                                      "params": dict(params)}
+                else:
+                    return fail("unknown strategy: " + strategy_id,
+                                2, "validation")
                 revision = 1
                 if match is not None:
                     revision = int(match.get("revision") or 0) + 1
@@ -1062,11 +1132,9 @@ def main():
                     "stale": False,
                     "stale_reasons": [],
                     "locked": False,
-                    "strategy": {"id": str(strategy.get("id") or "unknown"),
+                    "strategy": {"id": strategy_id,
                                  "version": int(strategy.get("version") or 1)},
-                    "action": {"type": "operation",
-                               "name": "set_header_rows",
-                               "params": request.get("params") or {}},
+                    "action": created_action,
                     "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
                                  "refs": []},
                     "dependencies": [],
@@ -1079,17 +1147,19 @@ def main():
                 }
                 entries.append(entry)
             else:
-                resolution = {
-                    "schema_version": 1,
-                    "resolution_id": "r-" + hashlib.sha256(
-                        str(item_id).encode("utf-8")).hexdigest()[:16],
-                    "change": "add",
-                    "item_id": str(item_id),
-                    "name": "defer",
-                    "reason_code": request.get("reason_code"),
-                    "reason": request.get("reason"),
-                    "recorded_at": "2026-11-05T00:00:00Z",
-                }
+                # Defer is an R0 resolution; a locked entry cannot be deferred
+                # and is never deleted (contract v1.3 §11.1; CP1.1 A3).
+                match = next((candidate for candidate in entries
+                              if candidate.get("item_id") == str(item_id)),
+                             None)
+                if match is not None and match.get("locked"):
+                    return fail("entry " + str(match.get("entry_id"))
+                                + " is locked; unlock it before deferring",
+                                2, "conflict")
+                resolution = resolution_record(
+                    item_id, "defer",
+                    reason_code=request.get("reason_code"),
+                    reason=request.get("reason"))
                 state.setdefault("resolutions", []).append(resolution)
         else:
             entry_id = option(rest, "--entry")
@@ -1107,7 +1177,20 @@ def main():
             if action == "confirm":
                 if match.get("stale"):
                     return fail("entry is stale", 2, "conflict")
-                match["status"] = "confirmed"
+                # R0 entries apply on confirm (contract v1.3 §11.1): write the
+                # resolution and move straight to ``applied``. Only operation
+                # entries become ``confirmed`` and wait for an ApplyBatch.
+                created_action = match.get("action") or {}
+                if created_action.get("type") == "resolution":
+                    resolution = resolution_record(
+                        match.get("item_id"), created_action.get("name"),
+                        entry_id=match.get("entry_id"),
+                        revision=match.get("revision"),
+                        evidence_hash=(match.get("evidence") or {}).get("hash"))
+                    state.setdefault("resolutions", []).append(resolution)
+                    match["status"] = "applied"
+                else:
+                    match["status"] = "confirmed"
             elif action == "lock":
                 match["locked"] = True
             else:
