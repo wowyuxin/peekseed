@@ -23,6 +23,33 @@ version/tag policy.
   and a `links.json` that still holds a key fails to load until it is migrated.
 - Env seeding (`PEEKSEED_EMBED_*`, `PEEKSEED_ANSWER_BASE`, `_PROTOCOL`, `_MODEL`,
   `PEEKSEED_RERANK_BASE`) is removed.
+- **Review API replaced (M2 CP1), with no compatibility mapping.** The per-item
+  `POST /api/datasets/{id}/sources/{sha}/review/{item}` decide route
+  (`accept|reject|override`), the old flat review payload
+  (`review_items`/`items[].asset`/`suggestion`), `PeelfeedClient.decide()` and
+  the `POST …/rebuild` route are gone. The Review UI no longer offers
+  Accept/Reject or "Apply & rebuild"; review data requires peelfeed
+  `capabilities.review_schema == 2` (otherwise the API returns `409`).
+- **Dataset schema 4.** `dataset.json` bumps from schema 3 to 4 in one
+  migration: each source's `extraction` block gains `review_jobs` (peelfeed review
+  job ids for restart re-attachment; `{}` for older datasets) and
+  `corrections_conflict` becomes a valid extraction state. Run `peekseed migrate`
+  (dry-run by default) or `peekseed migrate --apply`.
+
+### Added
+
+- **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:
+  `GET …/review?group=cluster|code&status=` returns the schema-2 review view
+  (counts, triage, plan, report summary, clusters, items) and never calls an
+  LLM; `GET …/review/items/{item_id}` returns one item with evidence, candidates
+  and strategies; `POST …/review/plan` runs a `select|confirm|lock|unlock|defer`
+  plan action (optimistic `base_plan_version`); `POST …/review/reports`
+  generates the deterministic rule report (synchronous `200` in CP1).
+- peelfeed error-code mapping for every reviewed call: `busy → 423`,
+  `conflict | stale | review_schema | corrections_conflict → 409`,
+  `validation → 400`, not found → `404`, other engine errors → `502`.
+- `capabilities`/handshake now expose `review_schema`, `operations`,
+  `resolutions` and `strategies` (frozen strategy catalog).
 
 ### Security
 

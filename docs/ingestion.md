@@ -41,9 +41,9 @@ built (zip-slip safe), and store the bytes **once** at
   "sha256": "…", "bytes": 12345, "pages": 0,
   "status": "uploaded",
   "extraction": {"state": "not_extracted", "peel_id": "", "conversion_id": "",
-                 "profile": "", "engine": "", "validation": {"errors": 0,
-                 "review_items": 0}, "started_at": null, "finished_at": null,
-                 "error": null}
+                 "profile": "", "engine": "", "review_jobs": {},
+                 "validation": {"errors": 0, "review_items": 0},
+                 "started_at": null, "finished_at": null, "error": null}
 }
 ```
 
@@ -63,8 +63,10 @@ with a readable reason and a Retry action). peelfeed's `.peel` log is the source
 of truth for the peel state; peekseed only stores the last observed state and
 identity in `dataset.json`.
 
-Review (crop + evidence + LLM suggestion) and Apply & rebuild run the peelfeed
-CLI (`review`/`decide`/`rebuild`); they never rewrite the corpus themselves.
+Review (clusters, evidence, strategies, plan, deterministic report) runs the
+peelfeed CLI (`review`/`plan`/`review-report`); the old per-item
+decide/rebuild entry points were removed in M2 CP1. peekseed only proxies review
+state and never rewrites the corpus itself.
 
 ## Chunk contract (from the peel corpus)
 

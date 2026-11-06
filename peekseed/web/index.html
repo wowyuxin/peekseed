@@ -1143,17 +1143,117 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .pf-banner.bad{color:var(--bad);border-color:rgba(251,113,133,.35);}
 .pf-banner.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
 .pf-banner[hidden]{display:none;}
-.review-list{display:flex;flex-direction:column;gap:8px;}
-.review-item{display:flex;flex-wrap:wrap;gap:10px;align-items:flex-start;padding:9px;
-  border:1px solid var(--line);border-radius:10px;background:var(--panel);}
-.review-item.decided-accept{border-color:var(--ok-line);}
-.review-item.decided-reject{border-color:rgba(251,113,133,.4);}
-.review-main{flex:1 1 240px;min-width:0;display:flex;flex-direction:column;gap:4px;}
-.review-msg{font-size:12px;line-height:1.5;overflow-wrap:anywhere;}
-.review-meta{font:10.5px var(--mono);color:var(--faint);overflow-wrap:anywhere;}
-.review-asset{font-size:11px;color:var(--accent);overflow-wrap:anywhere;}
-.review-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-start;}
-.review-actions button{padding:5px 10px;font-size:11px;min-height:27px;border-radius:7px;}
+/* ---- review report dialog ------------------------------------------------
+   The default page for a peel: a counts summary, the cluster list on the left,
+   and the selected cluster's conclusion, strategies and items on the right.
+   Every per-item action writes a plan edit through POST …/review/plan; Accept
+   and Reject are gone, so status is shown as first-class badges. */
+.rr-dialog{width:min(1120px,100%);max-height:88vh;}
+.rr-sum{display:flex;flex-direction:column;gap:5px;padding:9px 11px;margin:0 0 10px;
+  border:1px solid var(--line);border-radius:11px;background:var(--panel-2);min-height:0;}
+.rr-sum .hist-empty{padding:2px;}
+.rr-sum-row{display:flex;flex-wrap:wrap;gap:4px 15px;align-items:baseline;font-size:11.5px;
+  color:var(--muted);}
+.rr-sum-item{display:inline-flex;gap:5px;align-items:baseline;white-space:nowrap;}
+.rr-sum-item b{color:var(--text);font:600 12px var(--mono);}
+.rr-sum-item.ok b{color:var(--ok);}
+.rr-sum-item.accent b{color:var(--accent);}
+.rr-sum-item.warn b{color:var(--warn);}
+.rr-sum-item.bad b{color:var(--bad);}
+.rr-sum-meta{color:var(--faint);font:10.5px var(--mono);line-height:1.5;overflow-wrap:anywhere;}
+/* Status badges are the primary status signal: the old Accept/Reject buttons
+   are gone, so draft/confirmed/locked/stale/deferred must read at a glance. */
+.rr-badge{display:inline-flex;align-items:center;font:9.5px var(--mono);line-height:1.6;
+  border:1px solid var(--line);border-radius:5px;padding:0 5px;white-space:nowrap;
+  color:var(--muted);}
+.rr-badge.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.rr-badge.warn{color:var(--warn);border-color:rgba(251,191,36,.35);background:var(--warn-soft);}
+.rr-badge.bad{color:var(--bad);border-color:rgba(251,113,133,.35);background:var(--bad-soft);}
+.rr-badge.accent{color:var(--accent);border-color:var(--accent-line);background:var(--accent-soft);}
+.rr-badge.muted{color:var(--faint);}
+.rr-grid{display:grid;grid-template-columns:minmax(230px,330px) minmax(0,1fr);
+  gap:12px;align-items:start;min-width:0;}
+.rr-clusters{display:flex;flex-direction:column;gap:6px;min-width:0;max-height:64vh;
+  overflow-y:auto;overscroll-behavior:contain;padding-right:2px;}
+.rr-cl{display:flex;flex-direction:column;gap:3px;width:100%;text-align:left;
+  padding:8px 10px;border:1px solid var(--line);border-radius:10px;
+  background:var(--bg-soft);color:var(--text);font:inherit;cursor:pointer;
+  min-height:0;transition:border-color .15s ease,background-color .15s ease;}
+.rr-cl:hover{background:var(--panel-2);border-color:var(--line-strong);filter:none;}
+.rr-cl.is-on{border-color:var(--accent-line);background:var(--accent-soft);}
+.rr-cl-h{display:flex;flex-wrap:wrap;gap:5px;align-items:baseline;min-width:0;}
+.rr-cl-title{font-weight:650;font-size:12.5px;min-width:0;overflow-wrap:anywhere;}
+.rr-cl-code{font:9.5px var(--mono);color:var(--faint);border:1px solid var(--line);
+  border-radius:5px;padding:0 5px;white-space:nowrap;flex:none;}
+.rr-cl-meta{display:flex;flex-wrap:wrap;gap:3px 8px;align-items:center;
+  color:var(--muted);font-size:10.5px;line-height:1.5;}
+.rr-cl-rep{color:var(--faint);font:10px var(--mono);line-height:1.5;overflow-wrap:anywhere;}
+.rr-detail{display:flex;flex-direction:column;gap:10px;min-width:0;}
+.rr-det-h{display:flex;flex-direction:column;gap:3px;padding-bottom:7px;
+  border-bottom:1px solid var(--line-soft);min-width:0;}
+.rr-det-title{display:flex;flex-wrap:wrap;gap:6px;align-items:baseline;min-width:0;}
+.rr-det-title h3{margin:0;font-size:15px;letter-spacing:-.01em;overflow-wrap:anywhere;}
+.rr-det-meta{color:var(--faint);font:10.5px var(--mono);line-height:1.55;
+  overflow-wrap:anywhere;}
+.rr-sec{border:1px solid var(--line);border-radius:11px;background:var(--panel-2);
+  padding:9px 11px;min-width:0;}
+.rr-sec h4{margin:0 0 6px;font-size:10px;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--faint);}
+.rr-conclusion p{margin:0;font-size:12px;line-height:1.55;overflow-wrap:anywhere;}
+.rr-sugs{list-style:none;margin:7px 0 0;padding:0;display:flex;flex-direction:column;gap:3px;}
+.rr-sug{font-size:10.5px;color:var(--muted);line-height:1.55;overflow-wrap:anywhere;}
+.rr-sug-item{font:10px var(--mono);color:var(--muted);}
+.rr-strats{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px;}
+.rr-strat{display:flex;flex-direction:column;gap:2px;padding:6px 8px;
+  border:1px solid var(--line);border-radius:8px;background:var(--panel);min-width:0;}
+.rr-strat.off{opacity:.58;}
+.rr-strat-h{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;font-size:11.5px;
+  min-width:0;}
+.rr-strat-name{font-weight:650;overflow-wrap:anywhere;min-width:0;}
+.rr-strat-id{font:9.5px var(--mono);color:var(--faint);}
+.rr-strat-desc{font-size:10.5px;color:var(--muted);line-height:1.5;overflow-wrap:anywhere;}
+.rr-strat-risk{font-size:10px;color:var(--faint);line-height:1.5;overflow-wrap:anywhere;}
+.rr-strat-why{font-size:10.5px;color:var(--warn);line-height:1.5;overflow-wrap:anywhere;}
+.rr-items{display:flex;flex-direction:column;gap:8px;}
+.rr-item{display:flex;flex-direction:column;gap:5px;padding:8px 10px;
+  border:1px solid var(--line);border-radius:10px;background:var(--panel);min-width:0;}
+.rr-item-h{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;min-width:0;}
+.rr-item-id{font:10px var(--mono);color:var(--muted);}
+.rr-item-msg{margin:0;font-size:11.5px;line-height:1.5;overflow-wrap:anywhere;}
+.rr-item-meta{color:var(--faint);font:10px var(--mono);line-height:1.5;overflow-wrap:anywhere;}
+.rr-ev{display:flex;flex-wrap:wrap;gap:4px 10px;font-size:10.5px;line-height:1.5;}
+.rr-ev a{color:var(--accent);overflow-wrap:anywhere;}
+.rr-ba{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:8px;min-width:0;}
+.rr-ba-col{min-width:0;}
+.rr-ba-col h5{margin:0 0 2px;font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--faint);}
+.rr-ba-col code,.rr-cand code{font:10px var(--mono);color:var(--text);overflow-wrap:anywhere;}
+.rr-cand{font-size:10.5px;line-height:1.6;overflow-wrap:anywhere;}
+.rr-cand-s{font-weight:650;}
+.rr-params{font:9.5px var(--mono);color:var(--muted);overflow-wrap:anywhere;}
+.rr-why{font-size:10px;color:var(--warn);overflow-wrap:anywhere;}
+.rr-entry{font-size:10.5px;color:var(--muted);line-height:1.5;overflow-wrap:anywhere;
+  border-top:1px dashed var(--line-soft);padding-top:4px;}
+.rr-entry.is-stale{color:var(--warn);}
+.rr-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-end;min-width:0;}
+.rr-field{display:flex;flex-direction:column;gap:2px;font-size:9.5px;color:var(--faint);
+  min-width:0;}
+.rr-field select,.rr-field input,.rr-defer input{background:var(--bg-soft);color:var(--text);
+  border:1px solid var(--line);border-radius:7px;padding:4px 6px;font:11px var(--sans);
+  min-width:0;max-width:100%;}
+.rr-field select{max-width:220px;}
+.rr-actions button{padding:4px 9px;font-size:10.5px;min-height:25px;border-radius:6px;}
+.rr-defer{align-items:flex-end;}
+.rr-defer input{flex:1 1 130px;min-width:90px;}
+.rr-muted{color:var(--faint);font-size:10.5px;line-height:1.5;}
+.rr-impact{margin:0;font-size:10.5px;line-height:1.55;color:var(--faint);
+  border-top:1px solid var(--line-soft);padding-top:6px;overflow-wrap:anywhere;}
+.rr-impact b{color:var(--muted);}
+@media (max-width:860px){
+  .rr-grid{grid-template-columns:1fr;}
+  .rr-clusters{max-height:32vh;}
+  .rr-ba{grid-template-columns:1fr;}
+}
 .set-field input[type=file]{padding:6px 7px;font-size:12px;color:var(--muted);cursor:pointer;}
 .set-field input[type=file]::file-selector-button{font:inherit;font-size:11.5px;
   font-weight:600;margin-right:8px;padding:4px 9px;border-radius:7px;cursor:pointer;
@@ -1580,20 +1680,33 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   </div>
 </div>
 
-<!-- Peel review: review items come from peelfeed through the proxy route; a
-     decision is written to the peel's corrections log by peelfeed, and Apply &
-     rebuild asks peelfeed to re-run normalize/gate/chunk. -->
+<!-- Peel review report: the Phase-1 report view. Clusters come from
+     GET …/review?group=cluster; every per-item action posts to
+     POST …/review/plan with base_plan_version and the modal refetches the
+     merged view. There is no Accept/Reject and no "Apply & rebuild": defer and
+     lock are R0 review resolutions and only a confirmed plan entry in a future
+     batch build changes the corpus. -->
 <div class="hist-overlay" id="reviewModal" hidden>
-  <div class="hist-dialog settings-dialog" role="dialog" aria-modal="true"
-       aria-label="Peel review">
+  <div class="hist-dialog settings-dialog rr-dialog" role="dialog" aria-modal="true"
+       aria-label="审阅报告">
     <div class="hist-head">
-      <div><h2>Review peel</h2><p id="reviewHeadSub">Review items and evidence from peelfeed.</p></div>
-      <button class="secondary" id="reviewRebuildBtn" type="button">Apply &amp; rebuild</button>
+      <div>
+        <h2>审阅报告</h2>
+        <p id="reviewHeadSub">按簇审阅问题、证据与策略；选择、确认、锁定或暂缓后计划立即更新。</p>
+      </div>
+      <button class="secondary" id="reviewReportBtn" type="button"
+              title="用确定性规则生成/更新审阅报告">生成/更新报告</button>
+      <button class="secondary" id="reviewRefreshBtn" type="button"
+              title="重新读取审阅报告与计划">刷新</button>
       <button class="hist-close" id="reviewClose" type="button" aria-label="Close">&#215;</button>
     </div>
     <p class="settings-msg" id="reviewMsg" role="status" aria-live="polite"></p>
     <div class="hist-body settings-body">
-      <div class="review-list" id="reviewList"><span class="hist-empty">Loading review items…</span></div>
+      <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
+      <div class="rr-grid">
+        <div class="rr-clusters" id="reviewClusters"><span class="hist-empty">正在加载簇…</span></div>
+        <div class="rr-detail" id="reviewDetail"><span class="hist-empty">选择一个簇查看结论、证据与动作。</span></div>
+      </div>
     </div>
   </div>
 </div>
@@ -2160,6 +2273,10 @@ function datasetOptionLabel(ds){
 let PF_STATUS=null;
 let DATASET_SOURCES={};
 let REVIEW_CTX=null;
+/* Merged review counts per ``dataset|sha``, learned when the report modal loads.
+   The dataset list labels its report chip from this cache instead of fetching
+   one review payload per source on every list poll. */
+const REVIEW_COUNTS={};
 const PEEL_STATE_LABEL={uploaded:'not extracted',not_extracted:'not extracted',
   queued:'queued',running:'running',extracted:'extracted',failed:'failed',stale:'stale'};
 function peelfeedAvailable(){
@@ -2225,7 +2342,14 @@ async function loadDatasetSources(){
 function sourceRowHtml(dsId,src){
   const state=sourceState(src);
   const ex=sourceExtraction(src);
+  /* Raw validation count is the only per-source number available without a
+     review fetch; the merged cluster count is filled in from REVIEW_COUNTS
+     once this source's report has been opened at least once. */
   const reviewN=Number(((ex.validation||{}).review_items)||0);
+  const reviewKnown=REVIEW_COUNTS[reviewKey(dsId,src.sha256||'')];
+  const reviewChip=(reviewKnown&&Number(reviewKnown.clusters||0)>0)
+    ? ('Review · '+Number(reviewKnown.clusters)+' 簇')
+    : '审阅报告';
   const available=peelfeedAvailable();
   const busy=(state==='queued'||state==='running');
   const canExtract=available&&src.present&&!busy;
@@ -2237,9 +2361,11 @@ function sourceRowHtml(dsId,src){
   let actions='<button type="button" class="secondary" data-act="extract"'
     +' data-sha="'+escAttr(src.sha256||'')+'"'
     +(canExtract?'':' disabled')+' title="'+escAttr(why)+'">'+esc(label)+'</button>';
-  if(state==='extracted'&&reviewN>0){
+  if(state==='extracted'&&(reviewN>0||(reviewKnown&&Number(reviewKnown.pending||0)>0))){
     actions+='<button type="button" class="secondary" data-act="review"'
-      +' data-sha="'+escAttr(src.sha256||'')+'">Review ('+reviewN+')</button>';
+      +' data-sha="'+escAttr(src.sha256||'')+'"'
+      +' title="打开审阅报告：按簇查看建议、证据、策略与计划状态">'
+      +esc(reviewChip)+'</button>';
   }
   return '<div class="ds-src"><span class="src-name">'+esc(src.name||'?')+'</span>'
     +sourceChipHtml(state)+actions+'</div>';
@@ -4785,88 +4911,563 @@ async function pollPeel(dsId,sha){
   }
   datasetsMsg('Extraction is still running in the background; press Refresh to check again.',false);
 }
-async function openReview(dsId,sha){
-  REVIEW_CTX={dataset:dsId,sha:sha};
-  const m=$('#reviewModal'); if(!m) return;
-  m.hidden=false;
-  $('#reviewMsg').textContent='';
-  $('#reviewList').innerHTML='<span class="hist-empty">Loading review items…</span>';
-  try{
-    const r=await getJSON('/api/datasets/'+encodeURIComponent(dsId)
-      +'/sources/'+encodeURIComponent(sha)+'/review');
-    paintReview(r);
-  }catch(e){
-    $('#reviewList').innerHTML='<span class="hist-empty">Could not load review: '
-      +esc(e.message||e)+'</span>';
-  }
+/* ---- review report dialog ------------------------------------------------
+   The report is the default page for a peel: a summary line, the cluster list
+   on the left, and the selected cluster's conclusion, strategies, before/after
+   evidence and per-item actions on the right. Accept/Reject and "Apply &
+   rebuild" are gone: the vocabulary is select / confirm / lock / unlock and
+   defer (reason_code required). Every write posts ``base_plan_version`` and the
+   modal refetches GET .../review?group=cluster so counts, statuses and the
+   source-row chip stay in step. Locks and defer are R0 review records; only a
+   confirmed plan entry in a future batch build changes the corpus. */
+const REVIEW_STATUS_LABEL={needs_decision:'待决定',draft:'已选策略',confirmed:'已确认',
+  applied:'已应用',deferred:'已暂缓',auto_resolved:'自动归档',pending_evidence:'待补证据',
+  pending_report:'待报告',failed_check:'校验失败',stale:'已过期',informational:'仅提示',
+  ready:'就绪',partial:'部分',unsupported:'不支持'};
+const REVIEW_TRIAGE_LABEL={deterministic_candidate:'规则建议',needs_decision:'需人工决定',
+  needs_ocr:'待 OCR 证据',informational:'仅提示',unsupported:'不支持'};
+const REVIEW_REASON_LABEL={unsupported_evidence:'证据不足/不支持',grid_conflict:'网格冲突',
+  not_relevant:'与本数据集无关',other:'其他'};
+const REVIEW_DEFER_CODES=['unsupported_evidence','grid_conflict','not_relevant','other'];
+const REVIEW_ACTION_LABEL={select:'已选策略',confirm:'已确认',lock:'已锁定',
+  unlock:'已解锁',defer:'已暂缓'};
+function reviewKey(dsId,sha){ return dsId+'|'+(sha||''); }
+function reviewBase(dsId,sha){
+  return '/api/datasets/'+encodeURIComponent(dsId)+'/sources/'+encodeURIComponent(sha)+'/review';
 }
-function paintReview(r){
-  const items=(r&&r.items)||[];
-  const llm=(r&&r.llm)||{};
-  $('#reviewHeadSub').textContent='Peel '+((r&&r.peel_id)||'')+' · '
-    +items.length+' review item(s)'+(llm.available?' · LLM available':' · LLM off');
-  if(!items.length){
-    $('#reviewList').innerHTML='<span class="hist-empty">No review items.</span>';
-    return;
+/* Review calls carry the HTTP status so the caller can map 409/423/400 to a
+   sentence a reviewer can act on (the server's detail string is human text
+   that embeds the peelfeed error code; never parse it, branch on status). */
+async function reviewFetchJSON(path,opts){
+  const r=await fetch(path,opts);
+  let data=null;
+  try{ data=await r.json(); }catch(e){}
+  if(!r.ok){
+    const detail=(data&&typeof data.detail==='string')?data.detail:'';
+    const err=new Error(detail||(path+' returned HTTP '+r.status));
+    err.status=r.status;
+    throw err;
   }
-  $('#reviewList').innerHTML=items.map(function(it){
-    const asset=(it.asset)||{};
-    const pages=(asset.pages||[]).join(',')||'?';
-    const assetUrl=asset.path
-      ? '/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)+'/sources/'
-        +encodeURIComponent(REVIEW_CTX.sha)+'/assets/'+asset.path
-      : '';
-    return '<div class="review-item" data-item="'+escAttr(it.id)+'">'
-      +'<div class="review-main">'
-      +'<div class="review-msg">'+esc(it.message||'')+'</div>'
-      +'<div class="review-meta">'+esc(asset.kind||'asset')+' · '+esc(asset.id||'')
-      +' · p.'+esc(pages)+'</div>'
-      +(assetUrl?'<a class="review-asset" target="_blank" rel="noopener" href="'
-          +escAttr(assetUrl)+'">open '+esc(asset.path)+'</a>':'')
-      +'</div>'
-      +'<div class="review-actions">'
-      +'<button type="button" class="secondary" data-dec="accept">Accept</button>'
-      +'<button type="button" class="secondary" data-dec="reject">Reject</button>'
-      +'</div></div>';
+  return data||{};
+}
+function reviewErrText(e){
+  const msg=(e&&e.message)||String(e||'');
+  if(e&&e.status===409) return '冲突：'+msg+'。已刷新最新计划，请重试。';
+  if(e&&e.status===423) return 'peelfeed 正忙：'+msg+'。请稍后重试。';
+  if(e&&e.status===400) return '校验失败：'+msg;
+  if(e&&e.status===404) return '找不到该条目或数据：'+msg;
+  if(e&&e.status===503) return 'peelfeed 不可用：'+msg;
+  return '操作失败：'+msg;
+}
+/* Loading the report is not a plan write, so a 409 here means the review data
+   schema differs (the CP1 review_schema gate) rather than a stale plan. */
+function reviewLoadErrText(e){
+  const msg=(e&&e.message)||String(e||'');
+  if(e&&e.status===409){
+    return '无法读取审阅报告：'+msg+'（review_schema 不一致时需要同步升级 peelfeed 与 peekseed）';
+  }
+  return reviewErrText(e);
+}
+function reviewMsg(text,isError){
+  const el=$('#reviewMsg'); if(!el) return;
+  el.innerHTML=isError?('<span class="err">'+esc(text)+'</span>'):esc(text||'');
+  el.classList.toggle('is-error',!!isError);
+}
+function reviewNum(v){ return Number(v||0).toLocaleString(); }
+function reviewStr(v,fallback){
+  if(v==null||v==='') return fallback||'';
+  if(typeof v==='string') return v;
+  if(typeof v==='number'||typeof v==='boolean') return String(v);
+  const t=v.text||v.message||v.conclusion||v.title;
+  if(t) return String(t);
+  try{ return JSON.stringify(v); }catch(e){ return String(v); }
+}
+function reviewStatusClass(status){
+  const s=String(status||'');
+  if(s==='confirmed'||s==='applied'||s==='ready'||s==='auto_resolved') return 'ok';
+  if(s==='needs_decision'||s==='deferred'||s==='pending_evidence'||s==='pending_report'
+     ||s==='partial'||s==='needs_ocr') return 'warn';
+  if(s==='failed_check'||s==='stale'||s==='unsupported') return 'bad';
+  if(s==='draft'||s==='deterministic_candidate') return 'accent';
+  return 'muted';
+}
+function reviewBadge(label,status){
+  return '<span class="rr-badge '+reviewStatusClass(status)+'">'+esc(label)+'</span>';
+}
+function reviewCounts(r){
+  const c=(r&&r.counts)||{};
+  return {clusters:Number(c.human_pending_clusters||0),
+          pending:Number(c.human_pending||0),
+          items:Number(c.items||0)};
+}
+function reviewReportInfo(r){
+  const rep=r&&r.report;
+  if(!rep||typeof rep!=='object') return {status:'',generated_at:'',suggestions:null};
+  const inner=(rep.report&&typeof rep.report==='object')?rep.report:rep;
+  const counts=(rep.counts&&typeof rep.counts==='object')?rep.counts
+    :((inner&&inner.counts)||{});
+  return {status:String(rep.status||(inner&&inner.status)||''),
+          generated_at:String(rep.generated_at||(inner&&inner.generated_at)||''),
+          suggestions:(counts.suggestions!=null?Number(counts.suggestions):null)};
+}
+function reviewStateBadges(states){
+  const st=states||{};
+  return Object.keys(st).filter(function(k){ return Number(st[k])>0; }).map(function(k){
+    return reviewBadge((REVIEW_STATUS_LABEL[k]||k)+' '+reviewNum(st[k]),k);
   }).join('');
 }
-async function decideReview(btn){
-  const item=btn.closest('.review-item');
-  if(!item||!REVIEW_CTX) return;
-  const itemId=item.getAttribute('data-item');
-  const decision=btn.getAttribute('data-dec');
-  btn.disabled=true;
+function paintReviewHead(r){
+  const el=$('#reviewHeadSub'); if(!el) return;
+  const plan=(r&&r.plan)||{};
+  const rep=reviewReportInfo(r);
+  el.textContent='peel '+((r&&r.peel_id)||'—')+' · 计划 v'
+    +(plan.plan_version==null?0:plan.plan_version)
+    +' · 报告 '+(rep.status||'未生成')+' · 按簇审阅策略与证据';
+}
+function reviewSummaryHtml(r){
+  const c=(r&&r.counts)||{};
+  const tri=(r&&r.triage_counts)||{};
+  const rep=reviewReportInfo(r);
+  const suggest=(rep.suggestions!=null)?rep.suggestions:Number(tri.deterministic_candidate||0);
+  const bit=function(label,value,cls){
+    return '<span class="rr-sum-item '+(cls||'')+'"><span>'+esc(label)+'</span><b>'
+      +esc(value)+'</b></span>';
+  };
+  const plan=(r&&r.plan)||{};
+  return '<div class="rr-sum-row">'
+    +bit('自动归档',reviewNum(c.auto_resolved),'ok')
+    +bit('建议',reviewNum(suggest),'accent')
+    +bit('需要你决定',reviewNum(c.human_pending_clusters)+' 簇 / '+reviewNum(c.human_pending)+' 项','warn')
+    +bit('已确认待发布',reviewNum(c.confirmed))
+    +bit('暂缓',reviewNum(c.deferred))
+    +bit('校验失败',reviewNum(c.failed_check),Number(c.failed_check||0)?'bad':'')
+    +'</div><div class="rr-sum-meta">计划 v'
+    +esc(String(plan.plan_version==null?0:plan.plan_version))
+    +' · 报告 '+esc(rep.status||'未生成')
+    +(rep.generated_at?' · 生成于 '+esc(rep.generated_at):'')
+    +' · 簇 '+reviewNum(c.clusters)+' · 项 '+reviewNum(c.items)
+    +(Number(c.stale||0)?' · 已过期 '+reviewNum(c.stale):'')
+    +(Number(c.unsupported_items||0)?' · 不支持 '+reviewNum(c.unsupported_items):'')
+    +'</div>';
+}
+function paintReviewSummary(r){
+  const el=$('#reviewSummary'); if(!el) return;
+  el.innerHTML=reviewSummaryHtml(r);
+}
+function reviewStrategyName(item,ref){
+  const id=ref&&ref.id;
+  if(!id) return '';
+  const found=((item&&item.strategies)||[]).find(function(s){ return s&&s.id===id; });
+  return (found&&found.name)||id;
+}
+function reviewJsonBits(value){
+  if(value==null) return '—';
+  if(typeof value!=='object') return String(value);
+  const bits=[];
+  Object.keys(value).forEach(function(k){
+    const v=value[k];
+    if(v==null) return;
+    if(Array.isArray(v)){
+      if(!v.length) return;
+      bits.push(k+'=['+v.map(function(x){
+        return (x&&typeof x==='object')?JSON.stringify(x):String(x);
+      }).join(', ')+']');
+    }else if(typeof v==='object'){
+      bits.push(k+'='+JSON.stringify(v));
+    }else{
+      bits.push(k+'='+String(v));
+    }
+  });
+  return bits.length?bits.join(' · '):'—';
+}
+function paintReviewClusters(r){
+  const box=$('#reviewClusters'); if(!box) return;
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const data=r||ctx.data; if(!data) return;
+  const clusters=(data.clusters||[]);
+  if(!clusters.length){
+    box.innerHTML='<span class="hist-empty">没有需要审阅的簇。可点“生成/更新报告”运行确定性规则。</span>';
+    return;
+  }
+  box.innerHTML=clusters.map(function(cl){
+    const rep=cl.representative_item_id?(ctx.itemsById[cl.representative_item_id]||null):null;
+    const pages=(rep&&(rep.pages||[]).length)?('p.'+rep.pages.join(',')):'';
+    const repLine=rep?('代表项 '+rep.id+(rep.asset_id?' · '+rep.asset_id:'')
+      +(pages?' · '+pages:'')):'';
+    return '<button type="button" class="rr-cl'+(ctx.selected===cl.cluster_id?' is-on':'')+'"'
+      +' data-cluster="'+escAttr(cl.cluster_id||'')+'">'
+      +'<span class="rr-cl-h"><span class="rr-cl-title">'
+      +esc(cl.title||cl.code||cl.cluster_id||'?')+'</span>'
+      +'<span class="rr-cl-code">'+esc(cl.code||'')+'</span></span>'
+      +'<span class="rr-cl-meta"><span>'+reviewNum(cl.item_count)+' 项</span>'
+      +'<span>待决定 '+reviewNum(cl.human_pending)+'</span>'
+      +reviewStateBadges(cl.states)+'</span>'
+      +(repLine?'<span class="rr-cl-rep">'+esc(repLine)+'</span>':'')
+      +'</button>';
+  }).join('');
+}
+function reviewClusterItems(cl,data){
+  const ctx=REVIEW_CTX;
+  const map=(ctx&&ctx.itemsById)||{};
+  const ids=(cl&&cl.item_ids)||[];
+  if(ids.length){
+    return ids.map(function(id){ return map[id]; }).filter(Boolean);
+  }
+  return ((data&&data.items)||[]).filter(function(it){
+    return it&&it.cluster_id===(cl&&cl.cluster_id);
+  });
+}
+function reviewAssetUrl(path){
+  const ctx=REVIEW_CTX; if(!ctx) return '';
+  return '/api/datasets/'+encodeURIComponent(ctx.dataset)+'/sources/'
+    +encodeURIComponent(ctx.sha)+'/assets/'
+    +String(path||'').split('/').map(encodeURIComponent).join('/');
+}
+function reviewEvidenceHtml(item){
+  const ev=(item&&item.evidence)||{};
+  const crops=(ev.crops||[]).filter(Boolean);
+  const links=crops.map(function(c){
+    const name=String(c).split('/').pop()||c;
+    return '<a target="_blank" rel="noopener" href="'+escAttr(reviewAssetUrl(c))+'">crop '
+      +esc(name)+'</a>';
+  });
+  const nativeN=(ev.native_line_ids||[]).length;
+  return '<div class="rr-ev">'
+    +(links.length?links.join(''):'<span class="rr-muted">无 crop 证据</span>')
+    +(nativeN?'<span class="rr-muted">native lines '+reviewNum(nativeN)+'</span>':'')
+    +(ev.hash?'<span class="rr-muted">证据 '+esc(String(ev.hash).slice(0,12))+'…</span>':'')
+    +'</div>';
+}
+function reviewStrategyOptions(item){
+  const strategies=(item&&item.strategies)||[];
+  const cur=item&&item.entry&&item.entry.strategy;
+  return strategies.map(function(s){
+    const on=cur&&cur.id===s.id&&Number(cur.version)===Number(s.version==null?1:s.version);
+    const off=(s.available===false);
+    const label=(s.name||s.id||'?')+(s.recommended?' ★':'')+(off?'（不可用）':'');
+    return '<option value="'+escAttr(s.id||'')+'" data-version="'
+      +escAttr(String(s.version==null?1:s.version))+'"'
+      +(off?' title="'+escAttr(s.unavailable_reason||'不可用')+'"':'')
+      +(on?' selected':'')+(off?' disabled':'')+'>'+esc(label)+'</option>';
+  }).join('');
+}
+function reviewCandidateHtml(item){
+  const cands=(item&&item.candidates)||[];
+  if(!cands.length) return '<span class="rr-muted">无规则候选（需人工决定或暂缓）</span>';
+  return cands.map(function(c){
+    const strat=reviewStrategyName(item,c.strategy);
+    const action=(c.action&&(c.action.name||c.action.type))||'';
+    const params=(c.action&&c.action.params&&Object.keys(c.action.params).length)
+      ? reviewJsonBits(c.action.params):'';
+    const val=(c.validator&&c.validator.status)?String(c.validator.status):'';
+    const reasons=(c.validator&&(c.validator.reasons||[]))||[];
+    return '<div class="rr-cand">'
+      +(strat?'<span class="rr-cand-s">'+esc(strat)+'</span>':'')
+      +(action?' <code>'+esc(action)+'</code>':'')
+      +(params?' <span class="rr-params">'+esc(params)+'</span>':'')
+      +(val?' '+reviewBadge(val,val):'')
+      +(reasons.length?' <span class="rr-why">'+esc(reasons.join('; '))+'</span>':'')
+      +(c.source?' <span class="rr-params">'+esc(c.source)+'</span>':'')
+      +'</div>';
+  }).join('');
+}
+function reviewEntryHtml(item){
+  const entry=item&&item.entry;
+  if(!entry) return '<div class="rr-entry">计划条目：尚无（选择策略后创建；确认按条目进行）</div>';
+  const bits=['条目 '+entry.entry_id,
+    '状态 '+(REVIEW_STATUS_LABEL[entry.status]||entry.status||'draft'),
+    'revision r'+(entry.revision==null?'?':entry.revision),
+    '策略 '+reviewStrategyName(item,entry.strategy)];
+  if(entry.locked) bits.push('已锁定');
+  if(entry.stale) bits.push('已过期：'+((entry.stale_reasons||[]).join('; ')||'evidence 变化'));
+  return '<div class="rr-entry'+(entry.stale?' is-stale':'')+'">'+esc(bits.join(' · '))+'</div>';
+}
+function reviewResolutionHtml(item){
+  const res=item&&item.resolution;
+  if(!res) return '';
+  return '<div class="rr-entry">已记录：'+esc(res.name||'')
+    +(res.reason_code?' · '+(REVIEW_REASON_LABEL[res.reason_code]||res.reason_code):'')
+    +(res.reason?' · '+res.reason:'')
+    +(res.recorded_at?' · '+res.recorded_at:'')
+    +'</div>';
+}
+function reviewActionsHtml(item){
+  const entry=item&&item.entry;
+  const locked=!!(entry&&entry.locked);
+  const hasEntry=!!(entry&&entry.entry_id);
+  const strategies=(item&&item.strategies)||[];
+  const availableN=strategies.filter(function(s){ return s.available!==false; }).length;
+  let html='<div class="rr-actions">';
+  if(strategies.length){
+    html+='<label class="rr-field"><span>策略</span><select data-r="strategy"'
+      +(locked?' disabled title="条目已锁定，先解锁才能换策略"':'')+'>'
+      +'<option value="">选择策略…</option>'+reviewStrategyOptions(item)+'</select></label>'
+      +'<button type="button" class="secondary" data-r="select"'
+      +(locked||!availableN?' disabled':'')+'>选择</button>';
+  }else{
+    html+='<span class="rr-muted">无可用策略：可暂缓并选择原因</span>';
+  }
+  html+='<button type="button" class="secondary" data-r="confirm"'
+    +(hasEntry&&!(entry&&entry.stale)?'':' disabled')+'>确认</button>'
+    +'<button type="button" class="secondary" data-r="'+(locked?'unlock':'lock')+'"'
+    +(hasEntry?'':' disabled')+'>'+(locked?'解锁':'锁定')+'</button></div>'
+    +'<div class="rr-actions rr-defer">'
+    +'<label class="rr-field"><span>暂缓原因</span><select data-r="defer-code">'
+    +'<option value="">选择原因…</option>'
+    +REVIEW_DEFER_CODES.map(function(code){
+      return '<option value="'+escAttr(code)+'">'
+        +esc(REVIEW_REASON_LABEL[code]||code)+'</option>';
+    }).join('')
+    +'</select></label>'
+    +'<input data-r="defer-reason" type="text" maxlength="200" placeholder="说明（可选）"'
+    +' aria-label="暂缓说明">'
+    +'<button type="button" class="secondary" data-r="defer">暂缓</button></div>';
+  return html;
+}
+function reviewItemHtml(item){
+  const status=item.status||'needs_decision';
+  const pages=(item.pages||[]).join(',');
+  const meta=['asset '+(item.asset_id||'?'), pages?('页 p.'+pages):'',
+    'code '+(item.code||'')].filter(Boolean).join(' · ');
+  return '<article class="rr-item" data-item="'+escAttr(item.id||'')+'">'
+    +'<div class="rr-item-h"><span class="rr-item-id">'+esc(item.id||'')+'</span>'
+    +reviewBadge(REVIEW_STATUS_LABEL[status]||status,status)
+    +(item.triage?reviewBadge(REVIEW_TRIAGE_LABEL[item.triage]||item.triage,item.triage):'')
+    +(item.stale?'<span class="rr-badge bad">stale</span>':'')
+    +'</div>'
+    +'<p class="rr-item-msg">'+esc(item.message||'')+'</p>'
+    +'<div class="rr-item-meta">'+esc(meta)+'</div>'
+    +reviewEvidenceHtml(item)
+    +'<div class="rr-ba"><div class="rr-ba-col"><h5>当前</h5><code>'
+    +esc(reviewJsonBits(item.current))+'</code></div>'
+    +'<div class="rr-ba-col"><h5>建议</h5>'+reviewCandidateHtml(item)+'</div></div>'
+    +reviewEntryHtml(item)
+    +reviewResolutionHtml(item)
+    +reviewActionsHtml(item)
+    +'</article>';
+}
+function reviewSuggestionsHtml(suggestions){
+  const ctx=REVIEW_CTX||{itemsById:{}};
+  return '<ul class="rr-sugs">'+suggestions.map(function(s){
+    const item=ctx.itemsById[s.item_id];
+    const strat=reviewStrategyName(item||{},s.strategy)||(s.strategy&&s.strategy.id)||'';
+    const state=s.state||((s.validator&&s.validator.status)||'');
+    const reasons=(s.validator&&(s.validator.reasons||[]))||[];
+    return '<li class="rr-sug"><span class="rr-sug-item">'+esc(s.item_id||'')+'</span>'
+      +(strat?' · '+esc(strat)+(s.strategy&&s.strategy.version!=null
+          ?' @v'+esc(String(s.strategy.version)):''):'')
+      +(state?' '+reviewBadge(REVIEW_STATUS_LABEL[state]||state,state):'')
+      +(s.in_plan?' <span class="rr-badge muted">已在计划</span>':'')
+      +(reasons.length?' <span class="rr-why">'+esc(reasons.join('; '))+'</span>':'')
+      +'</li>';
+  }).join('')+'</ul>';
+}
+function reviewStrategiesHtml(strategies){
+  return '<ul class="rr-strats">'+strategies.map(function(s){
+    const available=(s.available!==false);
+    const bits=[];
+    if(s.recommended) bits.push('<span class="rr-badge accent">推荐</span>');
+    if(s.min_tier) bits.push('<span class="rr-badge muted">'+esc(s.min_tier)+'</span>');
+    if(s.batch_safe===false) bits.push('<span class="rr-badge warn">非批量安全</span>');
+    return '<li class="rr-strat'+(available?'':' off')+'">'
+      +'<div class="rr-strat-h"><span class="rr-strat-name">'
+      +esc(s.name||s.id||'?')+'</span>'
+      +'<span class="rr-strat-id">'+esc((s.id||'')+' @v'+(s.version==null?1:s.version))+'</span>'
+      +bits.join('')+'</div>'
+      +(s.description?'<div class="rr-strat-desc">'+esc(s.description)+'</div>':'')
+      +(s.risk?'<div class="rr-strat-risk">风险：'+esc(s.risk)+'</div>':'')
+      +(!available&&s.unavailable_reason?'<div class="rr-strat-why">不可用：'
+          +esc(s.unavailable_reason)+'</div>':'')
+      +'</li>';
+  }).join('')+'</ul>';
+}
+function paintReviewDetail(r){
+  const box=$('#reviewDetail'); if(!box) return;
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const data=r||ctx.data; if(!data) return;
+  const cl=(data.clusters||[]).find(function(c){ return c.cluster_id===ctx.selected; });
+  if(!cl){
+    box.innerHTML='<span class="hist-empty">选择一个簇查看结论、证据与动作，或点“生成/更新报告”。</span>';
+    return;
+  }
+  const items=reviewClusterItems(cl,data);
+  const rep=cl.representative_item_id?(ctx.itemsById[cl.representative_item_id]||null):null;
+  const repPages=(rep&&(rep.pages||[]).length)?('p.'+rep.pages.join(',')):'';
+  const detailMeta=[cl.cluster_id,cl.kind,cl.item_count+' 项',
+    cl.human_pending+' 待决定',
+    rep?('代表项 '+rep.id+(rep.asset_id?' · '+rep.asset_id:'')
+      +(repPages?' · '+repPages:'')):''].filter(Boolean).join(' · ');
+  const conclusion=cl.conclusion?reviewStr(cl.conclusion,''):'';
+  const suggestions=(cl.suggestions||[]);
+  const strategies=(cl.strategies||[]);
+  box.innerHTML='<header class="rr-det-h"><div class="rr-det-title"><h3>'
+    +esc(cl.title||cl.code||'簇')+'</h3>'
+    +'<span class="rr-cl-code">'+esc(cl.code||'')+'</span>'
+    +reviewStateBadges(cl.states)+'</div>'
+    +'<div class="rr-det-meta">'+esc(detailMeta)+'</div></header>'
+    +'<section class="rr-sec rr-conclusion"><h4>报告结论</h4>'
+    +(conclusion?'<p>'+esc(conclusion)+'</p>'
+      :'<p class="rr-muted">尚无报告结论。点“生成/更新报告”运行确定性规则，生成簇级建议。</p>')
+    +(suggestions.length?reviewSuggestionsHtml(suggestions):'')
+    +'</section>'
+    +(strategies.length?'<section class="rr-sec"><h4>可用策略</h4>'
+      +reviewStrategiesHtml(strategies)+'</section>':'')
+    +'<section class="rr-sec"><h4>条目 · '+items.length+'</h4>'
+    +(items.length?'<div class="rr-items">'+items.map(reviewItemHtml).join('')+'</div>'
+      :'<span class="hist-empty">该簇没有条目。</span>')
+    +'</section>'
+    +'<p class="rr-impact"><b>影响说明</b>：选择策略或确认只更新审阅计划（条目级，按 item 确认）；'
+    +'构建并发布候选才会按 R2 完整重建（CXL 约 2 分钟，发布后需要 reindex）。'
+    +'锁定与暂缓是 R0 审阅记录，不改变 corpus，也不触发重建。</p>';
+}
+function refreshReviewChip(){
+  if(DATASETS.length) paintDatasetDialog();
+}
+function paintReview(r){
+  const ctx=REVIEW_CTX; if(!ctx||!r) return;
+  ctx.data=r;
+  ctx.itemsById={};
+  (r.items||[]).forEach(function(it){ if(it&&it.id) ctx.itemsById[it.id]=it; });
+  const clusters=(r.clusters||[]);
+  if(!ctx.selected||!clusters.some(function(c){ return c.cluster_id===ctx.selected; })){
+    const preferred=clusters.find(function(c){ return Number(c.human_pending||0)>0; })
+      ||clusters[0]||null;
+    ctx.selected=preferred?preferred.cluster_id:null;
+  }
+  REVIEW_COUNTS[reviewKey(ctx.dataset,ctx.sha)]=reviewCounts(r);
+  paintReviewHead(r);
+  paintReviewSummary(r);
+  paintReviewClusters(r);
+  paintReviewDetail(r);
+  refreshReviewChip();
+}
+async function refreshReview(successText){
+  const ctx=REVIEW_CTX; if(!ctx) return;
   try{
-    await callJSON('/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)
-      +'/sources/'+encodeURIComponent(REVIEW_CTX.sha)+'/review/'
-      +encodeURIComponent(itemId),{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({decision:decision})});
-    item.classList.add('decided-'+decision);
-    item.querySelectorAll('button').forEach(function(b){ b.disabled=true; });
-    $('#reviewMsg').textContent='Decision "'+decision+'" recorded for '+itemId+'.';
+    const r=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'?group=cluster');
+    paintReview(r);
+    if(successText) reviewMsg(successText,false);
   }catch(e){
-    $('#reviewMsg').innerHTML='<span class="err">'+esc(e.message||e)+'</span>';
-    btn.disabled=false;
+    reviewMsg(reviewLoadErrText(e),true);
   }
 }
-async function rebuildReviewed(){
-  if(!REVIEW_CTX) return;
-  const btn=$('#reviewRebuildBtn');
-  btn.disabled=true; btn.textContent='Rebuilding…';
+async function openReview(dsId,sha){
+  REVIEW_CTX={dataset:dsId,sha:sha,data:null,itemsById:{},selected:null,busy:false};
+  const m=$('#reviewModal'); if(!m) return;
+  m.hidden=false;
+  reviewMsg('');
+  const sum=$('#reviewSummary');
+  if(sum) sum.innerHTML='<span class="hist-empty">正在读取审阅报告…</span>';
+  const cls=$('#reviewClusters');
+  if(cls) cls.innerHTML='<span class="hist-empty">正在加载簇…</span>';
+  const det=$('#reviewDetail');
+  if(det) det.innerHTML='<span class="hist-empty">正在加载…</span>';
   try{
-    await callJSON('/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)
-      +'/sources/'+encodeURIComponent(REVIEW_CTX.sha)+'/rebuild',{
-      method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({reasons:['review decisions']})});
-    $('#reviewMsg').textContent='Rebuild queued; the source returns to extracted '
-      +'when peelfeed finishes. Press Refresh to update the chip.';
-    await loadDatasets();
+    const r=await reviewFetchJSON(reviewBase(dsId,sha)+'?group=cluster');
+    paintReview(r);
   }catch(e){
-    $('#reviewMsg').innerHTML='<span class="err">'+esc(e.message||e)+'</span>';
-  }finally{
-    btn.disabled=false; btn.textContent='Apply & rebuild';
+    reviewMsg(reviewLoadErrText(e),true);
+    if(cls) cls.innerHTML='<span class="hist-empty">无法加载审阅报告：'+esc(e.message||e)+'</span>';
+    if(det) det.innerHTML='<span class="hist-empty">先修复 peelfeed 连接或重新抽取，再打开审阅报告。</span>';
   }
+  setTimeout(function(){ const c=$('#reviewClose'); if(c) c.focus(); },30);
+}
+async function generateReviewReport(){
+  const ctx=REVIEW_CTX;
+  if(!ctx||ctx.busy) return;
+  const btn=$('#reviewReportBtn');
+  ctx.busy=true;
+  if(btn){ btn.disabled=true; btn.textContent='生成中…'; }
+  reviewMsg('正在运行确定性规则并生成审阅报告…');
+  try{
+    const rep=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'/reports',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({})});
+    const counts=(rep&&rep.counts)||{};
+    await refreshReview();
+    reviewMsg('报告已生成（'+((rep&&rep.status)||'ready')+'）：建议 '
+      +reviewNum(counts.suggestions)+' · 自动归档 '+reviewNum(counts.auto_archived)
+      +' · 需要决定 '+reviewNum(counts.needs_decision)+'。',false);
+  }catch(e){
+    reviewMsg('生成报告失败：'+reviewErrText(e),true);
+  }finally{
+    ctx.busy=false;
+    if(btn){ btn.disabled=false; btn.textContent='生成/更新报告'; }
+  }
+}
+async function refreshReviewFromButton(){
+  if(!REVIEW_CTX) return;
+  const btn=$('#reviewRefreshBtn');
+  if(btn){ btn.disabled=true; btn.textContent='刷新中…'; }
+  reviewMsg('正在刷新审阅报告…');
+  await refreshReview('已刷新。');
+  if(btn){ btn.disabled=false; btn.textContent='刷新'; }
+}
+async function reviewPost(body,btn){
+  const ctx=REVIEW_CTX;
+  if(!ctx||ctx.busy) return;
+  ctx.busy=true;
+  const label=btn?btn.textContent:'';
+  if(btn){ btn.disabled=true; btn.textContent='处理中…'; }
+  try{
+    const plan=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'/plan',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    const v=(plan&&plan.plan_version!=null)?plan.plan_version
+      :((ctx.data&&ctx.data.plan)?ctx.data.plan.plan_version:0);
+    await refreshReview('计划已更新到 v'+v+'（'
+      +(REVIEW_ACTION_LABEL[body.action]||body.action)+'）。');
+  }catch(e){
+    reviewMsg(reviewErrText(e),true);
+    await refreshReview();   // a 409/stale response means the plan moved on
+  }finally{
+    ctx.busy=false;
+    if(btn&&btn.isConnected){ btn.disabled=false; btn.textContent=label; }
+  }
+}
+async function reviewAction(btn){
+  const ctx=REVIEW_CTX;
+  if(!ctx||!ctx.data) return;
+  const kind=btn&&btn.getAttribute('data-r');
+  if(!kind) return;
+  const card=btn.closest('.rr-item');
+  const itemId=card?card.getAttribute('data-item'):'';
+  const item=itemId?ctx.itemsById[itemId]:null;
+  const planVersion=Number(((ctx.data.plan||{}).plan_version)||0);
+  const body={base_plan_version:planVersion};
+  if(kind==='select'){
+    const sel=card?card.querySelector('select[data-r="strategy"]'):null;
+    const opt=sel&&sel.options[sel.selectedIndex];
+    if(!opt||!opt.value){ reviewMsg('先选择一个可用策略。',true); return; }
+    body.action='select';
+    body.entry={item_id:itemId,
+      strategy:{id:opt.value,version:Number(opt.getAttribute('data-version')||1)},
+      params:{}};
+  }else if(kind==='confirm'||kind==='lock'||kind==='unlock'){
+    const entry=item&&item.entry;
+    if(!entry||!entry.entry_id){ reviewMsg('该项还没有计划条目；先选择策略。',true); return; }
+    body.action=kind;
+    body.entry_id=entry.entry_id;
+  }else if(kind==='defer'){
+    const sel=card?card.querySelector('select[data-r="defer-code"]'):null;
+    const code=sel?sel.value:'';
+    if(!code){ reviewMsg('暂缓必须选择原因（reason_code）。',true); return; }
+    body.action='defer';
+    body.item_id=itemId;
+    body.reason_code=code;
+    const reasonEl=card?card.querySelector('input[data-r="defer-reason"]'):null;
+    if(reasonEl&&reasonEl.value.trim()) body.reason=reasonEl.value.trim();
+  }else{
+    return;
+  }
+  await reviewPost(body,btn);
+}
+function selectReviewCluster(clusterId){
+  const ctx=REVIEW_CTX;
+  if(!ctx||!ctx.data) return;
+  ctx.selected=clusterId;
+  paintReviewClusters(ctx.data);
+  paintReviewDetail(ctx.data);
 }
 async function addDataset(ev){
   ev.preventDefault();
@@ -4940,11 +5541,20 @@ $('#datasetList').addEventListener('click',function(ev){
                 btn.getAttribute('data-sha')||'');
 });
 $('#datasetForm').addEventListener('submit',addDataset);
-$('#reviewList').addEventListener('click',function(ev){
-  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-dec]'):null;
-  if(btn) decideReview(btn);
+$('#reviewClusters').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-cluster]'):null;
+  if(!btn) return;
+  selectReviewCluster(btn.getAttribute('data-cluster')||'');
 });
-$('#reviewRebuildBtn').onclick=rebuildReviewed;
+$('#reviewDetail').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  reviewAction(btn).catch(function(e){
+    reviewMsg('操作失败：'+(e&&e.message||e),true);
+  });
+});
+$('#reviewReportBtn').onclick=generateReviewReport;
+$('#reviewRefreshBtn').onclick=refreshReviewFromButton;
 $('#reviewClose').onclick=function(){ const m=$('#reviewModal'); if(m) m.hidden=true; };
 $('#reviewModal').addEventListener('click',function(ev){
   if(ev.target===this){ const m=$('#reviewModal'); if(m) m.hidden=true; }

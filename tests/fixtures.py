@@ -554,6 +554,7 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
         "conversion_id": conversion_id,
         "profile": profile,
         "engine": engine,
+        "review_jobs": {},
         "validation": {"errors": 0, "review_items": 0},
         "started_at": contracts.utc_now(),
         "finished_at": contracts.utc_now(),
@@ -590,6 +591,12 @@ DEFAULT_CAPABILITIES = {
     "chunk_contract": 1,
     "peel_event_schema": 1,
     "chunker_version": 1,
+    "review_schema": 2,
+    "operations": ["inherit_header_from", "set_header_rows"],
+    "resolutions": ["confirm_headerless", "confirm_known", "defer",
+                    "keep_original_figure", "keep_visual_fallback"],
+    "strategies": [{"id": "use_first_row_header", "version": 1,
+                    "name": "本表首行作表头"}],
     "formats": ["pdf"],
     "profiles": ["cxl", "ddr5", "dwc", "generic", "pcie", "pipe"],
     "chunk_profiles": ["default", "large", "small"],
@@ -599,26 +606,192 @@ DEFAULT_CAPABILITIES = {
                 "models_present": True},
 }
 
+# --- schema-2 review payloads (the shapes the real peelfeed CLI prints) ----
+
+STRATEGY_OPTIONS = [
+    {"id": "use_first_row_header", "version": 1, "name": "本表首行作表头",
+     "description": "把本表第 0 行作为表头；文本来自本表 native cells。",
+     "recommended": True, "available": True, "unavailable_reason": None,
+     "capabilities": ["native_lines"], "params_schema": {},
+     "action": {"type": "operation", "name": "set_header_rows"},
+     "min_tier": "R2", "batch_safe": True,
+     "risk": "误把数据行作表头；须过签名阈值和逐表 validator"},
+    {"id": "use_ocr_labels", "version": 1, "name": "OCR 标签",
+     "description": "用按需 OCR 恢复标签（需要 OCR）。",
+     "recommended": False, "available": False,
+     "unavailable_reason": "OCR is not configured",
+     "capabilities": ["ocr"], "params_schema": {},
+     "action": {"type": "operation", "name": "set_asset_labels_from_ocr"},
+     "min_tier": "R2", "batch_safe": False,
+     "risk": "OCR 文本不是 native evidence"},
+]
+
+CLUSTER_HEADER = {
+    "cluster_id": "cl-0f1e2d3c4b5a",
+    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
+                    "profile": "generic", "operation": "set_header_rows",
+                    "layout": "structured|cols=2|rows=6-11|caption=yes|pages=1",
+                    "evidence": "native_lines"},
+    "code": "table_header_absent",
+    "title": "表格缺少表头",
+    "kind": "table",
+    "item_count": 1,
+    "human_pending": 1,
+    "representative_item_id": "it-3f9c2a4b6d8e0f1a",
+    "states": {"needs_decision": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+}
+
+CLUSTER_FIGURE = {
+    "cluster_id": "cl-9a8b7c6d5e4f",
+    "cluster_key": {"code": "no_native_labels", "asset_kind": "figure",
+                    "profile": "generic", "operation": None,
+                    "layout": "figure|pages=2", "evidence": "page_image"},
+    "code": "no_native_labels",
+    "title": "图内没有 native 文本",
+    "kind": "figure",
+    "item_count": 1,
+    "human_pending": 0,
+    "representative_item_id": "it-8b7a6c5d4e3f2a10",
+    "states": {"pending_evidence": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-8b7a6c5d4e3f2a10"],
+}
+
+ITEM_HEADER = {
+    "id": "it-3f9c2a4b6d8e0f1a",
+    "code": "table_header_absent",
+    "kind": "table",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "table-3-19",
+    "pages": [109],
+    "cluster_id": "cl-0f1e2d3c4b5a",
+    "message": "table_header_absent: table-3-19; only explicit column "
+               "positions are named.",
+    "triage": "deterministic_candidate",
+    "status": "needs_decision",
+    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                 "crops": ["tables/table-3-19_p0109.png"],
+                 "native_line_ids": [123], "ocr_evidence": []},
+    "current": {"status": "structured", "row_count": 5, "col_count": 2,
+                "header_rows": []},
+    "candidates": [{
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "action": {"type": "operation", "name": "set_header_rows",
+                   "params": {"rows": [0]}},
+        "source": "rule",
+        "validator": {"status": "ready", "reasons": []},
+        "evidence_refs": ["asset:table-3-19", "row:0"],
+    }],
+    "parent_candidates": [],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": None,
+    "resolution": None,
+    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
+               "caption": "Table 3-19. RSP_PRE Encodings"},
+    "stale": False,
+}
+
+ITEM_FIGURE = {
+    "id": "it-8b7a6c5d4e3f2a10",
+    "code": "no_native_labels",
+    "kind": "figure",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "figure-1-1",
+    "pages": [2],
+    "cluster_id": "cl-9a8b7c6d5e4f",
+    "message": "no_native_labels: figure-1-1; use OCR evidence or keep the "
+               "original figure.",
+    "triage": "needs_ocr",
+    "status": "pending_evidence",
+    "evidence": {"hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+                 "crops": ["images/fig_1_1.png"], "native_line_ids": [],
+                 "ocr_evidence": []},
+    "current": {"status": "visual_fallback", "row_count": 0, "col_count": 0,
+                "header_rows": []},
+    "candidates": [],
+    "parent_candidates": [],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": None,
+    "resolution": None,
+    "layout": {"cols": 0, "rows_bucket": "0", "page_span": 1,
+               "caption": "Figure 1-1. Widget frame"},
+    "stale": False,
+}
+
 DEFAULT_REVIEW = {
     "peel_id": "peel",
-    "review_items": 2,
-    "items": [
-        {"id": "table-p0001-01/header", "message": "no header cells",
-         "asset": {"id": "table-p0001-01", "kind": "table",
-                   "caption": "Table 1-1", "pages": [1],
-                   "path": "tables/table-1-1.json", "segments": []},
-         "suggestion": None},
-        {"id": "figure-1-1/labels", "message": "no native labels",
-         "asset": {"id": "figure-1-1", "kind": "figure",
-                   "caption": "Figure 1-1", "pages": [2],
-                   "path": "images/fig_1_1.png", "segments": []},
-         "suggestion": None},
-    ],
-    "char_limit_exceptions": [],
-    "outline_reconciliations": [],
-    "asset_stats": {"tables": 1, "figures": 1},
-    "corrections": 0,
-    "llm": {"available": False, "prompt_set": ""},
+    "review_schema": 2,
+    "generated_at": "2026-11-05T00:00:00Z",
+    "profile": "generic",
+    "derived_from": {
+        "uncorrected_identity": "55959d86" + "0" * 56,
+        "engine_fingerprint": "23999f428fa6d365",
+        "derivation_version": 1,
+    },
+    "capabilities": {"review_schema": 2, "native_lines": True, "ocr": False,
+                     "ocr_detail": None, "vlm": False},
+    "counts": {"raw_items": 2, "items": 2, "clusters": 2, "human_pending": 1,
+               "human_pending_clusters": 1, "pending_evidence": 1,
+               "auto_resolved": 0, "needs_decision": 1, "draft": 0,
+               "confirmed": 0, "applied": 0, "deferred": 0, "failed_check": 0,
+               "stale": 0, "unsupported_items": 0},
+    "triage_counts": {"deterministic_candidate": 1, "needs_decision": 0,
+                      "needs_ocr": 1, "informational": 0, "unsupported": 0},
+    "plan": {"plan_version": 0, "entries": 0, "draft": 0, "confirmed": 0,
+             "locked": 0, "stale": 0},
+    "report": None,
+    "clusters": [CLUSTER_HEADER, CLUSTER_FIGURE],
+    "items": [ITEM_HEADER, ITEM_FIGURE],
+}
+
+DEFAULT_PLAN = {
+    "peel_id": "peel",
+    "review_schema": 2,
+    "plan_version": 0,
+    "updated_at": "2026-11-05T00:00:00Z",
+    "entries": [],
+    "entry": None,
+    "resolution": None,
+}
+
+DEFAULT_REPORT = {
+    "peel_id": "peel",
+    "status": "ready",
+    "report_path": "extract/review/report.json",
+    "report": {
+        "schema_version": 1,
+        "status": "ready",
+        "stale": False,
+        "generated_at": "2026-11-05T00:00:00Z",
+        "provider": {"kind": "rule", "model": None, "prompt_version": None},
+        "clusters": [{
+            "cluster_id": "cl-0f1e2d3c4b5a",
+            "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+            "conclusion": "规则建议把第 0 行作为表头。",
+            "suggestions": [{
+                "item_id": "it-3f9c2a4b6d8e0f1a",
+                "strategy": {"id": "use_first_row_header", "version": 1},
+                "params": {},
+                "evidence_refs": ["asset:table-3-19"],
+                "validator": {"status": "ready", "reasons": []},
+                "in_plan": False,
+                "state": "ready",
+            }],
+            "clarifications": [],
+        }],
+        "auto_archived": [],
+        "unsupported": [],
+    },
+    "counts": {"suggestions": 1, "auto_archived": 0, "unsupported": 0,
+               "needs_decision": 1},
 }
 
 
@@ -640,9 +813,24 @@ def emit(payload):
     return 0
 
 
-def fail(message, code=2):
-    print("error: " + message, file=sys.stderr)
+def copy_json(value):
+    return json.loads(json.dumps(value))
+
+
+def fail(message, code=2, error_code="error", detail=None):
+    """Emit the real peelfeed error protocol: stderr line + JSON error object."""
+    print("error [" + str(error_code) + "] " + str(message), file=sys.stderr)
+    print(json.dumps({"error": {"code": str(error_code),
+                                "message": str(message),
+                                "detail": detail or {}}}))
     return code
+
+
+def read_stdin_json():
+    try:
+        return json.loads(sys.stdin.read() or "null")
+    except ValueError:
+        return None
 
 
 def option(rest, name):
@@ -656,7 +844,8 @@ VALUE_FLAGS = {
     "--root", "--item", "--decision", "--note", "--evidence", "--model",
     "--confidence", "--event", "--data", "--reason", "--profile",
     "--chunk-profile", "--llm", "--limit", "--pages", "--slug",
-    "--collection", "--device",
+    "--collection", "--device", "--group", "--status", "--entry",
+    "--base-plan-version", "--input",
 }
 
 
@@ -696,6 +885,13 @@ def main():
     command, rest = argv[0], argv[1:]
     state = load_state()
     root = option(rest, "--root")
+
+    forced_error = (state.get("errors") or {}).get(command)
+    if forced_error:
+        return fail(forced_error.get("message") or "simulated failure",
+                    int(forced_error.get("exit") or 2),
+                    forced_error.get("code") or "error",
+                    forced_error.get("detail"))
 
     if command == "capabilities":
         delay = float(state.get("capabilities_delay") or 0)
@@ -789,32 +985,155 @@ def main():
     if command == "review":
         peel_id = first_positional(rest)
         if peel_id not in peels:
-            return fail("no such peel", 3)
-        payload = dict(state.get("review") or DEFAULT_REVIEW)
+            return fail("no such peel", 3, "not_found")
+        payload = copy_json(state.get("review") or DEFAULT_REVIEW)
         payload["peel_id"] = peel_id
+        item_id = option(rest, "--item")
+        if item_id:
+            item = next((candidate for candidate in payload.get("items") or []
+                         if candidate.get("id") == item_id), None)
+            if item is None:
+                return fail("no such review item", 3, "not_found")
+            return emit({"peel_id": peel_id,
+                         "review_schema": payload.get("review_schema", 2),
+                         "item": item})
+        status_filter = option(rest, "--status")
+        if status_filter:
+            items = [candidate for candidate in payload.get("items") or []
+                     if candidate.get("status") == status_filter]
+            cluster_ids = {candidate.get("cluster_id") for candidate in items}
+            payload["items"] = items
+            clusters = []
+            for cluster in payload.get("clusters") or []:
+                if cluster.get("cluster_id") not in cluster_ids:
+                    continue
+                states = {}
+                for candidate in items:
+                    if candidate.get("cluster_id") == cluster.get("cluster_id"):
+                        state_name = candidate.get("status")
+                        states[state_name] = states.get(state_name, 0) + 1
+                cluster = copy_json(cluster)
+                cluster["states"] = states
+                clusters.append(cluster)
+            payload["clusters"] = clusters
         return emit(payload)
 
-    if command == "decide":
+    if command == "plan":
         peel_id = first_positional(rest)
         if peel_id not in peels:
-            return fail("no such peel", 3)
-        item = option(rest, "--item")
-        decision = option(rest, "--decision")
-        if decision not in ("accept", "reject", "override"):
-            return fail("decision must be accept|reject|override")
-        state.setdefault("decisions", []).append({
-            "peel_id": peel_id,
-            "item": item,
-            "decision": decision,
-            "note": option(rest, "--note"),
-            "evidence": option(rest, "--evidence"),
-            "model": option(rest, "--model"),
-            "confidence": option(rest, "--confidence"),
-        })
+            return fail("no such peel", 3, "not_found")
+        plan = copy_json(state.get("plan") or DEFAULT_PLAN)
+        plan["peel_id"] = peel_id
+        plan.setdefault("review_schema", 2)
+        values = positionals(rest)
+        action = values[1] if len(values) > 1 else "show"
+        if action == "show":
+            return emit(plan)
+        if action not in ("select", "confirm", "lock", "unlock", "defer"):
+            return fail("unknown plan action: " + str(action), 2, "validation")
+        entries = plan.get("entries") or []
+        entry = None
+        resolution = None
+        if action in ("select", "defer"):
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                return fail("plan input must be a JSON object", 2, "validation")
+            base = request.get("base_plan_version")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            item_id = request.get("item_id")
+            if not item_id:
+                return fail("plan item_id is required", 2, "validation")
+            if action == "select":
+                strategy = request.get("strategy") or {}
+                entry_id = "e-" + hashlib.sha256(
+                    str(item_id).encode("utf-8")).hexdigest()[:16]
+                match = next((candidate for candidate in entries
+                              if candidate.get("entry_id") == entry_id), None)
+                revision = 1
+                if match is not None:
+                    revision = int(match.get("revision") or 0) + 1
+                    entries = [candidate for candidate in entries
+                               if candidate.get("entry_id") != entry_id]
+                entry = {
+                    "entry_id": entry_id,
+                    "item_id": str(item_id),
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": str(strategy.get("id") or "unknown"),
+                                 "version": int(strategy.get("version") or 1)},
+                    "action": {"type": "operation",
+                               "name": "set_header_rows",
+                               "params": request.get("params") or {}},
+                    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                                 "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": "user",
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": request.get("notes"),
+                }
+                entries.append(entry)
+            else:
+                resolution = {
+                    "schema_version": 1,
+                    "resolution_id": "r-" + hashlib.sha256(
+                        str(item_id).encode("utf-8")).hexdigest()[:16],
+                    "change": "add",
+                    "item_id": str(item_id),
+                    "name": "defer",
+                    "reason_code": request.get("reason_code"),
+                    "reason": request.get("reason"),
+                    "recorded_at": "2026-11-05T00:00:00Z",
+                }
+                state.setdefault("resolutions", []).append(resolution)
+        else:
+            entry_id = option(rest, "--entry")
+            base_raw = option(rest, "--base-plan-version")
+            try:
+                base = int(base_raw)
+            except (TypeError, ValueError):
+                return fail("--base-plan-version is required", 2, "validation")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            match = next((candidate for candidate in entries
+                          if candidate.get("entry_id") == entry_id), None)
+            if match is None:
+                return fail("no such plan entry", 3, "not_found")
+            if action == "confirm":
+                if match.get("stale"):
+                    return fail("entry is stale", 2, "conflict")
+                match["status"] = "confirmed"
+            elif action == "lock":
+                match["locked"] = True
+            else:
+                match["locked"] = False
+            entry = match
+        plan["entries"] = entries
+        plan["entry"] = entry
+        plan["resolution"] = resolution
+        plan["plan_version"] = int(plan.get("plan_version") or 0) + 1
+        plan["updated_at"] = "2026-11-05T00:00:00Z"
+        state["plan"] = plan
         save_state(state)
-        return emit({"ok": True, "peel_id": peel_id, "item_id": item,
-                     "decision": decision, "corrections": 1,
-                     "note": "corrections are append-only; run peelfeed rebuild"})
+        return emit(plan)
+
+    if command == "review-report":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        request = {}
+        if option(rest, "--input") is not None:
+            request = read_stdin_json() or {}
+            state.setdefault("review_report_requests", []).append(request)
+            save_state(state)
+        payload = copy_json(state.get("review_report") or DEFAULT_REPORT)
+        payload["peel_id"] = peel_id
+        return emit(payload)
 
     if command == "rebuild":
         peel_id = first_positional(rest)

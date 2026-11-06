@@ -1198,6 +1198,124 @@ def create_app():
             "working." % (hs.get("error") or "peelfeed is not configured"),
         )
 
+    def _require_review_schema():
+        """Handshake plus the structured review schema gate (contract §2/§4).
+
+        Review state lives in peelfeed and is only meaningful when its
+        ``capabilities`` advertise ``review_schema: 2``. A mismatch is a clear
+        409 (never a silent fallback to the removed flat review payload).
+        """
+        hs = _require_peelfeed()
+        schema = hs.get("review_schema")
+        if schema != peelfeed.REVIEW_SCHEMA:
+            raise HTTPException(
+                409,
+                "peelfeed review schema is %r but this build requires %d; "
+                "upgrade peelfeed to a CP1-capable version"
+                % (schema, peelfeed.REVIEW_SCHEMA),
+            )
+        return hs
+
+    def _call_peelfeed(what, call):
+        """Run one peelfeed call and map its typed error to HTTP (contract §4)."""
+        try:
+            return call()
+        except peelfeed.PeelfeedUnavailable as exc:
+            raise HTTPException(503, "extraction is unavailable: %s" % exc.detail)
+        except peelfeed.PeelfeedError as exc:
+            status = exc.status if exc.status in (400, 404, 409, 423) else 502
+            raise HTTPException(status, "peelfeed %s failed: %s"
+                                % (what, exc.detail))
+
+    def _review_plan_request(body):
+        """Validate ``POST …/review/plan`` and return ``(action, cli_request)``.
+
+        Shape per the CP1 wire contract §8:
+        ``{base_plan_version, action: select|confirm|lock|unlock|defer,
+        entry_id?, entry?, reason_code?, reason?}``. ``select`` wraps the
+        selection in ``entry``; ``defer`` carries ``item_id``/``reason_code``.
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(400, "a review plan request must be a JSON object")
+        action = str(body.get("action") or "").strip().lower()
+        if action not in peelfeed.PLAN_ACTIONS or action == "show":
+            raise HTTPException(
+                400, "action must be one of select, confirm, lock, unlock, defer")
+        base = body.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            raise HTTPException(
+                400, "base_plan_version is required and must be an integer >= 0")
+        if action == "select":
+            entry = body.get("entry")
+            if not isinstance(entry, dict):
+                raise HTTPException(
+                    400, "select needs an entry object "
+                         "{item_id, strategy{id,version}, params?, notes?}")
+            item_id = str(entry.get("item_id") or "").strip()
+            if not item_id:
+                raise HTTPException(400, "entry.item_id is required")
+            strategy = entry.get("strategy")
+            if not isinstance(strategy, dict):
+                raise HTTPException(400, "entry.strategy must be an object")
+            strategy_id = str(strategy.get("id") or "").strip()
+            if not strategy_id:
+                raise HTTPException(400, "entry.strategy.id is required")
+            version = strategy.get("version")
+            if isinstance(version, bool) or not isinstance(version, int):
+                raise HTTPException(
+                    400, "entry.strategy.version must be an integer")
+            params = entry.get("params")
+            if params is not None and not isinstance(params, dict):
+                raise HTTPException(400, "entry.params must be an object")
+            request = {
+                "base_plan_version": base,
+                "item_id": item_id,
+                "strategy": {"id": strategy_id, "version": version},
+            }
+            if params is not None:
+                request["params"] = params
+            notes = entry.get("notes")
+            if notes is not None:
+                request["notes"] = str(notes)
+            return action, request
+        if action in ("confirm", "lock", "unlock"):
+            entry_id = str(body.get("entry_id") or "").strip()
+            if not entry_id:
+                raise HTTPException(400, "%s needs entry_id" % action)
+            return action, {"base_plan_version": base, "entry_id": entry_id}
+        item_id = str(body.get("item_id") or "").strip()
+        if not item_id:
+            raise HTTPException(400, "defer needs item_id")
+        reason_code = str(body.get("reason_code") or "").strip().lower()
+        if reason_code not in peelfeed.DEFER_REASONS:
+            raise HTTPException(
+                400, "reason_code must be one of %s"
+                     % ", ".join(peelfeed.DEFER_REASONS))
+        request = {"base_plan_version": base, "item_id": item_id,
+                   "reason_code": reason_code}
+        reason = body.get("reason")
+        if reason is not None:
+            request["reason"] = str(reason)
+        return action, request
+
+    def _review_report_request(body):
+        """Validate ``POST …/review/reports`` filter ids (both optional)."""
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "a review report request must be a JSON object")
+        filters = {}
+        for field in ("item_ids", "cluster_ids"):
+            value = body.get(field)
+            if value is None:
+                continue
+            if not isinstance(value, list):
+                raise HTTPException(400, "%s must be a list of ids" % field)
+            cleaned = [str(item).strip() for item in value if str(item).strip()]
+            if cleaned:
+                filters[field] = cleaned
+        return filters
+
     def _source_by_sha(directory, sha):
         sha = str(sha or "").strip().lower()
         if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
@@ -1603,47 +1721,82 @@ def create_app():
         }
 
     @app.get("/api/datasets/{dataset_id}/sources/{sha}/review")
-    def source_review(dataset_id: str, sha: str):
-        """Proxy ``peelfeed review`` (items, asset crops, LLM availability)."""
-        directory = _dataset_dir(dataset_id)
-        entry = _source_by_sha(directory, sha)
-        peel_id = _peel_id_of(entry)
-        _require_peelfeed()
-        try:
-            return peelfeed.client().review(peel_id)
-        except peelfeed.PeelfeedUnavailable as exc:
-            raise HTTPException(503, "extraction is unavailable: %s" % exc.detail)
-        except peelfeed.PeelfeedError as exc:
-            raise HTTPException(
-                exc.status if exc.status in (400, 404, 409) else 502,
-                "peelfeed review failed: %s" % exc.detail)
+    def source_review(dataset_id: str, sha: str,
+                      group: Optional[str] = None,
+                      status: Optional[str] = None):
+        """Proxy ``peelfeed review`` — the structured schema-2 review view.
 
-    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/{item:path}")
-    def source_review_item(dataset_id: str, sha: str, item: str,
-                           payload: Optional[dict] = None):
-        """Proxy ``peelfeed decide`` (append-only corrections log)."""
+        ``group=cluster|code`` groups item ids (default: cluster) and
+        ``status=`` filters items/states; both are passed through unchanged.
+        Reading the list never calls an LLM. Requires ``review_schema == 2``
+        (409 otherwise) because the old flat queue no longer exists.
+        """
         directory = _dataset_dir(dataset_id)
         entry = _source_by_sha(directory, sha)
         peel_id = _peel_id_of(entry)
-        _require_peelfeed()
-        body = payload or {}
-        decision = str(body.get("decision") or "").strip().lower()
-        if decision not in ("accept", "reject", "override"):
-            raise HTTPException(400, "a review decision is required "
-                                     "(accept|reject|override)")
-        try:
-            return peelfeed.client().decide(
-                peel_id, item, decision,
-                note=body.get("note"),
-                evidence=body.get("evidence"),
-                model=body.get("model"),
-                confidence=body.get("confidence"))
-        except peelfeed.PeelfeedUnavailable as exc:
-            raise HTTPException(503, "extraction is unavailable: %s" % exc.detail)
-        except peelfeed.PeelfeedError as exc:
-            raise HTTPException(
-                exc.status if exc.status in (400, 404, 409) else 502,
-                "peelfeed review failed: %s" % exc.detail)
+        _require_review_schema()
+        group_value = str(group or "").strip().lower() or None
+        if group_value is not None and group_value not in peelfeed.REVIEW_GROUPS:
+            raise HTTPException(400, "group must be 'cluster' or 'code'")
+        status_value = str(status or "").strip() or None
+        return _call_peelfeed(
+            "review",
+            lambda: peelfeed.client().review(
+                peel_id, group=group_value, status=status_value))
+
+    @app.get("/api/datasets/{dataset_id}/sources/{sha}/review/items/{item_id}")
+    def source_review_item(dataset_id: str, sha: str, item_id: str):
+        """Proxy ``peelfeed review --item``: one item with evidence/strategies."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        identifier = str(item_id or "").strip()
+        if not identifier:
+            raise HTTPException(400, "invalid review item id")
+        return _call_peelfeed(
+            "review item",
+            lambda: peelfeed.client().review(peel_id, item=identifier))
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/plan")
+    def source_review_plan(dataset_id: str, sha: str,
+                           payload: Optional[dict] = None):
+        """Proxy one ``peelfeed plan`` action (select/confirm/lock/unlock/defer).
+
+        Returns the latest complete ReviewPlan (with the changed ``entry`` and
+        any R0 ``resolution``). Errors map per contract §4: 409 for a stale
+        ``base_plan_version``/conflict/review schema, 400 for validation, 423
+        when peelfeed's review lock is busy.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        action, request = _review_plan_request(payload or {})
+        request["action"] = action
+        return _call_peelfeed(
+            "review plan",
+            lambda: peelfeed.client().plan(peel_id, request))
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/reports")
+    def source_review_reports(dataset_id: str, sha: str,
+                              payload: Optional[dict] = None):
+        """Generate the deterministic review report (Phase 1: synchronous 200).
+
+        Body (both optional): ``{item_ids?: [...], cluster_ids?: [...]}``. The
+        payload is peelfeed's ready/partial report; persisted jobs replace this
+        synchronous call in M2 Phase 2/4.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        filters = _review_report_request(payload or {})
+        return _call_peelfeed(
+            "review report",
+            lambda: peelfeed.client().review_report(
+                peel_id, item_ids=filters.get("item_ids"),
+                cluster_ids=filters.get("cluster_ids")))
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/events")
     def source_events(dataset_id: str, sha: str,
@@ -1668,37 +1821,6 @@ def create_app():
             raise HTTPException(
                 exc.status if exc.status in (400, 404, 409) else 502,
                 "peelfeed event failed: %s" % exc.detail)
-
-    @app.post("/api/datasets/{dataset_id}/sources/{sha}/rebuild", status_code=202)
-    def source_rebuild(dataset_id: str, sha: str,
-                       payload: Optional[dict] = None):
-        """Run ``peelfeed rebuild`` in a thread (apply corrections, re-gate).
-
-        The source moves ``running → extracted|failed`` as the CLI finishes; the
-        poller updates the chip while normalize/gate/chunk run.
-        """
-        directory = _dataset_dir(dataset_id)
-        entry = _source_by_sha(directory, sha)
-        peel_id = _peel_id_of(entry)
-        _require_peelfeed()
-        body = payload or {}
-        reasons = body.get("reasons") or []
-        if not isinstance(reasons, list):
-            reasons = [str(reasons)]
-        reasons = [str(reason) for reason in reasons if str(reason).strip()]
-        block = dict(entry.get("extraction") or contracts.extraction_default())
-        block.update({"state": "running", "error": None})
-        ingest.update_source(directory, entry["sha256"], status="running",
-                             extraction=block)
-        threading.Thread(
-            target=_run_peel_command,
-            args=(directory, entry["sha256"], block, peel_id,
-                  lambda engine: engine.rebuild(peel_id, reasons)),
-            name="peel-rebuild-%s" % entry["sha256"][:8], daemon=True).start()
-        return {"source": {"sha256": entry["sha256"],
-                           "name": entry.get("name") or "",
-                           "extraction": block},
-                "peel": {"peel_id": peel_id, "state": "running"}}
 
     @app.get("/api/datasets/{dataset_id}/sources/{sha}/assets/{path:path}")
     def source_asset(dataset_id: str, sha: str, path: str):

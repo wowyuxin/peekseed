@@ -14,10 +14,13 @@ This module is the whole seam:
   at a different engine without rewriting the config. The peel root is always
   ``$PEELFEED_SHARED_DIR/peels`` (see :mod:`peekseed.config`).
 * :class:`PeelfeedClient` runs ``capabilities``/``status``/``ingest``/``review``/
-  ``decide``/``rebuild``/``event``/``archive`` with ``--root`` and
+  ``plan``/``review-report``/``rebuild``/``event``/``archive`` with ``--root`` and
   ``--json``, a timeout, and typed errors (:class:`PeelfeedUnavailable` when the
   command cannot start / ``capabilities`` fails, :class:`PeelfeedError` on a
-  failed command).
+  failed command, with the peelfeed error code mapped to an HTTP status).
+* Review state is owned by peelfeed: peekseed only proxies it. ``capabilities``
+  must advertise ``review_schema: 2``; the API refuses review calls with a clear
+  409 when it does not (contract §2/§4).
 * :func:`handshake` never raises: when peelfeed is unconfigured or its CLI is
   missing the result is ``available=False`` with a short reason, so uploads/file
   management keep working and the UI disables Extract with a banner (design
@@ -30,6 +33,7 @@ and used from the CLI; the subprocess call is the only external dependency.
 import copy
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -42,12 +46,16 @@ __all__ = [
     "DEFAULT_LLM_MODE",
     "DEFAULT_POLL",
     "DEFAULT_TIMEOUT",
+    "DEFER_REASONS",
     "HANDSHAKE_TTL",
     "LLM_MODES",
     "PeelfeedClient",
     "PeelfeedConfigError",
     "PeelfeedError",
     "PeelfeedUnavailable",
+    "PLAN_ACTIONS",
+    "REVIEW_GROUPS",
+    "REVIEW_SCHEMA",
     "SHORT_TIMEOUT",
     "STATE_MAP",
     "client",
@@ -70,14 +78,39 @@ VERSION = 1
 ENV_PREFIX = "PEEKSEED_PEELFEED_"
 #: Long operations (ingest/rebuild) may run for the whole Docling conversion.
 DEFAULT_TIMEOUT = 7200.0
-#: Short operations (capabilities/status/review/decide/event/archive) get a
-#: smaller cap so a hung CLI cannot stall a request.
+#: Short operations (capabilities/status/review/plan/review-report/event/archive)
+#: get a smaller cap so a hung CLI cannot stall a request.
 SHORT_TIMEOUT = 120.0
 DEFAULT_POLL = 2.0
 DEFAULT_LLM_MODE = "off"
 DEFAULT_CHUNK_PROFILE = "default"
 LLM_MODES = ("off", "review", "aggressive")
 HANDSHAKE_TTL = 60.0
+#: The structured review-item/plan schema peelfeed must advertise (contract §2).
+REVIEW_SCHEMA = 2
+#: ``GET …/review?group=`` values (contract §2): merged clusters or by code.
+REVIEW_GROUPS = ("cluster", "code")
+#: ``POST …/review/plan`` actions (contract §7). ``show`` is read-only.
+PLAN_ACTIONS = ("show", "select", "confirm", "lock", "unlock", "defer")
+#: ``plan defer`` reason codes (contract §7).
+DEFER_REASONS = ("unsupported_evidence", "grid_conflict", "not_relevant", "other")
+#: peelfeed exit-2 error code -> HTTP status (contract §4). Unknown codes are
+#: a peelfeed failure (502); exit code 3 is "not found" (404).
+_ERROR_STATUS = {
+    "busy": 423,
+    "conflict": 409,
+    "stale": 409,
+    "review_schema": 409,
+    "corrections_conflict": 409,
+    "validation": 400,
+    "privacy_confirmation_required": 400,
+    "not_found": 404,
+    "notfound": 404,
+    "not-found": 404,
+    "peel_not_found": 404,
+}
+#: ``error [<code>] <message>`` -- peelfeed's stderr first line for an error.
+_ERROR_LINE = re.compile(r"^\s*error\s*\[([A-Za-z0-9_.-]+)\]\s*(.*)$")
 #: Only these variables (plus every PEELFEED_*) reach the peelfeed subprocess;
 #: peekseed's token and API keys never do.
 _PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
@@ -95,6 +128,10 @@ STATE_MAP = {
     "rebuilding": "running",
     "ready": "extracted",
     "needs_review": "extracted",
+    # M2 Phase 2: a system rebuild blocked by a historical correction conflict.
+    # The current corpus is untouched (so the source stays readable) but the
+    # conflict is surfaced as its own state.
+    "corrections_conflict": "corrections_conflict",
     "failed": "failed",
     "archived": "stale",
     "deleted": "stale",
@@ -468,6 +505,12 @@ def handshake(force=False, timeout=None, *, cfg=None):
             "profiles": list(caps.get("profiles") or []),
             "chunk_profiles": list(caps.get("chunk_profiles") or []),
             "llm_modes": list(caps.get("llm_modes") or []),
+            # M2 review seam: the schema version gate plus the frozen catalogs
+            # the UI needs to render strategy options (contract §2/§3).
+            "review_schema": caps.get("review_schema"),
+            "operations": list(caps.get("operations") or []),
+            "resolutions": list(caps.get("resolutions") or []),
+            "strategies": list(caps.get("strategies") or []),
             "docling": caps.get("docling") or {},
             "peel_root": str(caps.get("peel_root") or ""),
         })
@@ -563,7 +606,7 @@ def extraction_from_summary(summary, *, previous=None):
     now = contracts.utc_now()
     if state in ("queued", "running") and not block.get("started_at"):
         block["started_at"] = now
-    if state in ("extracted", "failed", "stale"):
+    if state in ("extracted", "failed", "stale", "corrections_conflict"):
         block["finished_at"] = block.get("finished_at") or now
     return block
 
@@ -602,6 +645,29 @@ def _tail(text, limit=300):
     return lines[-1].strip()[:limit]
 
 
+def _legacy_error(payload, returncode):
+    """A readable reason from a pre-protocol error payload (older peelfeed)."""
+    reason = ""
+    if isinstance(payload, dict):
+        peel = payload.get("peel")
+        if isinstance(peel, dict):
+            reason = str(peel.get("error") or "")
+            validation = peel.get("validation")
+            if not reason and isinstance(validation, dict):
+                errors = validation.get("errors")
+                count = len(errors) if isinstance(errors, list) else int(
+                    errors or 0)
+                if count:
+                    reason = "%d validation error(s)" % count
+        gates = payload.get("gates")
+        if not reason and isinstance(gates, dict) and gates.get("errors"):
+            reason = "; ".join(str(item) for item in gates["errors"])[:300]
+        if not reason:
+            raw = payload.get("error")
+            reason = raw if isinstance(raw, str) else ""
+    return reason or "peelfeed exited with status %d" % returncode
+
+
 class PeelfeedClient(object):
     """A thin, typed adapter over the peelfeed command line interface."""
 
@@ -633,7 +699,8 @@ class PeelfeedClient(object):
                 env["PYTHONPATH"] = repo
         return env
 
-    def _run(self, args, *, timeout=None, root=True, json_flag=True):
+    def _run(self, args, *, timeout=None, root=True, json_flag=True,
+             stdin_text=None):
         argv = self._argv(args, root=root, json_flag=json_flag)
         try:
             completed = subprocess.run(
@@ -644,6 +711,7 @@ class PeelfeedClient(object):
                 errors="replace",
                 timeout=timeout or self.timeout,
                 env=self._environment(),
+                input=stdin_text,
             )
         except subprocess.TimeoutExpired:
             raise PeelfeedError(
@@ -656,9 +724,10 @@ class PeelfeedClient(object):
             raise PeelfeedUnavailable(
                 "cannot start the peelfeed CLI (%s)" % type(exc).__name__) from None
         if completed.returncode != 0:
+            code, reason = self._error_fields(completed)
             raise PeelfeedError(
-                self._error_status(completed.returncode),
-                self._error_detail(completed),
+                self._error_status(completed.returncode, code),
+                reason,
             )
         try:
             return _parse_json(completed.stdout)
@@ -668,41 +737,72 @@ class PeelfeedClient(object):
                 % (_tail(completed.stdout) or "empty output")) from None
 
     @staticmethod
-    def _error_status(code):
-        if int(code) == 3:  # peelfeed's NotFoundError
+    def _error_status(returncode, code=""):
+        """The HTTP status for one failed peelfeed command (contract §4).
+
+        ``busy→423``; ``conflict/stale/review_schema/corrections_conflict→409``;
+        ``validation/privacy_confirmation_required→400``; not found (exit code 3
+        or a ``not_found`` code) ``→404``; every other error is a peelfeed
+        failure (502).
+        """
+        if code and code in _ERROR_STATUS:
+            return _ERROR_STATUS[code]
+        if int(returncode) == 3:  # peelfeed's NotFoundError
             return 404
         return 502
 
-    def _error_detail(self, completed):
-        """A short, readable reason for a failed command (stderr + payload)."""
-        detail = _tail(completed.stderr)
+    @staticmethod
+    def _error_fields(completed):
+        """``(code, reason)`` for a failed command from its JSON/stderr error.
+
+        peelfeed's error protocol (contract §3): with ``--json`` stdout carries
+        ``{"error": {"code", "message", "detail"}}`` and the stderr first line is
+        ``error [<code>] <message>``. Older/partial outputs fall back to the JSON
+        ``peel``/``validation``/``gates`` heuristics so a failure is still
+        readable.
+        """
+        payload = None
         try:
             payload = _parse_json(completed.stdout)
         except ValueError:
             payload = None
-        reason = ""
+        code = ""
+        message = ""
+        detail = None
         if isinstance(payload, dict):
-            peel = payload.get("peel")
-            if isinstance(peel, dict):
-                reason = str(peel.get("error") or "")
-            validation = (peel.get("validation")
-                          if isinstance(peel, dict) else None)
-            if not reason and isinstance(validation, dict):
-                errors = validation.get("errors")
-                count = len(errors) if isinstance(errors, list) else int(
-                    errors or 0)
-                if count:
-                    reason = "%d validation error(s)" % count
-            gates = payload.get("gates")
-            if not reason and isinstance(gates, dict) and gates.get("errors"):
-                reason = "; ".join(str(item) for item in gates["errors"])[:300]
-            if not reason:
-                reason = str(payload.get("error") or "")
-        if detail and reason and reason not in detail:
-            detail = "%s (%s)" % (detail, reason)
-        elif not detail:
-            detail = reason or "peelfeed exited with status %d" % completed.returncode
-        return detail[:300]
+            error = payload.get("error")
+            if isinstance(error, dict):
+                code = str(error.get("code") or "").strip().lower()
+                message = str(error.get("message") or "").strip()
+                detail = error.get("detail")
+        stderr_lines = [line.strip() for line in str(completed.stderr or "").splitlines()
+                        if line.strip()]
+        matched = None
+        for line in stderr_lines:
+            candidate = _ERROR_LINE.match(line)
+            if candidate is not None:
+                matched = candidate
+                break
+        if matched is not None:
+            code = code or matched.group(1).strip().lower()
+            message = message or matched.group(2).strip()
+        elif stderr_lines and not message:
+            message = stderr_lines[0]
+        if not message:
+            message = _legacy_error(payload, completed.returncode)
+        if code:
+            reason = "error [%s] %s" % (code, message)
+        else:
+            reason = message
+        reasons = detail.get("reasons") if isinstance(detail, dict) else None
+        if isinstance(reasons, list) and reasons:
+            suffix = "; ".join(str(item) for item in reasons[:3])
+            reason = "%s (%s)" % (reason, suffix)
+        return code, reason[:300]
+
+    def _error_detail(self, completed):
+        """A short, readable reason for a failed command (kept for callers)."""
+        return self._error_fields(completed)[1]
 
     # --- capabilities / status ---
     def capabilities(self, timeout=None):
@@ -747,24 +847,74 @@ class PeelfeedClient(object):
             args.extend(["--chunk-versions", json.dumps(list(chunk_versions))])
         return self._run(args, timeout=timeout or self.timeout)
 
-    # --- short operations ---
-    def review(self, peel_id):
-        return self._run(["review", str(peel_id)],
-                         timeout=min(SHORT_TIMEOUT, self.timeout))
+    # --- review (M2 CP1) ---
+    def review(self, peel_id, group=None, status=None, item=None, limit=None):
+        """``peelfeed review <peel_id> [--group] [--status] [--item] [--limit]``.
 
-    def decide(self, peel_id, item, decision, note=None, evidence=None,
-               model=None, confidence=None):
-        args = ["decide", str(peel_id), "--item", str(item),
-                "--decision", str(decision)]
-        if note is not None:
-            args.extend(["--note", str(note)])
-        if evidence is not None:
-            args.extend(["--evidence", json.dumps(evidence)])
-        if model is not None:
-            args.extend(["--model", str(model)])
-        if confidence is not None:
-            args.extend(["--confidence", str(confidence)])
+        Pass-through proxy: the payload is the structured schema-2 review view
+        (counts/clusters/items/triage/plan/report). ``item`` returns the single
+        item payload ``{"peel_id", "review_schema", "item": {…}}``. Reading the
+        list never calls an LLM (contract §2).
+        """
+        args = ["review", str(peel_id)]
+        if group:
+            args.extend(["--group", str(group)])
+        if status:
+            args.extend(["--status", str(status)])
+        if item:
+            args.extend(["--item", str(item)])
+        if limit is not None:
+            args.extend(["--limit", str(int(limit))])
         return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def plan(self, peel_id, payload):
+        """Run one ``peelfeed plan`` action (contract §7).
+
+        ``payload`` always carries ``action`` (one of :data:`PLAN_ACTIONS``).
+        ``select``/``defer`` send their request as JSON on stdin via
+        ``--input -``; ``confirm``/``lock``/``unlock`` use
+        ``--entry <id> --base-plan-version <n>``; ``show`` is read-only. The
+        response is the latest complete ReviewPlan plus ``entry``/``resolution``.
+        """
+        request = dict(payload or {})
+        action = str(request.pop("action", "") or "").strip().lower()
+        if action not in PLAN_ACTIONS:
+            raise ValueError("plan action must be one of %s"
+                             % ", ".join(PLAN_ACTIONS))
+        args = ["plan", str(peel_id), action]
+        stdin_text = None
+        if action in ("select", "defer"):
+            args.extend(["--input", "-"])
+            stdin_text = json.dumps(request, ensure_ascii=False)
+        elif action in ("confirm", "lock", "unlock"):
+            entry_id = str(request.get("entry_id") or "")
+            if not entry_id:
+                raise ValueError("plan %s needs entry_id" % action)
+            args.extend(["--entry", entry_id,
+                         "--base-plan-version",
+                         str(int(request.get("base_plan_version") or 0))])
+        return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout),
+                         stdin_text=stdin_text)
+
+    def review_report(self, peel_id, item_ids=None, cluster_ids=None):
+        """``peelfeed review-report <peel_id> [--input -]`` (contract §5).
+
+        Phase 1 runs synchronously and returns the ready/partial report payload
+        (``status``/``report_path``/``report``/``counts``); the optional request
+        filters items/clusters. Persisted jobs arrive in Phase 2.
+        """
+        args = ["review-report", str(peel_id)]
+        request = {}
+        if item_ids:
+            request["item_ids"] = [str(item) for item in item_ids]
+        if cluster_ids:
+            request["cluster_ids"] = [str(cluster) for cluster in cluster_ids]
+        stdin_text = None
+        if request:
+            args.extend(["--input", "-"])
+            stdin_text = json.dumps(request, ensure_ascii=False)
+        return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout),
+                         stdin_text=stdin_text)
 
     def event(self, peel_id, event, data=None):
         args = ["event", str(peel_id), "--event", str(event)]

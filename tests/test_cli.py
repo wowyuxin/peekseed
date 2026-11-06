@@ -162,7 +162,7 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(main(["migrate"]), 0)
             text = buffer.getvalue()
             self.assertIn("dry-run (nothing written)", text)
-            self.assertIn("schema 1 -> 3", text)
+            self.assertIn("schema 1 -> 4", text)
             self.assertIn('"version": 1',
                           (dataset_dir / "dataset.json").read_text())
 

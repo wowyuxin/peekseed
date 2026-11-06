@@ -64,7 +64,7 @@ def sample_info(**overrides):
 
 def sample_dataset(**overrides):
     data = {
-        "schema": 3,
+        "schema": 4,
         "id": "cxl",
         "name": "CXL",
         "created_at": "2026-10-20T20:00:00Z",
@@ -178,14 +178,15 @@ class IdentifierTests(unittest.TestCase):
 class DatasetTests(unittest.TestCase):
     def test_dataset_validates(self):
         validated = contracts.validate_dataset(sample_dataset())
-        self.assertEqual(validated["schema"], 3)
+        self.assertEqual(validated["schema"], 4)
+        self.assertEqual(validated["sources"][0]["extraction"]["review_jobs"], {})
         self.assertEqual(validated["sources"][0]["sha256"], SHA_A)
         self.assertEqual(validated["sources"][0]["extraction"]["state"], "extracted")
         self.assertEqual(validated["sources"][0]["extraction"]["peel_id"], "peel-a")
 
     def test_dataset_refuses_a_newer_schema(self):
         with self.assertRaises(contracts.SchemaTooNew):
-            contracts.validate_dataset(sample_dataset(schema=4))
+            contracts.validate_dataset(sample_dataset(schema=5))
 
     def test_dataset_accepts_an_uploaded_source_with_no_extraction(self):
         data = sample_dataset()
@@ -215,7 +216,8 @@ class DatasetTests(unittest.TestCase):
             "notes": "n",
         }
         upgraded = contracts.upgrade_dataset(legacy, sha256_of=lambda path: SHA_A)
-        self.assertEqual(upgraded["schema"], 3)
+        self.assertEqual(upgraded["schema"], 4)
+        self.assertEqual(upgraded["sources"][0]["extraction"]["review_jobs"], {})
         self.assertEqual(upgraded["sources"][0]["sha256"], SHA_A)
         # A legacy source has no reusable extraction: it is stored, not extracted.
         self.assertEqual(upgraded["sources"][0]["status"], "uploaded")
@@ -229,6 +231,44 @@ class DatasetTests(unittest.TestCase):
     def test_dataset_upgrade_is_idempotent(self):
         once = contracts.upgrade_dataset(sample_dataset())
         self.assertEqual(contracts.upgrade_dataset(once), once)
+
+    def test_dataset_upgrade_from_schema_3_adds_review_jobs_and_keeps_extraction(self):
+        schema3 = sample_dataset(schema=3)
+        schema3["sources"][0]["extraction"].pop("review_jobs", None)
+        upgraded = contracts.upgrade_dataset(schema3)
+        self.assertEqual(upgraded["schema"], 4)
+        extraction = upgraded["sources"][0]["extraction"]
+        self.assertEqual(extraction["review_jobs"], {})
+        self.assertEqual(extraction["state"], "extracted")
+        self.assertEqual(extraction["peel_id"], "peel-a")
+
+    def test_dataset_accepts_review_jobs_and_corrections_conflict(self):
+        data = sample_dataset()
+        extraction = data["sources"][0]["extraction"]
+        extraction["review_jobs"] = {
+            "report-20261105T000000-a1b2": {
+                "type": "report", "created_at": "2026-11-05T00:00:00Z",
+                "batch_id": None},
+        }
+        validated = contracts.validate_dataset(data)
+        self.assertEqual(
+            validated["sources"][0]["extraction"]["review_jobs"]
+            ["report-20261105T000000-a1b2"]["type"], "report")
+        data = sample_dataset()
+        data["sources"][0]["extraction"]["state"] = "corrections_conflict"
+        validated = contracts.validate_dataset(data)
+        self.assertEqual(validated["sources"][0]["extraction"]["state"],
+                         "corrections_conflict")
+
+    def test_dataset_rejects_a_non_object_review_jobs_block(self):
+        data = sample_dataset()
+        data["sources"][0]["extraction"]["review_jobs"] = ["report-1"]
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_dataset(data)
+        data = sample_dataset()
+        data["sources"][0]["extraction"]["review_jobs"] = {"report-1": "nope"}
+        with self.assertRaises(contracts.ContractError):
+            contracts.validate_dataset(data)
 
 
 class InfoTests(unittest.TestCase):
