@@ -1235,6 +1235,17 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .rr-entry{font-size:10.5px;color:var(--muted);line-height:1.5;overflow-wrap:anywhere;
   border-top:1px dashed var(--line-soft);padding-top:4px;}
 .rr-entry.is-stale{color:var(--warn);}
+.rr-entry-hint{font-size:10px;color:var(--faint);line-height:1.5;margin-top:2px;
+  overflow-wrap:anywhere;}
+.rr-entry-hint.bad{color:var(--bad);}
+.rr-stale-hint{font-size:9.5px;color:var(--warn);align-self:center;overflow-wrap:anywhere;}
+.rr-stale-guide{font-size:9.5px;color:var(--bad);align-self:center;overflow-wrap:anywhere;}
+.rr-param-row{align-items:flex-start;}
+.rr-param-box{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:flex-end;min-width:0;}
+.rr-param-block{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-end;min-width:0;}
+.rr-param-block[hidden]{display:none;}
+.rr-field input[data-r="header-row-0"],.rr-field input[data-r="header-row-1"]{
+  width:82px;max-width:82px;}
 .rr-actions{display:flex;flex-wrap:wrap;gap:6px;align-items:flex-end;min-width:0;}
 .rr-field{display:flex;flex-direction:column;gap:2px;font-size:9.5px;color:var(--faint);
   min-width:0;}
@@ -4931,6 +4942,18 @@ const REVIEW_REASON_LABEL={unsupported_evidence:'证据不足/不支持',grid_co
 const REVIEW_DEFER_CODES=['unsupported_evidence','grid_conflict','not_relevant','other'];
 const REVIEW_ACTION_LABEL={select:'已选策略',confirm:'已确认',lock:'已锁定',
   unlock:'已解锁',defer:'已暂缓'};
+/* CP2 E3 (contract §11.1): stable stale reason codes -> Chinese. Only
+   evidence_changed/parent_changed can be refreshed by an explicit re-confirm;
+   every other reason needs a new strategy or the parent fixed first. The raw
+   code is kept in the element title for developers. */
+const REVIEW_STALE_LABEL={evidence_changed:'证据变化',parent_changed:'父表变化',
+  parent_header_not_selected:'父表表头未确认',strategy_changed:'策略已变更',
+  capability_unavailable:'能力不可用',action_invalid:'动作已失效',
+  chain_not_allowed:'禁止链式继承',item_missing:'条目缺失'};
+const REVIEW_STALE_REFRESHABLE=['evidence_changed','parent_changed'];
+/* CP2 E2: strategies whose select call must carry real params instead of {}. */
+const REVIEW_PARAM_STRATEGIES={inherit_parent_header:'parent',
+  use_header_rows:'rows'};
 function reviewKey(dsId,sha){ return dsId+'|'+(sha||''); }
 function reviewBase(dsId,sha){
   return '/api/datasets/'+encodeURIComponent(dsId)+'/sources/'+encodeURIComponent(sha)+'/review';
@@ -5060,6 +5083,129 @@ function reviewStrategyName(item,ref){
   const found=((item&&item.strategies)||[]).find(function(s){ return s&&s.id===id; });
   return (found&&found.name)||id;
 }
+/* --- CP2 E3: stale reason codes in Chinese ------------------------------ */
+function reviewStaleCodes(entry){
+  return ((entry&&entry.stale_reasons)||[]).filter(function(code){ return !!code; });
+}
+function reviewStaleLabel(code){ return REVIEW_STALE_LABEL[code]||code||'证据变化'; }
+function reviewStaleText(entry){
+  const codes=reviewStaleCodes(entry);
+  return codes.length?codes.map(reviewStaleLabel).join('；'):'证据变化';
+}
+/* True when a stale entry can be refreshed by an explicit re-confirm: every
+   reason is evidence_changed/parent_changed (an empty reason list is treated as
+   refresh-only so an older/partial payload is never stuck). */
+function reviewStaleRefreshable(entry){
+  return reviewStaleCodes(entry).every(function(code){
+    return REVIEW_STALE_REFRESHABLE.indexOf(code)>=0;
+  });
+}
+function reviewStaleBadge(item){
+  const entry=item&&item.entry;
+  const codes=reviewStaleCodes(entry);
+  const label=codes.length?('已过期：'+codes.map(reviewStaleLabel).join('；')):'已过期';
+  return '<span class="rr-badge bad" title="'+escAttr(codes.join(', '))+'">'
+    +esc(label)+'</span>';
+}
+/* --- CP2 E2: real strategy params --------------------------------------- */
+function reviewHeaderCellsText(cand){
+  const rows=(cand&&cand.header_cells)||[];
+  const text=rows.map(function(row){ return (row||[]).join(' | '); })
+    .filter(function(row){ return row; }).join(' / ');
+  return text||String((cand&&cand.header_signature)||'');
+}
+function reviewParentSourceLabel(cand){
+  const source=String((cand&&cand.header_source)||'');
+  if(source==='native') return '原生表头';
+  if(source==='rule') return '规则表头';
+  return source||'表头来源未知';
+}
+function reviewParentOptionLabel(cand){
+  const pages=((cand&&cand.pages)||[]).filter(function(page){ return page!=null; });
+  return [pages.length?('p.'+pages.join(',')):'页码未知',
+    reviewHeaderCellsText(cand)||'表头原文缺失',
+    reviewParentSourceLabel(cand)].join(' · ');
+}
+function reviewSelectedStrategyId(item){
+  const cur=item&&item.entry&&item.entry.strategy;
+  return (cur&&cur.id)||'';
+}
+function reviewStrategyParamsHtml(item,locked){
+  const curAction=(item&&item.entry&&item.entry.action)||{};
+  const curParams=(curAction.params&&typeof curAction.params==='object')
+    ?curAction.params:{};
+  const cands=(item&&item.parent_candidates)||[];
+  const selected=reviewSelectedStrategyId(item);
+  const disabled=locked?' disabled':'';
+  const parentBlock='<div class="rr-param-block" data-param="parent"'
+    +(selected==='inherit_parent_header'?'':' hidden')+'>'
+    +(cands.length
+      ? '<label class="rr-field"><span>父表（页码 · 表头原文 · 来源）</span>'
+        +'<select data-r="parent-asset"'+disabled+'>'
+        +'<option value="">选择父表…</option>'
+        +cands.map(function(cand){
+          const id=String((cand&&cand.asset_id)||'');
+          const on=id&&id===String(curParams.parent_asset_id||'');
+          return '<option value="'+escAttr(id)+'"'+(on?' selected':'')
+            +(id?'':' disabled')+'>'+esc(reviewParentOptionLabel(cand))+'</option>';
+        }).join('')
+        +'</select></label>'
+      : '<span class="rr-muted">无父表候选：该策略不可用，请改选其他策略。</span>')
+    +'</div>';
+  const curRows=Array.isArray(curParams.rows)?curParams.rows.filter(
+    function(row){ return row!=null; }):[];
+  const rowInput=function(index){
+    const value=curRows[index]!=null?String(curRows[index]):'';
+    return '<label class="rr-field"><span>'
+      +(index===0?'表头行号（0 基全局行）':'第二行（可选）')+'</span>'
+      +'<input data-r="header-row-'+index+'" type="number" min="0" step="1"'
+      +' inputmode="numeric" value="'+escAttr(value)+'"'+disabled
+      +' placeholder="'+(index===0?'例如 0':'可选')+'"></label>';
+  };
+  const rowsBlock='<div class="rr-param-block" data-param="rows"'
+    +(selected==='use_header_rows'?'':' hidden')+'>'
+    +rowInput(0)+rowInput(1)+'</div>';
+  return '<div class="rr-param-box" data-r="params">'+parentBlock+rowsBlock+'</div>';
+}
+/* Show only the param block of the strategy currently chosen in the select. */
+function reviewSyncStrategyParams(card,strategyId){
+  if(!card) return;
+  const box=card.querySelector('[data-r="params"]'); if(!box) return;
+  const kind=REVIEW_PARAM_STRATEGIES[strategyId]||null;
+  Array.prototype.forEach.call(box.querySelectorAll('[data-param]'),function(block){
+    block.hidden=(block.getAttribute('data-param')!==kind);
+  });
+}
+/* Build the params for one select. Returns {params} or {error} so an invalid
+   input shows a clear message instead of posting an unusable request. */
+function reviewStrategyParams(card,strategyId){
+  if(strategyId==='inherit_parent_header'){
+    const sel=card?card.querySelector('select[data-r="parent-asset"]'):null;
+    const parentId=sel?String(sel.value||'').trim():'';
+    if(!parentId) return {error:'继承父表必须选择父表（parent_asset_id 不能为空）。'};
+    return {params:{parent_asset_id:parentId}};
+  }
+  if(strategyId==='use_header_rows'){
+    const rows=[];
+    for(let index=0;index<2;index++){
+      const el=card?card.querySelector('input[data-r="header-row-'+index+'"]'):null;
+      const raw=el?String(el.value||'').trim():'';
+      if(!raw) continue;
+      if(!/^[0-9]+$/.test(raw))
+        return {error:'表头行号必须是 0 基非负整数（例如 0、1）。'};
+      const value=Number(raw);
+      if(!Number.isSafeInteger(value)||value<0)
+        return {error:'表头行号必须是 0 基非负整数（例如 0、1）。'};
+      if(rows.indexOf(value)>=0)
+        return {error:'两个表头行号必须不同。'};
+      rows.push(value);
+    }
+    if(!rows.length) return {error:'请至少输入一个表头行号（0 基全局行）。'};
+    rows.sort(function(a,b){ return a-b; });
+    return {params:{rows:rows}};
+  }
+  return {params:{}};
+}
 function reviewJsonBits(value){
   if(value==null) return '—';
   if(typeof value!=='object') return String(value);
@@ -5174,13 +5320,22 @@ function reviewCandidateHtml(item){
 function reviewEntryHtml(item){
   const entry=item&&item.entry;
   if(!entry) return '<div class="rr-entry">计划条目：尚无（选择策略后创建；确认按条目进行）</div>';
+  const codes=reviewStaleCodes(entry);
   const bits=['条目 '+entry.entry_id,
     '状态 '+(REVIEW_STATUS_LABEL[entry.status]||entry.status||'draft'),
     'revision r'+(entry.revision==null?'?':entry.revision),
     '策略 '+reviewStrategyName(item,entry.strategy)];
   if(entry.locked) bits.push('已锁定');
-  if(entry.stale) bits.push('已过期：'+((entry.stale_reasons||[]).join('; ')||'evidence 变化'));
-  return '<div class="rr-entry'+(entry.stale?' is-stale':'')+'">'+esc(bits.join(' · '))+'</div>';
+  if(entry.stale) bits.push('已过期：'+reviewStaleText(entry));
+  const attrs=(entry.stale&&codes.length)?' title="'+escAttr(codes.join(', '))+'"':'';
+  let html='<div class="rr-entry'+(entry.stale?' is-stale':'')+'"'+attrs+'>'
+    +esc(bits.join(' · '))+'</div>';
+  if(entry.stale){
+    html+=reviewStaleRefreshable(entry)
+      ?'<div class="rr-entry-hint">可点“确认”重新确认：会刷新该条目的证据与父表快照。</div>'
+      :'<div class="rr-entry-hint bad">需重新选择策略或先处理父表（父表表头未确认、策略变更等）。</div>';
+  }
+  return html;
 }
 function reviewResolutionHtml(item){
   const res=item&&item.resolution;
@@ -5195,6 +5350,12 @@ function reviewActionsHtml(item){
   const entry=item&&item.entry;
   const locked=!!(entry&&entry.locked);
   const hasEntry=!!(entry&&entry.entry_id);
+  const stale=!!(entry&&entry.stale);
+  const refreshable=stale&&reviewStaleRefreshable(entry);
+  /* CP2 E3: confirm stays enabled for non-stale entries and for stale entries
+     whose only reasons are evidence_changed/parent_changed (an explicit
+     re-confirm refreshes the snapshot; locked entries may still confirm). */
+  const canConfirm=hasEntry&&(!stale||refreshable);
   const strategies=(item&&item.strategies)||[];
   const availableN=strategies.filter(function(s){ return s.available!==false; }).length;
   let html='<div class="rr-actions">';
@@ -5208,10 +5369,19 @@ function reviewActionsHtml(item){
     html+='<span class="rr-muted">无可用策略：可暂缓并选择原因</span>';
   }
   html+='<button type="button" class="secondary" data-r="confirm"'
-    +(hasEntry&&!(entry&&entry.stale)?'':' disabled')+'>确认</button>'
+    +(canConfirm?'':' disabled')+'>确认</button>'
     +'<button type="button" class="secondary" data-r="'+(locked?'unlock':'lock')+'"'
-    +(hasEntry?'':' disabled')+'>'+(locked?'解锁':'锁定')+'</button></div>'
-    +'<div class="rr-actions rr-defer">'
+    +(hasEntry?'':' disabled')+'>'+(locked?'解锁':'锁定')+'</button>'
+    +(stale&&refreshable
+      ?'<span class="rr-stale-hint">重新确认会刷新证据快照</span>':'')
+    +(stale&&!refreshable
+      ?'<span class="rr-stale-guide">需重新选择策略或先处理父表</span>':'')
+    +'</div>';
+  if(strategies.length){
+    html+='<div class="rr-actions rr-param-row">'
+      +reviewStrategyParamsHtml(item,locked)+'</div>';
+  }
+  html+='<div class="rr-actions rr-defer">'
     +'<label class="rr-field"><span>暂缓原因</span><select data-r="defer-code">'
     +'<option value="">选择原因…</option>'
     +REVIEW_DEFER_CODES.map(function(code){
@@ -5233,7 +5403,7 @@ function reviewItemHtml(item){
     +'<div class="rr-item-h"><span class="rr-item-id">'+esc(item.id||'')+'</span>'
     +reviewBadge(REVIEW_STATUS_LABEL[status]||status,status)
     +(item.triage?reviewBadge(REVIEW_TRIAGE_LABEL[item.triage]||item.triage,item.triage):'')
-    +(item.stale?'<span class="rr-badge bad">stale</span>':'')
+    +(item.stale?reviewStaleBadge(item):'')
     +'</div>'
     +'<p class="rr-item-msg">'+esc(item.message||'')+'</p>'
     +'<div class="rr-item-meta">'+esc(meta)+'</div>'
@@ -5439,10 +5609,15 @@ async function reviewAction(btn){
     const sel=card?card.querySelector('select[data-r="strategy"]'):null;
     const opt=sel&&sel.options[sel.selectedIndex];
     if(!opt||!opt.value){ reviewMsg('先选择一个可用策略。',true); return; }
+    /* CP2 E2: send the real params for strategies that need them; validate
+       locally so an unusable request is never posted. Never send an empty
+       parent_asset_id and never send params:{} for a param strategy. */
+    const built=reviewStrategyParams(card,opt.value);
+    if(built.error){ reviewMsg(built.error,true); return; }
     body.action='select';
     body.entry={item_id:itemId,
       strategy:{id:opt.value,version:Number(opt.getAttribute('data-version')||1)},
-      params:{}};
+      params:built.params};
   }else if(kind==='confirm'||kind==='lock'||kind==='unlock'){
     const entry=item&&item.entry;
     if(!entry||!entry.entry_id){ reviewMsg('该项还没有计划条目；先选择策略。',true); return; }
@@ -5552,6 +5727,13 @@ $('#reviewDetail').addEventListener('click',function(ev){
   reviewAction(btn).catch(function(e){
     reviewMsg('操作失败：'+(e&&e.message||e),true);
   });
+});
+/* CP2 E2: choosing a strategy reveals only its own params (parent selector for
+   inherit_parent_header, 1-2 row inputs for use_header_rows). */
+$('#reviewDetail').addEventListener('change',function(ev){
+  const sel=ev.target&&ev.target.closest?ev.target.closest('select[data-r="strategy"]'):null;
+  if(!sel) return;
+  reviewSyncStrategyParams(sel.closest('.rr-item'),sel.value);
 });
 $('#reviewReportBtn').onclick=generateReviewReport;
 $('#reviewRefreshBtn').onclick=refreshReviewFromButton;

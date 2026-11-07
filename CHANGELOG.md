@@ -50,6 +50,18 @@ version/tag policy.
   `validation → 400`, not found → `404`, other engine errors → `502`.
 - `capabilities`/handshake now expose `review_schema`, `operations`,
   `resolutions` and `strategies` (frozen strategy catalog).
+- **CP2 E2/E3 review UI.** Strategy selection now sends real params:
+  `inherit_parent_header` renders a parent-table selector from
+  `item.parent_candidates` (page, original `header_cells` joined with ` | `,
+  header source) and posts `params:{"parent_asset_id":…}`; `use_header_rows`
+  renders 1–2 numeric 0-based global row inputs and posts `params:{"rows":[…]}`,
+  with client-side validation that shows a clear message instead of posting an
+  unusable request. Other strategies keep `params:{}`. Stale reason codes render
+  in Chinese (证据变化/父表变化/父表表头未确认/策略已变更/能力不可用/动作已失效/
+  禁止链式继承/条目缺失); a stale entry whose only reasons are
+  `evidence_changed`/`parent_changed` can be explicitly re-confirmed (locked
+  entries included, refreshing the evidence snapshot), while any other stale
+  reason disables 确认 with the guidance “需重新选择策略或先处理父表”.
 
 ### Fixed
 

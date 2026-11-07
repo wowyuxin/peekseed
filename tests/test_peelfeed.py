@@ -17,8 +17,8 @@ import os
 import time
 import unittest
 
-from tests.fixtures import (EMBED_CHUNK, FakeModelServer, FakePeelfeedCli, make_pdf,
-                            make_peel, temp_data_root)
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, FakePeelfeedCli,
+                            make_pdf, make_peel, temp_data_root)
 
 _PEELFEED_ENV_KEYS = ("PEEKSEED_PEELFEED_CLI", "PEEKSEED_PEELFEED_PYTHON",
                       "PEEKSEED_PEELFEED_REPO", "PEEKSEED_PEELFEED_ENABLED",
@@ -145,6 +145,49 @@ class UiWiringTests(unittest.TestCase):
             for gone in (b'reviewRebuildBtn', b'decideReview',
                          b'rebuildReviewed'):
                 self.assertNotIn(gone, page)
+
+    def test_the_ui_ships_cp2_strategy_param_inputs(self):
+        """CP2 E2: the served UI renders real params, never an unconditional {}."""
+        with temp_data_root():
+            page = _client().get("/").text
+            for marker in ("reviewStrategyParamsHtml", "reviewSyncStrategyParams",
+                           "reviewStrategyParams", "REVIEW_PARAM_STRATEGIES",
+                           "inherit_parent_header:'parent'",
+                           "use_header_rows:'rows'",
+                           "parent_candidates", 'data-r="parent-asset"',
+                           "parent_asset_id", 'data-r="header-row-0"',
+                           'data-r="header-row-1"', "header_cells",
+                           "原生表头", "规则表头",
+                           "请至少输入一个表头行号",
+                           "两个表头行号必须不同",
+                           "parent_asset_id 不能为空",
+                           "reviewStrategyParams(card,opt.value)",
+                           "params:built.params"):
+                self.assertIn(marker, page)
+
+    def test_the_ui_maps_stale_reasons_and_reconfirm_affordances(self):
+        """CP2 E3: every stable stale code has a Chinese label and confirm
+        distinguishes refresh-only reasons from blocking ones."""
+        with temp_data_root():
+            page = _client().get("/").text
+            for code, label in (
+                    ("evidence_changed", "证据变化"),
+                    ("parent_changed", "父表变化"),
+                    ("parent_header_not_selected", "父表表头未确认"),
+                    ("strategy_changed", "策略已变更"),
+                    ("capability_unavailable", "能力不可用"),
+                    ("action_invalid", "动作已失效"),
+                    ("chain_not_allowed", "禁止链式继承"),
+                    ("item_missing", "条目缺失")):
+                self.assertIn(code + ":'" + label + "'", page)
+            for marker in (
+                    "REVIEW_STALE_REFRESHABLE=['evidence_changed','parent_changed']",
+                    "reviewStaleRefreshable", "reviewStaleLabel",
+                    "reviewStaleBadge", "已过期：",
+                    "canConfirm=hasEntry&&(!stale||refreshable)",
+                    "重新确认会刷新证据快照",
+                    "需重新选择策略或先处理父表"):
+                self.assertIn(marker, page)
 
 
 class ConfigTests(unittest.TestCase):
@@ -1044,6 +1087,118 @@ class PeelfeedApiTests(unittest.TestCase):
                     "/api/datasets/%s/sources/%s/review/reports"
                     % (dataset["id"], sha), json={})
                 self.assertEqual(report.status_code, 409, report.text)
+
+    def test_review_plan_validation_maps_to_400_not_502(self):
+        """CP2 E1: peelfeed ``error [validation]`` (exit 2) on plan is a 400.
+
+        The review plan route must not turn a strategy-param validation failure
+        into a 502: the adapter maps the typed ``validation`` code to 400. A
+        malformed ``params`` shape is rejected by peekseed itself with 400 and
+        never reaches the CLI.
+        """
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                cli.clear_calls()
+                bad_shape = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_header_rows",
+                                           "version": 1},
+                              "params": ["rows", 0]}})
+                self.assertEqual(bad_shape.status_code, 400, bad_shape.text)
+                self.assertIn("params", bad_shape.json()["detail"])
+                self.assertNotIn("plan", cli.commands())
+                cli.update(errors={"plan": {
+                    "code": "validation", "exit": 2,
+                    "message": "params invalid: rows must be 0-based",
+                    "detail": {"reasons": ["rows[0] must be >= 0"]}}})
+                invalid = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_header_rows",
+                                           "version": 1},
+                              "params": {"rows": [-1]}}})
+                self.assertEqual(invalid.status_code, 400, invalid.text)
+                self.assertNotEqual(invalid.status_code, 502)
+                detail = invalid.json()["detail"]
+                self.assertIn("validation", detail)
+                self.assertIn("rows must be 0-based", detail)
+                self.assertIn("rows[0] must be >= 0", detail)
+
+    def test_review_payload_carries_parent_candidates_and_stale_reasons(self):
+        """CP2 E2/E3: the proxied payload exposes the fields the UI reads."""
+        with temp_data_root() as root:
+            item = {
+                "id": "it-3f9c2a4b6d8e0f1a",
+                "code": "table_header_absent",
+                "kind": "table",
+                "status": "confirmed",
+                "stale": True,
+                "parent_candidates": [{
+                    "asset_id": "table-p1041-01",
+                    "pages": [1041],
+                    "col_count": 2,
+                    "header_rows": [0],
+                    "header_cells": [["Bits", "Variable"]],
+                    "header_signature": "bits|variable",
+                    "source_refs": [{"segment": "table-p1041-01",
+                                     "source_row": 0,
+                                     "cells": ["Bits", "Variable"],
+                                     "evidence_hash": "ev-p1041"}],
+                    "parent_evidence_hash": "ev-p1041",
+                    "header_source": "native",
+                }],
+                "entry": {
+                    "entry_id": "e-3f9c2a4b6d8e0f1a",
+                    "item_id": "it-3f9c2a4b6d8e0f1a",
+                    "status": "confirmed",
+                    "stale": True,
+                    "stale_reasons": ["evidence_changed", "parent_changed"],
+                    "locked": True,
+                    "strategy": {"id": "inherit_parent_header", "version": 1},
+                    "action": {"type": "operation",
+                               "name": "inherit_header_from",
+                               "params": {
+                                   "parent_asset_id": "table-p1041-01",
+                                   "parent_header_rows": [0],
+                                   "parent_header_cells": [["Bits", "Variable"]],
+                                   "parent_source_refs": [],
+                                   "parent_header_source": "native"}},
+                    "evidence": {"hash": "9c1f2e3d4b5a6978", "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True, "ocr": None,
+                                            "vlm": None},
+                    "source": "user", "revision": 2, "batch_id": None,
+                    "notes": None,
+                },
+            }
+            review = {"review_schema": 2, "counts": {}, "clusters": [],
+                      "items": [item]}
+            cli = FakePeelfeedCli(root / "fake", {"review": review})
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                payload = client.get(base + "/review").json()
+                item = payload["items"][0]
+                candidate = item["parent_candidates"][0]
+                self.assertEqual(candidate["asset_id"], "table-p1041-01")
+                self.assertEqual(candidate["pages"], [1041])
+                self.assertEqual(candidate["header_cells"],
+                                 [["Bits", "Variable"]])
+                self.assertEqual(candidate["header_source"], "native")
+                entry = item["entry"]
+                self.assertTrue(entry["locked"])
+                self.assertTrue(entry["stale"])
+                self.assertEqual(entry["stale_reasons"],
+                                 ["evidence_changed", "parent_changed"])
+                # The served UI carries the handlers that read these fields.
+                page = client.get("/").text
+                self.assertIn("parent_candidates", page)
+                self.assertIn("stale_reasons", page)
 
     def test_review_reports_are_synchronous_and_accept_filters(self):
         with temp_data_root() as root:
