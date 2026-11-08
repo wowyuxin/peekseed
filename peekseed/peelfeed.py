@@ -90,8 +90,10 @@ HANDSHAKE_TTL = 60.0
 REVIEW_SCHEMA = 2
 #: ``GET …/review?group=`` values (contract §2): merged clusters or by code.
 REVIEW_GROUPS = ("cluster", "code")
-#: ``POST …/review/plan`` actions (contract §7). ``show`` is read-only.
-PLAN_ACTIONS = ("show", "select", "confirm", "lock", "unlock", "defer")
+#: ``POST …/review/plan`` actions (contract §7). ``show`` is read-only;
+#: ``accept``/``clear`` are the CP2 additions (contract §11.1, wire §2.6).
+PLAN_ACTIONS = ("show", "select", "confirm", "lock", "unlock", "defer",
+                "accept", "clear")
 #: ``plan defer`` reason codes (contract §7).
 DEFER_REASONS = ("unsupported_evidence", "grid_conflict", "not_relevant", "other")
 #: peelfeed exit-2 error code -> HTTP status (contract §4). Unknown codes are
@@ -645,6 +647,25 @@ def _tail(text, limit=300):
     return lines[-1].strip()[:limit]
 
 
+def _reason_text(reason):
+    """One ``error.detail.reasons[]`` entry as compact text for the UI.
+
+    CP2 ``plan accept`` is all-or-nothing and lists per-item reasons
+    (``{item_id, code, message}``, wire §2.6). The compact ``item_id=code``
+    token is what the review UI parses to show the reasons in Chinese; plain
+    string reasons (older payloads) pass through unchanged.
+    """
+    if isinstance(reason, dict):
+        item = str(reason.get("item_id") or "").strip()
+        code = str(reason.get("code") or "").strip()
+        message = str(reason.get("message") or "").strip()
+        token = "%s=%s" % (item, code) if item and code else (code or item)
+        if token and message:
+            return "%s (%s)" % (token, message)
+        return token or message
+    return str(reason)
+
+
 def _legacy_error(payload, returncode):
     """A readable reason from a pre-protocol error payload (older peelfeed)."""
     reason = ""
@@ -796,8 +817,11 @@ class PeelfeedClient(object):
             reason = message
         reasons = detail.get("reasons") if isinstance(detail, dict) else None
         if isinstance(reasons, list) and reasons:
-            suffix = "; ".join(str(item) for item in reasons[:3])
+            suffix = "; ".join(_reason_text(item) for item in reasons)
             reason = "%s (%s)" % (reason, suffix)
+            # Accept is all-or-nothing: keep every per-item reason readable for
+            # the UI instead of truncating the list to three entries.
+            return code, reason[:1000]
         return code, reason[:300]
 
     def _error_detail(self, completed):
@@ -868,13 +892,14 @@ class PeelfeedClient(object):
         return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout))
 
     def plan(self, peel_id, payload):
-        """Run one ``peelfeed plan`` action (contract §7).
+        """Run one ``peelfeed plan`` action (contract §7 / wire §2.6).
 
         ``payload`` always carries ``action`` (one of :data:`PLAN_ACTIONS``).
-        ``select``/``defer`` send their request as JSON on stdin via
-        ``--input -``; ``confirm``/``lock``/``unlock`` use
+        ``select``/``defer``/``accept`` send their request as JSON on stdin via
+        ``--input -``; ``confirm``/``lock``/``unlock``/``clear`` use
         ``--entry <id> --base-plan-version <n>``; ``show`` is read-only. The
-        response is the latest complete ReviewPlan plus ``entry``/``resolution``.
+        response is the latest complete ReviewPlan plus ``entry``/``resolution``
+        and the CP2 additive ``accepted``/``cleared``/``refresh`` objects.
         """
         request = dict(payload or {})
         action = str(request.pop("action", "") or "").strip().lower()
@@ -883,10 +908,12 @@ class PeelfeedClient(object):
                              % ", ".join(PLAN_ACTIONS))
         args = ["plan", str(peel_id), action]
         stdin_text = None
-        if action in ("select", "defer"):
+        if action in ("select", "defer", "accept"):
+            if action == "accept" and not request.get("item_ids"):
+                raise ValueError("plan accept needs a non-empty item_ids list")
             args.extend(["--input", "-"])
             stdin_text = json.dumps(request, ensure_ascii=False)
-        elif action in ("confirm", "lock", "unlock"):
+        elif action in ("confirm", "lock", "unlock", "clear"):
             entry_id = str(request.get("entry_id") or "")
             if not entry_id:
                 raise ValueError("plan %s needs entry_id" % action)

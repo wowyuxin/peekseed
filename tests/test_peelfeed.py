@@ -189,6 +189,27 @@ class UiWiringTests(unittest.TestCase):
                     "需重新选择策略或先处理父表"):
                 self.assertIn(marker, page)
 
+    def test_the_ui_ships_cp2_accept_clear_and_refresh_controls(self):
+        """CP2 W9: 确认选中项/清除选择 + the E4 re-confirm refresh display."""
+        with temp_data_root():
+            page = _client().get("/").text
+            for marker in (
+                    "确认选中项", "清除选择",
+                    'data-r="accept-selected"', 'data-r="accept-pick"',
+                    "reviewSelectedItemIds", "reviewSyncAcceptButton",
+                    "reviewAcceptErrText", "reviewAcceptReasons",
+                    "REVIEW_ACCEPT_REASON_LABEL",
+                    "locked:'已锁定'", "stale:'已过期'",
+                    "no_ready_suggestion:'无就绪建议'",
+                    "validator_failed:'校验未通过'", "item_missing:'条目缺失'",
+                    "body.action='accept'", "item_ids=ids",
+                    "body.action='clear'", "body.entry_id=entry.entry_id",
+                    "plan.cleared.reverted_resolution", "已撤销 R0 记录",
+                    "reviewRefreshText", "已重新确认（revision r",
+                    "证据已刷新（revision 不变）",
+                    "action_params：", "source_refs："):
+                self.assertIn(marker, page)
+
 
 class ConfigTests(unittest.TestCase):
     def test_env_seeds_a_0600_config_file_without_secrets(self):
@@ -410,8 +431,8 @@ class CliAdapterTests(unittest.TestCase):
                 self.assertEqual([row["peel_id"] for row in rows], [peel_id])
                 review = engine.review(peel_id)
                 self.assertEqual(review["review_schema"], 2)
-                self.assertEqual(review["counts"]["clusters"], 2)
-                self.assertEqual(len(review["items"]), 2)
+                self.assertEqual(review["counts"]["clusters"], 3)
+                self.assertEqual(len(review["items"]), 3)
                 item_id = review["items"][0]["id"]
                 self.assertTrue(item_id.startswith("it-"))
                 item = engine.review(peel_id, item=item_id)
@@ -528,6 +549,57 @@ class CliAdapterTests(unittest.TestCase):
                                   if call[2] == "defer")
                 self.assertIn("--input", defer_call)
 
+    def test_plan_accept_and_clear_use_the_cp2_argv_and_stdin(self):
+        """CP2 W9: accept goes via ``--input -``; clear via ``--entry``."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            source = make_pdf(root / "manual.pdf")
+            with peelfeed_env(CLI=str(cli.path)):
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source),
+                                        llm_mode="off")["peel"]["peel_id"]
+                accepted = engine.plan(peel_id, {
+                    "action": "accept", "base_plan_version": 0,
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a",
+                                 "it-8b7a6c5d4e3f2a10"]})
+                self.assertEqual(accepted["plan_version"], 1)
+                self.assertEqual(
+                    [row["item_id"] for row in accepted["accepted"]],
+                    ["it-3f9c2a4b6d8e0f1a", "it-8b7a6c5d4e3f2a10"])
+                self.assertIsNone(accepted["refresh"])
+                entry_id = accepted["accepted"][0]["entry_id"]
+                cleared = engine.plan(peel_id, {
+                    "action": "clear",
+                    "base_plan_version": accepted["plan_version"],
+                    "entry_id": entry_id})
+                self.assertEqual(cleared["plan_version"], 2)
+                self.assertEqual(cleared["cleared"]["entry_id"], entry_id)
+                self.assertEqual(cleared["cleared"]["status_before"],
+                                 "confirmed")
+                self.assertIsNone(cleared["cleared"]["reverted_resolution"])
+                # The fake CLI records the exact stdin request it received.
+                self.assertEqual(cli.state()["accept_requests"][-1], {
+                    "base_plan_version": 0,
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a",
+                                 "it-8b7a6c5d4e3f2a10"]})
+                self.assertEqual(cli.state()["clear_requests"][-1], {
+                    "entry_id": entry_id, "base_plan_version": 1})
+                plan_calls = [call["argv"] for call in cli.calls()
+                              if call["argv"][0] == "plan"]
+                accept_call = next(call for call in plan_calls
+                                   if call[2] == "accept")
+                self.assertIn("--input", accept_call)
+                self.assertIn("-", accept_call)
+                clear_call = next(call for call in plan_calls
+                                  if call[2] == "clear")
+                self.assertIn("--entry", clear_call)
+                self.assertIn(entry_id, clear_call)
+                self.assertIn("--base-plan-version", clear_call)
+                self.assertEqual(
+                    clear_call[clear_call.index("--base-plan-version") + 1],
+                    "1")
+
     def test_review_report_passes_filters_via_stdin(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
@@ -541,7 +613,7 @@ class CliAdapterTests(unittest.TestCase):
                 self.assertEqual(report["report_path"],
                                  "extract/review/report.json")
                 self.assertEqual(report["report"]["status"], "ready")
-                self.assertEqual(report["counts"]["suggestions"], 1)
+                self.assertEqual(report["counts"]["suggestions"], 3)
                 filtered = engine.review_report(
                     peel_id, item_ids=["it-3f9c2a4b6d8e0f1a"],
                     cluster_ids=["cl-0f1e2d3c4b5a"])
@@ -779,10 +851,10 @@ class PeelfeedApiTests(unittest.TestCase):
                 payload = review.json()
                 self.assertEqual(payload["review_schema"], 2)
                 self.assertEqual(payload["peel_id"], peel_id)
-                self.assertEqual(payload["counts"]["clusters"], 2)
-                self.assertEqual(payload["counts"]["human_pending"], 1)
-                self.assertEqual(len(payload["items"]), 2)
-                self.assertEqual(len(payload["clusters"]), 2)
+                self.assertEqual(payload["counts"]["clusters"], 3)
+                self.assertEqual(payload["counts"]["human_pending"], 2)
+                self.assertEqual(len(payload["items"]), 3)
+                self.assertEqual(len(payload["clusters"]), 3)
                 self.assertEqual(payload["clusters"][0]["strategies"][0]["id"],
                                  "use_first_row_header")
                 self.assertEqual(payload["items"][0]["id"],
@@ -977,6 +1049,371 @@ class PeelfeedApiTests(unittest.TestCase):
                               [row["entry_id"]
                                for row in unlocked.json()["entries"]])
                 self.assertFalse(unlocked.json()["entry"]["locked"])
+
+    def test_review_plan_accept_round_trip(self):
+        """CP2 W9: accept adopts each ready suggestion, bumps version once."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                accepted = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a",
+                                 "it-8b7a6c5d4e3f2a10"]})
+                self.assertEqual(accepted.status_code, 200, accepted.text)
+                plan = accepted.json()
+                self.assertEqual(plan["plan_version"], 1)
+                self.assertIsNone(plan["entry"])
+                self.assertIsNone(plan["resolution"])
+                self.assertIsNone(plan["refresh"])
+                rows = {row["item_id"]: row for row in plan["accepted"]}
+                self.assertEqual(set(rows), {"it-3f9c2a4b6d8e0f1a",
+                                             "it-8b7a6c5d4e3f2a10"})
+                operation = rows["it-3f9c2a4b6d8e0f1a"]
+                self.assertEqual(set(operation), {
+                    "item_id", "entry_id", "strategy", "action", "status",
+                    "revision", "replaced_existing"})
+                self.assertEqual(operation["status"], "confirmed")
+                self.assertEqual(operation["revision"], 1)
+                self.assertFalse(operation["replaced_existing"])
+                self.assertEqual(operation["action"], {
+                    "type": "operation", "name": "set_header_rows",
+                    "params": {"rows": [0]}})
+                self.assertEqual(operation["strategy"],
+                                 {"id": "use_first_row_header", "version": 1})
+                resolution = rows["it-8b7a6c5d4e3f2a10"]
+                self.assertEqual(resolution["status"], "applied")
+                self.assertEqual(resolution["action"], {
+                    "type": "resolution", "name": "keep_visual_fallback"})
+                self.assertEqual(cli.state()["resolutions"][-1]["name"],
+                                 "keep_visual_fallback")
+                # The exact stdin request is the frozen wire §2.6 accept shape.
+                self.assertEqual(cli.state()["accept_requests"][-1], {
+                    "base_plan_version": 0,
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a",
+                                 "it-8b7a6c5d4e3f2a10"]})
+                # Accepting the same item again replaces its entry: revision +1,
+                # still exactly one plan_version bump.
+                again = client.post(route, json={
+                    "base_plan_version": plan["plan_version"],
+                    "action": "accept",
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a"]})
+                self.assertEqual(again.status_code, 200, again.text)
+                self.assertEqual(again.json()["plan_version"], 2)
+                replaced = again.json()["accepted"][0]
+                self.assertTrue(replaced["replaced_existing"])
+                self.assertEqual(replaced["revision"], 2)
+
+    def test_review_plan_accept_is_all_or_nothing_with_per_item_reasons(self):
+        """CP2 W9: any failing item fails the whole accept with reasons."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                default_report = client.post(base + "/review/reports",
+                                             json={}).json()
+                failed = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a",
+                                 "it-5a7c8b9d0e1f2a3b",
+                                 "it-0000000000000000"]})
+                self.assertEqual(failed.status_code, 400, failed.text)
+                detail = failed.json()["detail"]
+                self.assertIn("validation", detail)
+                self.assertIn("it-5a7c8b9d0e1f2a3b=stale", detail)
+                self.assertIn("it-0000000000000000=item_missing", detail)
+                # All-or-nothing: the good item was not accepted either.
+                state = cli.state()
+                plan_state = state.get("plan") or {}
+                self.assertEqual(plan_state.get("plan_version", 0), 0)
+                self.assertFalse(plan_state.get("entries"))
+                self.assertFalse(state.get("resolutions"))
+                # no_ready_suggestion when the report has no ready candidate.
+                report = json.loads(json.dumps(default_report))
+                report["report"]["clusters"] = report["report"]["clusters"][:1]
+                cli.update(review_report=report)
+                missing = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": ["it-8b7a6c5d4e3f2a10"]})
+                self.assertEqual(missing.status_code, 400, missing.text)
+                self.assertIn("it-8b7a6c5d4e3f2a10=no_ready_suggestion",
+                              missing.json()["detail"])
+                # validator_failed when the item's only candidate failed check.
+                review = client.get(base + "/review").json()
+                stale_item = review["items"][2]
+                stale_item["stale"] = False
+                stale_item["status"] = "needs_decision"
+                stale_item["entry"] = None
+                cli.update(review=review, review_report=default_report)
+                invalid = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": ["it-5a7c8b9d0e1f2a3b"]})
+                self.assertEqual(invalid.status_code, 400, invalid.text)
+                self.assertIn("it-5a7c8b9d0e1f2a3b=validator_failed",
+                              invalid.json()["detail"])
+
+    def test_review_plan_accept_locked_and_409_busy(self):
+        """CP2 W9: a locked item is an accept reason; stale base/busy map 409/423."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                locked = client.post(route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "lock", "entry_id": entry_id})
+                self.assertEqual(locked.status_code, 200, locked.text)
+                version = locked.json()["plan_version"]
+                rejected = client.post(route, json={
+                    "base_plan_version": version, "action": "accept",
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a"]})
+                self.assertEqual(rejected.status_code, 400, rejected.text)
+                self.assertIn("it-3f9c2a4b6d8e0f1a=locked",
+                              rejected.json()["detail"])
+                # The plan is unchanged: the locked entry is still there.
+                self.assertEqual(cli.state()["plan"]["plan_version"], version)
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                # A stale base_plan_version is a 409 conflict.
+                stale = client.post(route, json={
+                    "base_plan_version": 99, "action": "accept",
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a"]})
+                self.assertEqual(stale.status_code, 409, stale.text)
+                self.assertIn("conflict", stale.json()["detail"])
+                # A busy review lock is 423, not a 400/502.
+                cli.update(errors={"plan": {"code": "busy",
+                                            "message": "review lock held"}})
+                busy = client.post(route, json={
+                    "base_plan_version": version, "action": "accept",
+                    "item_ids": ["it-3f9c2a4b6d8e0f1a"]})
+                self.assertEqual(busy.status_code, 423, busy.text)
+                self.assertIn("busy", busy.json()["detail"])
+
+    def test_review_plan_clear_round_trip_and_r0_revert(self):
+        """CP2 W9: clear deletes an entry; an applied R0 entry is reverted."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.json()["entry"]["status"],
+                                 "confirmed")
+                cleared = client.post(route, json={
+                    "base_plan_version": confirmed.json()["plan_version"],
+                    "action": "clear", "entry_id": entry_id})
+                self.assertEqual(cleared.status_code, 200, cleared.text)
+                plan = cleared.json()
+                self.assertEqual(plan["plan_version"], 3)
+                self.assertIsNone(plan["entry"])
+                self.assertIsNone(plan["resolution"])
+                self.assertIsNone(plan["refresh"])
+                self.assertEqual(set(plan["cleared"]), {
+                    "entry_id", "item_id", "status_before",
+                    "reverted_resolution"})
+                self.assertEqual(plan["cleared"]["entry_id"], entry_id)
+                self.assertEqual(plan["cleared"]["item_id"],
+                                 "it-3f9c2a4b6d8e0f1a")
+                self.assertEqual(plan["cleared"]["status_before"],
+                                 "confirmed")
+                self.assertIsNone(plan["cleared"]["reverted_resolution"])
+                self.assertFalse(plan["entries"])
+                # R0: clear an applied resolution entry writes a revert row.
+                selected = client.post(route, json={
+                    "base_plan_version": plan["plan_version"],
+                    "action": "select",
+                    "entry": {"item_id": "it-8b7a6c5d4e3f2a10",
+                              "strategy": {"id": "keep_visual_fallback",
+                                           "version": 1}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry = selected.json()["entry"]
+                self.assertEqual(entry["status"], "draft")
+                confirmed = client.post(route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry["entry_id"]})
+                self.assertEqual(confirmed.json()["entry"]["status"],
+                                 "applied")
+                add_row = confirmed.json()["resolution"]
+                cleared = client.post(route, json={
+                    "base_plan_version": confirmed.json()["plan_version"],
+                    "action": "clear", "entry_id": entry["entry_id"]})
+                self.assertEqual(cleared.status_code, 200, cleared.text)
+                reverted = cleared.json()["cleared"]["reverted_resolution"]
+                self.assertIsNotNone(reverted)
+                self.assertEqual(reverted["change"], "revert")
+                self.assertEqual(reverted["supersedes"],
+                                 add_row["resolution_id"])
+                self.assertEqual(reverted["item_id"],
+                                 "it-8b7a6c5d4e3f2a10")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+
+    def test_review_plan_clear_conflicts_and_not_found(self):
+        """CP2 W9: locked/batch clear is 409; unknown entry is 404."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                selected = client.post(route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": "it-3f9c2a4b6d8e0f1a",
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                entry_id = selected.json()["entry"]["entry_id"]
+                locked = client.post(route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "lock", "entry_id": entry_id})
+                rejected = client.post(route, json={
+                    "base_plan_version": locked.json()["plan_version"],
+                    "action": "clear", "entry_id": entry_id})
+                self.assertEqual(rejected.status_code, 409, rejected.text)
+                self.assertIn("conflict", rejected.json()["detail"])
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                # A batch-bound entry is read-only -> conflict.
+                review = client.get(base + "/review").json()
+                batch_entry = json.loads(json.dumps(
+                    review["items"][2]["entry"]))
+                batch_entry["batch_id"] = "batch-1"
+                cli.update(plan={
+                    "peel_id": "peel", "review_schema": 2, "plan_version": 0,
+                    "updated_at": "2026-11-05T00:00:00Z",
+                    "entries": [batch_entry], "entry": None,
+                    "resolution": None})
+                batch = client.post(route, json={
+                    "base_plan_version": 0, "action": "clear",
+                    "entry_id": batch_entry["entry_id"]})
+                self.assertEqual(batch.status_code, 409, batch.text)
+                self.assertIn("conflict", batch.json()["detail"])
+                # An unknown entry is a 404 (peelfeed exit code 3).
+                unknown = client.post(route, json={
+                    "base_plan_version": 0, "action": "clear",
+                    "entry_id": "e-0000000000000000"})
+                self.assertEqual(unknown.status_code, 404, unknown.text)
+
+    def test_review_plan_accept_clear_request_validation(self):
+        """CP2 W9: peekseed rejects malformed accept/clear bodies with 400."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                cli.clear_calls()
+                cases = [
+                    ({"base_plan_version": 0, "action": "accept"}, "item_ids"),
+                    ({"base_plan_version": 0, "action": "accept",
+                      "item_ids": []}, "item_ids"),
+                    ({"base_plan_version": 0, "action": "accept",
+                      "item_ids": "it-x"}, "item_ids"),
+                    ({"base_plan_version": 0, "action": "accept",
+                      "item_ids": ["it-x", "it-x"]}, "unique"),
+                    ({"base_plan_version": 0, "action": "accept",
+                      "item_ids": [7]}, "strings"),
+                    ({"base_plan_version": 0, "action": "clear"}, "entry_id"),
+                    ({"base_plan_version": 0, "action": "explode"},
+                     "action must be one of"),
+                ]
+                for body, marker in cases:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn(marker, response.json()["detail"])
+                self.assertNotIn("plan", cli.commands())
+
+    def test_review_plan_confirm_refresh_matches_wire(self):
+        """CP2 W9/E4: refresh before/after + revision rules match wire §2.7."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                review = client.get(base + "/review").json()
+                stale_entry = json.loads(json.dumps(
+                    review["items"][2]["entry"]))
+                self.assertTrue(stale_entry["stale"])
+                stale_plan = {"peel_id": "peel", "review_schema": 2,
+                              "plan_version": 0,
+                              "updated_at": "2026-11-05T00:00:00Z",
+                              "entries": [stale_entry], "entry": None,
+                              "resolution": None}
+                cli.update(plan=stale_plan)
+                confirmed = client.post(route, json={
+                    "base_plan_version": 0, "action": "confirm",
+                    "entry_id": stale_entry["entry_id"]})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                plan = confirmed.json()
+                self.assertEqual(plan["plan_version"], 1)
+                refresh = plan["refresh"]
+                self.assertEqual(set(refresh), {
+                    "changed", "revision_before", "revision_after",
+                    "action_params_before", "action_params_after",
+                    "source_refs_before", "source_refs_after"})
+                self.assertTrue(refresh["changed"])
+                self.assertEqual(refresh["revision_before"], 2)
+                self.assertEqual(refresh["revision_after"], 3)
+                self.assertEqual(
+                    refresh["action_params_before"]["parent_header_cells"],
+                    [["bits", "variable"]])
+                self.assertEqual(
+                    refresh["action_params_after"]["parent_header_cells"],
+                    [["Bits", "Variable"]])
+                self.assertEqual(plan["entry"]["revision"], 3)
+                self.assertEqual(plan["entry"]["status"], "confirmed")
+                self.assertFalse(plan["entry"]["stale"])
+                # Hash-only evidence change: same cells, no revision bump.
+                hash_review = json.loads(json.dumps(review))
+                stale_item = hash_review["items"][2]
+                candidate = stale_item["parent_candidates"][0]
+                candidate["header_cells"] = [["bits", "variable"]]
+                candidate["source_refs"][0]["cells"] = ["bits", "variable"]
+                candidate["source_refs"][0]["evidence_hash"] = "ev-p1041-new"
+                cli.update(plan=json.loads(json.dumps(stale_plan)),
+                           review=hash_review)
+                hash_only = client.post(route, json={
+                    "base_plan_version": 0, "action": "confirm",
+                    "entry_id": stale_entry["entry_id"]})
+                self.assertEqual(hash_only.status_code, 200, hash_only.text)
+                refresh = hash_only.json()["refresh"]
+                self.assertFalse(refresh["changed"])
+                self.assertEqual(refresh["revision_before"], 2)
+                self.assertEqual(refresh["revision_after"], 2)
+                self.assertEqual(hash_only.json()["entry"]["revision"], 2)
+                # A non-refreshable stale reason is a conflict, no plan write.
+                blocked_plan = json.loads(json.dumps(stale_plan))
+                blocked_plan["entries"][0]["stale_reasons"] = [
+                    "strategy_changed"]
+                cli.update(plan=blocked_plan)
+                conflict = client.post(route, json={
+                    "base_plan_version": 0, "action": "confirm",
+                    "entry_id": stale_entry["entry_id"]})
+                self.assertEqual(conflict.status_code, 409, conflict.text)
+                self.assertIn("conflict", conflict.json()["detail"])
 
     def test_review_payload_exposes_converter_code_hash_only(self):
         """CP1.1: derived_from names the diagnostic converter hash, not the engine."""
@@ -1219,7 +1656,7 @@ class PeelfeedApiTests(unittest.TestCase):
                 self.assertEqual(payload["report_path"],
                                  "extract/review/report.json")
                 self.assertEqual(payload["report"]["status"], "ready")
-                self.assertEqual(payload["counts"]["suggestions"], 1)
+                self.assertEqual(payload["counts"]["suggestions"], 3)
                 self.assertTrue(payload["report"]["clusters"][0]["suggestions"])
                 filtered = client.post(route, json={
                     "item_ids": ["it-3f9c2a4b6d8e0f1a"],

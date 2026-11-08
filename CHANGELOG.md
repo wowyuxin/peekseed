@@ -62,6 +62,31 @@ version/tag policy.
   `evidence_changed`/`parent_changed` can be explicitly re-confirmed (locked
   entries included, refreshing the evidence snapshot), while any other stale
   reason disables 确认 with the guidance “需重新选择策略或先处理父表”.
+- **CP2 W9 review accept/clear.** `POST …/review/plan` now also accepts
+  `action:"accept"` (`{base_plan_version, item_ids:[…]}`, sent to peelfeed via
+  `plan accept --input -`) and `action:"clear"` (`{base_plan_version,
+  entry_id}`, sent via `plan clear --entry <id> --base-plan-version <n>`). The
+  adapter `PLAN_ACTIONS` gains `accept`/`clear`; peekseed validates a non-empty,
+  unique string `item_ids` list and a string `entry_id`, and keeps the frozen
+  error mapping (`busy → 423`, `conflict/stale/review_schema →
+  409`, `validation → 400`, not found → `404`, other → `502`). Accept is
+  all-or-nothing: a failure returns `400` with the per-item `detail.reasons`
+  (`locked`, `stale`, `no_ready_suggestion`, `validator_failed`, `item_missing`)
+  and leaves the plan unchanged; a success bumps `plan_version` exactly once,
+  reports `accepted[]` (each entry confirmed with its own revision, R0 ready
+  suggestions applied immediately) and `refresh: null`. Clear returns
+  `cleared{entry_id,item_id,status_before,reverted_resolution}` and rejects
+  locked or batch-bound entries with `409`.
+- **CP2 W9 review UI: 确认选中项 / 清除选择 / re-confirm refresh display.** The
+  cluster detail renders a per-item checkbox and a cluster-level
+  “确认选中项” button (disabled when nothing is ticked or the plan is busy);
+  a `400` shows each failing item in Chinese (已锁定/已过期/无就绪建议/
+  校验未通过/条目缺失). Each entry gets “清除选择” (enabled only when the entry
+  is not locked and has no `batch_id`); a successful clear shows “已撤销 R0 记录”
+  when `cleared.reverted_resolution` is present. After a successful `confirm`
+  with `refresh != null`, the UI shows “已重新确认（revision rX → rY）” with a
+  before→after diff of `action_params`/`source_refs` when `changed`, and
+  “证据已刷新（revision 不变）” for a hash-only refresh (wire §2.7).
 
 ### Fixed
 

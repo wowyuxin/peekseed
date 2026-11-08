@@ -1230,21 +1230,50 @@ def create_app():
     def _review_plan_request(body):
         """Validate ``POST …/review/plan`` and return ``(action, cli_request)``.
 
-        Shape per the CP1 wire contract §8:
-        ``{base_plan_version, action: select|confirm|lock|unlock|defer,
-        entry_id?, entry?, reason_code?, reason?}``. ``select`` wraps the
-        selection in ``entry``; ``defer`` carries ``item_id``/``reason_code``.
+        Shape per the CP2 wire contract §2.6/§4.1:
+        ``{base_plan_version, action: select|confirm|lock|unlock|defer|accept|
+        clear, entry_id?, entry?, item_ids?, reason_code?, reason?}``.
+        ``select`` wraps the selection in ``entry``; ``defer`` carries
+        ``item_id``/``reason_code``; ``accept`` is all-or-nothing over a
+        non-empty, unique ``item_ids`` list; ``clear`` names one ``entry_id``.
         """
         if not isinstance(body, dict):
             raise HTTPException(400, "a review plan request must be a JSON object")
         action = str(body.get("action") or "").strip().lower()
         if action not in peelfeed.PLAN_ACTIONS or action == "show":
             raise HTTPException(
-                400, "action must be one of select, confirm, lock, unlock, defer")
+                400, "action must be one of select, confirm, lock, unlock, "
+                     "defer, accept, clear")
         base = body.get("base_plan_version")
         if isinstance(base, bool) or not isinstance(base, int) or base < 0:
             raise HTTPException(
                 400, "base_plan_version is required and must be an integer >= 0")
+        if action == "accept":
+            item_ids = body.get("item_ids")
+            if not isinstance(item_ids, list) or not item_ids:
+                raise HTTPException(
+                    400, "accept needs a non-empty item_ids list")
+            cleaned = []
+            seen = set()
+            for raw in item_ids:
+                if not isinstance(raw, str):
+                    raise HTTPException(
+                        400, "item_ids must contain only strings")
+                item_id = raw.strip()
+                if not item_id:
+                    raise HTTPException(
+                        400, "item_ids must not contain empty ids")
+                if item_id in seen:
+                    raise HTTPException(
+                        400, "item_ids must be unique (duplicate %s)" % item_id)
+                seen.add(item_id)
+                cleaned.append(item_id)
+            return action, {"base_plan_version": base, "item_ids": cleaned}
+        if action == "clear":
+            entry_id = str(body.get("entry_id") or "").strip()
+            if not entry_id:
+                raise HTTPException(400, "clear needs entry_id")
+            return action, {"base_plan_version": base, "entry_id": entry_id}
         if action == "select":
             entry = body.get("entry")
             if not isinstance(entry, dict):
@@ -1761,12 +1790,15 @@ def create_app():
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/plan")
     def source_review_plan(dataset_id: str, sha: str,
                            payload: Optional[dict] = None):
-        """Proxy one ``peelfeed plan`` action (select/confirm/lock/unlock/defer).
+        """Proxy one ``peelfeed plan`` action.
 
-        Returns the latest complete ReviewPlan (with the changed ``entry`` and
-        any R0 ``resolution``). Errors map per contract §4: 409 for a stale
-        ``base_plan_version``/conflict/review schema, 400 for validation, 423
-        when peelfeed's review lock is busy.
+        Actions: select/confirm/lock/unlock/defer/accept/clear. Returns the
+        latest complete ReviewPlan (with the changed ``entry`` and any R0
+        ``resolution``) plus the CP2 additive ``accepted``/``cleared``/
+        ``refresh`` objects. Errors map per contract §4: 409 for a stale
+        ``base_plan_version``/conflict/review schema, 400 for validation
+        (``accept`` lists all per-item reasons, all-or-nothing), 423 when
+        peelfeed's review lock is busy.
         """
         directory = _dataset_dir(dataset_id)
         entry = _source_by_sha(directory, sha)

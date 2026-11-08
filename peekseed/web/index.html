@@ -4941,7 +4941,7 @@ const REVIEW_REASON_LABEL={unsupported_evidence:'证据不足/不支持',grid_co
   not_relevant:'与本数据集无关',other:'其他'};
 const REVIEW_DEFER_CODES=['unsupported_evidence','grid_conflict','not_relevant','other'];
 const REVIEW_ACTION_LABEL={select:'已选策略',confirm:'已确认',lock:'已锁定',
-  unlock:'已解锁',defer:'已暂缓'};
+  unlock:'已解锁',defer:'已暂缓',accept:'已确认选中项',clear:'已清除选择'};
 /* CP2 E3 (contract §11.1): stable stale reason codes -> Chinese. Only
    evidence_changed/parent_changed can be refreshed by an explicit re-confirm;
    every other reason needs a new strategy or the parent fixed first. The raw
@@ -4951,6 +4951,12 @@ const REVIEW_STALE_LABEL={evidence_changed:'证据变化',parent_changed:'父表
   capability_unavailable:'能力不可用',action_invalid:'动作已失效',
   chain_not_allowed:'禁止链式继承',item_missing:'条目缺失'};
 const REVIEW_STALE_REFRESHABLE=['evidence_changed','parent_changed'];
+/* CP2 W9: ``plan accept`` is all-or-nothing; a 400 embeds compact
+   ``item_id=code`` tokens from ``detail.reasons`` (wire §2.6) which are mapped
+   to these Chinese labels. ``entry_in_batch`` is reserved for CP3. */
+const REVIEW_ACCEPT_REASON_LABEL={locked:'已锁定',stale:'已过期',
+  no_ready_suggestion:'无就绪建议',validator_failed:'校验未通过',
+  item_missing:'条目缺失',entry_in_batch:'已在批次中'};
 /* CP2 E2: strategies whose select call must carry real params instead of {}. */
 const REVIEW_PARAM_STRATEGIES={inherit_parent_header:'parent',
   use_header_rows:'rows'};
@@ -5206,6 +5212,84 @@ function reviewStrategyParams(card,strategyId){
   }
   return {params:{}};
 }
+/* --- CP2 W9: accept selection + per-item reasons ------------------------- */
+function reviewSelectedItemIds(){
+  const box=$('#reviewDetail'); if(!box) return [];
+  const ids=[];
+  Array.prototype.forEach.call(box.querySelectorAll('input[data-r="accept-pick"]'),
+    function(el){ if(el.checked&&el.value) ids.push(el.value); });
+  return ids;
+}
+function reviewAcceptReasonLabel(code){
+  return REVIEW_ACCEPT_REASON_LABEL[code]||code||'';
+}
+/* The server's 400 detail embeds ``item_id=code`` tokens (adapter formatting of
+   ``detail.reasons``); parse them so every failing item is shown in Chinese. */
+function reviewAcceptReasons(detail){
+  const text=String(detail||'');
+  const out=[]; const seen={};
+  const re=/(it-[0-9a-z]+)=([a-z_]+)/g; let match;
+  while((match=re.exec(text))){
+    const key=match[1]+'|'+match[2];
+    if(seen[key]) continue;
+    seen[key]=true;
+    out.push({item_id:match[1],code:match[2]});
+  }
+  return out;
+}
+function reviewAcceptErrText(e){
+  if(e&&e.status===400){
+    const reasons=reviewAcceptReasons(e.message);
+    if(reasons.length){
+      return '确认选中项失败（全部或全不）：'+reasons.map(function(reason){
+        return reason.item_id+'：'+reviewAcceptReasonLabel(reason.code);
+      }).join('；')+'。已刷新最新计划，请重试。';
+    }
+  }
+  return reviewErrText(e);
+}
+/* Disable 确认选中项 when nothing is ticked or the plan is busy. */
+function reviewSyncAcceptButton(){
+  const box=$('#reviewDetail'); if(!box) return;
+  const btn=box.querySelector('button[data-r="accept-selected"]');
+  if(!btn) return;
+  const count=reviewSelectedItemIds().length;
+  const busy=!!(REVIEW_CTX&&REVIEW_CTX.busy);
+  btn.disabled=(count===0||busy);
+  btn.textContent='确认选中项'+(count?('（'+count+'）'):'');
+}
+/* --- CP2 W9/E4: re-confirm refresh display ------------------------------- */
+function reviewRefreshValueText(value){
+  if(value==null) return '—';
+  if(Array.isArray(value)) return value.length?JSON.stringify(value):'—';
+  if(typeof value==='object') return reviewJsonBits(value);
+  return String(value);
+}
+function reviewRefreshDiffText(refresh){
+  const bits=[];
+  if(refresh.action_params_before!=null||refresh.action_params_after!=null){
+    bits.push('action_params：'+reviewRefreshValueText(refresh.action_params_before)
+      +' → '+reviewRefreshValueText(refresh.action_params_after));
+  }
+  if(refresh.source_refs_before!=null||refresh.source_refs_after!=null){
+    bits.push('source_refs：'+reviewRefreshValueText(refresh.source_refs_before)
+      +' → '+reviewRefreshValueText(refresh.source_refs_after));
+  }
+  return bits.join('；');
+}
+/* Wire §2.7: changed=true bumps the revision and shows a before→after diff;
+   a hash-only evidence change keeps the revision and says so. */
+function reviewRefreshText(refresh){
+  if(!refresh||typeof refresh!=='object') return '';
+  const before=(refresh.revision_before==null)?'?':refresh.revision_before;
+  const after=(refresh.revision_after==null)?'?':refresh.revision_after;
+  if(refresh.changed){
+    const diff=reviewRefreshDiffText(refresh);
+    return '已重新确认（revision r'+before+' → r'+after+'）'
+      +(diff?('；'+diff):'');
+  }
+  return '证据已刷新（revision 不变）';
+}
 function reviewJsonBits(value){
   if(value==null) return '—';
   if(typeof value!=='object') return String(value);
@@ -5351,6 +5435,11 @@ function reviewActionsHtml(item){
   const locked=!!(entry&&entry.locked);
   const hasEntry=!!(entry&&entry.entry_id);
   const stale=!!(entry&&entry.stale);
+  const busy=!!(REVIEW_CTX&&REVIEW_CTX.busy);
+  const batchId=(entry&&entry.batch_id)?String(entry.batch_id):'';
+  /* CP2 W9 clear: enabled only for an entry that is neither locked nor already
+     in a batch (wire §2.6); the item returns to its merged status afterwards. */
+  const canClear=hasEntry&&!locked&&!batchId&&!busy;
   const refreshable=stale&&reviewStaleRefreshable(entry);
   /* CP2 E3: confirm stays enabled for non-stale entries and for stale entries
      whose only reasons are evidence_changed/parent_changed (an explicit
@@ -5372,6 +5461,11 @@ function reviewActionsHtml(item){
     +(canConfirm?'':' disabled')+'>确认</button>'
     +'<button type="button" class="secondary" data-r="'+(locked?'unlock':'lock')+'"'
     +(hasEntry?'':' disabled')+'>'+(locked?'解锁':'锁定')+'</button>'
+    +'<button type="button" class="secondary" data-r="clear"'
+    +(canClear?'':' disabled')
+    +' title="'+(locked?'条目已锁定，先解锁才能清除'
+      :(batchId?'条目已在批次中，不能清除':'删除该计划条目（已应用的 R0 会写 revert）'))
+    +'">清除选择</button>'
     +(stale&&refreshable
       ?'<span class="rr-stale-hint">重新确认会刷新证据快照</span>':'')
     +(stale&&!refreshable
@@ -5397,10 +5491,14 @@ function reviewActionsHtml(item){
 function reviewItemHtml(item){
   const status=item.status||'needs_decision';
   const pages=(item.pages||[]).join(',');
+  const busy=!!(REVIEW_CTX&&REVIEW_CTX.busy);
   const meta=['asset '+(item.asset_id||'?'), pages?('页 p.'+pages):'',
     'code '+(item.code||'')].filter(Boolean).join(' · ');
   return '<article class="rr-item" data-item="'+escAttr(item.id||'')+'">'
     +'<div class="rr-item-h"><span class="rr-item-id">'+esc(item.id||'')+'</span>'
+    +'<label class="rr-pick" title="勾选后可点“确认选中项”">'
+    +'<input type="checkbox" data-r="accept-pick" value="'+escAttr(item.id||'')+'"'
+    +(busy?' disabled':'')+'>选中</label>'
     +reviewBadge(REVIEW_STATUS_LABEL[status]||status,status)
     +(item.triage?reviewBadge(REVIEW_TRIAGE_LABEL[item.triage]||item.triage,item.triage):'')
     +(item.stale?reviewStaleBadge(item):'')
@@ -5474,7 +5572,11 @@ function paintReviewDetail(r){
     +esc(cl.title||cl.code||'簇')+'</h3>'
     +'<span class="rr-cl-code">'+esc(cl.code||'')+'</span>'
     +reviewStateBadges(cl.states)+'</div>'
-    +'<div class="rr-det-meta">'+esc(detailMeta)+'</div></header>'
+    +'<div class="rr-det-meta">'+esc(detailMeta)+'</div>'
+    +'<div class="rr-det-actions"><button type="button" class="secondary"'
+    +' data-r="accept-selected" disabled>确认选中项</button>'
+    +'<span class="rr-muted">勾选条目后按报告各自的 ready 建议确认（全部或全不）</span>'
+    +'</div></header>'
     +'<section class="rr-sec rr-conclusion"><h4>报告结论</h4>'
     +(conclusion?'<p>'+esc(conclusion)+'</p>'
       :'<p class="rr-muted">尚无报告结论。点“生成/更新报告”运行确定性规则，生成簇级建议。</p>')
@@ -5489,6 +5591,7 @@ function paintReviewDetail(r){
     +'<p class="rr-impact"><b>影响说明</b>：选择策略或确认只更新审阅计划（条目级，按 item 确认）；'
     +'构建并发布候选才会按 R2 完整重建（CXL 约 2 分钟，发布后需要 reindex）。'
     +'锁定与暂缓是 R0 审阅记录，不改变 corpus，也不触发重建。</p>';
+  reviewSyncAcceptButton();
 }
 function refreshReviewChip(){
   if(DATASETS.length) paintDatasetDialog();
@@ -5573,26 +5676,40 @@ async function refreshReviewFromButton(){
   await refreshReview('已刷新。');
   if(btn){ btn.disabled=false; btn.textContent='刷新'; }
 }
-async function reviewPost(body,btn){
+async function reviewPost(body,btn,errorText){
   const ctx=REVIEW_CTX;
   if(!ctx||ctx.busy) return;
   ctx.busy=true;
   const label=btn?btn.textContent:'';
   if(btn){ btn.disabled=true; btn.textContent='处理中…'; }
+  reviewSyncAcceptButton();
   try{
     const plan=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'/plan',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(body)});
     const v=(plan&&plan.plan_version!=null)?plan.plan_version
       :((ctx.data&&ctx.data.plan)?ctx.data.plan.plan_version:0);
-    await refreshReview('计划已更新到 v'+v+'（'
-      +(REVIEW_ACTION_LABEL[body.action]||body.action)+'）。');
+    let msg='计划已更新到 v'+v+'（'
+      +(REVIEW_ACTION_LABEL[body.action]||body.action)+'）。';
+    if(body.action==='accept'){
+      const accepted=(plan&&Array.isArray(plan.accepted))?plan.accepted:[];
+      msg='已确认选中 '+accepted.length+' 项，计划 v'+v+'。';
+    }else if(body.action==='clear'&&plan&&plan.cleared){
+      msg='已清除选择，计划 v'+v+'。';
+      if(plan.cleared.reverted_resolution) msg+='已撤销 R0 记录。';
+    }else if(body.action==='confirm'){
+      /* CP2 W9/E4: a stale re-confirm returns ``refresh`` (wire §2.7). */
+      const refreshText=reviewRefreshText(plan&&plan.refresh);
+      if(refreshText) msg=refreshText+'；计划 v'+v+'。';
+    }
+    await refreshReview(msg);
   }catch(e){
-    reviewMsg(reviewErrText(e),true);
+    reviewMsg(errorText?errorText(e):reviewErrText(e),true);
     await refreshReview();   // a 409/stale response means the plan moved on
   }finally{
     ctx.busy=false;
     if(btn&&btn.isConnected){ btn.disabled=false; btn.textContent=label; }
+    reviewSyncAcceptButton();
   }
 }
 async function reviewAction(btn){
@@ -5605,6 +5722,7 @@ async function reviewAction(btn){
   const item=itemId?ctx.itemsById[itemId]:null;
   const planVersion=Number(((ctx.data.plan||{}).plan_version)||0);
   const body={base_plan_version:planVersion};
+  let errorText=null;
   if(kind==='select'){
     const sel=card?card.querySelector('select[data-r="strategy"]'):null;
     const opt=sel&&sel.options[sel.selectedIndex];
@@ -5623,6 +5741,22 @@ async function reviewAction(btn){
     if(!entry||!entry.entry_id){ reviewMsg('该项还没有计划条目；先选择策略。',true); return; }
     body.action=kind;
     body.entry_id=entry.entry_id;
+  }else if(kind==='accept-selected'){
+    /* CP2 W9: cluster-level accept of every ticked item, all-or-nothing. */
+    const ids=reviewSelectedItemIds();
+    if(!ids.length){ reviewMsg('先勾选要确认的条目。',true); return; }
+    body.action='accept';
+    body.item_ids=ids;
+    errorText=reviewAcceptErrText;
+  }else if(kind==='clear'){
+    /* CP2 W9: clear one plan entry; locked/batch entries are rejected by the
+       server with 409 and the per-entry button is disabled for them. */
+    const entry=item&&item.entry;
+    if(!entry||!entry.entry_id){
+      reviewMsg('该项还没有计划条目；无需清除。',true); return;
+    }
+    body.action='clear';
+    body.entry_id=entry.entry_id;
   }else if(kind==='defer'){
     const sel=card?card.querySelector('select[data-r="defer-code"]'):null;
     const code=sel?sel.value:'';
@@ -5635,7 +5769,7 @@ async function reviewAction(btn){
   }else{
     return;
   }
-  await reviewPost(body,btn);
+  await reviewPost(body,btn,errorText);
 }
 function selectReviewCluster(clusterId){
   const ctx=REVIEW_CTX;
@@ -5729,8 +5863,11 @@ $('#reviewDetail').addEventListener('click',function(ev){
   });
 });
 /* CP2 E2: choosing a strategy reveals only its own params (parent selector for
-   inherit_parent_header, 1-2 row inputs for use_header_rows). */
+   inherit_parent_header, 1-2 row inputs for use_header_rows).
+   CP2 W9: ticking an item checkbox re-evaluates 确认选中项. */
 $('#reviewDetail').addEventListener('change',function(ev){
+  const pick=ev.target&&ev.target.closest?ev.target.closest('input[data-r="accept-pick"]'):null;
+  if(pick){ reviewSyncAcceptButton(); return; }
   const sel=ev.target&&ev.target.closest?ev.target.closest('select[data-r="strategy"]'):null;
   if(!sel) return;
   reviewSyncStrategyParams(sel.closest('.rr-item'),sel.value);

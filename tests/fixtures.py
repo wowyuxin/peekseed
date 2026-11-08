@@ -689,7 +689,19 @@ ITEM_HEADER = {
         "validator": {"status": "ready", "reasons": []},
         "evidence_refs": ["asset:table-3-19", "row:0"],
     }],
-    "parent_candidates": [],
+    "parent_candidates": [{
+        "asset_id": "table-p1041-01",
+        "pages": [1041],
+        "col_count": 2,
+        "header_rows": [0],
+        "header_cells": [["Bits", "Variable"]],
+        "header_signature": "bits|variable",
+        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
+                         "cells": ["Bits", "Variable"],
+                         "evidence_hash": "ev-p1041"}],
+        "parent_evidence_hash": "ev-p1041",
+        "header_source": "native",
+    }],
     "strategies": STRATEGY_OPTIONS,
     "entry": None,
     "resolution": None,
@@ -726,6 +738,95 @@ ITEM_FIGURE = {
     "stale": False,
 }
 
+# CP2 W9: a stale ``inherit_header_from`` entry. The stored snapshot keeps the
+# old lower-case parent cells; the parent candidate carries the source original
+# case ("Bits"/"Variable"), so re-confirm changes content and bumps revision
+# (wire §2.7). A hash-only refresh test keeps the cells identical and changes
+# only ``evidence_hash`` (no revision bump).
+STALE_ENTRY = {
+    "entry_id": "e-5a7c8b9d0e1f2a3b",
+    "item_id": "it-5a7c8b9d0e1f2a3b",
+    "status": "confirmed",
+    "stale": True,
+    "stale_reasons": ["evidence_changed", "parent_changed"],
+    "locked": False,
+    "strategy": {"id": "inherit_parent_header", "version": 1},
+    "action": {"type": "operation", "name": "inherit_header_from",
+               "params": {
+                   "parent_asset_id": "table-p1041-01",
+                   "parent_header_rows": [0],
+                   "parent_header_cells": [["bits", "variable"]],
+                   "parent_source_refs": [{"segment": "table-p1041-01",
+                                           "source_row": 0,
+                                           "cells": ["bits", "variable"],
+                                           "evidence_hash": "ev-p1041-old"}],
+                   "parent_header_source": "rule"}},
+    "evidence": {"hash": "5d6e7f8091a2b3c4", "refs": []},
+    "dependencies": [{"parent_asset_id": "table-p1041-01",
+                      "parent_evidence_hash": "ev-p1041-old",
+                      "item_id": None, "correction_hash": None}],
+    "capability_snapshot": {"native_lines": True, "ocr": None, "vlm": None},
+    "source": "user", "revision": 2, "batch_id": None, "notes": None,
+}
+
+ITEM_STALE = {
+    "id": "it-5a7c8b9d0e1f2a3b",
+    "code": "table_header_absent",
+    "kind": "table",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "table-4-07",
+    "pages": [204],
+    "cluster_id": "cl-1a2b3c4d5e6f",
+    "message": "table_header_absent: table-4-07; inherited parent evidence "
+               "changed.",
+    "triage": "needs_decision",
+    "status": "stale",
+    "evidence": {"hash": "5d6e7f8091a2b3c4",
+                 "crops": ["tables/table-4-07_p0204.png"],
+                 "native_line_ids": [7], "ocr_evidence": []},
+    "current": {"status": "structured", "row_count": 4, "col_count": 2,
+                "header_rows": []},
+    "candidates": [],
+    "parent_candidates": [{
+        "asset_id": "table-p1041-01",
+        "pages": [1041],
+        "col_count": 2,
+        "header_rows": [0],
+        "header_cells": [["Bits", "Variable"]],
+        "header_signature": "bits|variable",
+        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
+                         "cells": ["Bits", "Variable"],
+                         "evidence_hash": "ev-p1041-new"}],
+        "parent_evidence_hash": "ev-p1041-new",
+        "header_source": "rule",
+    }],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": STALE_ENTRY,
+    "resolution": None,
+    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
+               "caption": "Table 4-07. Inherited header"},
+    "stale": True,
+}
+
+CLUSTER_STALE = {
+    "cluster_id": "cl-1a2b3c4d5e6f",
+    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
+                    "profile": "generic", "operation": "inherit_header_from",
+                    "layout": "table|pages=204", "evidence": "native"},
+    "code": "table_header_absent",
+    "title": "表头缺失（继承父表后父表证据变化）",
+    "kind": "table",
+    "item_count": 1,
+    "human_pending": 1,
+    "representative_item_id": "it-5a7c8b9d0e1f2a3b",
+    "states": {"stale": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-5a7c8b9d0e1f2a3b"],
+}
+
 DEFAULT_REVIEW = {
     "peel_id": "peel",
     "review_schema": 2,
@@ -743,18 +844,18 @@ DEFAULT_REVIEW = {
     },
     "capabilities": {"review_schema": 2, "native_lines": True, "ocr": False,
                      "ocr_detail": None, "vlm": False},
-    "counts": {"raw_items": 2, "items": 2, "clusters": 2, "human_pending": 1,
-               "human_pending_clusters": 1, "pending_evidence": 1,
+    "counts": {"raw_items": 3, "items": 3, "clusters": 3, "human_pending": 2,
+               "human_pending_clusters": 2, "pending_evidence": 1,
                "auto_resolved": 0, "needs_decision": 1, "draft": 0,
-               "confirmed": 0, "applied": 0, "deferred": 0, "failed_check": 0,
-               "stale": 0, "unsupported_items": 0},
-    "triage_counts": {"deterministic_candidate": 1, "needs_decision": 0,
+               "confirmed": 0, "applied": 0, "deferred": 0, "failed_check": 1,
+               "stale": 1, "unsupported_items": 0},
+    "triage_counts": {"deterministic_candidate": 1, "needs_decision": 1,
                       "needs_ocr": 1, "informational": 0, "unsupported": 0},
     "plan": {"plan_version": 0, "entries": 0, "draft": 0, "confirmed": 0,
              "locked": 0, "stale": 0},
     "report": None,
-    "clusters": [CLUSTER_HEADER, CLUSTER_FIGURE],
-    "items": [ITEM_HEADER, ITEM_FIGURE],
+    "clusters": [CLUSTER_HEADER, CLUSTER_FIGURE, CLUSTER_STALE],
+    "items": [ITEM_HEADER, ITEM_FIGURE, ITEM_STALE],
 }
 
 DEFAULT_PLAN = {
@@ -791,11 +892,40 @@ DEFAULT_REPORT = {
                 "state": "ready",
             }],
             "clarifications": [],
+        }, {
+            "cluster_id": "cl-9a8b7c6d5e4f",
+            "item_ids": ["it-8b7a6c5d4e3f2a10"],
+            "conclusion": "图内无 native 文本：保留原始图（R0 resolution）。",
+            "suggestions": [{
+                "item_id": "it-8b7a6c5d4e3f2a10",
+                "strategy": {"id": "keep_visual_fallback", "version": 1},
+                "params": {},
+                "evidence_refs": ["asset:figure-1-1"],
+                "validator": {"status": "ready", "reasons": []},
+                "in_plan": False,
+                "state": "ready",
+            }],
+            "clarifications": [],
+        }, {
+            "cluster_id": "cl-1a2b3c4d5e6f",
+            "item_ids": ["it-5a7c8b9d0e1f2a3b"],
+            "conclusion": "父表证据变化，候选校验未通过。",
+            "suggestions": [{
+                "item_id": "it-5a7c8b9d0e1f2a3b",
+                "strategy": {"id": "inherit_parent_header", "version": 1},
+                "params": {"parent_asset_id": "table-p1041-01"},
+                "evidence_refs": ["asset:table-p1041-01"],
+                "validator": {"status": "failed_check",
+                              "reasons": ["parent_evidence_changed"]},
+                "in_plan": False,
+                "state": "failed_check",
+            }],
+            "clarifications": [],
         }],
         "auto_archived": [],
         "unsupported": [],
     },
-    "counts": {"suggestions": 1, "auto_archived": 0, "unsupported": 0,
+    "counts": {"suggestions": 3, "auto_archived": 0, "unsupported": 0,
                "needs_decision": 1},
 }
 
@@ -876,6 +1006,115 @@ def resolution_record(item_id, name, entry_id=None, revision=0,
         "evidence_hash": evidence_hash,
         "source": "user",
         "recorded_at": "2026-11-05T00:00:00Z",
+    }
+
+
+def revert_resolution_record(target):
+    """A ``revert`` resolutions.jsonl row (contract §11.6), written by clear."""
+    row = dict(target)
+    row["change"] = "revert"
+    row["supersedes"] = target.get("resolution_id")
+    material = "%%s|revert" %% target.get("resolution_id")
+    row["resolution_id"] = "r-" + hashlib.sha256(
+        material.encode("utf-8")).hexdigest()[:16]
+    row["idempotency_key"] = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    row["recorded_at"] = "2026-11-05T00:00:00Z"
+    return row
+
+
+def report_suggestions(report_payload):
+    """Flatten a review-report payload into its per-item suggestions."""
+    payload = report_payload if isinstance(report_payload, dict) else {}
+    inner = payload.get("report")
+    report = inner if isinstance(inner, dict) else payload
+    suggestions = []
+    for cluster in report.get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        for suggestion in cluster.get("suggestions") or []:
+            if isinstance(suggestion, dict):
+                suggestions.append(suggestion)
+    return suggestions
+
+
+def _item_evidence_hash(review, item_id):
+    """The review item's current evidence hash (used for accepted entries)."""
+    for item in review.get("items") or []:
+        if isinstance(item, dict) and item.get("id") == item_id:
+            return (item.get("evidence") or {}).get("hash")
+    return None
+
+
+def _strip_evidence_hashes(value):
+    """Drop ``evidence_hash`` keys so a hash-only refresh compares unchanged."""
+    if isinstance(value, dict):
+        return {key: _strip_evidence_hashes(item) for key, item in value.items()
+                if key != "evidence_hash"}
+    if isinstance(value, list):
+        return [_strip_evidence_hashes(item) for item in value]
+    return value
+
+
+def strategy_action(strategy_id, params):
+    """The plan entry action for one strategy, like ``plan select`` (wire §2.6)."""
+    params = dict(params or {})
+    if strategy_id in RESOLUTION_STRATEGIES:
+        return {"type": "resolution", "name": RESOLUTION_STRATEGIES[strategy_id]}
+    if strategy_id in OPERATION_STRATEGIES:
+        name = OPERATION_STRATEGIES[strategy_id]
+        if name == "set_header_rows" and not params:
+            params = {"rows": [0]}
+        return {"type": "operation", "name": name, "params": params}
+    return None
+
+
+def refresh_stale_entry(match, review):
+    """Refresh one stale entry's fixed parent snapshot (wire §2.7).
+
+    The fake CLI has no real parent table, so it refreshes from the item's
+    ``parent_candidates`` (the source original-case cells). ``changed`` is true
+    only when the refreshed ``action.params``/``source_refs`` content differs
+    from the stored values; a hash-only evidence change keeps the revision.
+    """
+    item = next((candidate for candidate in (review.get("items") or [])
+                 if candidate.get("id") == match.get("item_id")), None)
+    candidates = (item or {}).get("parent_candidates") or []
+    candidate = candidates[0] if candidates else {}
+    action = match.get("action") or {}
+    before_params = copy_json(action.get("params")) if action.get("params") else None
+    after_params = copy_json(before_params) if before_params is not None else None
+    if after_params is not None:
+        if candidate.get("header_cells") is not None:
+            after_params["parent_header_cells"] = copy_json(
+                candidate.get("header_cells"))
+        if candidate.get("source_refs") is not None:
+            after_params["parent_source_refs"] = copy_json(
+                candidate.get("source_refs"))
+        if candidate.get("header_source"):
+            after_params["parent_header_source"] = candidate.get("header_source")
+    before_refs = before_params.get("parent_source_refs") if before_params else None
+    after_refs = after_params.get("parent_source_refs") if after_params else None
+    changed = (_strip_evidence_hashes(before_params)
+               != _strip_evidence_hashes(after_params)
+               or _strip_evidence_hashes(before_refs)
+               != _strip_evidence_hashes(after_refs))
+    revision_before = int(match.get("revision") or 0)
+    revision_after = revision_before + 1 if changed else revision_before
+    match["action"] = dict(action, params=after_params)
+    match["revision"] = revision_after
+    match["stale"] = False
+    match["stale_reasons"] = []
+    match["evidence"] = dict(match.get("evidence") or {},
+                             hash=((item or {}).get("evidence") or {}).get("hash")
+                             or (match.get("evidence") or {}).get("hash"))
+    return {
+        "changed": changed,
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "action_params_before": before_params,
+        "action_params_after": after_params,
+        "source_refs_before": before_refs,
+        "source_refs_after": after_refs,
     }
 
 
@@ -1075,11 +1314,17 @@ def main():
         action = values[1] if len(values) > 1 else "show"
         if action == "show":
             return emit(plan)
-        if action not in ("select", "confirm", "lock", "unlock", "defer"):
+        if action not in ("select", "confirm", "lock", "unlock", "defer",
+                          "accept", "clear"):
             return fail("unknown plan action: " + str(action), 2, "validation")
         entries = plan.get("entries") or []
         entry = None
         resolution = None
+        refresh = None
+        accepted = None
+        cleared = None
+        review = copy_json(state.get("review") or DEFAULT_REVIEW)
+        report = copy_json(state.get("review_report") or DEFAULT_REPORT)
         if action in ("select", "defer"):
             request = read_stdin_json()
             if not isinstance(request, dict):
@@ -1161,6 +1406,189 @@ def main():
                     reason_code=request.get("reason_code"),
                     reason=request.get("reason"))
                 state.setdefault("resolutions", []).append(resolution)
+        elif action == "accept":
+            # Wire §2.6: all-or-nothing. Adopt each item's own ``ready`` report
+            # suggestion, fail the whole request with per-item ``detail.reasons``
+            # when any item is locked/stale/unsuggested/invalid, and bump
+            # ``plan_version`` exactly once.
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                return fail("plan input must be a JSON object", 2, "validation")
+            base = request.get("base_plan_version")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            item_ids = request.get("item_ids")
+            if not isinstance(item_ids, list) or not item_ids:
+                return fail("item_ids is required", 2, "validation")
+            state.setdefault("accept_requests", []).append(copy_json(request))
+            items_by_id = {item.get("id"): item
+                           for item in review.get("items") or []
+                           if isinstance(item, dict)}
+            ready = {}
+            failed = {}
+            for suggestion in report_suggestions(report):
+                item_id = suggestion.get("item_id")
+                status = (suggestion.get("validator") or {}).get("status")
+                if status == "ready":
+                    ready.setdefault(item_id, suggestion)
+                elif status == "failed_check":
+                    failed.setdefault(item_id, suggestion)
+            reasons = []
+            resolved = []
+            for raw_id in item_ids:
+                item_id = str(raw_id)
+                item = items_by_id.get(item_id)
+                if item is None:
+                    reasons.append({"item_id": item_id, "code": "item_missing",
+                                    "message": "review item not found"})
+                    continue
+                match = next((candidate for candidate in entries
+                              if candidate.get("item_id") == item_id), None)
+                if match is not None and match.get("locked"):
+                    reasons.append({"item_id": item_id, "code": "locked",
+                                    "message": "entry is locked"})
+                    continue
+                item_entry = item.get("entry") or {}
+                stale_reasons = (item_entry.get("stale_reasons")
+                                 or item.get("stale_reasons") or [])
+                if item.get("stale") or item_entry.get("stale"):
+                    reasons.append({
+                        "item_id": item_id, "code": "stale",
+                        "message": "item is stale: " + ", ".join(
+                            str(code) for code in stale_reasons)})
+                    continue
+                suggestion = ready.get(item_id)
+                if suggestion is None:
+                    if item_id in failed:
+                        failed_reasons = ((failed[item_id].get("validator") or {})
+                                          .get("reasons") or [])
+                        reasons.append({
+                            "item_id": item_id, "code": "validator_failed",
+                            "message": "ready suggestion failed validation: "
+                                       + "; ".join(str(reason)
+                                                   for reason in failed_reasons)})
+                    else:
+                        reasons.append({
+                            "item_id": item_id, "code": "no_ready_suggestion",
+                            "message": "report has no ready suggestion for "
+                                       "this item"})
+                    continue
+                resolved.append((item_id, suggestion))
+            if reasons:
+                return fail(
+                    "plan accept failed: %%d item(s) are not acceptable"
+                    %% len(reasons), 2, "validation",
+                    {"item_ids": [str(raw) for raw in item_ids],
+                     "reasons": reasons})
+            accepted = []
+            for item_id, suggestion in resolved:
+                strategy = suggestion.get("strategy") or {}
+                strategy_id = str(strategy.get("id") or "")
+                created_action = strategy_action(
+                    strategy_id, suggestion.get("params") or {})
+                if created_action is None:
+                    return fail("unknown strategy: " + strategy_id,
+                                2, "validation")
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                match = next((candidate for candidate in entries
+                              if candidate.get("entry_id") == entry_id), None)
+                replaced = match is not None
+                revision = 1
+                if match is not None:
+                    revision = int(match.get("revision") or 0) + 1
+                    entries = [candidate for candidate in entries
+                               if candidate.get("entry_id") != entry_id]
+                match = {
+                    "entry_id": entry_id,
+                    "item_id": item_id,
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": int(strategy.get("version") or 1)},
+                    "action": created_action,
+                    "evidence": {"hash": _item_evidence_hash(review, item_id),
+                                 "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": suggestion.get("source") or "rule",
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": None,
+                }
+                # Confirm immediately, like ``plan select`` + ``plan confirm``:
+                # a resolution becomes ``applied`` (R0 written now); an operation
+                # becomes ``confirmed`` and waits for a batch.
+                if created_action.get("type") == "resolution":
+                    resolution = resolution_record(
+                        item_id, created_action.get("name"),
+                        entry_id=entry_id, revision=revision,
+                        evidence_hash=match["evidence"]["hash"])
+                    state.setdefault("resolutions", []).append(resolution)
+                    match["status"] = "applied"
+                else:
+                    match["status"] = "confirmed"
+                entries.append(match)
+                accepted.append({
+                    "item_id": item_id,
+                    "entry_id": entry_id,
+                    "strategy": match["strategy"],
+                    "action": created_action,
+                    "status": match["status"],
+                    "revision": revision,
+                    "replaced_existing": replaced,
+                })
+            # Accept reports applied R0 rows through ``accepted``; the top-level
+            # ``resolution`` stays null (wire §2.6).
+            resolution = None
+        elif action == "clear":
+            # Wire §2.6: delete one entry; locked/batch-bound entries are a
+            # conflict and an applied R0 entry writes a ``revert`` resolution.
+            entry_id = option(rest, "--entry")
+            base_raw = option(rest, "--base-plan-version")
+            try:
+                base = int(base_raw)
+            except (TypeError, ValueError):
+                return fail("--base-plan-version is required", 2, "validation")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            state.setdefault("clear_requests", []).append(
+                {"entry_id": entry_id, "base_plan_version": base})
+            match = next((candidate for candidate in entries
+                          if candidate.get("entry_id") == entry_id), None)
+            if match is None:
+                return fail("no such plan entry", 3, "not_found")
+            if match.get("locked"):
+                return fail("entry " + str(entry_id) + " is locked", 2,
+                            "conflict")
+            if match.get("batch_id"):
+                return fail("entry " + str(entry_id) + " is in a batch", 2,
+                            "conflict")
+            status_before = match.get("status")
+            reverted = None
+            created_action = match.get("action") or {}
+            if (status_before == "applied"
+                    and created_action.get("type") == "resolution"):
+                target = None
+                for candidate in reversed(state.get("resolutions") or []):
+                    if (candidate.get("change") != "revert"
+                            and candidate.get("item_id") == match.get("item_id")
+                            and candidate.get("name")
+                            == created_action.get("name")):
+                        target = candidate
+                        break
+                if target is not None:
+                    reverted = revert_resolution_record(target)
+                    state.setdefault("resolutions", []).append(reverted)
+            entries = [candidate for candidate in entries
+                       if candidate.get("entry_id") != entry_id]
+            cleared = {"entry_id": entry_id,
+                       "item_id": match.get("item_id"),
+                       "status_before": status_before,
+                       "reverted_resolution": reverted}
         else:
             entry_id = option(rest, "--entry")
             base_raw = option(rest, "--base-plan-version")
@@ -1175,8 +1603,18 @@ def main():
             if match is None:
                 return fail("no such plan entry", 3, "not_found")
             if action == "confirm":
+                # Wire §2.7: a stale entry whose only reasons are
+                # evidence_changed/parent_changed is re-confirmed with a refresh
+                # (revision +1 only when the content changed; hash-only keeps
+                # the revision). Any other stale reason is a conflict.
                 if match.get("stale"):
-                    return fail("entry is stale", 2, "conflict")
+                    codes = list(match.get("stale_reasons") or [])
+                    refreshable = bool(codes) and all(
+                        code in ("evidence_changed", "parent_changed")
+                        for code in codes)
+                    if not refreshable:
+                        return fail("entry is stale", 2, "conflict")
+                    refresh = refresh_stale_entry(match, review)
                 # R0 entries apply on confirm (contract v1.3 §11.1): write the
                 # resolution and move straight to ``applied``. Only operation
                 # entries become ``confirmed`` and wait for an ApplyBatch.
@@ -1202,8 +1640,15 @@ def main():
         plan["plan_version"] = int(plan.get("plan_version") or 0) + 1
         plan["updated_at"] = "2026-11-05T00:00:00Z"
         state["plan"] = plan
+        response = copy_json(plan)
+        # Additive CP2 response objects live only in the response (wire §2.6/§2.7).
+        response["refresh"] = refresh
+        if accepted is not None:
+            response["accepted"] = accepted
+        if cleared is not None:
+            response["cleared"] = cleared
         save_state(state)
-        return emit(plan)
+        return emit(response)
 
     if command == "review-report":
         peel_id = first_positional(rest)
