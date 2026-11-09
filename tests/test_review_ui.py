@@ -793,7 +793,7 @@ class ReviewUiCp4OcrTests(unittest.TestCase):
                 "function reviewOcrRefreshSelected", "reviewSelectedItemIds()",
                 "function reviewStartOcrRefresh",
                 "reviewBase(ctx.dataset,ctx.sha)+'/ocr/refresh'",
-                "item_ids:ids,provider:{}",
+                "body:JSON.stringify({item_ids:ids})",
                 "function reviewOcrRefreshRowHtml",
                 "function reviewSyncOcrRefreshButton",
                 "function reviewLoadOcrCounts",
@@ -802,6 +802,19 @@ class ReviewUiCp4OcrTests(unittest.TestCase):
                 "function reviewRetryJob", "type==='ocr'",
                 "OCR 任务中断，可手动重试（不会自动重跑）"):
             self.assertIn(marker, text)
+        # CP4.1 G1: neither OCR fetch body may carry a provider object. Assert
+        # on the exact request snippets (the word "provider" appears elsewhere
+        # in the UI, e.g. the read-only config dialog).
+        refresh_at = text.index(
+            "reviewBase(ctx.dataset,ctx.sha)+'/ocr/refresh'")
+        refresh_snippet = text[refresh_at:refresh_at + 240]
+        self.assertIn("body:JSON.stringify({item_ids:ids})", refresh_snippet)
+        self.assertNotIn("provider", refresh_snippet)
+        check_at = text.index("reviewBase(ctx.dataset,ctx.sha)+'/ocr/check'")
+        check_snippet = text[check_at:check_at + 240]
+        self.assertIn("body:JSON.stringify({})", check_snippet)
+        self.assertNotIn("provider", check_snippet)
+        self.assertNotIn("provider:{}", text)
         refresh = text.index("function reviewStartOcrRefresh")
         refresh_body = text[refresh:text.index("function reviewOcrRefreshSelected")]
         self.assertIn("reviewPollJob(jobId)", refresh_body)
@@ -881,6 +894,13 @@ class ReviewUiCp4OcrTests(unittest.TestCase):
                        "reviewOcrConfigOpen", "reviewOcrRefreshSelected",
                        "ocr/refresh", "ocr/check", "只读"):
             self.assertIn(marker, page)
+        # CP4.1 G1: the served UI never sends a provider override in either
+        # OCR request body (the config dialog still names PEELFEED_OCR_PROVIDER).
+        self.assertNotIn("provider:{}", page)
+        self.assertIn("body:JSON.stringify({item_ids:ids})", page)
+        check_at = page.index("reviewBase(ctx.dataset,ctx.sha)+'/ocr/check'")
+        self.assertNotIn("provider",
+                         page[check_at:check_at + 240])
 
 
 # ---------------------------------------------------------------------------
@@ -1388,7 +1408,8 @@ class ReviewUiOcrBehaviorTests(unittest.TestCase):
         self.assertEqual(opened["refreshPosts"], 1, opened)
         body = json.loads(opened["refreshBody"])
         self.assertEqual(body["item_ids"], ["it-fig"], body)
-        self.assertEqual(body["provider"], {}, body)
+        # CP4.1 G1: the UI never sends a provider object.
+        self.assertNotIn("provider", body)
         self.assertIn("OCR 覆盖 1/1", opened["bar"], opened)
         self.assertIn("OCR 已配置", opened["bar"], opened)
         self.assertIn("自动创建 OCR 任务", opened["msg"], opened)
@@ -1400,11 +1421,10 @@ class ReviewUiOcrBehaviorTests(unittest.TestCase):
         reopen = by_step["reopen"]
         self.assertEqual(reopen["newRefreshPosts"], 0, reopen)
         self.assertIn("docs|" + "a" * 64, reopen["autoTried"], reopen)
-        # [检查 OCR] posts provider {} and shows availability + probe seconds.
+        # [检查 OCR] posts an empty body ({}), never a provider object.
         checked = by_step["check"]
         self.assertEqual(checked["checks"], 1, checked)
-        self.assertEqual(json.loads(checked["checkBody"]), {"provider": {}},
-                         checked)
+        self.assertEqual(json.loads(checked["checkBody"]), {}, checked)
         self.assertIn("检查结果：可用", checked["bar"], checked)
         self.assertIn("探测 0.85s", checked["bar"], checked)
         # read-only config dialog lists the effective env-only config.
@@ -1427,7 +1447,7 @@ class ReviewUiOcrBehaviorTests(unittest.TestCase):
         self.assertEqual(retried["refreshPosts"], 1, retried)
         body = json.loads(retried["refreshBody"])
         self.assertEqual(body["item_ids"], ["it-fig"], body)
-        self.assertEqual(body["provider"], {}, body)
+        self.assertNotIn("provider", body)
 
     def test_no_ocr_fallback_grays_out_and_check_maps_503(self):
         by_step = self._run_harness()

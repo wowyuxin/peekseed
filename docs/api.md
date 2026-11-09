@@ -51,6 +51,8 @@ are not listed.
 | GET | `/api/datasets/{id}/sources/{sha}/review/items/{item_id}` | One review item with evidence, candidates and strategies |
 | POST | `/api/datasets/{id}/sources/{sha}/review/plan` | Select/confirm/lock/unlock/defer a review plan entry |
 | POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Generate the deterministic review report (synchronous in CP1) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/ocr/check` | Probe the OCR provider (body empty or `{}`; no `provider`) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/ocr/refresh` | Create one `type=ocr` evidence-refresh job (body exactly `{item_ids:[…]}`) |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
 | GET | `/api/datasets/{id}/sources/{sha}/assets/{path}` | Proxy one peel/corpus asset (crop, page image, table) |
 | DELETE | `/api/datasets/{id}/sources/{sha}` | Remove a source; `?peel=keep|delete` |
@@ -302,6 +304,24 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   `200` and always covers the whole peel (the optional id filters are forwarded
   but peelfeed ignores them until the Phase 2 report jobs); persisted jobs
   replace the synchronous call in M2 Phase 2/4 (`202` + job id).
+- `POST …/review/ocr/check` proxies `peelfeed ocr-check` (M2.1; wire §2.8) and
+  returns `200` with the probe payload (`available`, `engine`, `provider`,
+  `probe`, `checked_at`, `error`); `503` when OCR is unconfigured/unrunnable,
+  `400` for `ocr_config_invalid`/validation and `502` for other OCR failures.
+  The request body is optional but must be **empty or `{}`**: the HTTP API does
+  not accept a `provider` object (any field is `400`). OCR configuration is
+  env-only (`PEELFEED_OCR_*`); peekseed always sends `{"provider": {}}`.
+- `POST …/review/ocr/refresh` creates one persistent `type=ocr` evidence-refresh
+  job and returns `202 {job_id, status:"queued", result_ref:null}`, storing the
+  descriptor in `extraction.review_jobs` for restart re-attachment (never
+  rerun). The body is exactly `{item_ids:[…]}` — a non-empty, unique list of
+  non-empty strings — and any extra field (including `provider`) is `400`;
+  `409` `not_ready` when there is no current build. The job takes only a reader
+  lease and never blocks builds/publishing.
+- **No provider override over HTTP (CP4.1 G1).** A caller-supplied `provider`
+  object is executable input in peelfeed (its `command` is spawned as a
+  subprocess), so the HTTP routes never accept or forward one; a provider
+  override exists only in peelfeed's local CLI.
 - `POST …/events` with `{event: "embed"|"feedback", data?}` runs `peelfeed
   event` and appends the event to the peel's `.peel` log.
 - `GET …/assets/{path}` serves a peel-relative (`<root>/<peel_id>/<path>`) or

@@ -93,17 +93,17 @@ version/tag policy.
 - **OCR API routes.** `POST …/review/ocr/check` proxies `peelfeed ocr-check`
   (200 probe payload; 503 `ocr_unavailable`; 400 `ocr_config_invalid`/validation;
   other OCR codes 502) and `POST …/review/ocr/refresh` validates
-  `{item_ids:[…], provider?}` (non-empty unique strings, no tier/scope/
-  operations) and returns 202 `{job_id, status:"queued", result_ref:null}`,
+  `{item_ids:[…]}` (non-empty unique strings, no tier/scope/operations/provider)
+  and returns 202 `{job_id, status:"queued", result_ref:null}`,
   storing `extraction.review_jobs[job_id] = {"type":"ocr","created_at":…,
   "batch_id":null}` for restart re-attachment. Dataset schema stays 4 (no
   migration); the OCR job only refreshes evidence, so an existing index stays
   valid and `needs_reindex` is unchanged until a later OCR batch publish.
-- **OCR client seam.** `PeelfeedClient.ocr_check(peel_id, provider=None)` and
-  `ocr_refresh(peel_id, item_ids, provider=None)` use the frozen
-  `--input - --json` shapes and always send `provider:{}` (env-only config);
-  a provider object is accepted for CLI/testing. `_ERROR_STATUS` adds
-  `ocr_unavailable→503`, `not_ready→409`, `ocr_config_invalid→400`; the
+- **OCR client seam.** `PeelfeedClient.ocr_check(peel_id)` and
+  `ocr_refresh(peel_id, item_ids)` use the frozen `--input - --json` shapes and
+  send `{"provider": {}}` (check) / `{"item_ids": […]}` (refresh) only — the
+  client never accepts or sends a provider override (CP4.1 G1). `_ERROR_STATUS`
+  adds `ocr_unavailable→503`, `not_ready→409`, `ocr_config_invalid→400`; the
   `PEELFEED_OCR_*` env vars ride the existing allowlisted subprocess seam.
 - **Review UI.** A header OCR bar shows the capability chip (OCR 已配置 ·
   `<engine>` / OCR 未配置（相关策略置灰） / OCR 不可用：`<detail>`), a
@@ -209,6 +209,16 @@ version/tag policy.
 ### Security
 
 - The peelfeed subprocess gets an allowlisted environment.
+- **OCR HTTP routes no longer accept provider overrides (CP4.1 G1).**
+  `POST …/review/ocr/check` accepts only an empty body or `{}` and
+  `POST …/review/ocr/refresh` accepts exactly `{item_ids:[…]}`; any extra field,
+  including `provider`, is `400` and the peelfeed CLI is never invoked. A
+  caller-supplied provider object reached peelfeed's OCR provider `command`,
+  which it executes as a subprocess, so any API-token holder could run arbitrary
+  commands on the host. The `PeelfeedClient` no longer has a `provider`
+  parameter and always sends `{"provider": {}}` for the check; the Review UI
+  sends no provider in either OCR request. A provider override remains available
+  only in peelfeed's local CLI.
 
 ## 0.1.0 - 2026-10-23
 

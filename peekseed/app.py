@@ -1468,40 +1468,37 @@ def create_app():
     def _review_ocr_check_request(body):
         """Validate ``POST …/review/ocr/check`` (contract §4 / wire §2.8).
 
-        The body is optional. When present it may carry only ``provider``, and
-        that must be a JSON object: M2.1 OCR config is env-only
-        (``PEELFEED_OCR_*``), so ``provider:{}`` means "use the deploy env"; the
-        UI always sends ``{}`` and never writes a secret. Returns the provider
-        object or ``None`` (the adapter then sends ``{}``).
+        The body is optional and may be empty or ``{}`` only: M2.1 OCR config
+        is env-only (``PEELFEED_OCR_*``), so the HTTP API must never accept a
+        caller-supplied ``provider`` (CP4.1 G1: peelfeed would execute its
+        ``command`` as a subprocess). Any field at all is a ``400``. Returns
+        ``None`` (the adapter always sends ``{"provider": {}}``).
         """
         if body is None:
             body = {}
         if not isinstance(body, dict):
             raise HTTPException(
                 400, "an OCR check request must be a JSON object")
-        unknown = sorted(set(body) - {"provider"})
-        if unknown:
+        if body:
             raise HTTPException(400, "unknown OCR check field(s): %s"
-                                % ", ".join(unknown))
-        provider = body.get("provider")
-        if provider is not None and not isinstance(provider, dict):
-            raise HTTPException(400, "provider must be a JSON object")
-        return provider
+                                % ", ".join(sorted(body)))
+        return None
 
     def _review_ocr_refresh_request(body):
         """Validate ``POST …/review/ocr/refresh`` (contract §4 / wire §2.8).
 
-        Body is exactly ``{item_ids:[…], provider?}``; ``item_ids`` must be a
-        non-empty, unique list of non-empty strings (the frozen job payload) and
-        ``provider`` must be an object when present. Returns
-        ``(item_ids, provider)``.
+        Body is exactly ``{item_ids:[…]}``; ``item_ids`` must be a non-empty,
+        unique list of non-empty strings (the frozen job payload). No other
+        field is accepted, in particular ``provider`` (CP4.1 G1: the HTTP API
+        never forwards a provider override; it exists only in peelfeed's local
+        CLI). Returns the cleaned ``item_ids`` list.
         """
         if body is None:
             body = {}
         if not isinstance(body, dict):
             raise HTTPException(
                 400, "an OCR refresh request must be a JSON object")
-        unknown = sorted(set(body) - {"item_ids", "provider"})
+        unknown = sorted(set(body) - {"item_ids"})
         if unknown:
             raise HTTPException(400, "unknown OCR refresh field(s): %s"
                                 % ", ".join(unknown))
@@ -1522,10 +1519,7 @@ def create_app():
                     400, "item_ids must be unique (duplicate %s)" % item_id)
             seen.add(item_id)
             cleaned.append(item_id)
-        provider = body.get("provider")
-        if provider is not None and not isinstance(provider, dict):
-            raise HTTPException(400, "provider must be a JSON object")
-        return cleaned, provider
+        return cleaned
 
     def _review_batches_request(body):
         """Validate ``POST …/review/batches`` (wire §2.7): only ``entry_ids``.
@@ -2103,9 +2097,10 @@ def create_app():
                                 payload: Optional[dict] = None):
         """Probe the OCR provider through ``peelfeed ocr-check`` (wire §2.8).
 
-        Body is optional ``{provider:{}}``; the provider must be an object when
-        present. M2.1 config is env-only (``PEELFEED_OCR_*``), so peekseed always
-        sends ``{}`` from the UI. 200 with the check payload
+        Body is optional and must be empty or ``{}``: the HTTP API never accepts
+        a ``provider`` object (CP4.1 G1), so any field is a ``400``. The
+        adapter always sends ``{"provider": {}}`` = the deploy env
+        ``PEELFEED_OCR_*`` config. 200 with the check payload
         (``available/engine/provider/probe/checked_at/error``); 503
         ``ocr_unavailable``; 400 ``ocr_config_invalid``/validation; other OCR
         codes 502. The short probe never writes the corpus and creates no job.
@@ -2114,10 +2109,10 @@ def create_app():
         entry = _source_by_sha(directory, sha)
         peel_id = _peel_id_of(entry)
         _require_review_schema()
-        provider = _review_ocr_check_request(payload)
+        _review_ocr_check_request(payload)
         return _call_peelfeed(
             "ocr check",
-            lambda: peelfeed.client().ocr_check(peel_id, provider=provider))
+            lambda: peelfeed.client().ocr_check(peel_id))
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/ocr/refresh",
               status_code=202)
@@ -2125,9 +2120,11 @@ def create_app():
                                   payload: Optional[dict] = None):
         """Create one persistent ``type=ocr`` evidence-refresh job (wire §2.8).
 
-        Body is exactly ``{item_ids:[…], provider?}``; item_ids must be a
-        non-empty, unique list of non-empty strings (no other fields). Returns
-        202 ``{job_id, status:"queued", result_ref:null}`` and stores
+        Body is exactly ``{item_ids:[…]}``; item_ids must be a non-empty,
+        unique list of non-empty strings. No other field is accepted, in
+        particular ``provider`` (CP4.1 G1; the HTTP API never forwards a
+        provider override). Returns 202 ``{job_id, status:"queued",
+        result_ref:null}`` and stores
         ``extraction.review_jobs[job_id] = {"type":"ocr","created_at":…,
         "batch_id":null}`` for restart re-attachment (never auto-rerun). The job
         takes a reader lease only and never blocks builds/publishing; 409
@@ -2137,11 +2134,10 @@ def create_app():
         entry = _source_by_sha(directory, sha)
         peel_id = _peel_id_of(entry)
         _require_review_schema()
-        item_ids, provider = _review_ocr_refresh_request(payload)
+        item_ids = _review_ocr_refresh_request(payload)
         result = _call_peelfeed(
             "ocr refresh",
-            lambda: peelfeed.client().ocr_refresh(
-                peel_id, item_ids, provider=provider))
+            lambda: peelfeed.client().ocr_refresh(peel_id, item_ids))
         job_id = str((result or {}).get("job_id") or "")
         if not job_id:
             raise HTTPException(502, "peelfeed ocr-refresh returned no job_id")

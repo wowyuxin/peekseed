@@ -801,11 +801,12 @@ class CliAdapterTests(unittest.TestCase):
                 self.assertEqual(job_calls[-1][1:3], ["list", peel_id])
 
     def test_cp4_ocr_client_argv_stdin_and_env_forwarding(self):
-        """CP4 K1 (wire §2.8): the frozen ``ocr-check``/``ocr-refresh`` shapes.
+        """CP4 K1/K2 (wire §2.8): the frozen ``ocr-check``/``ocr-refresh`` shapes.
 
         ``provider:{}`` means "use the env config"; peekseed forwards every
-        ``PEELFEED_OCR_*`` env var through the existing allowlist seam. A
-        provider object is accepted for CLI/testing and forwarded verbatim.
+        ``PEELFEED_OCR_*`` env var through the existing allowlist seam. CP4.1
+        G1: the client never accepts or sends a caller-supplied provider object
+        (only peelfeed's local CLI may override the provider).
         """
         ocr_keys = ("PEELFEED_OCR_PROVIDER", "PEELFEED_OCR_ENGINE",
                     "PEELFEED_OCR_PARAMS", "PEELFEED_OCR_TIMEOUT",
@@ -831,22 +832,22 @@ class CliAdapterTests(unittest.TestCase):
                     self.assertTrue(checked["available"])
                     self.assertEqual(checked["engine"], "rapidocr@1.4.4")
                     self.assertIsNone(checked["error"])
-                    # Frozen stdin: provider is ALWAYS present as an object.
+                    # Frozen stdin: provider is ALWAYS the env-config object.
                     self.assertEqual(cli.state()["ocr_check_requests"][-1],
                                      {"provider": {}})
                     refreshed = engine.ocr_refresh(peel_id, ["it-a", "it-b"])
                     self.assertEqual(refreshed["status"], "queued")
                     self.assertTrue(refreshed["job_id"].startswith("ocr-"))
                     self.assertIsNone(refreshed["result_ref"])
+                    # Frozen stdin: item ids only, no provider key at all.
                     self.assertEqual(
                         cli.state()["ocr_refresh_requests"][-1],
-                        {"item_ids": ["it-a", "it-b"], "provider": {}})
-                    # A non-empty provider object overrides the env for one call.
-                    override = {"command": ["/tmp/provider", "--probe"],
-                                "engine": "rapidocr@1.4.4"}
-                    engine.ocr_check(peel_id, provider=override)
-                    self.assertEqual(cli.state()["ocr_check_requests"][-1],
-                                     {"provider": override})
+                        {"item_ids": ["it-a", "it-b"]})
+                    # CP4.1 G1: the client API no longer accepts a provider.
+                    with self.assertRaises(TypeError):
+                        engine.ocr_check(peel_id, provider={})
+                    with self.assertRaises(TypeError):
+                        engine.ocr_refresh(peel_id, ["it-a"], provider={})
                     # The job is persisted in the fake peel and re-attachable.
                     job = engine.job_show(peel_id, refreshed["job_id"])
                     self.assertEqual(job["type"], "ocr")
@@ -880,9 +881,6 @@ class CliAdapterTests(unittest.TestCase):
                     self.assertEqual(check_call["peel_shared_dir"],
                                      str(_shared(root)))
                     # Local validation never invokes the CLI with a bad request.
-                    with self.assertRaises(ValueError):
-                        engine.ocr_check(peel_id, provider=["not", "an",
-                                                            "object"])
                     with self.assertRaises(ValueError):
                         engine.ocr_refresh(peel_id, [])
                     with self.assertRaises(ValueError):
@@ -918,7 +916,7 @@ class CliAdapterTests(unittest.TestCase):
                     engine.ocr_check(peel_id)
                 self.assertEqual(caught.exception.status, 503)
                 self.assertIn("ocr_unavailable", caught.exception.detail)
-                # ocr_config_invalid -> 400 (bad env config/request provider)
+                # ocr_config_invalid -> 400 (bad env config)
                 cli.update(ocr_check_error={"code": "ocr_config_invalid",
                                             "message": "bad engine"})
                 with self.assertRaises(peelfeed.PeelfeedError) as caught:

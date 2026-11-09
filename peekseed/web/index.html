@@ -5223,7 +5223,9 @@ function reviewReindexText(reindex){
    evidence.ocr_evidence. peekseed only proxies: POST …/review/ocr/check probes
    the provider, POST …/review/ocr/refresh creates one persistent type=ocr job
    (polled like report/build jobs, never auto-rerun). OCR configuration is
-   env-only in M2.1 (PEELFEED_OCR_*), so the config dialog is read-only.
+   env-only in M2.1 (PEELFEED_OCR_*), so the config dialog is read-only and
+   the HTTP request bodies never carry a provider object (CP4.1 G1: only
+   peelfeed's local CLI may override the provider).
    Stable peelfeed OCR reason codes keep the wire spelling in payloads; every
    Chinese label lives here (unknown codes fall back to the raw text). */
 const REVIEW_OCR_REASON_LABEL={ocr_unavailable:'OCR 未配置或不可用',
@@ -5527,7 +5529,7 @@ async function reviewStartOcrRefresh(itemIds,options){
     const result=await reviewFetchJSON(
       reviewBase(ctx.dataset,ctx.sha)+'/ocr/refresh',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({item_ids:ids,provider:{}})});
+        body:JSON.stringify({item_ids:ids})});
     const jobId=String((result&&result.job_id)||'');
     if(!jobId){
       reviewMsg('服务器没有返回 OCR job_id，无法跟踪任务。',true);
@@ -5585,7 +5587,7 @@ async function reviewOcrCheck(){
     const result=await reviewFetchJSON(
       reviewBase(ctx.dataset,ctx.sha)+'/ocr/check',{
         method:'POST',headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({provider:{}})});
+        body:JSON.stringify({})});
     const engine=String((result&&result.engine)||'');
     const probe=(result&&result.probe&&typeof result.probe==='object')
       ?result.probe:{};

@@ -136,14 +136,14 @@ class ReviewOcrRouteTests(unittest.TestCase):
                 # Frozen stdin: provider is always the env-config object.
                 self.assertEqual(cli.state()["ocr_check_requests"][-1],
                                  {"provider": {}})
-                # A provider object is forwarded verbatim (CLI/testing override).
-                override = {"command": ["/tmp/provider"], "engine":
-                            "rapidocr@1.4.4"}
-                forwarded = client.post(base + "/review/ocr/check",
-                                        json={"provider": override})
-                self.assertEqual(forwarded.status_code, 200, forwarded.text)
+                # CP4.1 G1: no provider override is accepted over HTTP; the
+                # caller-supplied object is never forwarded to peelfeed.
+                rejected = client.post(base + "/review/ocr/check",
+                                       json={"provider": {"command": [
+                                           "/bin/sh", "-c", "true"]}})
+                self.assertEqual(rejected.status_code, 400, rejected.text)
                 self.assertEqual(cli.state()["ocr_check_requests"][-1],
-                                 {"provider": override})
+                                 {"provider": {}})
                 # The check is short: no job and no corpus write.
                 self.assertEqual(_review_jobs(client, _dataset_id, _sha), {})
                 self.assertNotIn("ocr-refresh",
@@ -178,14 +178,37 @@ class ReviewOcrRouteTests(unittest.TestCase):
                 client = _client()
                 base, _dataset_id, _sha = _extracted_review_source(client, root)
                 route = base + "/review/ocr/check"
-                for body in ({"provider": ["not", "an", "object"]},
-                             {"provider": "ocr"},
-                             {"item_ids": ["it-1"]},
-                             {"provider": {}, "mode": "vlm"}):
+                # A no-body check works first and warms the handshake cache, so
+                # the rejections below must not invoke the fake CLI at all.
+                empty = client.post(route)
+                self.assertEqual(empty.status_code, 200, empty.text)
+                self.assertEqual(cli.state()["ocr_check_requests"][-1],
+                                 {"provider": {}})
+                cli.clear_calls()
+                # CP4.1 G1: any field is rejected; in particular a provider
+                # object with a command must never reach peelfeed.
+                bodies = (
+                    {"provider": {"command": [
+                        "/bin/sh", "-c",
+                        "touch %s" % (root / "cp41-pwned")]}},
+                    {"provider": {}},
+                    {"provider": ["not", "an", "object"]},
+                    {"provider": "ocr"},
+                    {"item_ids": ["it-1"]},
+                    {"provider": {}, "mode": "vlm"},
+                )
+                for body in bodies:
                     response = client.post(route, json=body)
                     self.assertEqual(response.status_code, 400, response.text)
-                # An absent body means "use the env config" (provider {}).
-                empty = client.post(route)
+                    self.assertIn("unknown OCR check field(s)",
+                                  response.json()["detail"])
+                # No provider override was forwarded: the fake CLI was never
+                # invoked and nothing executed the command.
+                self.assertEqual(cli.calls(), [])
+                self.assertEqual(cli.commands(), [])
+                self.assertFalse((root / "cp41-pwned").exists())
+                # The empty body still means "use the env config" (provider {}).
+                empty = client.post(route, json={})
                 self.assertEqual(empty.status_code, 200, empty.text)
                 self.assertEqual(cli.state()["ocr_check_requests"][-1],
                                  {"provider": {}})
@@ -206,11 +229,10 @@ class ReviewOcrRouteTests(unittest.TestCase):
                 self.assertEqual(created["status"], "queued")
                 self.assertIsNone(created["result_ref"])
                 self.assertTrue(created["job_id"].startswith("ocr-"))
-                # Frozen stdin: item ids + provider {} always.
+                # Frozen stdin: item ids only; CP4.1 G1 forbids a provider.
                 self.assertEqual(
                     cli.state()["ocr_refresh_requests"][-1],
-                    {"item_ids": ["it-figure-1", "it-figure-2"],
-                     "provider": {}})
+                    {"item_ids": ["it-figure-1", "it-figure-2"]})
                 # The descriptor is stored in extraction.review_jobs (schema 4,
                 # no migration) for restart re-attachment.
                 descriptors = _review_jobs(client, dataset_id, sha)
@@ -247,6 +269,16 @@ class ReviewOcrRouteTests(unittest.TestCase):
                 client = _client()
                 base, _dataset_id, _sha = _extracted_review_source(client, root)
                 route = base + "/review/ocr/refresh"
+                # A valid refresh first warms the handshake cache so the
+                # rejected requests below must not invoke the fake CLI at all.
+                valid = client.post(route, json={"item_ids": ["it-warm"]})
+                self.assertEqual(valid.status_code, 202, valid.text)
+                self.assertEqual(
+                    cli.state()["ocr_refresh_requests"][-1],
+                    {"item_ids": ["it-warm"]})
+                jobs_before = dict(_review_jobs(client, _dataset_id, _sha))
+                self.assertIn(valid.json()["job_id"], jobs_before)
+                cli.clear_calls()
                 cases = [
                     {},
                     {"item_ids": []},
@@ -255,6 +287,12 @@ class ReviewOcrRouteTests(unittest.TestCase):
                     {"item_ids": ["  "]},
                     {"item_ids": [7]},
                     {"item_ids": ["it-1", "it-1"]},
+                    # CP4.1 G1: provider is never accepted, including a
+                    # command payload that peelfeed would execute.
+                    {"item_ids": ["it-1"], "provider": {"command": [
+                        "/bin/sh", "-c",
+                        "touch %s" % (root / "cp41-pwned")]}},
+                    {"item_ids": ["it-1"], "provider": {}},
                     {"item_ids": ["it-1"], "provider": "env"},
                     {"item_ids": ["it-1"], "tier": "R2"},
                     {"item_ids": ["it-1"], "scope": "peel"},
@@ -264,10 +302,46 @@ class ReviewOcrRouteTests(unittest.TestCase):
                     response = client.post(route, json=body)
                     self.assertEqual(response.status_code, 400,
                                      "%r -> %s" % (body, response.text))
+                # No rejected request invoked the fake CLI (and no command ran).
+                self.assertEqual(cli.calls(), [])
+                self.assertEqual(cli.commands(), [])
+                self.assertFalse((root / "cp41-pwned").exists())
                 # No job was created for any rejected request.
-                self.assertEqual(_review_jobs(client, _dataset_id, _sha), {})
-                self.assertNotIn("ocr-refresh",
-                                 [call["argv"][0] for call in cli.calls()])
+                self.assertEqual(_review_jobs(client, _dataset_id, _sha),
+                                 jobs_before)
+
+    def test_ocr_routes_reject_provider_command_payloads(self):
+        """CP4.1 G1: both OCR HTTP routes reject a provider command payload.
+
+        A provider object is executable input in peelfeed (``provider.command``
+        is spawned as a subprocess), so any API-token holder could run arbitrary
+        commands if the route forwarded it. Both routes must answer 400 and the
+        fake peelfeed CLI must never be invoked for the rejected request.
+        """
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, dataset_id, sha = _extracted_review_source(client, root)
+                # Warm the handshake so the 400s below are pure validation.
+                warmed = client.post(base + "/review/ocr/check", json={})
+                self.assertEqual(warmed.status_code, 200, warmed.text)
+                cli.clear_calls()
+                pwned = root / "cp41-pwned"
+                provider = {"command": ["/bin/sh", "-c", "touch %s" % pwned]}
+                routes = (
+                    (base + "/review/ocr/check", {"provider": provider}),
+                    (base + "/review/ocr/refresh",
+                     {"item_ids": ["it-1"], "provider": provider}),
+                )
+                for route, body in routes:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("provider", response.json()["detail"])
+                self.assertEqual(cli.calls(), [])
+                self.assertEqual(cli.commands(), [])
+                self.assertFalse(pwned.exists())
+                self.assertEqual(_review_jobs(client, dataset_id, sha), {})
 
     def test_ocr_refresh_error_mapping(self):
         with temp_data_root() as root:

@@ -121,7 +121,7 @@ _ERROR_STATUS = {
     # M2.1 OCR (contract §4 additions / wire §2.8): the provider being
     # unconfigured or unrunnable is a 503 (extraction is configured but OCR is
     # not); ``ocr-refresh`` without a current build is a 409; an invalid
-    # ``PEELFEED_OCR_*`` env config or request provider object is a 400. The
+    # ``PEELFEED_OCR_*`` env config is a 400. The
     # remaining OCR codes (ocr_timeout/ocr_bad_output/ocr_engine_mismatch) are
     # peelfeed failures -> 502 (the fallback).
     "ocr_unavailable": 503,
@@ -971,46 +971,34 @@ class PeelfeedClient(object):
                          stdin_text=stdin_text)
 
     # --- on-demand OCR (M2.1 CP4; contract §4 additions, wire §2.8) ---
-    @staticmethod
-    def _ocr_provider(provider):
-        """The ``provider`` object sent to peelfeed (``{}`` means "use env").
-
-        M2.1 OCR configuration is env-only (``PEELFEED_OCR_*``); the UI/API
-        always send ``{}``. A non-empty object is accepted for CLI/testing and
-        overrides the env config for that call only (wire §2.8). A non-object
-        provider is a local validation error so it is never forwarded as a
-        malformed request.
-        """
-        if provider is None:
-            return {}
-        if not isinstance(provider, dict):
-            raise ValueError("provider must be a JSON object")
-        return copy.deepcopy(provider)
-
-    def ocr_check(self, peel_id, provider=None, timeout=None):
+    # CP4.1 G1: this client NEVER sends a caller-supplied ``provider`` object.
+    # The HTTP API must not forward one because peelfeed executes a provider
+    # ``command`` as a subprocess; a provider override exists only in peelfeed's
+    # local CLI (and the fake CLI used by tests).
+    def ocr_check(self, peel_id, timeout=None):
         """``peelfeed ocr-check <peel> --input - --json`` (wire §2.8).
 
         Short probe: validates the effective OCR config and the provider (a
         generated 64x64 probe image), persists ``extract/ocr/status.json`` under
         the peel and returns
         ``{available, engine, provider, probe, checked_at, error}``. It never
-        writes the corpus and never creates a job. ``provider`` defaults to
-        ``{}`` = use the deploy env ``PEELFEED_OCR_*`` config (forwarded by
-        :meth:`_environment`); a non-empty object overrides it for this call
-        only (CLI/testing). Errors: ``ocr_unavailable`` -> 503,
-        ``ocr_config_invalid`` -> 400, other OCR codes -> 502.
+        writes the corpus and never creates a job. The request body is always
+        ``{"provider": {}}`` = use the deploy env ``PEELFEED_OCR_*`` config
+        (forwarded by :meth:`_environment`); no override is accepted here.
+        Errors: ``ocr_unavailable`` -> 503, ``ocr_config_invalid`` -> 400, other
+        OCR codes -> 502.
         """
         peel = str(peel_id or "").strip()
         if not peel:
             raise ValueError("ocr-check needs a peel id")
-        request = {"provider": self._ocr_provider(provider)}
+        request = {"provider": {}}
         return self._run(
             ["ocr-check", peel, "--input", "-"],
             timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
             stdin_text=json.dumps(request, ensure_ascii=False),
         )
 
-    def ocr_refresh(self, peel_id, item_ids, provider=None, timeout=None):
+    def ocr_refresh(self, peel_id, item_ids, timeout=None):
         """``peelfeed ocr-refresh <peel> --input - --json`` (wire §2.8).
 
         Creates one persistent ``type=ocr`` job for the requested review items
@@ -1018,10 +1006,11 @@ class PeelfeedClient(object):
         job refreshes the crops' OCR evidence under ``extract/ocr/`` and
         re-derives items/report. It takes no operation lock (never blocks
         builds/publishing) and is never re-run automatically (contract §8).
-        ``item_ids`` must be non-empty, unique non-empty strings. ``provider``
-        defaults to ``{}`` (env config) like :meth:`ocr_check`. Errors:
-        ``not_ready`` -> 409 (no current build), ``validation`` -> 400,
-        ``ocr_config_invalid`` -> 400, ``ocr_unavailable`` -> 503.
+        ``item_ids`` must be non-empty, unique non-empty strings. The request
+        body is exactly ``{"item_ids": [...]}``: no ``provider`` is ever sent
+        (CP4.1 G1; env-only config). Errors: ``not_ready`` -> 409 (no current
+        build), ``validation`` -> 400, ``ocr_config_invalid`` -> 400,
+        ``ocr_unavailable`` -> 503.
         """
         peel = str(peel_id or "").strip()
         if not peel:
@@ -1041,7 +1030,7 @@ class PeelfeedClient(object):
             cleaned.append(item_id)
         if not cleaned:
             raise ValueError("ocr-refresh needs a non-empty item_ids list")
-        request = {"item_ids": cleaned, "provider": self._ocr_provider(provider)}
+        request = {"item_ids": cleaned}
         return self._run(
             ["ocr-refresh", peel, "--input", "-"],
             timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
