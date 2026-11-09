@@ -69,6 +69,8 @@ __all__ = [
     "JOB_STATES",
     "PEEL_CHUNKER_VERSION",
     "PROBE_TEXT",
+    "REVIEW_JOB_STATUSES",
+    "REVIEW_JOB_TYPES",
     "SchemaTooNew",
     "chunk_id",
     "chunker_identity",
@@ -85,6 +87,7 @@ __all__ = [
     "new_job",
     "probe_sha256",
     "read_json",
+    "review_job_descriptor",
     "sha256_bytes",
     "sha256_file",
     "space_identity",
@@ -129,6 +132,7 @@ FILE_STATUSES = (
     "extracted",
     "failed",
     "stale",
+    "corrections_conflict",
     "new",
     "unchanged",
     "changed",
@@ -153,6 +157,12 @@ EXTRACTION_STATES = (
     "stale",
     "corrections_conflict",
 )
+
+#: peelfeed persistent job types (contract v1.3 §11.4 / CP3 wire §2.5). ``ocr``
+#: and ``discuss`` are schema-accepted but not exposed until CP4/CP5.
+REVIEW_JOB_TYPES = ("report", "build", "rollback", "ocr", "discuss")
+#: peelfeed persistent job states (CP3 wire §2.5).
+REVIEW_JOB_STATUSES = ("queued", "running", "done", "failed", "interrupted")
 
 # Collection-level states. ``uploaded``/``extracted`` describe storage and peel
 # state; the terminal states are ``indexed``, ``stale`` (the index no longer
@@ -339,11 +349,15 @@ def extraction_default():
     """The per-source extraction block of a freshly uploaded file.
 
     ``review_jobs`` (schema 4) maps a peelfeed review job id to its small
-    recorded descriptor (``{"type": "report|discuss|build|ocr", "created_at":
+    recorded descriptor (``{"type": "report|build|rollback|ocr", "created_at":
     …, "batch_id": …}``); peekseed persists it so a restarted service can
     re-attach to a running job by id instead of re-running it. It is empty
-    until the first review job is created (M2 Phase 2+; Phase 1 reports are
-    synchronous).
+    until the first review job is created (M2 Phase 2+).
+
+    ``corrections_conflict`` (CP3 additive, schema 4 unchanged) carries the
+    peelfeed ``status`` payload's conflicting-corrections detail while the
+    source is in the ``corrections_conflict`` state; it is ``None`` otherwise.
+    The key is optional on read (older schema-4 files do not have it).
     """
     return {
         "state": "not_extracted",
@@ -352,11 +366,34 @@ def extraction_default():
         "profile": "",
         "engine": "",
         "review_jobs": {},
+        "corrections_conflict": None,
         "validation": {"errors": 0, "review_items": 0},
         "started_at": None,
         "finished_at": None,
         "error": None,
     }
+
+
+def review_job_descriptor(job_type, *, created_at=None, batch_id=None):
+    """The schema-4 ``extraction.review_jobs[job_id]`` descriptor (CP3 wire §2.7).
+
+    ``type`` is one of :data:`REVIEW_JOB_TYPES`; ``batch_id`` is ``None`` for
+    report jobs and the ApplyBatch id for build/rollback jobs. Terminal
+    descriptors stay so the UI can query the job after a restart; peekseed
+    never re-runs a job automatically.
+    """
+    job_type = str(job_type or "").strip().lower()
+    if job_type not in REVIEW_JOB_TYPES:
+        raise ContractError(
+            "unknown review job type %r; expected one of %s"
+            % (job_type, ", ".join(REVIEW_JOB_TYPES))
+        )
+    return {
+        "type": job_type,
+        "created_at": created_at or utc_now(),
+        "batch_id": str(batch_id) if batch_id else None,
+    }
+
 
 
 def extraction_state(entry):
@@ -671,6 +708,15 @@ def _validate_extraction(raw):
                     "source extraction review_jobs entry %r must be a JSON "
                     "object." % str(job_id))
             out["review_jobs"][str(job_id)] = dict(descriptor)
+    conflict = block.get("corrections_conflict")
+    if isinstance(conflict, (dict, list)):
+        # Additive CP3 detail (wire §2.7/§2.9): the conflicting corrections and
+        # their source batches, surfaced in the source list / dataset info.
+        out["corrections_conflict"] = conflict
+    elif conflict is not None:
+        raise ContractError(
+            "source extraction field 'corrections_conflict' must be an object, "
+            "a list or null.")
     validation = block.get("validation")
     if isinstance(validation, dict):
         out["validation"] = {

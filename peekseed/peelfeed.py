@@ -14,9 +14,10 @@ This module is the whole seam:
   at a different engine without rewriting the config. The peel root is always
   ``$PEELFEED_SHARED_DIR/peels`` (see :mod:`peekseed.config`).
 * :class:`PeelfeedClient` runs ``capabilities``/``status``/``ingest``/``review``/
-  ``plan``/``review-report``/``rebuild``/``event``/``archive`` with ``--root`` and
-  ``--json``, a timeout, and typed errors (:class:`PeelfeedUnavailable` when the
-  command cannot start / ``capabilities`` fails, :class:`PeelfeedError` on a
+  ``plan``/``review-report``/``apply``/``batch show``/``publish``/``discard``/
+  ``rollback``/``job show|list``/``rebuild``/``event``/``archive`` with ``--root``
+  and ``--json``, a timeout, and typed errors (:class:`PeelfeedUnavailable` when
+  the command cannot start / ``capabilities`` fails, :class:`PeelfeedError` on a
   failed command, with the peelfeed error code mapped to an HTTP status).
 * Review state is owned by peelfeed: peekseed only proxies it. ``capabilities``
   must advertise ``review_schema: 2``; the API refuses review calls with a clear
@@ -55,6 +56,8 @@ __all__ = [
     "PeelfeedUnavailable",
     "PLAN_ACTIONS",
     "REVIEW_GROUPS",
+    "REVIEW_JOB_STATUSES",
+    "REVIEW_JOB_TYPES",
     "REVIEW_SCHEMA",
     "SHORT_TIMEOUT",
     "STATE_MAP",
@@ -96,6 +99,11 @@ PLAN_ACTIONS = ("show", "select", "confirm", "lock", "unlock", "defer",
                 "accept", "clear")
 #: ``plan defer`` reason codes (contract §7).
 DEFER_REASONS = ("unsupported_evidence", "grid_conflict", "not_relevant", "other")
+#: peelfeed persistent job types (contract §11.4 / CP3 wire §2.5). Only
+#: ``report``/``build``/``rollback`` are exposed in CP3.
+REVIEW_JOB_TYPES = ("report", "build", "rollback", "ocr", "discuss")
+#: peelfeed persistent job states (CP3 wire §2.5).
+REVIEW_JOB_STATUSES = ("queued", "running", "done", "failed", "interrupted")
 #: peelfeed exit-2 error code -> HTTP status (contract §4). Unknown codes are
 #: a peelfeed failure (502); exit code 3 is "not found" (404).
 _ERROR_STATUS = {
@@ -601,6 +609,14 @@ def extraction_from_summary(summary, *, previous=None):
         },
         "error": str(summary.get("error") or "") or None,
     })
+    # CP3 wire §2.7/§2.9: ``status`` adds the conflicting-corrections detail when
+    # the peel is in ``corrections_conflict``; keep it on the source so the UI
+    # can list the conflicting corrections and their source batches.
+    conflict = summary.get("corrections_conflict")
+    if isinstance(conflict, (dict, list)):
+        block["corrections_conflict"] = conflict
+    elif state != "corrections_conflict":
+        block["corrections_conflict"] = None
     if source.get("pages"):
         block["pages"] = int(source["pages"])
     elif counts.get("pages"):
@@ -926,9 +942,11 @@ class PeelfeedClient(object):
     def review_report(self, peel_id, item_ids=None, cluster_ids=None):
         """``peelfeed review-report <peel_id> [--input -]`` (contract §5).
 
-        Phase 1 runs synchronously and returns the ready/partial report payload
-        (``status``/``report_path``/``report``/``counts``); the optional request
-        filters items/clusters. Persisted jobs arrive in Phase 2.
+        CP3 (wire §2.6): the command creates a persistent ``report`` job and
+        returns ``{"job_id", "status": "queued", "result_ref": null}``; the job
+        writes ``extract/review/report.json`` when it finishes (poll ``job
+        show``). The optional request filters items/clusters are passed through
+        as the job payload (rules-only CP3 reports are full-peel).
         """
         args = ["review-report", str(peel_id)]
         request = {}
@@ -942,6 +960,93 @@ class PeelfeedClient(object):
             stdin_text = json.dumps(request, ensure_ascii=False)
         return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout),
                          stdin_text=stdin_text)
+
+    # --- ApplyBatch / publish / jobs (M2 CP3; contract §4, wire §2.6) ---
+    def apply(self, peel_id, entry_ids):
+        """``peelfeed apply <peel> --input -``: prepare a batch + ``build`` job.
+
+        The request is exactly ``{"entry_ids": [...]}`` (wire §2.6): tier/scope/
+        operations are chosen by the planner and cannot be passed. Response
+        ``{"job_id", "batch_id", "status": "queued"}``; ``busy`` when the
+        operation lock is held (no batch/job created).
+        """
+        cleaned = []
+        seen = set()
+        for raw in entry_ids or []:
+            entry_id = str(raw or "").strip()
+            if not entry_id:
+                raise ValueError("entry_ids must not contain empty ids")
+            if entry_id in seen:
+                raise ValueError("entry_ids must be unique (duplicate %s)"
+                                 % entry_id)
+            seen.add(entry_id)
+            cleaned.append(entry_id)
+        if not cleaned:
+            raise ValueError("apply needs a non-empty entry_ids list")
+        return self._run(
+            ["apply", str(peel_id), "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps({"entry_ids": cleaned}, ensure_ascii=False),
+        )
+
+    def batch_show(self, peel_id, batch_id):
+        """``batch show <peel> --batch <id>``: the persisted ApplyBatch record."""
+        batch_id = str(batch_id or "").strip()
+        if not batch_id:
+            raise ValueError("batch show needs a batch id")
+        return self._run(
+            ["batch", str(peel_id), "show", "--batch", batch_id],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def publish(self, peel_id, batch_id):
+        """``publish <peel> --batch <id>``: synchronous publish under the lock.
+
+        Response ``{"batch": {...}, "current": {...}}``; ``busy`` (423) when the
+        operation lock is held, ``conflict``/``stale``/``corrections_conflict``
+        (409) on a base CAS failure, ``validation`` (400) for a rejected batch.
+        """
+        batch_id = str(batch_id or "").strip()
+        if not batch_id:
+            raise ValueError("publish needs a batch id")
+        return self._run(
+            ["publish", str(peel_id), "--batch", batch_id],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def discard(self, peel_id, batch_id):
+        """``discard <peel> --batch <id>``: discard; current/ledger unchanged."""
+        batch_id = str(batch_id or "").strip()
+        if not batch_id:
+            raise ValueError("discard needs a batch id")
+        return self._run(
+            ["discard", str(peel_id), "--batch", batch_id],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def rollback(self, peel_id, reason=None):
+        """``rollback <peel>``: revert the latest published batch via a job.
+
+        Response ``{"job_id", "batch_id", "status": "queued"}``; the job builds
+        (or reuses the kept previous build) and auto-publishes the revert.
+        """
+        args = ["rollback", str(peel_id)]
+        if reason:
+            args.extend(["--reason", str(reason)])
+        return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def job_show(self, peel_id, job_id):
+        """``job show <peel> --job <id>``: the persisted job record (§2.5)."""
+        job_id = str(job_id or "").strip()
+        if not job_id:
+            raise ValueError("job show needs a job id")
+        return self._run(
+            ["job", str(peel_id), "show", "--job", job_id],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def job_list(self, peel_id, status=None):
+        """``job list <peel> [--status …]``: every persisted job record."""
+        args = ["job", str(peel_id), "list"]
+        if status:
+            args.extend(["--status", str(status)])
+        return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout))
 
     def event(self, peel_id, event, data=None):
         args = ["event", str(peel_id), "--event", str(event)]

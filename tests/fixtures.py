@@ -418,17 +418,26 @@ def write_chunk_sets(corpus, chunks, chunk_sets, conversion_id):
 
 def make_peel(dataset, *, pages=None, source=None, profile="generic",
               validation_errors=None, peel_root=None, engine="peelfeed-test@1",
-              conversion_salt="1", chunks=None, chunk_sets=(EMBED_CHUNK,)):
+              conversion_salt="1", chunks=None, chunk_sets=(EMBED_CHUNK,),
+              layout="build"):
     """Create a fake peelfeed peel for one dataset source and mark it extracted.
 
-    ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. The peel is
-    written under ``config.paths().peels_dir`` with the files
+    ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. By default
+    the peel uses the CP3 build layout (wire-contract §2.1)::
+
+        extract/corpus -> conversions/<build_id>/     relative symlink
+        extract/conversions/<build_id>/manifest.json  conversion identity
+        extract/conversions/<build_id>/build_summary.json
+
+    ``layout="legacy"`` writes a real ``extract/corpus`` directory instead, which
+    exercises the pre-cutover fallback. The peel is written under
+    ``config.paths().peels_dir`` with the files
     :func:`peekseed.ingest.build_index` consumes: ``manifest.json``,
     ``chunks.jsonl``, ``blocks.jsonl``, ``assets.jsonl``, ``validation.json``,
     ``review_queue.json`` and a copy of the source under ``source/``. The dataset
     source entry is updated to ``status="extracted"`` with the peel identity.
 
-    Returns ``{"peel_id", "peel_dir", "conversion_id"}``.
+    Returns ``{"peel_id", "peel_dir", "conversion_id", "build_id", "build_dir"}``.
     """
     from peekseed import config, contracts, ingest
 
@@ -460,14 +469,34 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     peel_root = Path(peel_root)
     peel_id = "%s-%s" % (_peel_slug(Path(name).stem), sha[:8])
     peel_dir = peel_root / peel_id
-    corpus = peel_dir / "extract" / "corpus"
-    (peel_dir / "source").mkdir(parents=True, exist_ok=True)
-    corpus.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(source_file), str(peel_dir / "source" / name))
-
+    extract = peel_dir / "extract"
     conversion_id = hashlib.sha256(
         ("conv|%s|%s|%s" % (sha, profile, conversion_salt)).encode()
     ).hexdigest()
+    build_id = "b20261108T120000-" + hashlib.sha256(
+        ("build|%s|%s" % (conversion_id, layout)).encode()
+    ).hexdigest()[:8]
+    if layout == "legacy":
+        corpus = extract / "corpus"
+        if corpus.is_symlink():
+            corpus.unlink()
+        build_dir = corpus
+        build_id = "cutover-" + conversion_id
+    else:
+        build_dir = extract / "conversions" / build_id
+        corpus = build_dir
+    (peel_dir / "source").mkdir(parents=True, exist_ok=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    if layout != "legacy":
+        link = extract / "corpus"
+        if link.is_symlink():
+            link.unlink()
+        elif link.is_dir():
+            shutil.rmtree(str(link))
+        extract.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.join("conversions", build_id), str(link))
+    shutil.copyfile(str(source_file), str(peel_dir / "source" / name))
+
     if pages is None:
         pages = [
             "Widget installation. The widget is mounted on the frame with two screws.",
@@ -508,9 +537,13 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
                 "page": int(chunk.get("page_start") or 1),
                 "text": str(chunk.get("text") or ""),
             })
+    empty_hash = hashlib.sha256(b"[]").hexdigest()
     manifest = {
         "schema_version": 2,
         "conversion_id": conversion_id,
+        "effective_corrections_hash": empty_hash,
+        "correction_engine_version": "corr-test0000000000",
+        "uncorrected_identity": conversion_id,
         "title": Path(name).stem,
         "profile": profile,
         "source": name,
@@ -530,7 +563,27 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     }
     review_queue = {"warnings": [], "char_limit_exceptions": [],
                     "outline_reconciliations": []}
+    build_summary = {
+        "schema_version": 1,
+        "peel_id": peel_id,
+        "build_id": build_id,
+        "build_kind": "cutover" if layout == "legacy" else "system",
+        "batch_id": None,
+        "conversion_id": conversion_id,
+        "corrections": {"effective_corrections_hash": empty_hash,
+                        "correction_engine_version": "corr-test0000000000"},
+        "gates": {"all_pass": True, "checks": 1, "errors": []},
+        "diff": {"assets_changed": 0, "blocks_changed": 0, "chunks_changed": 0,
+                 "new_warnings": [], "changed_assets": [], "samples": []},
+        "counts": {"pages": len(pages), "chunks": len(chunks),
+                   "review_items": 0},
+        "validation_errors": len(validation_errors or []),
+        "engine": {"name": "peelfeed", "version": "0.1.0",
+                   "fingerprint": engine},
+        "created_utc": contracts.utc_now(),
+    }
     contracts.write_json_atomic(corpus / "manifest.json", manifest)
+    contracts.write_json_atomic(corpus / "build_summary.json", build_summary)
     contracts.write_json_atomic(corpus / "validation.json", validation)
     contracts.write_json_atomic(corpus / "review_queue.json", review_queue)
     (corpus / "assets.jsonl").write_text("", encoding="utf-8")
@@ -555,6 +608,7 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
         "profile": profile,
         "engine": engine,
         "review_jobs": {},
+        "corrections_conflict": None,
         "validation": {"errors": 0, "review_items": 0},
         "started_at": contracts.utc_now(),
         "finished_at": contracts.utc_now(),
@@ -567,7 +621,66 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     metadata["updated_at"] = contracts.utc_now()
     contracts.write_json_atomic(dataset_dir / "dataset.json", metadata)
     return {"peel_id": peel_id, "peel_dir": str(peel_dir),
-            "conversion_id": conversion_id}
+            "conversion_id": conversion_id, "build_id": build_id,
+            "build_dir": str(build_dir)}
+
+
+def write_peel_build(peel, *, conversion_id=None, build_id=None,
+                     chunk_sets=None, engine=None):
+    """Move a fake peel's current pointer to a (possibly new) build dir.
+
+    Simulates a peelfeed publish / system rebuild on the peel filesystem only:
+    the new build directory copies the current corpus, optionally records a new
+    ``conversion_id`` and/or adds chunk sets, and ``extract/corpus`` is replaced
+    with the relative symlink. ``dataset.json`` is deliberately **not** touched,
+    so a reconcile test can prove the shared-dataset refresh updates it.
+
+    A chunk-set-only change keeps ``conversion_id`` (new ``build_id``, same
+    content identity), which must leave existing indexes valid.
+    """
+    from peekseed import contracts
+
+    peel_dir = Path(peel["peel_dir"])
+    extract = peel_dir / "extract"
+    link = extract / "corpus"
+    current_dir = link.resolve()
+    manifest = json.loads((current_dir / "manifest.json").read_text())
+    conversion_id = conversion_id or str(manifest.get("conversion_id") or "")
+    if build_id is None:
+        build_id = "b20261108T120000-" + hashlib.sha256(
+            ("build|%s|%s" % (conversion_id, chunk_sets)).encode()
+        ).hexdigest()[:8]
+    build_dir = extract / "conversions" / build_id
+    if build_dir.resolve() != current_dir:
+        build_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(current_dir), str(build_dir), dirs_exist_ok=True)
+    manifest = dict(manifest, conversion_id=conversion_id)
+    contracts.write_json_atomic(build_dir / "manifest.json", manifest)
+    validation_path = build_dir / "validation.json"
+    if validation_path.is_file():
+        validation = json.loads(validation_path.read_text())
+        validation["conversion_id"] = conversion_id
+        contracts.write_json_atomic(validation_path, validation)
+    summary_path = build_dir / "build_summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text())
+        summary.update({"build_id": build_id, "conversion_id": conversion_id})
+        if engine:
+            summary.setdefault("engine", {})["fingerprint"] = engine
+        contracts.write_json_atomic(summary_path, summary)
+    if chunk_sets:
+        chunks = [json.loads(line) for line in
+                  (build_dir / "chunks.jsonl").read_text().splitlines()
+                  if line.strip()]
+        write_chunk_sets(build_dir, chunks, chunk_sets, conversion_id)
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        shutil.rmtree(str(link))
+    extract.mkdir(parents=True, exist_ok=True)
+    os.symlink(os.path.join("conversions", build_id), str(link))
+    return {"peel_id": peel["peel_id"], "build_id": build_id,
+            "build_dir": str(build_dir), "conversion_id": conversion_id}
 
 
 # --- fake peelfeed CLI -----------------------------------------------------
@@ -868,66 +981,7 @@ DEFAULT_PLAN = {
     "resolution": None,
 }
 
-DEFAULT_REPORT = {
-    "peel_id": "peel",
-    "status": "ready",
-    "report_path": "extract/review/report.json",
-    "report": {
-        "schema_version": 1,
-        "status": "ready",
-        "stale": False,
-        "generated_at": "2026-11-05T00:00:00Z",
-        "provider": {"kind": "rule", "model": None, "prompt_version": None},
-        "clusters": [{
-            "cluster_id": "cl-0f1e2d3c4b5a",
-            "item_ids": ["it-3f9c2a4b6d8e0f1a"],
-            "conclusion": "规则建议把第 0 行作为表头。",
-            "suggestions": [{
-                "item_id": "it-3f9c2a4b6d8e0f1a",
-                "strategy": {"id": "use_first_row_header", "version": 1},
-                "params": {},
-                "evidence_refs": ["asset:table-3-19"],
-                "validator": {"status": "ready", "reasons": []},
-                "in_plan": False,
-                "state": "ready",
-            }],
-            "clarifications": [],
-        }, {
-            "cluster_id": "cl-9a8b7c6d5e4f",
-            "item_ids": ["it-8b7a6c5d4e3f2a10"],
-            "conclusion": "图内无 native 文本：保留原始图（R0 resolution）。",
-            "suggestions": [{
-                "item_id": "it-8b7a6c5d4e3f2a10",
-                "strategy": {"id": "keep_visual_fallback", "version": 1},
-                "params": {},
-                "evidence_refs": ["asset:figure-1-1"],
-                "validator": {"status": "ready", "reasons": []},
-                "in_plan": False,
-                "state": "ready",
-            }],
-            "clarifications": [],
-        }, {
-            "cluster_id": "cl-1a2b3c4d5e6f",
-            "item_ids": ["it-5a7c8b9d0e1f2a3b"],
-            "conclusion": "父表证据变化，候选校验未通过。",
-            "suggestions": [{
-                "item_id": "it-5a7c8b9d0e1f2a3b",
-                "strategy": {"id": "inherit_parent_header", "version": 1},
-                "params": {"parent_asset_id": "table-p1041-01"},
-                "evidence_refs": ["asset:table-p1041-01"],
-                "validator": {"status": "failed_check",
-                              "reasons": ["parent_evidence_changed"]},
-                "in_plan": False,
-                "state": "failed_check",
-            }],
-            "clarifications": [],
-        }],
-        "auto_archived": [],
-        "unsupported": [],
-    },
-    "counts": {"suggestions": 3, "auto_archived": 0, "unsupported": 0,
-               "needs_decision": 1},
-}
+DEFAULT_REPORT = %(default_report)r
 
 
 def load_state():
@@ -1118,6 +1172,153 @@ def refresh_stale_entry(match, review):
     }
 
 
+def corpus_operation(action):
+    """The normalized CP3 §2.1 ``corpus_operation`` for one plan action."""
+    action = action if isinstance(action, dict) else {}
+    name = str(action.get("name") or "")
+    params = dict(action.get("params") or {})
+    if name == "set_header_rows":
+        rows = sorted({int(value) for value in params.get("rows") or []}) or [0]
+        cells = ["Header A", "Header B"]
+        semantic = {"rows": rows}
+        refs = [{"segment": 0, "source_row": row, "cells": list(cells),
+                 "evidence_hash": "ev-fake"} for row in rows]
+    elif name == "inherit_header_from":
+        rows = sorted({int(value) for value in params.get("parent_header_rows")
+                       or []}) or [0]
+        cells = params.get("parent_header_cells") or [["Header A", "Header B"]]
+        semantic = {
+            "parent_asset_id": params.get("parent_asset_id") or "table-parent",
+            "parent_header_rows": rows,
+            "parent_header_cells": copy_json(cells),
+            "parent_header_source": params.get("parent_header_source") or "native",
+        }
+        refs = params.get("parent_source_refs") or [{
+            "segment": 0, "source_row": rows[0],
+            "cells": copy_json(cells[0] if cells else ["Header A", "Header B"]),
+            "evidence_hash": "ev-fake"}]
+    else:
+        return None
+    return {"schema_version": 1, "name": name, "semantic": semantic,
+            "source_refs": copy_json(refs)}
+
+
+def new_job(job_type, *, batch_id=None, result_ref=None, status="done",
+            error=None, nonce=""):
+    """A deterministic CP3 §2.5 persistent job record (terminal immediately).
+
+    The fake CLI makes jobs terminal right away (the CP2 flake hardening: a
+    poller never has to wait for a fake process). Tests that need queued/running/
+    failed/interrupted records set ``state["jobs"]`` directly.
+    """
+    job_id = str(job_type) + "-20261108T120000-" + hashlib.sha256(
+        (str(job_type) + "|" + str(batch_id) + "|" + str(result_ref)
+         + "|" + str(nonce)).encode()
+    ).hexdigest()[:4]
+    now = "2026-11-08T12:00:00Z"
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "type": str(job_type),
+        "status": str(status),
+        "progress": {"stage": "done" if status == "done" else status,
+                     "done": 1 if status == "done" else 0,
+                     "total": 1},
+        "result_ref": result_ref,
+        "error": error,
+        "pid": None,
+        "process_started_at": None,
+        "created_at": now,
+        "started_at": now,
+        "updated_at": now,
+        "log_ref": "jobs/" + job_id + ".log",
+        "batch_id": batch_id,
+    }
+
+
+def default_batch(peel_id, entry_ids, entries, state):
+    """A deterministic ready_to_publish ApplyBatch record (CP3 wire §2.3)."""
+    empty_hash = hashlib.sha256(b"[]").hexdigest()
+    changes = []
+    for entry_id in entry_ids:
+        entry = entries.get(str(entry_id)) or {}
+        action = entry.get("action") or {}
+        operation = corpus_operation(action)
+        changes.append({
+            "change": "add",
+            "entry_id": str(entry_id),
+            "item_id": entry.get("item_id"),
+            "operation": operation,
+            "supersedes": None,
+        })
+    batch_id = "batch-20261108T120000-" + hashlib.sha256(
+        "|".join(str(item) for item in entry_ids).encode()).hexdigest()[:4]
+    conversion_id = state.get("batch_conversion_id") or (
+        hashlib.sha256(("batch|" + batch_id).encode()).hexdigest())
+    build_id = "b20261108T120000-" + hashlib.sha256(
+        ("build|" + batch_id).encode()).hexdigest()[:8]
+    base = {
+        "conversion_id": conversion_id,
+        "effective_corrections_hash": state.get("effective_corrections_hash")
+        or empty_hash,
+        "entry_revisions": {str(entry_id): int(
+            (entries.get(str(entry_id)) or {}).get("revision") or 1)
+            for entry_id in entry_ids},
+        "evidence_hashes": {str(entry_id): (
+            (entries.get(str(entry_id)) or {}).get("evidence") or {}).get("hash")
+            for entry_id in entry_ids},
+        "engine_fingerprint": state.get("engine_fingerprint") or "test-fingerprint",
+        "profile": "generic",
+        "chunk_sets": ["c8000-12000-i3"],
+        "correction_engine_version": "corr-test0000000000",
+    }
+    projected = hashlib.sha256(json.dumps(
+        changes, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    return {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "status": "ready_to_publish",
+        "created_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "changes": changes,
+        "base": base,
+        "projected_effective_corrections_hash": projected,
+        "plan_level": {"tier": "R2", "reasons": ["corpus_operation"]},
+        "estimate": {"items": len(changes), "assets": len(changes),
+                     "pages": [], "docling_rerun": False, "seconds": 120,
+                     "reindex": None},
+        "build": {
+            "build_id": build_id,
+            "candidate_conversion_id": conversion_id,
+            "gates": {"all_pass": True, "checks": 12, "errors": []},
+            "diff": {"assets_changed": len(changes), "blocks_changed": 0,
+                     "chunks_changed": len(changes), "new_warnings": [],
+                     "changed_assets": [change["item_id"] for change in changes],
+                     "samples": []},
+            "carried_corrections": 0,
+        },
+        "publish": {"committed_at": None, "current_build_id": None,
+                    "error": None},
+        "failures": [],
+    }
+
+
+def batch_current(batch, state):
+    """The ``current`` block a publish/discard response carries (wire §2.6)."""
+    override = state.get("publish_current")
+    if isinstance(override, dict):
+        return copy_json(override)
+    build = batch.get("build") or {}
+    return {
+        "build_id": build.get("build_id") or "",
+        "conversion_id": build.get("candidate_conversion_id") or "",
+        "effective_corrections_hash": (
+            batch.get("projected_effective_corrections_hash") or ""),
+        "published": True,
+    }
+
+
 def option(rest, name):
     for index, item in enumerate(rest):
         if item == name and index + 1 < len(rest):
@@ -1130,7 +1331,7 @@ VALUE_FLAGS = {
     "--confidence", "--event", "--data", "--reason", "--profile",
     "--chunk-profile", "--llm", "--limit", "--pages", "--slug",
     "--collection", "--device", "--group", "--status", "--entry",
-    "--base-plan-version", "--input",
+    "--base-plan-version", "--input", "--batch", "--job",
 }
 
 
@@ -1225,22 +1426,30 @@ def main():
         pages = int(state.get("ingest_pages") or 2)
         review_items = int(state.get("ingest_review_items") or 0)
         errors = list(state.get("ingest_errors") or [])
+        delay = float(state.get("ingest_seconds") or 0)
         peels[peel_id] = {
             "peel_id": peel_id,
-            "state": "converting",
+            # CP3 flake hardening: with no simulated delay the terminal state is
+            # observable immediately (no intermediate "converting" write for a
+            # 0.05s poller to catch and persist late).
+            "state": "converting" if delay else (
+                "failed" if errors else "ready"),
             "source": {"name": os.path.basename(source),
                        "size": os.path.getsize(source),
                        "sha256": sha, "pages": pages},
             "profile": state.get("ingest_profile") or "generic",
-            "conversion_id": "",
+            "conversion_id": "" if delay else hashlib.sha256(
+                ("conv|" + sha).encode()).hexdigest(),
             "counts": {"pages": pages, "chunks": pages},
-            "validation": {"errors": [], "review_items": review_items},
+            "validation": {"errors": [] if delay else errors,
+                           "review_items": review_items},
             "review_items": review_items,
-            "error": None,
+            "error": None if delay or not errors else "validation failed",
         }
         state["peels"] = peels
         save_state(state)
-        time.sleep(float(state.get("ingest_seconds") or 0))
+        if delay:
+            time.sleep(delay)
         conversion_id = hashlib.sha256(("conv|" + sha).encode()).hexdigest()
         summary = dict(peels[peel_id])
         summary.update({
@@ -1654,14 +1863,205 @@ def main():
         peel_id = first_positional(rest)
         if peel_id not in peels:
             return fail("no such peel", 3, "not_found")
+        if "--with-vlm" in rest:
+            return fail("VLM reports are not available in CP3", 2, "validation")
         request = {}
         if option(rest, "--input") is not None:
             request = read_stdin_json() or {}
             state.setdefault("review_report_requests", []).append(request)
-            save_state(state)
-        payload = copy_json(state.get("review_report") or DEFAULT_REPORT)
-        payload["peel_id"] = peel_id
-        return emit(payload)
+        # CP3: a persistent ``report`` job; the fake job is terminal immediately
+        # (the poller never waits for a fake process) and the report payload is
+        # still available in ``state["review_report"]`` for assertions.
+        job = new_job("report", result_ref="report.json",
+                      nonce=len(state.get("jobs") or {}))
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "status": "queued",
+                     "result_ref": None})
+
+    if command == "apply":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for apply", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            return fail("apply input must be a JSON object", 2, "validation")
+        for forbidden in ("tier", "scope", "operations"):
+            if forbidden in request:
+                return fail("apply accepts only entry_ids; " + forbidden
+                            + " is chosen by the planner and cannot be passed",
+                            2, "validation")
+        entry_ids = request.get("entry_ids")
+        if not isinstance(entry_ids, list) or not entry_ids:
+            return fail("entry_ids must be a non-empty list of entry ids",
+                        2, "validation")
+        state.setdefault("apply_requests", []).append(copy_json(request))
+        plan = copy_json(state.get("plan") or DEFAULT_PLAN)
+        entries = {entry.get("entry_id"): entry
+                   for entry in plan.get("entries") or []
+                   if isinstance(entry, dict)}
+        for entry_id in entry_ids:
+            entry = entries.get(str(entry_id))
+            if entry is None:
+                return fail("no such plan entry: " + str(entry_id), 3,
+                            "not_found")
+            if entry.get("locked") or entry.get("batch_id"):
+                return fail("entry " + str(entry_id) + " is locked or already "
+                            "in a batch", 2, "conflict")
+            if str(entry.get("status") or "") != "confirmed":
+                return fail("entry " + str(entry_id) + " is not confirmed",
+                            2, "validation")
+            if (entry.get("action") or {}).get("type") != "operation":
+                return fail("only operation entries enter a batch", 2,
+                            "validation")
+        batch = default_batch(peel_id, [str(item) for item in entry_ids],
+                              entries, state)
+        state.setdefault("batches", {})[batch["batch_id"]] = batch
+        job = new_job("build", batch_id=batch["batch_id"],
+                      result_ref="batches/" + batch["batch_id"] + ".json")
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "batch_id": batch["batch_id"],
+                     "status": "queued"})
+
+    if command == "batch":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        values = positionals(rest)
+        action = values[1] if len(values) > 1 else None
+        if action != "show":
+            return fail("unknown batch action: " + str(action), 2, "validation")
+        batch_id = option(rest, "--batch")
+        if not batch_id:
+            return fail("--batch is required for batch show", 2, "validation")
+        batch = (state.get("batches") or {}).get(str(batch_id))
+        if not isinstance(batch, dict):
+            return fail("unknown batch: " + str(batch_id), 3, "not_found")
+        return emit(copy_json(batch))
+
+    if command == "publish":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        batch_id = option(rest, "--batch")
+        if not batch_id:
+            return fail("--batch is required for publish", 2, "validation")
+        batch = (state.get("batches") or {}).get(str(batch_id))
+        if not isinstance(batch, dict):
+            return fail("unknown batch: " + str(batch_id), 3, "not_found")
+        status = str(batch.get("status") or "")
+        if status not in ("ready_to_publish", "publishing"):
+            return fail("batch is not ready to publish (status " + status + ")",
+                        2, "conflict")
+        current = batch_current(batch, state)
+        batch = copy_json(batch)
+        batch["status"] = "published"
+        batch["updated_at"] = "2026-11-08T12:00:05Z"
+        batch["publish"] = {"committed_at": "2026-11-08T12:00:05Z",
+                            "current_build_id": current.get("build_id"),
+                            "error": None}
+        state.setdefault("batches", {})[str(batch_id)] = batch
+        state.setdefault("published_batches", []).append(str(batch_id))
+        save_state(state)
+        return emit({"batch": batch, "current": current})
+
+    if command == "discard":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        batch_id = option(rest, "--batch")
+        if not batch_id:
+            return fail("--batch is required for discard", 2, "validation")
+        batch = (state.get("batches") or {}).get(str(batch_id))
+        if not isinstance(batch, dict):
+            return fail("unknown batch: " + str(batch_id), 3, "not_found")
+        if str(batch.get("status") or "") in ("published", "publishing"):
+            return fail("batch is already published", 2, "conflict")
+        batch = copy_json(batch)
+        batch["status"] = "discarded"
+        batch["updated_at"] = "2026-11-08T12:00:05Z"
+        state.setdefault("batches", {})[str(batch_id)] = batch
+        current = state.get("publish_current") or {
+            "build_id": "", "conversion_id": "",
+            "effective_corrections_hash": "", "published": False}
+        save_state(state)
+        return emit({"batch": batch, "current": copy_json(current)})
+
+    if command == "rollback":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        state.setdefault("rollback_requests", []).append(
+            {"peel_id": peel_id, "reason": option(rest, "--reason")})
+        batch_id = "batch-20261108T120000-" + hashlib.sha256(
+            ("rollback|" + peel_id + "|" + str(len(
+                state.get("rollback_requests") or []))).encode()
+        ).hexdigest()[:4]
+        batch = {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "status": "ready_to_publish",
+            "created_at": "2026-11-08T12:00:00Z",
+            "updated_at": "2026-11-08T12:00:00Z",
+            "changes": [{"change": "revert", "entry_id": "e-revert",
+                         "item_id": "it-revert", "operation": None,
+                         "supersedes": "c-revert"}],
+            "base": {"conversion_id": "", "effective_corrections_hash": "",
+                     "entry_revisions": {}, "evidence_hashes": {},
+                     "engine_fingerprint": "test-fingerprint",
+                     "profile": "generic", "chunk_sets": ["c8000-12000-i3"],
+                     "correction_engine_version": "corr-test0000000000"},
+            "projected_effective_corrections_hash": hashlib.sha256(
+                b"[]").hexdigest(),
+            "plan_level": {"tier": "R2", "reasons": ["corpus_operation"]},
+            "estimate": {"items": 1, "assets": 1, "pages": [],
+                         "docling_rerun": False, "seconds": 120,
+                         "reindex": None},
+            "build": None,
+            "publish": {"committed_at": None, "current_build_id": None,
+                        "error": None},
+            "failures": [],
+        }
+        state.setdefault("batches", {})[batch_id] = batch
+        job = new_job("rollback", batch_id=batch_id,
+                      result_ref="batches/" + batch_id + ".json")
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "batch_id": batch_id,
+                     "status": "queued"})
+
+    if command == "job":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        values = positionals(rest)
+        action = values[1] if len(values) > 1 else None
+        jobs = state.get("jobs") or {}
+        if action == "show":
+            job_id = option(rest, "--job")
+            if not job_id:
+                return fail("--job is required for job show", 2, "validation")
+            job = jobs.get(str(job_id))
+            if not isinstance(job, dict):
+                return fail("unknown job: " + str(job_id), 3, "not_found")
+            payload = copy_json(job)
+            if payload.get("status") == "running" and payload.get("interrupted"):
+                payload["status"] = "interrupted"
+                payload["result_ref"] = None
+                payload["error"] = {
+                    "code": "interrupted",
+                    "message": "the job process is no longer running"}
+                payload["derived_interrupted"] = True
+            return emit(payload)
+        if action == "list":
+            status_filter = option(rest, "--status")
+            rows = [copy_json(job) for job in jobs.values()
+                    if not status_filter or job.get("status") == status_filter]
+            return emit(rows)
+        return fail("unknown job action: " + str(action), 2, "validation")
 
     if command == "rebuild":
         peel_id = first_positional(rest)
@@ -1714,6 +2114,71 @@ if __name__ == "__main__":
 '''
 
 
+
+DEFAULT_REPORT = {
+    "peel_id": "peel",
+    "status": "ready",
+    "report_path": "extract/review/report.json",
+    "report": {
+        "schema_version": 1,
+        "status": "ready",
+        "stale": False,
+        "generated_at": "2026-11-05T00:00:00Z",
+        "provider": {"kind": "rule", "model": None, "prompt_version": None},
+        "clusters": [{
+            "cluster_id": "cl-0f1e2d3c4b5a",
+            "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+            "conclusion": "规则建议把第 0 行作为表头。",
+            "suggestions": [{
+                "item_id": "it-3f9c2a4b6d8e0f1a",
+                "strategy": {"id": "use_first_row_header", "version": 1},
+                "params": {},
+                "evidence_refs": ["asset:table-3-19"],
+                "validator": {"status": "ready", "reasons": []},
+                "in_plan": False,
+                "state": "ready",
+            }],
+            "clarifications": [],
+        }, {
+            "cluster_id": "cl-9a8b7c6d5e4f",
+            "item_ids": ["it-8b7a6c5d4e3f2a10"],
+            "conclusion": "图内无 native 文本：保留原始图（R0 resolution）。",
+            "suggestions": [{
+                "item_id": "it-8b7a6c5d4e3f2a10",
+                "strategy": {"id": "keep_visual_fallback", "version": 1},
+                "params": {},
+                "evidence_refs": ["asset:figure-1-1"],
+                "validator": {"status": "ready", "reasons": []},
+                "in_plan": False,
+                "state": "ready",
+            }],
+            "clarifications": [],
+        }, {
+            "cluster_id": "cl-1a2b3c4d5e6f",
+            "item_ids": ["it-5a7c8b9d0e1f2a3b"],
+            "conclusion": "父表证据变化，候选校验未通过。",
+            "suggestions": [{
+                "item_id": "it-5a7c8b9d0e1f2a3b",
+                "strategy": {"id": "inherit_parent_header", "version": 1},
+                "params": {"parent_asset_id": "table-p1041-01"},
+                "evidence_refs": ["asset:table-p1041-01"],
+                "validator": {"status": "failed_check",
+                              "reasons": ["parent_evidence_changed"]},
+                "in_plan": False,
+                "state": "failed_check",
+            }],
+            "clarifications": [],
+        }],
+        "auto_archived": [],
+        "unsupported": [],
+    },
+    "counts": {"suggestions": 3, "auto_archived": 0, "unsupported": 0,
+               "needs_decision": 1},
+}
+
+
+
+
 class FakePeelfeedCli:
     """A fake ``peelfeed`` executable for tests (no daemon, no HTTP).
 
@@ -1738,6 +2203,7 @@ class FakePeelfeedCli:
             "python": sys.executable,
             "state": str(self.state_path),
             "log": str(self.log_path),
+            "default_report": DEFAULT_REPORT,
         }
         self.path.write_text(script, encoding="utf-8")
         self.path.chmod(0o755)

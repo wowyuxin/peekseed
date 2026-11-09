@@ -368,7 +368,42 @@ def _dataset_public(dataset_id):
                     for s in info.get("sources") or []],
         "chunks": info.get("chunks") or 0,
         "indexes": [_index_public(entry) for entry in info.get("indexes") or []],
+        # CP3 wire §2.7/§2.9: the dataset-level corrections-conflict banner data
+        # (empty when no source is in the ``corrections_conflict`` state).
+        "corrections_conflict": _dataset_conflicts(
+            config.paths().datasets_dir / dataset_id),
     }
+
+
+def _dataset_conflicts(directory):
+    """Sources in ``corrections_conflict`` with their conflicting-correction data.
+
+    The detail comes from peelfeed's ``status`` payload (persisted on the source
+    extraction block); it lists the conflicting corrections and their source
+    batches so the dataset/review banner can link back to them.
+    """
+    try:
+        raw = contracts.read_json(Path(directory) / "dataset.json")
+    except contracts.ContractError:
+        return []
+    if not isinstance(raw, dict):
+        return []
+    rows = []
+    for entry in raw.get("sources") or []:
+        if not isinstance(entry, dict):
+            continue
+        if contracts.extraction_state(entry) != "corrections_conflict":
+            continue
+        block = entry.get("extraction") if isinstance(
+            entry.get("extraction"), dict) else {}
+        rows.append({
+            "sha256": str(entry.get("sha256") or ""),
+            "name": str(entry.get("name") or ""),
+            "state": "corrections_conflict",
+            "corrections_conflict": block.get("corrections_conflict"),
+            "error": block.get("error"),
+        })
+    return rows
 
 
 def _index_public(info):
@@ -473,6 +508,65 @@ def _release_added(entries):
                 ingest.release_shared_source(sha)
             except Exception:  # noqa: BLE001 - rollback must not mask the error
                 pass
+
+
+#: Extraction states that are authoritative. A late poller (or a stale status
+#: read) must never downgrade one of these back to queued/running, and a
+#: request-path refresh may persist a terminal block when peelfeed already
+#: reports it (restart recovery) -- never the reverse.
+TERMINAL_EXTRACTION_STATES = ("extracted", "failed", "stale",
+                              "corrections_conflict")
+
+#: Serialises ``dataset.json`` extraction writes in this process: the worker's
+#: authoritative final block and the status pollers can race on one source.
+_EXTRACTION_WRITE_LOCK = threading.RLock()
+
+
+def _persist_extraction(directory, sha, block, *, terminal=False):
+    """Merge one extraction block into ``dataset.json`` (best-effort).
+
+    ``terminal=True`` is the authoritative write after the CLI command/worker
+    finished. Non-terminal poll updates never overwrite an already terminal
+    block: with ``PEEKSEED_PEELFEED_POLL=0.05`` a poller can otherwise persist a
+    stale ``running`` block *after* the worker wrote ``extracted``, leaving the
+    source stuck and the UI polling forever (the CP2 flake hardened in CP3).
+    Returns True when the block was written.
+    """
+    state = str((block or {}).get("state") or "")
+    with _EXTRACTION_WRITE_LOCK:
+        if not terminal and state not in TERMINAL_EXTRACTION_STATES:
+            try:
+                entry = ingest.find_source(Path(directory), sha)
+            except ingest.IngestError:
+                entry = None
+            current = contracts.extraction_state(entry) if entry else "not_extracted"
+            if current in TERMINAL_EXTRACTION_STATES:
+                return False
+        try:
+            ingest.update_source(directory, sha, status=block.get("state"),
+                                 extraction=block, pages=block.get("pages"))
+        except ingest.IngestError:
+            return False
+    return True
+
+
+def _reconcile_datasets(paths):
+    """Best-effort shared-dataset refresh; a read must never fail on a peel."""
+    try:
+        return ingest.reconcile_all_datasets(paths)
+    except Exception as exc:  # noqa: BLE001 - reconcile is a best-effort side path
+        LOG.warning("could not reconcile dataset sources: %s", _http_detail(exc))
+        return {}
+
+
+def _reconcile_after_peel_change(peel_id):
+    """Refresh every dataset referencing ``peel_id`` after publish/discard/rollback."""
+    try:
+        return ingest.reconcile_peel(peel_id)
+    except Exception as exc:  # noqa: BLE001 - a successful publish stays successful
+        LOG.warning("could not reconcile datasets after peel %s changed: %s",
+                    peel_id, _http_detail(exc))
+        return {}
 
 
 async def _store_uploads(name, note, files):
@@ -1116,6 +1210,10 @@ def create_app():
         except links.LinkConfigError as exc:
             LOG.warning("model links config is not readable: %s", exc)
         reload_store()
+        # CP3 wire §2.7: reconcile every dataset's peel identity at startup, so a
+        # publish that happened while the service was down is reflected before
+        # the first read (only a changed conversion_id makes an index stale).
+        _reconcile_datasets(config.paths())
         yield
 
     app = FastAPI(title="peekseed", version=__version__, lifespan=lifespan)
@@ -1176,6 +1274,9 @@ def create_app():
     # --- datasets ---------------------------------------------------------
     @app.get("/api/datasets")
     def datasets_list():
+        # Cheap reconcile on reads (wire §2.7): external CLI publishes are picked
+        # up without a hard failure; broken peels are left untouched.
+        _reconcile_datasets(config.paths())
         return {"datasets": _all_datasets()}
 
     # --- peelfeed (the extraction engine) ---------------------------------
@@ -1328,11 +1429,24 @@ def create_app():
         return action, request
 
     def _review_report_request(body):
-        """Validate ``POST …/review/reports`` filter ids (both optional)."""
+        """Validate ``POST …/review/reports`` (CP3 wire §2.7).
+
+        CP3 reports are rules-only persistent jobs: ``{item_ids?, cluster_ids?}``.
+        A VLM request (``mode``/``confirmation``) is not available until M2.2 and
+        is a 400 validation error, never a silent rules-only downgrade.
+        """
         if body is None:
             body = {}
         if not isinstance(body, dict):
             raise HTTPException(400, "a review report request must be a JSON object")
+        if "mode" in body or "confirmation" in body:
+            raise HTTPException(
+                400, "VLM reports are not available in CP3 (rules-only); "
+                     "mode/confirmation are not accepted")
+        unknown = sorted(set(body) - {"item_ids", "cluster_ids"})
+        if unknown:
+            raise HTTPException(400, "unknown review report field(s): %s"
+                                % ", ".join(unknown))
         filters = {}
         for field in ("item_ids", "cluster_ids"):
             value = body.get(field)
@@ -1344,6 +1458,69 @@ def create_app():
             if cleaned:
                 filters[field] = cleaned
         return filters
+
+    def _review_batches_request(body):
+        """Validate ``POST …/review/batches`` (wire §2.7): only ``entry_ids``.
+
+        Tier/scope/operations are planner inputs and must never be passed by the
+        API/UI (contract §4); they are rejected explicitly rather than ignored.
+        ``entry_ids`` must be a non-empty, unique list of non-empty strings.
+        """
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "a review batch request must be a JSON object")
+        for forbidden in ("tier", "scope", "operations"):
+            if forbidden in body:
+                raise HTTPException(
+                    400, "a review batch accepts only entry_ids; %s is chosen by "
+                         "the planner and cannot be passed" % forbidden)
+        unknown = sorted(set(body) - {"entry_ids"})
+        if unknown:
+            raise HTTPException(400, "unknown review batch field(s): %s"
+                                % ", ".join(unknown))
+        entry_ids = body.get("entry_ids")
+        if not isinstance(entry_ids, list) or not entry_ids:
+            raise HTTPException(400, "a review batch needs a non-empty entry_ids list")
+        cleaned = []
+        seen = set()
+        for raw in entry_ids:
+            if not isinstance(raw, str):
+                raise HTTPException(400, "entry_ids must contain only strings")
+            entry_id = raw.strip()
+            if not entry_id:
+                raise HTTPException(400, "entry_ids must not contain empty ids")
+            if entry_id in seen:
+                raise HTTPException(400, "entry_ids must be unique (duplicate %s)"
+                                    % entry_id)
+            seen.add(entry_id)
+            cleaned.append(entry_id)
+        return cleaned
+
+    def _review_publish_body(body):
+        """Validate the empty publish/discard/rollback request (wire §2.7)."""
+        if body is None:
+            return {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "the request must be a JSON object")
+        if body:
+            raise HTTPException(
+                400, "publish/discard/rollback take an empty JSON object; the "
+                     "batch id is in the URL")
+        return {}
+
+    def _record_review_job(directory, sha, job_id, *, job_type, batch_id=None):
+        """Persist a peelfeed job descriptor in ``extraction.review_jobs``.
+
+        Best-effort: the job already exists in the peel; losing the descriptor
+        only costs restart re-attachment, so a successful 202 stays successful.
+        """
+        try:
+            ingest.record_review_job(directory, sha, job_id, job_type=job_type,
+                                     batch_id=batch_id)
+        except (ingest.IngestError, contracts.ContractError) as exc:
+            LOG.warning("could not persist review job %s for source %s: %s",
+                        job_id, str(sha)[:8], _http_detail(exc))
 
     def _source_by_sha(directory, sha):
         sha = str(sha or "").strip().lower()
@@ -1406,14 +1583,6 @@ def create_app():
             return None
         return _match_peel(rows, sha)
 
-    def _persist_extraction(directory, sha, block):
-        """Merge one extraction block into ``dataset.json`` (best-effort)."""
-        try:
-            ingest.update_source(directory, sha, status=block.get("state"),
-                                 extraction=block, pages=block.get("pages"))
-        except ingest.IngestError:
-            return
-
     def _poll_peel(directory, sha, block, engine, stop, peel_id=None):
         """Update a source's extraction state from ``peelfeed status`` until done.
 
@@ -1439,10 +1608,10 @@ def create_app():
             if not isinstance(summary, dict):
                 continue
             updated = peelfeed.extraction_from_summary(summary, previous=block)
-            if updated.get("state") in ("extracted", "failed"):
-                # Pollers never write terminal states: only the worker writes the
-                # authoritative extracted/failed block from the CLI result. This
-                # also prevents a late poll from downgrading a finished source.
+            if updated.get("state") in TERMINAL_EXTRACTION_STATES:
+                # The worker writes the authoritative terminal block from the CLI
+                # result; this poller only reports progress. `_persist_extraction`
+                # also refuses to downgrade a terminal block if the timing races.
                 continue
             _persist_extraction(directory, sha, updated)
 
@@ -1463,6 +1632,18 @@ def create_app():
                 kind = "failed"
                 error = str(summary.get("error") or "") or (
                     "peelfeed reported state '%s'" % state)
+            elif state == "corrections_conflict":
+                # A system rebuild blocked by a historical correction conflict:
+                # the current corpus is untouched; keep the conflict state and
+                # the conflicting-corrections detail (wire §2.7).
+                updated.update({
+                    "state": "corrections_conflict",
+                    "error": str(summary.get("error") or "")
+                    or "peelfeed reported a corrections conflict",
+                })
+                updated["finished_at"] = contracts.utc_now()
+                _persist_extraction(directory, sha, updated, terminal=True)
+                return
             elif errors:
                 kind = "failed"
                 error = "validation reported %d error(s)" % errors
@@ -1472,7 +1653,9 @@ def create_app():
             updated.update({"state": "failed",
                             "error": (error or "unknown error")[:300]})
         updated["finished_at"] = contracts.utc_now()
-        _persist_extraction(directory, sha, updated)
+        # The worker's terminal write is authoritative (terminal=True) and wins
+        # over any late poller observation (flake hardened in CP3 W0/W4).
+        _persist_extraction(directory, sha, updated, terminal=True)
 
     def _run_peel_command(directory, sha, block, peel_id, command):
         """Run one long CLI command (ingest/rebuild) with a status poller.
@@ -1505,11 +1688,14 @@ def create_app():
         _finish_extraction(directory, sha, block, outcome)
 
     def _refresh_peel_states(directory):
-        """Poll peelfeed for queued/running sources and persist the new state.
+        """Poll peelfeed for non-terminal sources and persist the new state.
 
         Called by ``GET /api/datasets/{id}/sources`` (the UI poll) and before an
         index build. Cheap when peelfeed is unavailable: the 60s handshake cache
-        answers without a CLI call, and terminal sources are never re-polled.
+        answers without a CLI call. CP3: a source already terminal in peelfeed is
+        persisted (restart recovery), so a source can never stay stuck at
+        ``running`` after a worker crash or a lost final write; ``_persist_extraction``
+        still refuses to downgrade a terminal block with a stale non-terminal one.
         """
         if not peelfeed.configured():
             return
@@ -1531,7 +1717,8 @@ def create_app():
                 continue
             block = entry.get("extraction") if isinstance(
                 entry.get("extraction"), dict) else {}
-            if str(block.get("state") or "") in ("queued", "running"):
+            if str(block.get("state") or "") in ("queued", "running",
+                                                 "corrections_conflict"):
                 pending.append((entry, block))
         if not pending:
             return
@@ -1553,16 +1740,19 @@ def create_app():
             if not isinstance(summary, dict):
                 continue
             updated = peelfeed.extraction_from_summary(summary, previous=block)
-            if updated.get("state") in ("extracted", "failed"):
-                # Pollers never write terminal states: only the worker writes the
-                # authoritative extracted/failed block from the CLI result. This
-                # also prevents a late poll from downgrading a finished source.
-                continue
-            _persist_extraction(directory, sha, updated)
+            terminal = updated.get("state") in TERMINAL_EXTRACTION_STATES
+            _persist_extraction(directory, sha, updated, terminal=terminal)
 
     @app.get("/api/datasets/{dataset_id}/sources")
     def dataset_sources(dataset_id: str):
         directory = _dataset_dir(dataset_id)
+        # CP3 wire §2.7: cheap reconcile before the UI poll, so a publish by
+        # peelfeed (or another dataset) is visible on the next read.
+        try:
+            ingest.reconcile_peels(directory)
+        except Exception as exc:  # noqa: BLE001 - a broken peel must not fail reads
+            LOG.warning("could not reconcile dataset %s: %s", dataset_id,
+                        _http_detail(exc))
         _refresh_peel_states(directory)
         return {"dataset": dataset_id, "sources": _source_rows(directory)}
 
@@ -1810,25 +2000,168 @@ def create_app():
             "review plan",
             lambda: peelfeed.client().plan(peel_id, request))
 
-    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/reports")
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/reports",
+              status_code=202)
     def source_review_reports(dataset_id: str, sha: str,
                               payload: Optional[dict] = None):
-        """Generate the deterministic review report (Phase 1: synchronous 200).
+        """Create a persistent peelfeed ``report`` job (CP3 wire §2.7).
 
-        Body (both optional): ``{item_ids?: [...], cluster_ids?: [...]}``. The
-        payload is peelfeed's ready/partial report; persisted jobs replace this
-        synchronous call in M2 Phase 2/4.
+        Body (both optional): ``{item_ids?: [...], cluster_ids?: [...]}``; VLM
+        mode is not available in CP3 (400). Returns 202
+        ``{job_id, status: "queued"}``; the job writes ``report.json`` and is
+        polled through ``GET …/review/jobs/{id}``. The descriptor is stored in
+        ``extraction.review_jobs`` so a restart re-attaches by id (never reruns).
         """
         directory = _dataset_dir(dataset_id)
         entry = _source_by_sha(directory, sha)
         peel_id = _peel_id_of(entry)
         _require_review_schema()
         filters = _review_report_request(payload or {})
-        return _call_peelfeed(
+        result = _call_peelfeed(
             "review report",
             lambda: peelfeed.client().review_report(
                 peel_id, item_ids=filters.get("item_ids"),
                 cluster_ids=filters.get("cluster_ids")))
+        job_id = str((result or {}).get("job_id") or "")
+        if not job_id:
+            raise HTTPException(502, "peelfeed review-report returned no job_id")
+        _record_review_job(directory, str(entry.get("sha256") or ""), job_id,
+                           job_type="report")
+        return {"job_id": job_id,
+                "status": str(result.get("status") or "queued")}
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/batches",
+              status_code=202)
+    def source_review_batches(dataset_id: str, sha: str,
+                              payload: Optional[dict] = None):
+        """Prepare an ApplyBatch and a ``build`` job (wire §2.7).
+
+        Body is exactly ``{entry_ids: [...]}`` (confirmed operation entries);
+        tier/scope/operations are planner inputs and are rejected. Returns 202
+        ``{job_id, batch_id, status: "queued"}``; the descriptor is persisted in
+        ``extraction.review_jobs`` with ``type="build"`` and the batch id.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        entry_ids = _review_batches_request(payload or {})
+        result = _call_peelfeed(
+            "review apply",
+            lambda: peelfeed.client().apply(peel_id, entry_ids))
+        job_id = str((result or {}).get("job_id") or "")
+        batch_id = str((result or {}).get("batch_id") or "")
+        if not job_id or not batch_id:
+            raise HTTPException(
+                502, "peelfeed apply returned no job_id/batch_id")
+        _record_review_job(directory, str(entry.get("sha256") or ""), job_id,
+                           job_type="build", batch_id=batch_id)
+        return {"job_id": job_id, "batch_id": batch_id,
+                "status": str(result.get("status") or "queued")}
+
+    @app.get("/api/datasets/{dataset_id}/sources/{sha}/review/batches/{batch_id}")
+    def source_review_batch(dataset_id: str, sha: str, batch_id: str):
+        """Proxy ``batch show``: the persisted ApplyBatch record (wire §2.7)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        identifier = str(batch_id or "").strip()
+        if not identifier:
+            raise HTTPException(400, "invalid batch id")
+        return _call_peelfeed(
+            "batch show",
+            lambda: peelfeed.client().batch_show(peel_id, identifier))
+
+    @app.post(
+        "/api/datasets/{dataset_id}/sources/{sha}/review/batches/{batch_id}/publish")
+    def source_review_batch_publish(dataset_id: str, sha: str, batch_id: str,
+                                    payload: Optional[dict] = None):
+        """Publish a ready batch synchronously (wire §2.7).
+
+        200 ``{batch, current}``; 409 stale/conflict/corrections_conflict, 423
+        busy, 400 validation. After success **every** dataset referencing the
+        peel is reconciled; only a changed conversion_id makes an index stale.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        _review_publish_body(payload)
+        identifier = str(batch_id or "").strip()
+        if not identifier:
+            raise HTTPException(400, "invalid batch id")
+        result = _call_peelfeed(
+            "review publish",
+            lambda: peelfeed.client().publish(peel_id, identifier))
+        _reconcile_after_peel_change(peel_id)
+        return result
+
+    @app.post(
+        "/api/datasets/{dataset_id}/sources/{sha}/review/batches/{batch_id}/discard")
+    def source_review_batch_discard(dataset_id: str, sha: str, batch_id: str,
+                                    payload: Optional[dict] = None):
+        """Discard an unpublished batch; current/ledger unchanged (wire §2.7)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        _review_publish_body(payload)
+        identifier = str(batch_id or "").strip()
+        if not identifier:
+            raise HTTPException(400, "invalid batch id")
+        result = _call_peelfeed(
+            "review discard",
+            lambda: peelfeed.client().discard(peel_id, identifier))
+        _reconcile_after_peel_change(peel_id)
+        return result
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/rollback",
+              status_code=202)
+    def source_review_rollback(dataset_id: str, sha: str,
+                               payload: Optional[dict] = None):
+        """Create the revert batch + ``rollback`` job (wire §2.7).
+
+        202 ``{job_id, batch_id, status: "queued"}``; the job auto-publishes the
+        revert when it finishes, so the datasets are reconciled again on reads.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        _review_publish_body(payload)
+        result = _call_peelfeed(
+            "review rollback",
+            lambda: peelfeed.client().rollback(peel_id))
+        job_id = str((result or {}).get("job_id") or "")
+        batch_id = str((result or {}).get("batch_id") or "")
+        if not job_id or not batch_id:
+            raise HTTPException(
+                502, "peelfeed rollback returned no job_id/batch_id")
+        _record_review_job(directory, str(entry.get("sha256") or ""), job_id,
+                           job_type="rollback", batch_id=batch_id)
+        _reconcile_after_peel_change(peel_id)
+        return {"job_id": job_id, "batch_id": batch_id,
+                "status": str(result.get("status") or "queued")}
+
+    @app.get("/api/datasets/{dataset_id}/sources/{sha}/review/jobs/{job_id}")
+    def source_review_job(dataset_id: str, sha: str, job_id: str):
+        """Proxy ``job show``: the real job status/progress/result (wire §2.7).
+
+        peekseed only polls and re-attaches from ``extraction.review_jobs``; it
+        never reruns a job automatically. A terminal descriptor stays for UI
+        queries, and the record's derived ``interrupted`` state is passed through.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        identifier = str(job_id or "").strip()
+        if not identifier:
+            raise HTTPException(400, "invalid job id")
+        return _call_peelfeed(
+            "job show",
+            lambda: peelfeed.client().job_show(peel_id, identifier))
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/events")
     def source_events(dataset_id: str, sha: str,
