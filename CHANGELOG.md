@@ -61,6 +61,33 @@ version/tag policy.
   request-path refresh can no longer downgrade a terminal extraction state, and a
   GET refresh persists an already-terminal CLI result.
 
+### Changed — CP3.1 review fixes (M2 CP3.1)
+
+- **F3 candidate diff + reindex display.** The review candidate panel now labels
+  the actual change line as a **content diff** (`assets_changed`,
+  `blocks_changed`, `chunks_changed`, excluding `conversion_id`/`build_id`
+  identity) and renders the additive `build.diff.reindex` object
+  (`{required, reason, chunks}`) as a separate 索引影响 line with Chinese reason
+  labels (conversion 变化 / 尚无当前构建): “需要重建索引：全量 N chunks” or
+  “无需重建索引（conversion 未变，已有索引仍有效）”. The published-batch list
+  marks batches whose publish made existing indexes stale. The fake peelfeed CLI
+  and fixtures carry the new shape (`build_summary.json.diff.reindex` included).
+- **F4 rollback confirmation.** “回滚最近一批” no longer creates and publishes a
+  revert batch on one click: it opens a confirmation dialog explaining that the
+  most recent still-effective correction batch will be reverted and
+  auto-published, that existing indexes become stale and need a rebuild, and
+  that only the most recent batch can be rolled back. Cancel (or backdrop/close)
+  sends no request and leaves current/ledger unchanged; the explicit
+  “确认回滚并发布” button sends the existing `POST …/review/rollback` request.
+  An interrupted rollback job's manual retry goes through the same confirmation.
+- **F5 batch/job id validation.** peelfeed validates `batch_id`/`job_id` against
+  the generated formats (`batch-…`, `system-b…`, `<type>-…`) before any path
+  join and returns `error [validation]` otherwise; peekseed's frozen error
+  mapping turns that into HTTP `400` on the review batch/job routes. The fake
+  CLI mirrors the validation (malformed ids exit `2` with
+  `error [validation] …`) and tests cover `../plan`, empty/whitespace and
+  slash-containing ids. Dataset schema stays 4 (no other contract changes).
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:

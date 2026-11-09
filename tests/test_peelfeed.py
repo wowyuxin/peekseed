@@ -853,7 +853,7 @@ class CliAdapterTests(unittest.TestCase):
                     engine.batch_show(peel_id, "batch-missing")
                 self.assertEqual(caught.exception.status, 404)
                 with self.assertRaises(peelfeed.PeelfeedError) as caught:
-                    engine.job_show(peel_id, "job-missing")
+                    engine.job_show(peel_id, "build-missing")
                 self.assertEqual(caught.exception.status, 404)
 
         """CP3 wire §2.6: ``review-report`` returns a queued job, not a report."""
@@ -1986,6 +1986,17 @@ class PeelfeedApiTests(unittest.TestCase):
                 self.assertEqual(record["status"], "ready_to_publish")
                 self.assertEqual(record["changes"][0]["entry_id"], entry_id)
                 self.assertEqual(record["build"]["gates"]["all_pass"], True)
+                # CP3.1 F3: the batch record carries the additive diff.reindex
+                # shape; content counts are content-only (one changed entry).
+                diff = record["build"]["diff"]
+                self.assertEqual(set(diff["reindex"]),
+                                 {"required", "reason", "chunks"})
+                self.assertTrue(diff["reindex"]["required"])
+                self.assertEqual(diff["reindex"]["reason"],
+                                 "conversion_changed")
+                self.assertEqual(diff["reindex"]["chunks"], 2)
+                self.assertEqual(diff["chunks_changed"], 1)
+                self.assertEqual(diff["blocks_changed"], 0)
                 # GET job -> the §2.5 record (terminal immediately in the fake).
                 job = _wait_review_job(client, base, created["job_id"])
                 self.assertEqual(job["type"], "build")
@@ -2045,7 +2056,7 @@ class PeelfeedApiTests(unittest.TestCase):
                 # Unknown batch/job are 404.
                 missing = client.get(base + "/review/batches/batch-missing")
                 self.assertEqual(missing.status_code, 404, missing.text)
-                missing_job = client.get(base + "/review/jobs/job-missing")
+                missing_job = client.get(base + "/review/jobs/build-missing")
                 self.assertEqual(missing_job.status_code, 404, missing_job.text)
 
     def test_review_batch_request_validation_and_error_mapping(self):
@@ -2110,6 +2121,179 @@ class PeelfeedApiTests(unittest.TestCase):
                 mismatch = client.post(route, json={"entry_ids": [entry_id]})
                 self.assertEqual(mismatch.status_code, 409, mismatch.text)
                 self.assertIn("review schema", mismatch.json()["detail"])
+
+    def test_cp31_malformed_batch_and_job_ids_are_validation_400(self):
+        """CP3.1 F5: generated-id validation in peelfeed maps to HTTP 400.
+
+        peelfeed rejects ids that cannot have been generated (``../plan``,
+        slash-containing, wrong prefix) with ``error [validation]`` before any
+        path join; peekseed's seam maps that to 400. The malformed id must reach
+        the CLI -- the validation lives in peelfeed, not in peekseed.
+        """
+        import subprocess
+
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            source = make_pdf(root / "manual.pdf")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source),
+                                        llm_mode="off")["peel"]["peel_id"]
+                cases = [
+                    ("batch show", lambda: engine.batch_show(peel_id, "../plan")),
+                    ("batch show", lambda: engine.batch_show(peel_id, "batch-a/b")),
+                    ("batch show", lambda: engine.batch_show(peel_id, "not-a-batch")),
+                    # system batches are ``system-b<build id>``.
+                    ("batch show", lambda: engine.batch_show(peel_id, "system-x")),
+                    ("publish", lambda: engine.publish(peel_id, "../plan")),
+                    ("publish", lambda: engine.publish(peel_id, "batch-a/b")),
+                    ("discard", lambda: engine.discard(peel_id, "batch-a/b")),
+                    ("job show", lambda: engine.job_show(peel_id, "../plan")),
+                    ("job show", lambda: engine.job_show(peel_id, "build-a/b")),
+                    # ``job`` is not a generated job type (types are
+                    # report/build/rollback/ocr/discuss).
+                    ("job show", lambda: engine.job_show(peel_id, "job-x")),
+                ]
+                for what, call in cases:
+                    with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.status, 400, what)
+                    self.assertIn("validation", caught.exception.detail, what)
+                # The fake CLI itself emits the real error protocol: exit 2 and
+                # ``error [validation] …`` on stderr.
+                completed = subprocess.run(
+                    [str(cli.path), "batch", "show", peel_id,
+                     "--batch", "../plan", "--root", str(_shared(root) / "peels"),
+                     "--json"],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(completed.returncode, 2, completed.stdout)
+                self.assertIn("error [validation]", completed.stderr)
+                self.assertIn("invalid batch id", completed.stderr)
+                # Valid-shaped but unknown ids stay 404 (no regression).
+                for call in (lambda: engine.batch_show(peel_id, "batch-missing"),
+                             lambda: engine.job_show(peel_id, "build-missing")):
+                    with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.status, 404)
+                    self.assertIn("not_found", caught.exception.detail)
+
+    def test_cp31_malformed_ids_map_to_400_on_review_routes(self):
+        """CP3.1 F5: batch/job routes return 400 for malformed ids."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                # Empty/whitespace ids are rejected by peekseed itself (400)
+                # before any peelfeed subprocess is started.
+                for path in ("/review/batches/%20", "/review/jobs/%20"):
+                    response = client.get(base + path)
+                    self.assertEqual(response.status_code, 400,
+                                     (path, response.text))
+                    self.assertIn("invalid", response.json()["detail"])
+                # ``..`` decodes to a path segment that still reaches the route:
+                # peelfeed's validation error maps to 400.
+                calls_before = len(cli.calls())
+                for method, path in (
+                        ("get", "/review/batches/%2E%2E"),
+                        ("get", "/review/jobs/%2E%2E"),
+                        ("post", "/review/batches/%2E%2E/publish"),
+                        ("post", "/review/batches/%2E%2E/discard")):
+                    kwargs = {"json": {}} if method == "post" else {}
+                    response = getattr(client, method)(base + path, **kwargs)
+                    self.assertEqual(response.status_code, 400,
+                                     (path, response.text))
+                    self.assertIn("validation", response.json()["detail"])
+                # The malformed ids did reach the CLI, which is the validation
+                # layer (defence in depth, not a peekseed-side regex).
+                cli_calls = [call["argv"] for call in cli.calls()[calls_before:]]
+                self.assertTrue(any(argv[0] == "batch" for argv in cli_calls),
+                                cli_calls)
+                self.assertTrue(any(argv[0] == "job" for argv in cli_calls),
+                                cli_calls)
+                # Ids containing "/" can never match one HTTP path segment, so
+                # those requests do not reach the route (404) and no CLI call is
+                # made; peelfeed's validation remains the backstop for any
+                # non-HTTP caller.
+                calls_before = len(cli.calls())
+                for path in ("/review/batches/batch-a%2Fb",
+                             "/review/batches/%2E%2E%2Fplan",
+                             "/review/jobs/build-a%2Fb"):
+                    response = client.get(base + path)
+                    self.assertEqual(response.status_code, 404,
+                                     (path, response.text))
+                    self.assertEqual(response.json()["detail"], "Not Found")
+                self.assertEqual(len(cli.calls()), calls_before)
+
+    def test_cp31_batch_diff_reindex_shape_and_content_only_counts(self):
+        """CP3.1 F3: additive ``diff.reindex`` + content-only change counts."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            source = make_pdf(root / "manual.pdf")
+            with peelfeed_env(CLI=str(cli.path)):
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source),
+                                        llm_mode="off")["peel"]["peel_id"]
+                state = cli.state()
+                peel = state["peels"][peel_id]
+
+                def confirmed(item_id, base_version):
+                    selected = engine.plan(peel_id, {
+                        "action": "select", "base_plan_version": base_version,
+                        "item_id": item_id,
+                        "strategy": {"id": "use_first_row_header",
+                                     "version": 1},
+                        "params": {"rows": [0]}})
+                    confirmed = engine.plan(peel_id, {
+                        "action": "confirm",
+                        "base_plan_version": selected["plan_version"],
+                        "entry_id": selected["entry"]["entry_id"]})
+                    return confirmed["plan_version"], selected["entry"]["entry_id"]
+
+                def diff_of(batch_id):
+                    return engine.batch_show(peel_id, batch_id)["build"]["diff"]
+
+                # 1. no current build yet -> full rebuild, no_current_build.
+                cli.update(peels={peel_id: dict(peel, conversion_id="")})
+                version, first = confirmed("it-cp31-a", 0)
+                applied = engine.apply(peel_id, [first])
+                diff = diff_of(applied["batch_id"])
+                self.assertEqual(
+                    set(diff),
+                    {"assets_changed", "blocks_changed", "chunks_changed",
+                     "new_warnings", "changed_assets", "samples", "reindex"})
+                self.assertEqual(set(diff["reindex"]),
+                                 {"required", "reason", "chunks"})
+                self.assertTrue(diff["reindex"]["required"])
+                self.assertEqual(diff["reindex"]["reason"], "no_current_build")
+                self.assertEqual(diff["reindex"]["chunks"], 2)
+                # content-only counts: one changed entry/chunk, not every chunk
+                self.assertEqual(diff["assets_changed"], 1)
+                self.assertEqual(diff["blocks_changed"], 0)
+                self.assertEqual(diff["chunks_changed"], 1)
+
+                # 2. conversion changed -> full rebuild, conversion_changed.
+                cli.update(peels={peel_id: dict(peel,
+                                                conversion_id="a" * 64)})
+                version, second = confirmed("it-cp31-b", version)
+                applied = engine.apply(peel_id, [second])
+                diff = diff_of(applied["batch_id"])
+                self.assertTrue(diff["reindex"]["required"])
+                self.assertEqual(diff["reindex"]["reason"],
+                                 "conversion_changed")
+                self.assertEqual(diff["reindex"]["chunks"], 2)
+                self.assertEqual(diff["chunks_changed"], 1)
+
+                # 3. same conversion (e.g. chunk-set-only build) -> no reindex.
+                cli.update(batch_conversion_id="a" * 64)
+                version, third = confirmed("it-cp31-c", version)
+                applied = engine.apply(peel_id, [third])
+                diff = diff_of(applied["batch_id"])
+                self.assertEqual(diff["reindex"],
+                                 {"required": False, "reason": None,
+                                  "chunks": 0})
 
     def test_corrections_conflict_is_surfaced_in_sources_and_datasets(self):
         """CP3 wire §2.7/§2.9: state + conflicting corrections in reads."""

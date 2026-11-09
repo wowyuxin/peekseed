@@ -15,8 +15,10 @@ evidence stream).
 """
 
 import contextlib
+import json
 import os
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -152,6 +154,89 @@ class ReviewUiCp3Tests(unittest.TestCase):
                 "仅最近一批", "published"):
             self.assertIn(marker, text)
 
+    def test_candidate_panel_shows_content_diff_and_reindex(self):
+        """CP3.1 F3: the panel separates content diff from the reindex scope."""
+        text = _ui()
+        for marker in (
+                "实际变更", "内容 diff，不含 conversion/build",
+                "索引影响", "function reviewReindexText",
+                "function reviewReindexReasonLabel",
+                "REVIEW_REINDEX_REASON_LABEL", "diff.reindex",
+                "reindex.required", "reindex.chunks",
+                "需要重建索引", "无需重建索引", "全量",
+                "conversion 变化", "尚无当前构建",
+                "未知（peelfeed 未返回 diff.reindex）",
+                "索引需重建", "rr-reindex"):
+            self.assertIn(marker, text)
+        panel = text.index("function reviewCandidatePanelHtml")
+        panel_body = text[panel:text.index("function reviewPublishedBatches")]
+        for key in ("assets_changed", "blocks_changed", "chunks_changed"):
+            self.assertIn(key, panel_body)
+        # the content counts and the reindex line are rendered separately
+        self.assertIn("reviewReindexText(diff.reindex)", panel_body)
+        self.assertIn("assets_changed", panel_body)
+
+    def test_rollback_button_opens_confirmation_dialog(self):
+        """CP3.1 F4: the rollback control opens a dialog, not the request."""
+        text = _ui()
+        for marker in (
+                'id="reviewRollbackConfirm"', 'role="alertdialog"',
+                'aria-label="确认回滚最近一批"', "确认回滚最近一批",
+                "撤销最近一批仍生效的修正并自动发布",
+                "已有索引会变", "stale", "需要重建",
+                "更早批次的修正保持不变", "回滚只作用于最近一批",
+                "取消不会发送任何请求", "current 与正式账本保持不变",
+                "确认回滚并发布", "取消",
+                'id="reviewRollbackConfirmBtn"',
+                'id="reviewRollbackCancelBtn"',
+                'id="reviewRollbackConfirmClose"',
+                "function reviewRollbackConfirmOpen",
+                "function reviewRollbackConfirmClose",
+                "function reviewRollbackConfirmed"):
+            self.assertIn(marker, text)
+        handler = text.index("$('#reviewBatch').addEventListener('click'")
+        handler_body = text[handler:text.index(
+            "$('#reviewConflict').addEventListener('click'")]
+        self.assertIn("kind==='rollback'", handler_body)
+        self.assertIn("reviewRollbackConfirmOpen()", handler_body)
+        # the button itself must never send the rollback request
+        self.assertNotIn("reviewRollback()", handler_body)
+
+    def test_rollback_cancel_sends_no_request(self):
+        """CP3.1 F4: cancel only hides the dialog; no request is issued."""
+        text = _ui()
+        close = text.index("function reviewRollbackConfirmClose")
+        close_body = text[close:text.index("function reviewRollbackConfirmed")]
+        for forbidden in ("fetch(", "reviewFetchJSON", "reviewRollback(",
+                          "/rollback", "method:'POST'", "POST"):
+            self.assertNotIn(forbidden, close_body)
+        self.assertIn("hidden=true", close_body)
+        # cancel is wired only to the close handler
+        self.assertIn("$('#reviewRollbackCancelBtn').onclick="
+                      "reviewRollbackConfirmClose", text)
+        self.assertIn("$('#reviewRollbackConfirmClose').onclick="
+                      "reviewRollbackConfirmClose", text)
+
+    def test_rollback_confirm_sends_the_existing_rollback_request(self):
+        """CP3.1 F4: only the explicit confirm button sends POST …/rollback."""
+        text = _ui()
+        confirmed = text.index("function reviewRollbackConfirmed")
+        confirmed_body = text[confirmed:text.index("async function reviewRetryJob")]
+        self.assertIn("reviewRollbackConfirmClose()", confirmed_body)
+        self.assertIn("reviewRollback()", confirmed_body)
+        self.assertIn("$('#reviewRollbackConfirmBtn').onclick="
+                      "reviewRollbackConfirmed", text)
+        rollback = text.index("async function reviewRollback()")
+        rollback_body = text[rollback:text.index("function reviewRollbackConfirmOpen")]
+        self.assertIn("reviewBase(ctx.dataset,ctx.sha)+'/rollback'", rollback_body)
+        self.assertIn("method:'POST'", rollback_body)
+        # an interrupted rollback retry is destructive too: it goes through the
+        # same confirmation instead of firing the request immediately
+        retry = text.index("async function reviewRetryJob")
+        retry_body = text[retry:text.index("function reviewRunAction")]
+        self.assertIn("reviewRollbackConfirmOpen()", retry_body)
+        self.assertNotIn("await reviewRollback()", retry_body)
+
     def test_batch_entries_read_only_while_building(self):
         text = _ui()
         for marker in (
@@ -247,12 +332,18 @@ class ReviewUiCp3Tests(unittest.TestCase):
             self.assertEqual(response.status_code, 200, response.text)
             page = response.text
         for marker in ('id="reviewBatch"', 'id="reviewConflict"',
-                       "构建本批候选", "无需重建 (R0/no-op)",
+                       'id="reviewRollbackConfirm"', "构建本批候选",
+                       "无需重建 (R0/no-op)",
                        "任务中断，可手动重试", "候选已过期，需重新构建",
-                       "回滚最近一批", "修正冲突",
+                       "回滚最近一批", "确认回滚并发布",
+                       "撤销最近一批仍生效的修正并自动发布",
+                       "取消不会发送任何请求", "索引影响",
+                       "需要重建索引", "无需重建索引", "修正冲突",
                        "peelfeed review schema 不一致",
                        "REVIEW_BATCH_STATUS_LABEL", "REVIEW_JOB_STATUS_LABEL",
+                       "REVIEW_REINDEX_REASON_LABEL",
                        "reviewPublishBatch", "reviewRollback",
+                       "reviewRollbackConfirmOpen", "reviewReindexText",
                        "datasetConflictHtml", "review_schema"):
             self.assertIn(marker, page)
 
@@ -426,3 +517,197 @@ class ReviewUiCp3ApiRoundTripTests(unittest.TestCase):
                     extraction["review_jobs"][created_batch["job_id"]]["type"],
                     "build")
 
+
+
+# ---------------------------------------------------------------------------
+# CP3.1 F4: a Node stub-DOM behavior harness for the rollback confirmation.
+# It runs the real review JS block from ``index.html`` and proves that
+# clicking 回滚最近一批 only opens the dialog, cancel sends no request, and the
+# explicit confirm button sends the existing POST …/review/rollback request.
+# ``fetch`` is stubbed, so the harness never touches the network. Node is only
+# needed for this behavior check; the static contract tests above always run.
+# ---------------------------------------------------------------------------
+
+NODE_ROLLBACK_HARNESS = r"""
+/*
+ * Drive the real review JS block with a stub DOM. No browser, no network: the
+ * fetch stub records requests and rejects, so only the dialog wiring is tested.
+ */
+const fs = require("fs");
+const vm = require("vm");
+
+const html = fs.readFileSync(process.argv[2], "utf8");
+const start = html.indexOf("/* ---- review report dialog", 150000);
+const end = html.indexOf("/* ---- workspace dialog", start);
+if (start < 0 || end < 0) throw new Error("review block markers not found");
+const block = html.slice(start, end);
+
+const elements = new Map();
+function element(key) {
+  if (elements.has(key)) return elements.get(key);
+  const listeners = {};
+  const value = {
+    id: key, innerHTML: "", textContent: "", hidden: true, disabled: false,
+    value: "", files: [], checked: false, listeners, onclick: null,
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    addEventListener(type, fn) {
+      (listeners[type] = listeners[type] || []).push(fn);
+    },
+    appendChild() {}, focus() {}, blur() {}, closest() { return null; },
+    remove() {}, querySelector() { return element(key + ":child"); },
+    querySelectorAll() { return []; }, getAttribute() { return null; },
+    setAttribute() {}, style: {}, dataset: {}, scrollIntoView() {},
+  };
+  elements.set(key, value);
+  return value;
+}
+const document = {
+  querySelector(selector) { return element(selector); },
+  querySelectorAll() { return []; },
+  addEventListener() {}, getElementById(id) { return element("#" + id); },
+  createElement() { return element("created"); },
+  createTextNode() { return {}; },
+  body: { style: {}, classList: { toggle() {} }, appendChild() {} },
+  documentElement: { style: {}, classList: { toggle() {} } },
+  head: { appendChild() {} },
+};
+const fetchCalls = [];
+function fetchStub(url, opts) {
+  fetchCalls.push({ url: String(url),
+                    method: String((opts || {}).method || "GET") });
+  return Promise.reject(new Error("network disabled in the harness"));
+}
+const window = {
+  addEventListener() {}, removeEventListener() {}, fetch: fetchStub,
+  matchMedia() { return { matches: false, addEventListener() {} }; },
+  location: { hash: "", origin: "http://127.0.0.1:0", href: "" },
+  history: { replaceState() {}, pushState() {} },
+  localStorage: { getItem() { return ""; }, setItem() {}, removeItem() {} },
+  sessionStorage: { getItem() { return ""; }, setItem() {}, removeItem() {} },
+  innerWidth: 1400, innerHeight: 900,
+};
+function esc(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function escAttr(value) { return esc(value); }
+function callJSON() { throw new Error("network call in harness"); }
+function getJSON() { return Promise.reject(new Error("network in harness")); }
+function $(selector) { return element(selector); }
+function toast() {}
+function fmtBytes(value) { return String(value) + " B"; }
+function fmtTime(value) { return String(value || ""); }
+
+const sandbox = {
+  document, window, DATASETS: [], DATASET_SOURCES: {}, REVIEW_COUNTS: {},
+  REVIEW_CTX: null, $, esc, escAttr, callJSON, getJSON, toast, fmtBytes,
+  fmtTime, console, setTimeout, clearTimeout, setInterval, clearInterval,
+  Promise, Number, String, JSON, Math, Date, Error, RegExp, Array, Object,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat, isNaN,
+  fetch: fetchStub, location: window.location, history: window.history,
+  localStorage: window.localStorage, sessionStorage: window.sessionStorage,
+  FormData: function () {}, Headers: function () {},
+  AbortController: function () { this.signal = {}; this.abort = function () {}; },
+  navigator: { clipboard: { writeText() { return Promise.resolve(); } } },
+  requestAnimationFrame(fn) { return setTimeout(fn, 0); },
+  matchMedia: window.matchMedia,
+  alert() {}, confirm() { return true; }, prompt() { return ""; },
+  innerWidth: window.innerWidth, innerHeight: window.innerHeight,
+  addEventListener() {}, removeEventListener() {},
+};
+sandbox.globalThis = sandbox;
+
+const code = block
+  + "\n;globalThis.__review = {reviewRollbackConfirmOpen,"
+  + " reviewRollbackConfirmClose, reviewRollbackConfirmed, reviewRollback};";
+const context = vm.createContext(sandbox);
+vm.runInContext(code, context, { filename: "index.html#review-block" });
+
+sandbox.REVIEW_CTX = {
+  dataset: "docs", sha: "a".repeat(64), data: null, itemsById: {},
+  selected: null, busy: false, source: null, conflict: null, jobs: {},
+  batchesById: {}, candidateBatchId: null, candidate: null,
+  candidateStale: false, building: false, publishing: false, current: null,
+  lastBuildEntryIds: [],
+};
+const batchId = "batch-20261108T120000-abcd";
+sandbox.REVIEW_CTX.batchesById[batchId] = {
+  batch_id: batchId, status: "published", created_at: "2026-11-08T12:00:05Z",
+  build: {
+    build_id: "b20261108T120000-12345678",
+    diff: { assets_changed: 1, blocks_changed: 0, chunks_changed: 2,
+            reindex: { required: true, reason: "conversion_changed",
+                       chunks: 2829 } },
+  },
+  publish: { committed_at: "2026-11-08T12:00:05Z",
+             current_build_id: "b20261108T120000-12345678" },
+};
+
+function tick() { return new Promise((resolve) => setTimeout(resolve, 20)); }
+function rollbackButton() {
+  return { getAttribute(name) { return name === "data-r" ? "rollback" : null; } };
+}
+
+async function main() {
+  const results = [];
+  const batchEl = elements.get("#reviewBatch");
+  const clickHandlers = batchEl.listeners.click || [];
+  if (!clickHandlers.length) throw new Error("no #reviewBatch click listener");
+  // 1. clicking 回滚最近一批 only opens the confirmation dialog.
+  clickHandlers.forEach((handler) => handler({
+    target: { closest() { return rollbackButton(); } } }));
+  await tick();
+  const dialog = elements.get("#reviewRollbackConfirm");
+  results.push({ step: "open", dialogVisible: dialog.hidden === false,
+                 requests: fetchCalls.slice() });
+  // 2. cancel closes the dialog and sends no request.
+  elements.get("#reviewRollbackCancelBtn").onclick();
+  await tick();
+  results.push({ step: "cancel", dialogVisible: dialog.hidden === false,
+                 requests: fetchCalls.slice() });
+  // 3. confirm sends the existing POST …/review/rollback request.
+  elements.get("#reviewRollbackConfirmBtn").onclick();
+  await tick();
+  results.push({ step: "confirm", dialogVisible: dialog.hidden === false,
+                 requests: fetchCalls.slice() });
+  console.log(JSON.stringify(results));
+}
+
+main().catch((error) => {
+  console.error((error && error.stack) || error);
+  process.exit(1);
+});
+"""
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed for the DOM behavior harness")
+class ReviewUiRollbackConfirmBehaviorTests(unittest.TestCase):
+    def test_rollback_opens_dialog_cancel_sends_nothing_confirm_sends_request(
+            self):
+        base = Path(tempfile.mkdtemp(prefix="peekseed-rollback-ui-"))
+        try:
+            harness = base / "rollback_confirm.js"
+            harness.write_text(NODE_ROLLBACK_HARNESS, encoding="utf-8")
+            completed = subprocess.run(
+                [shutil.which("node"), str(harness), str(UI_PATH)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stderr or completed.stdout)
+            results = json.loads(completed.stdout)
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
+        by_step = {row["step"]: row for row in results}
+        opened = by_step["open"]
+        self.assertTrue(opened["dialogVisible"], opened)
+        self.assertEqual(opened["requests"], [], opened)
+        cancelled = by_step["cancel"]
+        self.assertFalse(cancelled["dialogVisible"], cancelled)
+        self.assertEqual(cancelled["requests"], [], cancelled)
+        confirmed = by_step["confirm"]
+        self.assertFalse(confirmed["dialogVisible"], confirmed)
+        self.assertTrue(any("/review/rollback" in row["url"]
+                            and row["method"] == "POST"
+                            for row in confirmed["requests"]),
+                        confirmed["requests"])

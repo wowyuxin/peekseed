@@ -1300,6 +1300,15 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .rr-progress{height:4px;border-radius:3px;background:var(--line);overflow:hidden;}
 .rr-progress span{display:block;height:100%;background:var(--accent);}
 .rr-rebuild-hint{font-size:10px;color:var(--warn);line-height:1.5;overflow-wrap:anywhere;}
+/* CP3.1 F4: destructive rollback confirmation dialog (nested inside the review
+   overlay, painted above it). The cancel path only hides this overlay. */
+.rr-confirm-overlay{z-index:71;}
+.rr-confirm{width:min(720px,100%);max-height:78vh;}
+.rr-confirm-list{margin:0 0 10px;padding-left:18px;font-size:11.5px;line-height:1.6;
+  color:var(--muted);overflow-wrap:anywhere;}
+.rr-confirm-list li{margin:0 0 5px;}
+.rr-confirm .rr-batch-row{margin-top:2px;}
+.rr-reindex{color:var(--text);}
 .rr-conflict{margin:0 0 10px;padding:8px 10px;border-radius:9px;font-size:11px;
   line-height:1.55;border:1px solid rgba(251,113,133,.4);background:var(--bad-soft);
   color:var(--text);min-width:0;}
@@ -1779,6 +1788,39 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
       <div class="rr-grid">
         <div class="rr-clusters" id="reviewClusters"><span class="hist-empty">正在加载簇…</span></div>
         <div class="rr-detail" id="reviewDetail"><span class="hist-empty">选择一个簇查看结论、证据与动作。</span></div>
+      </div>
+    </div>
+  </div>
+  <!-- CP3.1 F4 (contract §14.5): the rollback button is destructive -- it
+       creates a revert batch and auto-publishes it, so it must be confirmed
+       first. Cancel closes this dialog and sends no request; only the explicit
+       confirm button calls the existing POST …/review/rollback route. -->
+  <div class="hist-overlay rr-confirm-overlay" id="reviewRollbackConfirm" hidden>
+    <div class="hist-dialog rr-confirm" role="alertdialog" aria-modal="true"
+         aria-label="确认回滚最近一批">
+      <div class="hist-head">
+        <div>
+          <h2>确认回滚最近一批？</h2>
+          <p>回滚会撤销最近一批仍生效的修正并自动发布；发布后已有索引会变
+          stale，需要重建。</p>
+        </div>
+        <button class="hist-close" id="reviewRollbackConfirmClose" type="button"
+                aria-label="Close">&#215;</button>
+      </div>
+      <div class="hist-body settings-body">
+        <ul class="rr-confirm-list">
+          <li>撤销（revert）最近一批仍生效的修正并自动发布：后台回滚任务会构建
+          revert 候选、跑 gates 并自动发布；更早批次的修正保持不变。</li>
+          <li>发布后若 conversion 变化，所有引用该 peel 的 dataset 已有索引会变
+          stale，需要重建索引（CXL 全量约 14 分钟）；旧索引仍可搜索旧结果。</li>
+          <li>回滚只作用于最近一批，不能撤销更早的批次；任务中断时不会自动重跑，
+          只能手动重试。</li>
+          <li>取消不会发送任何请求，current 与正式账本保持不变。</li>
+        </ul>
+        <div class="rr-batch-row">
+          <button type="button" id="reviewRollbackConfirmBtn">确认回滚并发布</button>
+          <button type="button" class="secondary" id="reviewRollbackCancelBtn">取消</button>
+        </div>
       </div>
     </div>
   </div>
@@ -5068,6 +5110,28 @@ const REVIEW_CONFLICT_REASON_LABEL={history_correction_revalidation:'历史修�
   parent_fields_invalid:'父表字段非法',duplicate_operation:'重复操作',
   conflicting_operations:'操作冲突',duplicate_inheritance:'重复继承',
   entry_in_batch:'条目已在批次中'};
+/* CP3.1 F3 (wire §2.2): the additive ``diff.reindex`` object reports whether
+   the candidate conversion requires a full index rebuild and the re-embed
+   scope (the candidate chunk count). Only these stable reason codes are
+   labelled; unknown codes fall back to the wire spelling. */
+const REVIEW_REINDEX_REASON_LABEL={conversion_changed:'conversion 变化',
+  no_current_build:'尚无当前构建'};
+function reviewReindexReasonLabel(reason){
+  return REVIEW_REINDEX_REASON_LABEL[reason]||reason||'';
+}
+/* Render the index impact of a candidate: content diff and reindex are two
+   different signals (content-only counts ignore conversion/build identity,
+   reindex is the full rebuild scope). Missing reindex is shown as unknown
+   rather than silently claiming the index stays valid. */
+function reviewReindexText(reindex){
+  if(!reindex||typeof reindex!=='object') return '未知（peelfeed 未返回 diff.reindex）';
+  if(reindex.required){
+    const reason=reviewReindexReasonLabel(String(reindex.reason||''));
+    return '需要重建索引：全量 '+reviewNum(reindex.chunks||0)+' chunks'
+      +(reason?'（原因：'+reason+'）':'');
+  }
+  return '无需重建索引（conversion 未变，已有索引仍有效）';
+}
 function reviewKey(dsId,sha){ return dsId+'|'+(sha||''); }
 function reviewBase(dsId,sha){
   return '/api/datasets/'+encodeURIComponent(dsId)+'/sources/'+encodeURIComponent(sha)+'/review';
@@ -5971,11 +6035,17 @@ function reviewCandidatePanelHtml(batch){
         return '<li>'+esc(reviewStr(err,''))+'</li>'; }).join('')+'</ul>';
     }
     const newWarnings=((diff.new_warnings||[])).filter(Boolean);
-    html+='<div class="rr-cand-sec"><b>实际变更</b>：资产 '
-      +reviewNum(diff.assets_changed||0)+' · blocks '+reviewNum(diff.blocks_changed||0)
+    html+='<div class="rr-cand-sec"><b>实际变更</b>（内容 diff，不含 conversion/build '
+      +'身份）：资产 '+reviewNum(diff.assets_changed||0)+' · blocks '
+      +reviewNum(diff.blocks_changed||0)
       +' · chunks '+reviewNum(diff.chunks_changed||0)
       +' · 新增 warning '+reviewNum(newWarnings.length)
       +' · 带入已生效修正 '+reviewNum(build.carried_corrections||0)+'</div>';
+    /* CP3.1 F3: content diff (above) and the full reindex scope (below) are
+       separate signals; a conversion change rebuilds the whole index even when
+       the content diff is small. */
+    html+='<div class="rr-cand-sec rr-reindex"><b>索引影响</b>：'
+      +esc(reviewReindexText(diff.reindex))+'</div>';
     const changed=((diff.changed_assets||[])).filter(Boolean);
     if(changed.length){
       html+='<div class="rr-cand-meta">变更资产：'
@@ -6054,7 +6124,7 @@ function reviewPublishedBatchesHtml(){
   let html='<div class="rr-batch-h"><h5>已发布批次</h5>'
     +'<button type="button" class="secondary" data-r="rollback"'
     +(list.length&&!busy?'':' disabled')
-    +' title="'+(list.length?'创建 revert 批次并发布上一构建（仅最近一批）'
+    +' title="'+(list.length?'打开确认对话框：撤销最近一批仍生效的修正并自动发布（仅最近一批）'
       :'还没有已发布批次')+'">回滚最近一批</button></div>';
   if(!list.length){
     return html+'<div class="rr-cand-meta">还没有已发布批次。发布候选后会出现在这里。</div>';
@@ -6062,12 +6132,14 @@ function reviewPublishedBatchesHtml(){
   html+='<div class="rr-jobs">'+list.slice(0,8).map(function(batch){
     const diff=(batch.build&&batch.build.diff)||{};
     const publish=(batch.publish&&typeof batch.publish==='object')?batch.publish:{};
+    const reindex=(diff.reindex&&typeof diff.reindex==='object')?diff.reindex:null;
     return '<div class="rr-job"><div class="rr-job-h">'
       +esc(String(batch.batch_id||''))+reviewBadge('已发布','ok')
       +'<span class="rr-job-id">'+esc(String(publish.committed_at||batch.created_at||''))
       +'</span></div><div class="rr-cand-meta">资产 '
       +reviewNum(diff.assets_changed||0)+' · blocks '+reviewNum(diff.blocks_changed||0)
       +' · chunks '+reviewNum(diff.chunks_changed||0)
+      +(reindex&&reindex.required?' · 索引需重建':'')
       +(publish.current_build_id?' · 当前构建 '
         +esc(String(publish.current_build_id)):'')+'</div></div>';
   }).join('')+'</div>';
@@ -6387,10 +6459,42 @@ async function reviewRollback(){
     paintReviewDetail();
   }
 }
+/* CP3.1 F4 (contract §14.5): "回滚最近一批" is destructive -- it creates a
+   revert batch and the rollback job auto-publishes it, so the button only opens
+   this confirmation dialog. Cancel hides the dialog and sends no request; the
+   confirm button is the only caller of reviewRollback(). */
+function reviewRollbackConfirmOpen(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const list=reviewPublishedBatches();
+  if(!list.length){
+    reviewMsg('还没有已发布批次，无法回滚最近一批。',true);
+    return;
+  }
+  const dialog=$('#reviewRollbackConfirm');
+  if(!dialog) return;
+  dialog.hidden=false;
+  const confirm=$('#reviewRollbackConfirmBtn');
+  if(confirm) confirm.disabled=!!(ctx.building||ctx.publishing);
+  const cancel=$('#reviewRollbackCancelBtn');
+  if(cancel) cancel.focus();
+}
+function reviewRollbackConfirmClose(){
+  const dialog=$('#reviewRollbackConfirm');
+  if(dialog) dialog.hidden=true;
+}
+function reviewRollbackConfirmed(){
+  reviewRollbackConfirmClose();
+  reviewRunAction(function(){ return reviewRollback(); });
+}
 async function reviewRetryJob(btn){
   const type=String((btn&&btn.getAttribute('data-type'))||'');
   if(type==='report'){ await generateReviewReport(); return; }
-  if(type==='rollback'){ await reviewRollback(); return; }
+  if(type==='rollback'){
+    /* The retry is destructive too (another revert batch + auto-publish): route
+       it through the same confirmation instead of sending the request at once. */
+    reviewRollbackConfirmOpen();
+    return;
+  }
   if(type==='build'){
     /* Explicit retry only: recovery may have failed/released the interrupted
        batch, so refetch the plan and batch records before re-submitting. */
@@ -6735,7 +6839,9 @@ $('#reviewBatch').addEventListener('click',function(ev){
   if(kind==='build') reviewRunAction(function(){ return reviewBuildCandidate(); });
   else if(kind==='publish') reviewRunAction(function(){ return reviewPublishBatch(); });
   else if(kind==='discard') reviewRunAction(function(){ return reviewDiscardBatch(); });
-  else if(kind==='rollback') reviewRunAction(function(){ return reviewRollback(); });
+  /* CP3.1 F4: the rollback button opens the confirmation dialog only; the
+     request is sent by the dialog's explicit confirm button. */
+  else if(kind==='rollback') reviewRunAction(function(){ return reviewRollbackConfirmOpen(); });
   else if(kind==='job-retry') reviewRunAction(function(){ return reviewRetryJob(btn); });
 });
 $('#reviewConflict').addEventListener('click',function(ev){
@@ -6745,11 +6851,21 @@ $('#reviewConflict').addEventListener('click',function(ev){
     reviewConflictJump(btn.getAttribute('data-item')||'');
   }
 });
+/* CP3.1 F4: only the confirm button calls the rollback route; cancel and the
+   backdrop/close controls hide the dialog and never issue a request. */
+$('#reviewRollbackConfirmBtn').onclick=reviewRollbackConfirmed;
+$('#reviewRollbackCancelBtn').onclick=reviewRollbackConfirmClose;
+$('#reviewRollbackConfirmClose').onclick=reviewRollbackConfirmClose;
+$('#reviewRollbackConfirm').addEventListener('click',function(ev){
+  if(ev.target===this) reviewRollbackConfirmClose();
+});
 $('#reviewReportBtn').onclick=generateReviewReport;
 $('#reviewRefreshBtn').onclick=refreshReviewFromButton;
-$('#reviewClose').onclick=function(){ const m=$('#reviewModal'); if(m) m.hidden=true; };
+$('#reviewClose').onclick=function(){ const m=$('#reviewModal'); if(m) m.hidden=true;
+  reviewRollbackConfirmClose(); };
 $('#reviewModal').addEventListener('click',function(ev){
-  if(ev.target===this){ const m=$('#reviewModal'); if(m) m.hidden=true; }
+  if(ev.target===this){ const m=$('#reviewModal'); if(m) m.hidden=true;
+    reviewRollbackConfirmClose(); }
 });
 
 /* ---- workspace dialog ----------------------------------------------------

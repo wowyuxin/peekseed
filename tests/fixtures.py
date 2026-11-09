@@ -574,7 +574,14 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
                         "correction_engine_version": "corr-test0000000000"},
         "gates": {"all_pass": True, "checks": 1, "errors": []},
         "diff": {"assets_changed": 0, "blocks_changed": 0, "chunks_changed": 0,
-                 "new_warnings": [], "changed_assets": [], "samples": []},
+                 "new_warnings": [], "changed_assets": [], "samples": [],
+                 # CP3.1 F3: a cutover has no current build yet, so the first
+                 # index must be built from scratch; system builds of an
+                 # existing corpus need no reindex.
+                 "reindex": ({"required": True, "reason": "no_current_build",
+                              "chunks": len(chunks)}
+                             if layout == "legacy" else
+                             {"required": False, "reason": None, "chunks": 0})},
         "counts": {"pages": len(pages), "chunks": len(chunks),
                    "review_items": 0},
         "validation_errors": len(validation_errors or []),
@@ -645,7 +652,8 @@ def write_peel_build(peel, *, conversion_id=None, build_id=None,
     link = extract / "corpus"
     current_dir = link.resolve()
     manifest = json.loads((current_dir / "manifest.json").read_text())
-    conversion_id = conversion_id or str(manifest.get("conversion_id") or "")
+    previous_conversion = str(manifest.get("conversion_id") or "")
+    conversion_id = conversion_id or previous_conversion
     if build_id is None:
         build_id = "b20261108T120000-" + hashlib.sha256(
             ("build|%s|%s" % (conversion_id, chunk_sets)).encode()
@@ -667,6 +675,23 @@ def write_peel_build(peel, *, conversion_id=None, build_id=None,
         summary.update({"build_id": build_id, "conversion_id": conversion_id})
         if engine:
             summary.setdefault("engine", {})["fingerprint"] = engine
+        # CP3.1 F3: keep the fixture's build summary faithful to the additive
+        # ``diff.reindex`` shape when the conversion identity changes.
+        diff = summary.get("diff") if isinstance(summary.get("diff"), dict) else {}
+        required = conversion_id != previous_conversion
+        chunk_count = 0
+        chunks_path = build_dir / "chunks.jsonl"
+        if chunks_path.is_file():
+            chunk_count = sum(1 for line in
+                              chunks_path.read_text(encoding="utf-8").splitlines()
+                              if line.strip())
+        diff["reindex"] = {
+            "required": required,
+            "reason": (("conversion_changed" if previous_conversion
+                        else "no_current_build") if required else None),
+            "chunks": chunk_count if required else 0,
+        }
+        summary["diff"] = diff
         contracts.write_json_atomic(summary_path, summary)
     if chunk_sets:
         chunks = [json.loads(line) for line in
@@ -1257,6 +1282,29 @@ def default_batch(peel_id, entry_ids, entries, state):
         hashlib.sha256(("batch|" + batch_id).encode()).hexdigest())
     build_id = "b20261108T120000-" + hashlib.sha256(
         ("build|" + batch_id).encode()).hexdigest()[:8]
+    # CP3.1 F3 (wire §2.2): the additive ``diff.reindex`` object. ``required``
+    # is true iff the candidate conversion differs from the current one (or
+    # there is no current build yet); ``chunks`` is the full candidate chunk
+    # count (the re-embed scope), not the changed-chunk count.
+    peel = (state.get("peels") or {}).get(peel_id) or {}
+    override_current = state.get("publish_current")
+    if isinstance(override_current, dict):
+        current_conversion = str(override_current.get("conversion_id") or "")
+    else:
+        current_conversion = str(peel.get("conversion_id") or "")
+    reindex = {"required": False, "reason": None, "chunks": 0}
+    if conversion_id != current_conversion:
+        reindex = {
+            "required": True,
+            "reason": ("conversion_changed" if current_conversion
+                       else "no_current_build"),
+            "chunks": int(state.get("reindex_chunks")
+                          or (peel.get("counts") or {}).get("chunks")
+                          or len(changes)),
+        }
+    override_reindex = state.get("batch_reindex")
+    if isinstance(override_reindex, dict):
+        reindex = copy_json(override_reindex)
     base = {
         "conversion_id": conversion_id,
         "effective_corrections_hash": state.get("effective_corrections_hash")
@@ -1295,7 +1343,7 @@ def default_batch(peel_id, entry_ids, entries, state):
             "diff": {"assets_changed": len(changes), "blocks_changed": 0,
                      "chunks_changed": len(changes), "new_warnings": [],
                      "changed_assets": [change["item_id"] for change in changes],
-                     "samples": []},
+                     "samples": [], "reindex": reindex},
             "carried_corrections": 0,
         },
         "publish": {"committed_at": None, "current_build_id": None,
@@ -1324,6 +1372,40 @@ def option(rest, name):
         if item == name and index + 1 < len(rest):
             return rest[index + 1]
     return None
+
+
+# CP3.1 F5 (contract §14.7): peelfeed validates batch_id/job_id against the
+# generated shape before joining any path; anything else is
+# ``error [validation]``. The fake CLI mirrors that check so peekseed's
+# validation->400 mapping is exercised without a real peelfeed.
+BATCH_ID_PREFIXES = ("batch", "system")
+JOB_ID_PREFIXES = ("report", "build", "rollback", "ocr", "discuss")
+
+
+def _generated_id_shape(value, prefixes):
+    text = str(value or "")
+    if not text or text != text.strip():
+        return False
+    if "/" in text or "\\" in text or ".." in text:
+        return False
+    for prefix in prefixes:
+        if text.startswith(prefix + "-") and len(text) > len(prefix) + 1:
+            return True
+    return False
+
+
+def valid_batch_id(value):
+    text = str(value or "")
+    if not _generated_id_shape(text, BATCH_ID_PREFIXES):
+        return False
+    # System rebuild batches are ``system-<build_id>`` (build ids start with b).
+    if text.startswith("system-"):
+        return text.startswith("system-b") and len(text) > len("system-b")
+    return True
+
+
+def valid_job_id(value):
+    return _generated_id_shape(value, JOB_ID_PREFIXES)
 
 
 VALUE_FLAGS = {
@@ -1938,6 +2020,8 @@ def main():
         batch_id = option(rest, "--batch")
         if not batch_id:
             return fail("--batch is required for batch show", 2, "validation")
+        if not valid_batch_id(batch_id):
+            return fail("invalid batch id: " + str(batch_id), 2, "validation")
         batch = (state.get("batches") or {}).get(str(batch_id))
         if not isinstance(batch, dict):
             return fail("unknown batch: " + str(batch_id), 3, "not_found")
@@ -1950,6 +2034,8 @@ def main():
         batch_id = option(rest, "--batch")
         if not batch_id:
             return fail("--batch is required for publish", 2, "validation")
+        if not valid_batch_id(batch_id):
+            return fail("invalid batch id: " + str(batch_id), 2, "validation")
         batch = (state.get("batches") or {}).get(str(batch_id))
         if not isinstance(batch, dict):
             return fail("unknown batch: " + str(batch_id), 3, "not_found")
@@ -1976,6 +2062,8 @@ def main():
         batch_id = option(rest, "--batch")
         if not batch_id:
             return fail("--batch is required for discard", 2, "validation")
+        if not valid_batch_id(batch_id):
+            return fail("invalid batch id: " + str(batch_id), 2, "validation")
         batch = (state.get("batches") or {}).get(str(batch_id))
         if not isinstance(batch, dict):
             return fail("unknown batch: " + str(batch_id), 3, "not_found")
@@ -2046,6 +2134,8 @@ def main():
             job_id = option(rest, "--job")
             if not job_id:
                 return fail("--job is required for job show", 2, "validation")
+            if not valid_job_id(job_id):
+                return fail("invalid job id: " + str(job_id), 2, "validation")
             job = jobs.get(str(job_id))
             if not isinstance(job, dict):
                 return fail("unknown job: " + str(job_id), 3, "not_found")
