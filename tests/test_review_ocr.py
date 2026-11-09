@@ -19,11 +19,16 @@ No network: the fake CLI is the only engine and every job is terminal at once.
 """
 
 import contextlib
+import hashlib
 import os
 import time
 import unittest
 
-from tests.fixtures import FakePeelfeedCli, make_pdf, temp_data_root
+from tests.fixtures import (EMBED_CHUNK, REVIEW_OCR, REVIEW_OCR_EMPTY,
+                            REVIEW_OCR_LOW_CONFIDENCE, REVIEW_OCR_UNAVAILABLE,
+                            REVIEW_OCR_UNCOVERED, FakeModelServer,
+                            FakePeelfeedCli, make_pdf, make_peel,
+                            temp_data_root)
 
 _PEELFEED_ENV_KEYS = ("PEEKSEED_PEELFEED_CLI", "PEEKSEED_PEELFEED_POLL")
 
@@ -342,6 +347,267 @@ class ReviewOcrRouteTests(unittest.TestCase):
                 self.assertIn(job_id,
                               validated["sources"][0]["extraction"]
                               ["review_jobs"])
+
+
+def _wait_index_job(client, job_id, timeout=30.0):
+    deadline = time.time() + timeout
+    state = {}
+    while time.time() < deadline:
+        state = client.get("/api/jobs/%s" % job_id).json()
+        if state.get("state") in ("succeeded", "failed", "cancelled",
+                                  "interrupted"):
+            return state
+        time.sleep(0.02)
+    raise AssertionError("index job %s did not finish: %r" % (job_id, state))
+
+
+def _collection_status(client, dataset_id):
+    rows = client.get("/api/collections").json()["collections"]
+    row = next((item for item in rows if item["id"] == dataset_id), {})
+    return str(row.get("status") or "")
+
+
+class ReviewOcrPayloadTests(unittest.TestCase):
+    """Plan §6 #28: the review payload/coverage/evidence shapes the UI renders."""
+
+    def test_review_payload_carries_ocr_capabilities_coverage_and_evidence(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            cli.update(review=REVIEW_OCR)
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, _dataset_id, _sha = _extracted_review_source(client, root)
+                response = client.get(base + "/review?group=cluster")
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                caps = payload["capabilities"]
+                self.assertEqual(caps["review_schema"], 2)
+                self.assertTrue(caps["ocr"])
+                self.assertTrue(caps["ocr_configured"])
+                self.assertIsNone(caps["ocr_detail"])
+                self.assertEqual(caps["ocr_engine"], "rapidocr@1.4.4")
+                self.assertEqual(caps["ocr_min_confidence"], 0.6)
+                self.assertEqual(caps["ocr_status"]["available"], True)
+                self.assertIsNone(caps["ocr_status"]["error"])
+                self.assertFalse(caps["vlm"])
+                coverage = payload["ocr"]
+                for key in ("items", "with_evidence", "empty",
+                            "low_confidence", "uncovered", "invalid_evidence",
+                            "evidence_files", "engine", "min_confidence"):
+                    self.assertIn(key, coverage)
+                self.assertEqual(coverage["items"], 1)
+                self.assertEqual(coverage["with_evidence"], 1)
+                self.assertEqual(coverage["uncovered"], 0)
+                self.assertEqual(coverage["evidence_files"], 1)
+                figure = next(item for item in payload["items"]
+                              if item["code"] == "no_native_labels")
+                evidence = figure["evidence"]["ocr_evidence"]
+                self.assertEqual(len(evidence), 1)
+                entry = evidence[0]
+                for key in ("path", "crop_ref", "image_sha256", "engine",
+                            "params_sha256", "evidence_sha256", "label_count",
+                            "max_confidence", "min_confidence", "created_at"):
+                    self.assertIn(key, entry)
+                self.assertEqual(entry["engine"], "rapidocr@1.4.4")
+                self.assertEqual(entry["label_count"], 3)
+                self.assertEqual(entry["max_confidence"], 0.99)
+                labels = entry["labels"]
+                self.assertEqual([label["text"] for label in labels],
+                                 ["Compute Express Link", "CXL 3.1",
+                                  "Figure 1-1"])
+                self.assertTrue(all(label["confidence"] >= 0.6
+                                    for label in labels))
+                ocr_option = next(option for option in figure["strategies"]
+                                  if option["id"] == "use_ocr_labels")
+                self.assertTrue(ocr_option["available"])
+                self.assertIsNone(ocr_option["unavailable_reason"])
+                # The single-item route returns the same additive evidence keys.
+                item = client.get(
+                    base + "/review/items/" + figure["id"])
+                self.assertEqual(item.status_code, 200, item.text)
+                self.assertEqual(
+                    item.json()["item"]["evidence"]["ocr_evidence"][0]
+                    ["label_count"], 3)
+
+    def test_ocr_refresh_updates_the_coverage_after_the_job(self):
+        """#28: refresh -> 202 -> poll done -> review refetched, coverage updated."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            cli.update(review=REVIEW_OCR_UNCOVERED,
+                       ocr_review_after_refresh=REVIEW_OCR,
+                       ocr_job_counts={"requested": 1, "refreshed": 1,
+                                       "cache_hits": 0, "failed": 0,
+                                       "empty": 0, "low_confidence": 0})
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, _dataset_id, _sha = _extracted_review_source(client, root)
+                before = client.get(base + "/review?group=cluster").json()
+                self.assertEqual(before["ocr"]["uncovered"], 1)
+                self.assertEqual(before["ocr"]["with_evidence"], 0)
+                figure = next(item for item in before["items"]
+                              if item["code"] == "no_native_labels")
+                self.assertEqual(figure["evidence"]["ocr_evidence"], [])
+                ocr_option = next(option for option in figure["strategies"]
+                                  if option["id"] == "use_ocr_labels")
+                self.assertFalse(ocr_option["available"])
+                self.assertIn("先运行局部 OCR",
+                              ocr_option["unavailable_reason"])
+                refreshed = client.post(
+                    base + "/review/ocr/refresh",
+                    json={"item_ids": [figure["id"]]})
+                self.assertEqual(refreshed.status_code, 202, refreshed.text)
+                job = _wait_review_job(client, base,
+                                       refreshed.json()["job_id"])
+                self.assertEqual(job["status"], "done")
+                self.assertEqual(job["type"], "ocr")
+                after = client.get(base + "/review?group=cluster").json()
+                self.assertEqual(after["ocr"]["uncovered"], 0)
+                self.assertEqual(after["ocr"]["with_evidence"], 1)
+                self.assertEqual(after["ocr"]["evidence_files"], 1)
+                figure_after = next(item for item in after["items"]
+                                    if item["code"] == "no_native_labels")
+                self.assertEqual(len(
+                    figure_after["evidence"]["ocr_evidence"]), 1)
+                self.assertEqual(figure_after["evidence"]["ocr_evidence"][0]
+                                 ["max_confidence"], 0.99)
+                self.assertEqual(
+                    next(option for option in figure_after["strategies"]
+                         if option["id"] == "use_ocr_labels")["available"],
+                    True)
+                # The frozen result summary is the source of the UI counts.
+                summary = cli.state()["ocr_job_results"][
+                    refreshed.json()["job_id"]]
+                self.assertEqual(summary["counts"],
+                                 {"requested": 1, "refreshed": 1,
+                                  "cache_hits": 0, "failed": 0, "empty": 0,
+                                  "low_confidence": 0})
+                # The UI also shows empty/low-confidence variants without
+                # inventing client-side state: the coverage payload drives it.
+                cli.update(review=REVIEW_OCR_EMPTY)
+                empty = client.get(base + "/review").json()
+                self.assertEqual(empty["ocr"]["empty"], 1)
+                cli.update(review=REVIEW_OCR_LOW_CONFIDENCE)
+                low = client.get(base + "/review").json()
+                self.assertEqual(low["ocr"]["low_confidence"], 1)
+                self.assertLess(
+                    low["items"][1]["evidence"]["ocr_evidence"][0]
+                    ["max_confidence"],
+                    low["capabilities"]["ocr_min_confidence"])
+
+    def test_no_ocr_fallback_keeps_review_and_report_working(self):
+        """#29: capabilities ocr=false -> grayed strategy, check 503, review OK."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            cli.update(review=REVIEW_OCR_UNAVAILABLE,
+                       ocr_check_error={"code": "ocr_unavailable",
+                                        "message":
+                                        "PEELFEED_OCR_PROVIDER is not set"})
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, _dataset_id, _sha = _extracted_review_source(client, root)
+                payload = client.get(base + "/review").json()
+                caps = payload["capabilities"]
+                self.assertFalse(caps["ocr"])
+                self.assertFalse(caps["ocr_configured"])
+                self.assertIn("OCR", caps["ocr_detail"])
+                figure = next(item for item in payload["items"]
+                              if item["code"] == "no_native_labels")
+                options = {option["id"]: option
+                           for option in figure["strategies"]}
+                self.assertFalse(options["use_ocr_labels"]["available"])
+                self.assertIn("局部 OCR",
+                              options["use_ocr_labels"]["unavailable_reason"])
+                self.assertTrue(options["keep_original_figure"]["available"])
+                # The review report job still works without OCR.
+                report = client.post(base + "/review/reports", json={})
+                self.assertEqual(report.status_code, 202, report.text)
+                self.assertEqual(
+                    _wait_review_job(client, base,
+                                     report.json()["job_id"])["status"],
+                    "done")
+                # A check on the unconfigured provider is the frozen 503.
+                check = client.post(base + "/review/ocr/check", json={})
+                self.assertEqual(check.status_code, 503, check.text)
+                self.assertIn("ocr_unavailable", check.json()["detail"])
+
+    def test_ocr_refresh_does_not_invalidate_an_existing_index(self):
+        """#30: OCR evidence refresh changes no conversion identity/reindex."""
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                pdf = make_pdf(root / "manual.pdf")
+                created = client.post(
+                    "/api/datasets", data={"name": "Docs"},
+                    files=[("files", ("manual.pdf", pdf.read_bytes(),
+                                      "application/pdf"))])
+                self.assertEqual(created.status_code, 201, created.text)
+                dataset_id = created.json()["dataset"]["id"]
+                sha = hashlib.sha256(pdf.read_bytes()).hexdigest()
+                peel = make_peel(dataset_id, pages=[
+                    "Widget installation. The widget is mounted with two "
+                    "screws.",
+                    "Widget operation. Press the green button to start it."])
+                cli.update(
+                    peels={peel["peel_id"]: {
+                        "peel_id": peel["peel_id"], "state": "ready",
+                        "source": {"name": "manual.pdf", "sha256": sha,
+                                   "pages": 2},
+                        "profile": "generic",
+                        "conversion_id": peel["conversion_id"],
+                        "counts": {"pages": 2, "chunks": 2},
+                        "validation": {"errors": [], "review_items": 0},
+                        "review_items": 0, "error": None,
+                    }},
+                    review=REVIEW_OCR_UNCOVERED,
+                    ocr_review_after_refresh=REVIEW_OCR)
+                link = client.post("/api/links", json={
+                    "role": "embed", "label": "Fake embed",
+                    "protocol": "openai", "base_url": fake.openai_base,
+                    "model": "test-embed", "enabled": True,
+                    "chunk": dict(EMBED_CHUNK)})
+                self.assertEqual(link.status_code, 201, link.text)
+                index = client.post(
+                    "/api/datasets/%s/index" % dataset_id, json={})
+                self.assertEqual(index.status_code, 202, index.text)
+                job = _wait_index_job(client, index.json()["job"])
+                self.assertEqual(job["state"], "succeeded", job)
+                self.assertEqual(_collection_status(client, dataset_id),
+                                 "indexed")
+                base = "/api/datasets/%s/sources/%s" % (dataset_id, sha)
+                rows = client.get(
+                    "/api/datasets/%s/sources" % dataset_id).json()["sources"]
+                extraction_before = dict(rows[0]["extraction"])
+                self.assertEqual(extraction_before["conversion_id"],
+                                 peel["conversion_id"])
+                # The OCR evidence refresh writes extract/ocr/ only: no
+                # conversion/build change, so the index stays valid.
+                refreshed = client.post(base + "/review/ocr/refresh",
+                                        json={"item_ids":
+                                              ["it-8b7a6c5d4e3f2a10"]})
+                self.assertEqual(refreshed.status_code, 202, refreshed.text)
+                self.assertEqual(
+                    _wait_review_job(client, base,
+                                     refreshed.json()["job_id"])["status"],
+                    "done")
+                rows = client.get(
+                    "/api/datasets/%s/sources" % dataset_id).json()["sources"]
+                extraction_after = dict(rows[0]["extraction"])
+                self.assertEqual(extraction_after["conversion_id"],
+                                 extraction_before["conversion_id"])
+                self.assertEqual(extraction_after["state"], "extracted")
+                self.assertEqual(extraction_after["review_jobs"].keys(),
+                                 extraction_before["review_jobs"].keys()
+                                 | {refreshed.json()["job_id"]})
+                self.assertEqual(_collection_status(client, dataset_id),
+                                 "indexed")
+                info = client.get("/api/datasets").json()["datasets"]
+                row = next(item for item in info if item["id"] == dataset_id)
+                self.assertEqual(len(row["indexes"]), 1)
+                # The OCR refresh never runs the publish/reconcile path.
+                commands = [call["argv"][0] for call in cli.calls()]
+                for command in ("publish", "discard", "rollback"):
+                    self.assertNotIn(command, commands)
 
 
 if __name__ == "__main__":

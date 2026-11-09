@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -357,6 +358,42 @@ class ApiTests(unittest.TestCase):
             self.assertFalse((config.paths().sources_dir / sha).exists())
             self.assertEqual(list(config.paths().datasets_dir.iterdir()), [])
 
+
+    def test_dataset_schema_4_carries_an_ocr_review_job_without_migration(self):
+        """CP4: the schema-4 ``extraction.review_jobs`` accepts ``type=ocr``.
+
+        The OCR routes persist a descriptor exactly like report/build jobs; no
+        dataset schema bump is needed, so an old schema-4 dataset still loads
+        (``review_jobs`` defaults to ``{}``) and validates after the write.
+        """
+        with temp_data_root() as root:
+            self.root = root
+            client = self._client()
+            dataset = self._upload(client)
+            sha = hashlib.sha256(
+                (root / "manual.pdf.tmp").read_bytes()).hexdigest()
+            make_peel(dataset["id"])
+            from peekseed import config, contracts, ingest
+
+            directory = config.paths().datasets_dir / dataset["id"]
+            job_id = "ocr-20261109T031000-a1b2"
+            descriptor = ingest.record_review_job(
+                directory, sha, job_id, job_type="ocr")
+            self.assertEqual(descriptor["type"], "ocr")
+            self.assertIsNone(descriptor["batch_id"])
+            self.assertTrue(descriptor["created_at"])
+            rows = client.get(
+                "/api/datasets/%s/sources" % dataset["id"]).json()["sources"]
+            self.assertEqual(rows[0]["extraction"]["review_jobs"][job_id],
+                             descriptor)
+            raw = contracts.read_json(directory / "dataset.json")
+            self.assertEqual(raw["schema"], contracts.DATASET_SCHEMA)
+            self.assertEqual(contracts.DATASET_SCHEMA, 4)
+            # The schema-4 document still validates with the ocr descriptor.
+            validated = contracts.validate_dataset(raw)
+            self.assertEqual(
+                validated["sources"][0]["extraction"]["review_jobs"][job_id]
+                ["type"], "ocr")
 
 class IndexGateTests(unittest.TestCase):
     def _client(self):

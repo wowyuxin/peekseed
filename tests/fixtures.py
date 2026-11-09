@@ -769,267 +769,10 @@ DEFAULT_OCR_CHECK = {
     "error": None,
 }
 
-# --- schema-2 review payloads (the shapes the real peelfeed CLI prints) ----
-
-STRATEGY_OPTIONS = [
-    {"id": "use_first_row_header", "version": 1, "name": "本表首行作表头",
-     "description": "把本表第 0 行作为表头；文本来自本表 native cells。",
-     "recommended": True, "available": True, "unavailable_reason": None,
-     "capabilities": ["native_lines"], "params_schema": {},
-     "action": {"type": "operation", "name": "set_header_rows"},
-     "min_tier": "R2", "batch_safe": True,
-     "risk": "误把数据行作表头；须过签名阈值和逐表 validator"},
-    {"id": "use_ocr_labels", "version": 1, "name": "OCR 标签",
-     "description": "用按需 OCR 恢复标签（需要 OCR）。",
-     "recommended": False, "available": False,
-     "unavailable_reason": "OCR is not configured",
-     "capabilities": ["ocr"], "params_schema": {},
-     "action": {"type": "operation", "name": "set_asset_labels_from_ocr"},
-     "min_tier": "R2", "batch_safe": False,
-     "risk": "OCR 文本不是 native evidence"},
-]
-
-CLUSTER_HEADER = {
-    "cluster_id": "cl-0f1e2d3c4b5a",
-    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
-                    "profile": "generic", "operation": "set_header_rows",
-                    "layout": "structured|cols=2|rows=6-11|caption=yes|pages=1",
-                    "evidence": "native_lines"},
-    "code": "table_header_absent",
-    "title": "表格缺少表头",
-    "kind": "table",
-    "item_count": 1,
-    "human_pending": 1,
-    "representative_item_id": "it-3f9c2a4b6d8e0f1a",
-    "states": {"needs_decision": 1},
-    "conclusion": None,
-    "suggestions": [],
-    "strategies": STRATEGY_OPTIONS,
-    "item_ids": ["it-3f9c2a4b6d8e0f1a"],
-}
-
-CLUSTER_FIGURE = {
-    "cluster_id": "cl-9a8b7c6d5e4f",
-    "cluster_key": {"code": "no_native_labels", "asset_kind": "figure",
-                    "profile": "generic", "operation": None,
-                    "layout": "figure|pages=2", "evidence": "page_image"},
-    "code": "no_native_labels",
-    "title": "图内没有 native 文本",
-    "kind": "figure",
-    "item_count": 1,
-    "human_pending": 0,
-    "representative_item_id": "it-8b7a6c5d4e3f2a10",
-    "states": {"pending_evidence": 1},
-    "conclusion": None,
-    "suggestions": [],
-    "strategies": STRATEGY_OPTIONS,
-    "item_ids": ["it-8b7a6c5d4e3f2a10"],
-}
-
-ITEM_HEADER = {
-    "id": "it-3f9c2a4b6d8e0f1a",
-    "code": "table_header_absent",
-    "kind": "table",
-    "severity": "warning",
-    "blocking": False,
-    "asset_id": "table-3-19",
-    "pages": [109],
-    "cluster_id": "cl-0f1e2d3c4b5a",
-    "message": "table_header_absent: table-3-19; only explicit column "
-               "positions are named.",
-    "triage": "deterministic_candidate",
-    "status": "needs_decision",
-    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
-                 "crops": ["tables/table-3-19_p0109.png"],
-                 "native_line_ids": [123], "ocr_evidence": []},
-    "current": {"status": "structured", "row_count": 5, "col_count": 2,
-                "header_rows": []},
-    "candidates": [{
-        "strategy": {"id": "use_first_row_header", "version": 1},
-        "action": {"type": "operation", "name": "set_header_rows",
-                   "params": {"rows": [0]}},
-        "source": "rule",
-        "validator": {"status": "ready", "reasons": []},
-        "evidence_refs": ["asset:table-3-19", "row:0"],
-    }],
-    "parent_candidates": [{
-        "asset_id": "table-p1041-01",
-        "pages": [1041],
-        "col_count": 2,
-        "header_rows": [0],
-        "header_cells": [["Bits", "Variable"]],
-        "header_signature": "bits|variable",
-        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
-                         "cells": ["Bits", "Variable"],
-                         "evidence_hash": "ev-p1041"}],
-        "parent_evidence_hash": "ev-p1041",
-        "header_source": "native",
-    }],
-    "strategies": STRATEGY_OPTIONS,
-    "entry": None,
-    "resolution": None,
-    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
-               "caption": "Table 3-19. RSP_PRE Encodings"},
-    "stale": False,
-}
-
-ITEM_FIGURE = {
-    "id": "it-8b7a6c5d4e3f2a10",
-    "code": "no_native_labels",
-    "kind": "figure",
-    "severity": "warning",
-    "blocking": False,
-    "asset_id": "figure-1-1",
-    "pages": [2],
-    "cluster_id": "cl-9a8b7c6d5e4f",
-    "message": "no_native_labels: figure-1-1; use OCR evidence or keep the "
-               "original figure.",
-    "triage": "needs_ocr",
-    "status": "pending_evidence",
-    "evidence": {"hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
-                 "crops": ["images/fig_1_1.png"], "native_line_ids": [],
-                 "ocr_evidence": []},
-    "current": {"status": "visual_fallback", "row_count": 0, "col_count": 0,
-                "header_rows": []},
-    "candidates": [],
-    "parent_candidates": [],
-    "strategies": STRATEGY_OPTIONS,
-    "entry": None,
-    "resolution": None,
-    "layout": {"cols": 0, "rows_bucket": "0", "page_span": 1,
-               "caption": "Figure 1-1. Widget frame"},
-    "stale": False,
-}
-
-# CP2 W9: a stale ``inherit_header_from`` entry. The stored snapshot keeps the
-# old lower-case parent cells; the parent candidate carries the source original
-# case ("Bits"/"Variable"), so re-confirm changes content and bumps revision
-# (wire §2.7). A hash-only refresh test keeps the cells identical and changes
-# only ``evidence_hash`` (no revision bump).
-STALE_ENTRY = {
-    "entry_id": "e-5a7c8b9d0e1f2a3b",
-    "item_id": "it-5a7c8b9d0e1f2a3b",
-    "status": "confirmed",
-    "stale": True,
-    "stale_reasons": ["evidence_changed", "parent_changed"],
-    "locked": False,
-    "strategy": {"id": "inherit_parent_header", "version": 1},
-    "action": {"type": "operation", "name": "inherit_header_from",
-               "params": {
-                   "parent_asset_id": "table-p1041-01",
-                   "parent_header_rows": [0],
-                   "parent_header_cells": [["bits", "variable"]],
-                   "parent_source_refs": [{"segment": "table-p1041-01",
-                                           "source_row": 0,
-                                           "cells": ["bits", "variable"],
-                                           "evidence_hash": "ev-p1041-old"}],
-                   "parent_header_source": "rule"}},
-    "evidence": {"hash": "5d6e7f8091a2b3c4", "refs": []},
-    "dependencies": [{"parent_asset_id": "table-p1041-01",
-                      "parent_evidence_hash": "ev-p1041-old",
-                      "item_id": None, "correction_hash": None}],
-    "capability_snapshot": {"native_lines": True, "ocr": None, "vlm": None},
-    "source": "user", "revision": 2, "batch_id": None, "notes": None,
-}
-
-ITEM_STALE = {
-    "id": "it-5a7c8b9d0e1f2a3b",
-    "code": "table_header_absent",
-    "kind": "table",
-    "severity": "warning",
-    "blocking": False,
-    "asset_id": "table-4-07",
-    "pages": [204],
-    "cluster_id": "cl-1a2b3c4d5e6f",
-    "message": "table_header_absent: table-4-07; inherited parent evidence "
-               "changed.",
-    "triage": "needs_decision",
-    "status": "stale",
-    "evidence": {"hash": "5d6e7f8091a2b3c4",
-                 "crops": ["tables/table-4-07_p0204.png"],
-                 "native_line_ids": [7], "ocr_evidence": []},
-    "current": {"status": "structured", "row_count": 4, "col_count": 2,
-                "header_rows": []},
-    "candidates": [],
-    "parent_candidates": [{
-        "asset_id": "table-p1041-01",
-        "pages": [1041],
-        "col_count": 2,
-        "header_rows": [0],
-        "header_cells": [["Bits", "Variable"]],
-        "header_signature": "bits|variable",
-        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
-                         "cells": ["Bits", "Variable"],
-                         "evidence_hash": "ev-p1041-new"}],
-        "parent_evidence_hash": "ev-p1041-new",
-        "header_source": "rule",
-    }],
-    "strategies": STRATEGY_OPTIONS,
-    "entry": STALE_ENTRY,
-    "resolution": None,
-    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
-               "caption": "Table 4-07. Inherited header"},
-    "stale": True,
-}
-
-CLUSTER_STALE = {
-    "cluster_id": "cl-1a2b3c4d5e6f",
-    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
-                    "profile": "generic", "operation": "inherit_header_from",
-                    "layout": "table|pages=204", "evidence": "native"},
-    "code": "table_header_absent",
-    "title": "表头缺失（继承父表后父表证据变化）",
-    "kind": "table",
-    "item_count": 1,
-    "human_pending": 1,
-    "representative_item_id": "it-5a7c8b9d0e1f2a3b",
-    "states": {"stale": 1},
-    "conclusion": None,
-    "suggestions": [],
-    "strategies": STRATEGY_OPTIONS,
-    "item_ids": ["it-5a7c8b9d0e1f2a3b"],
-}
-
-DEFAULT_REVIEW = {
-    "peel_id": "peel",
-    "review_schema": 2,
-    "generated_at": "2026-11-05T00:00:00Z",
-    "profile": "generic",
-    # ``converter_code_hash`` is a diagnostic hash of the converter code
-    # (``sha256(canonical converter_hashes)[:16]``). It is NOT
-    # ``normalize.engine_fingerprint()`` and must never drive stale/CAS
-    # decisions (contract v1.3 §2/§13.8; renamed from ``engine_fingerprint``
-    # in CP1.1). The real CXL value is d6ef5d97b7865966.
-    "derived_from": {
-        "uncorrected_identity": "55959d86" + "0" * 56,
-        "converter_code_hash": "d6ef5d97b7865966",
-        "derivation_version": 1,
-    },
-    "capabilities": {"review_schema": 2, "native_lines": True, "ocr": False,
-                     "ocr_detail": None, "vlm": False},
-    "counts": {"raw_items": 3, "items": 3, "clusters": 3, "human_pending": 2,
-               "human_pending_clusters": 2, "pending_evidence": 1,
-               "auto_resolved": 0, "needs_decision": 1, "draft": 0,
-               "confirmed": 0, "applied": 0, "deferred": 0, "failed_check": 1,
-               "stale": 1, "unsupported_items": 0},
-    "triage_counts": {"deterministic_candidate": 1, "needs_decision": 1,
-                      "needs_ocr": 1, "informational": 0, "unsupported": 0},
-    "plan": {"plan_version": 0, "entries": 0, "draft": 0, "confirmed": 0,
-             "locked": 0, "stale": 0},
-    "report": None,
-    "clusters": [CLUSTER_HEADER, CLUSTER_FIGURE, CLUSTER_STALE],
-    "items": [ITEM_HEADER, ITEM_FIGURE, ITEM_STALE],
-}
-
-DEFAULT_PLAN = {
-    "peel_id": "peel",
-    "review_schema": 2,
-    "plan_version": 0,
-    "updated_at": "2026-11-05T00:00:00Z",
-    "entries": [],
-    "entry": None,
-    "resolution": None,
-}
+# The schema-2 review/plan payloads are module-level fixtures (one source
+# of truth shared by the tests and this fake CLI, injected via %%r below).
+DEFAULT_REVIEW = %(default_review)r
+DEFAULT_PLAN = %(default_plan)r
 
 DEFAULT_REPORT = %(default_report)r
 
@@ -2109,6 +1852,10 @@ def main():
             "created_at": "2026-11-09T03:10:00Z",
         }
         state.setdefault("ocr_job_results", {})[job["job_id"]] = summary
+        # The real OCR job re-derives items/report when it finishes; tests can
+        # install the post-refresh review payload to assert the coverage update.
+        if state.get("ocr_review_after_refresh"):
+            state["review"] = copy_json(state["ocr_review_after_refresh"])
         save_state(state)
         return emit({"job_id": job["job_id"], "status": "queued",
                      "result_ref": None})
@@ -2422,6 +2169,468 @@ DEFAULT_REPORT = {
 
 
 
+# --- schema-2 review payloads (the shapes the real peelfeed CLI prints) --
+# Module-level so tests can import them and the fake CLI receives them via
+# %r substitutions (one source of truth).
+
+def copy_json(value):
+    return json.loads(json.dumps(value))
+
+
+# --- schema-2 review payloads (the shapes the real peelfeed CLI prints) ----
+
+STRATEGY_OPTIONS = [
+    {"id": "use_first_row_header", "version": 1, "name": "本表首行作表头",
+     "description": "把本表第 0 行作为表头；文本来自本表 native cells。",
+     "recommended": True, "available": True, "unavailable_reason": None,
+     "capabilities": ["native_lines"], "params_schema": {},
+     "action": {"type": "operation", "name": "set_header_rows"},
+     "min_tier": "R2", "batch_safe": True,
+     "risk": "误把数据行作表头；须过签名阈值和逐表 validator"},
+    {"id": "use_ocr_labels", "version": 1, "name": "OCR 标签",
+     "description": "用按需 OCR 恢复标签（需要 OCR）。",
+     "recommended": False, "available": False,
+     "unavailable_reason": "OCR is not configured",
+     "capabilities": ["ocr"], "params_schema": {},
+     "action": {"type": "operation", "name": "set_asset_labels_from_ocr"},
+     "min_tier": "R2", "batch_safe": False,
+     "risk": "OCR 文本不是 native evidence"},
+]
+
+CLUSTER_HEADER = {
+    "cluster_id": "cl-0f1e2d3c4b5a",
+    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
+                    "profile": "generic", "operation": "set_header_rows",
+                    "layout": "structured|cols=2|rows=6-11|caption=yes|pages=1",
+                    "evidence": "native_lines"},
+    "code": "table_header_absent",
+    "title": "表格缺少表头",
+    "kind": "table",
+    "item_count": 1,
+    "human_pending": 1,
+    "representative_item_id": "it-3f9c2a4b6d8e0f1a",
+    "states": {"needs_decision": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+}
+
+CLUSTER_FIGURE = {
+    "cluster_id": "cl-9a8b7c6d5e4f",
+    "cluster_key": {"code": "no_native_labels", "asset_kind": "figure",
+                    "profile": "generic", "operation": None,
+                    "layout": "figure|pages=2", "evidence": "page_image"},
+    "code": "no_native_labels",
+    "title": "图内没有 native 文本",
+    "kind": "figure",
+    "item_count": 1,
+    "human_pending": 0,
+    "representative_item_id": "it-8b7a6c5d4e3f2a10",
+    "states": {"pending_evidence": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-8b7a6c5d4e3f2a10"],
+}
+
+ITEM_HEADER = {
+    "id": "it-3f9c2a4b6d8e0f1a",
+    "code": "table_header_absent",
+    "kind": "table",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "table-3-19",
+    "pages": [109],
+    "cluster_id": "cl-0f1e2d3c4b5a",
+    "message": "table_header_absent: table-3-19; only explicit column "
+               "positions are named.",
+    "triage": "deterministic_candidate",
+    "status": "needs_decision",
+    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                 "crops": ["tables/table-3-19_p0109.png"],
+                 "native_line_ids": [123], "ocr_evidence": []},
+    "current": {"status": "structured", "row_count": 5, "col_count": 2,
+                "header_rows": []},
+    "candidates": [{
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "action": {"type": "operation", "name": "set_header_rows",
+                   "params": {"rows": [0]}},
+        "source": "rule",
+        "validator": {"status": "ready", "reasons": []},
+        "evidence_refs": ["asset:table-3-19", "row:0"],
+    }],
+    "parent_candidates": [{
+        "asset_id": "table-p1041-01",
+        "pages": [1041],
+        "col_count": 2,
+        "header_rows": [0],
+        "header_cells": [["Bits", "Variable"]],
+        "header_signature": "bits|variable",
+        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
+                         "cells": ["Bits", "Variable"],
+                         "evidence_hash": "ev-p1041"}],
+        "parent_evidence_hash": "ev-p1041",
+        "header_source": "native",
+    }],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": None,
+    "resolution": None,
+    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
+               "caption": "Table 3-19. RSP_PRE Encodings"},
+    "stale": False,
+}
+
+ITEM_FIGURE = {
+    "id": "it-8b7a6c5d4e3f2a10",
+    "code": "no_native_labels",
+    "kind": "figure",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "figure-1-1",
+    "pages": [2],
+    "cluster_id": "cl-9a8b7c6d5e4f",
+    "message": "no_native_labels: figure-1-1; use OCR evidence or keep the "
+               "original figure.",
+    "triage": "needs_ocr",
+    "status": "pending_evidence",
+    "evidence": {"hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+                 "crops": ["images/fig_1_1.png"], "native_line_ids": [],
+                 "ocr_evidence": []},
+    "current": {"status": "visual_fallback", "row_count": 0, "col_count": 0,
+                "header_rows": []},
+    "candidates": [],
+    "parent_candidates": [],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": None,
+    "resolution": None,
+    "layout": {"cols": 0, "rows_bucket": "0", "page_span": 1,
+               "caption": "Figure 1-1. Widget frame"},
+    "stale": False,
+}
+
+# CP2 W9: a stale ``inherit_header_from`` entry. The stored snapshot keeps the
+# old lower-case parent cells; the parent candidate carries the source original
+# case ("Bits"/"Variable"), so re-confirm changes content and bumps revision
+# (wire §2.7). A hash-only refresh test keeps the cells identical and changes
+# only ``evidence_hash`` (no revision bump).
+STALE_ENTRY = {
+    "entry_id": "e-5a7c8b9d0e1f2a3b",
+    "item_id": "it-5a7c8b9d0e1f2a3b",
+    "status": "confirmed",
+    "stale": True,
+    "stale_reasons": ["evidence_changed", "parent_changed"],
+    "locked": False,
+    "strategy": {"id": "inherit_parent_header", "version": 1},
+    "action": {"type": "operation", "name": "inherit_header_from",
+               "params": {
+                   "parent_asset_id": "table-p1041-01",
+                   "parent_header_rows": [0],
+                   "parent_header_cells": [["bits", "variable"]],
+                   "parent_source_refs": [{"segment": "table-p1041-01",
+                                           "source_row": 0,
+                                           "cells": ["bits", "variable"],
+                                           "evidence_hash": "ev-p1041-old"}],
+                   "parent_header_source": "rule"}},
+    "evidence": {"hash": "5d6e7f8091a2b3c4", "refs": []},
+    "dependencies": [{"parent_asset_id": "table-p1041-01",
+                      "parent_evidence_hash": "ev-p1041-old",
+                      "item_id": None, "correction_hash": None}],
+    "capability_snapshot": {"native_lines": True, "ocr": None, "vlm": None},
+    "source": "user", "revision": 2, "batch_id": None, "notes": None,
+}
+
+ITEM_STALE = {
+    "id": "it-5a7c8b9d0e1f2a3b",
+    "code": "table_header_absent",
+    "kind": "table",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "table-4-07",
+    "pages": [204],
+    "cluster_id": "cl-1a2b3c4d5e6f",
+    "message": "table_header_absent: table-4-07; inherited parent evidence "
+               "changed.",
+    "triage": "needs_decision",
+    "status": "stale",
+    "evidence": {"hash": "5d6e7f8091a2b3c4",
+                 "crops": ["tables/table-4-07_p0204.png"],
+                 "native_line_ids": [7], "ocr_evidence": []},
+    "current": {"status": "structured", "row_count": 4, "col_count": 2,
+                "header_rows": []},
+    "candidates": [],
+    "parent_candidates": [{
+        "asset_id": "table-p1041-01",
+        "pages": [1041],
+        "col_count": 2,
+        "header_rows": [0],
+        "header_cells": [["Bits", "Variable"]],
+        "header_signature": "bits|variable",
+        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
+                         "cells": ["Bits", "Variable"],
+                         "evidence_hash": "ev-p1041-new"}],
+        "parent_evidence_hash": "ev-p1041-new",
+        "header_source": "rule",
+    }],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": STALE_ENTRY,
+    "resolution": None,
+    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
+               "caption": "Table 4-07. Inherited header"},
+    "stale": True,
+}
+
+CLUSTER_STALE = {
+    "cluster_id": "cl-1a2b3c4d5e6f",
+    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
+                    "profile": "generic", "operation": "inherit_header_from",
+                    "layout": "table|pages=204", "evidence": "native"},
+    "code": "table_header_absent",
+    "title": "表头缺失（继承父表后父表证据变化）",
+    "kind": "table",
+    "item_count": 1,
+    "human_pending": 1,
+    "representative_item_id": "it-5a7c8b9d0e1f2a3b",
+    "states": {"stale": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-5a7c8b9d0e1f2a3b"],
+}
+
+DEFAULT_REVIEW = {
+    "peel_id": "peel",
+    "review_schema": 2,
+    "generated_at": "2026-11-05T00:00:00Z",
+    "profile": "generic",
+    # ``converter_code_hash`` is a diagnostic hash of the converter code
+    # (``sha256(canonical converter_hashes)[:16]``). It is NOT
+    # ``normalize.engine_fingerprint()`` and must never drive stale/CAS
+    # decisions (contract v1.3 §2/§13.8; renamed from ``engine_fingerprint``
+    # in CP1.1). The real CXL value is d6ef5d97b7865966.
+    "derived_from": {
+        "uncorrected_identity": "55959d86" + "0" * 56,
+        "converter_code_hash": "d6ef5d97b7865966",
+        "derivation_version": 1,
+    },
+    "capabilities": {"review_schema": 2, "native_lines": True, "ocr": False,
+                     "ocr_detail": None, "vlm": False},
+    "counts": {"raw_items": 3, "items": 3, "clusters": 3, "human_pending": 2,
+               "human_pending_clusters": 2, "pending_evidence": 1,
+               "auto_resolved": 0, "needs_decision": 1, "draft": 0,
+               "confirmed": 0, "applied": 0, "deferred": 0, "failed_check": 1,
+               "stale": 1, "unsupported_items": 0},
+    "triage_counts": {"deterministic_candidate": 1, "needs_decision": 1,
+                      "needs_ocr": 1, "informational": 0, "unsupported": 0},
+    "plan": {"plan_version": 0, "entries": 0, "draft": 0, "confirmed": 0,
+             "locked": 0, "stale": 0},
+    "report": None,
+    "clusters": [CLUSTER_HEADER, CLUSTER_FIGURE, CLUSTER_STALE],
+    "items": [ITEM_HEADER, ITEM_FIGURE, ITEM_STALE],
+}
+
+DEFAULT_PLAN = {
+    "peel_id": "peel",
+    "review_schema": 2,
+    "plan_version": 0,
+    "updated_at": "2026-11-05T00:00:00Z",
+    "entries": [],
+    "entry": None,
+    "resolution": None,
+}
+
+
+# --- M2.1 CP4: OCR review payload fixtures (wire §2.8, plan §5.3/§5.5) ------
+# ``review.capabilities`` additive OCR keys for a configured / unconfigured
+# provider (env-only ``PEELFEED_OCR_*`` resolved by peelfeed), the frozen
+# ``payload.ocr`` coverage summary, and the per-item ``evidence.ocr_evidence``
+# entries. The additive ``labels`` list is what the Review UI renders inline;
+# the evidence file itself keeps the frozen §11.8 shape.
+
+REVIEW_CAPABILITIES_OCR = {
+    "review_schema": 2, "native_lines": True,
+    "ocr": True, "ocr_configured": True, "ocr_detail": None,
+    "ocr_engine": "rapidocr@1.4.4", "ocr_min_confidence": 0.6,
+    "ocr_status": {"available": True, "checked_at": "2026-11-09T03:10:00Z",
+                   "error": None},
+    "vlm": False, "vlm_detail": "VLM 报告未实现（M2.2）",
+}
+REVIEW_CAPABILITIES_NO_OCR = {
+    "review_schema": 2, "native_lines": True,
+    "ocr": False, "ocr_configured": False,
+    "ocr_detail": "OCR 未配置：设置 PEELFEED_OCR_PROVIDER/ENGINE",
+    "ocr_engine": None, "ocr_min_confidence": None,
+    "ocr_status": {"available": False, "checked_at": None, "error": None},
+    "vlm": False, "vlm_detail": "VLM 报告未实现（M2.2）",
+}
+OCR_COVERAGE_COVERED = {
+    "items": 1, "with_evidence": 1, "empty": 0, "low_confidence": 0,
+    "uncovered": 0, "invalid_evidence": 0, "evidence_files": 1,
+    "engine": "rapidocr@1.4.4", "min_confidence": 0.6,
+}
+OCR_COVERAGE_UNCOVERED = dict(OCR_COVERAGE_COVERED, with_evidence=0,
+                              uncovered=1, evidence_files=0)
+OCR_COVERAGE_LOW = dict(OCR_COVERAGE_COVERED, low_confidence=1)
+OCR_COVERAGE_EMPTY = dict(OCR_COVERAGE_COVERED, empty=1)
+# The R0 resolution strategies stay selectable when OCR is unavailable.
+RESOLUTION_STRATEGY_OPTIONS = [{
+    "id": "keep_original_figure", "version": 1, "name": "保留原始图",
+    "description": "不改变 corpus，保留原始图与视觉回退。",
+    "recommended": True, "available": True, "unavailable_reason": None,
+    "capabilities": [], "params_schema": {},
+    "action": {"type": "resolution", "name": "keep_original_figure"},
+    "min_tier": "R0", "batch_safe": False,
+    "risk": "图内文字不会进入检索",
+}]
+
+
+def ocr_strategy_options(*, available=True, reason=None, extra=None):
+    """``item.strategies`` with ``use_ocr_labels`` available/grayed with reason."""
+    options = copy_json(STRATEGY_OPTIONS)
+    for option in options:
+        if option["id"] == "use_ocr_labels":
+            option["available"] = bool(available)
+            option["unavailable_reason"] = reason
+            option["recommended"] = bool(available)
+    if extra:
+        options.extend(copy_json(extra))
+    return options
+
+
+def ocr_evidence(*, labels=None, engine="rapidocr@1.4.4",
+                 asset_id="figure-1-1", crop_ref="images/fig_1_1.png",
+                 image_sha256="ab" * 32, created_at="2026-11-09T03:10:00Z"):
+    """One ``evidence.ocr_evidence`` entry (plan §3.2) incl. display labels."""
+    labels = copy_json(labels or [])
+    digest = hashlib.sha256(
+        json.dumps(labels, sort_keys=True).encode()).hexdigest()
+    confidences = [float(label.get("confidence") or 0) for label in labels]
+    return {
+        "path": "extract/ocr/%s/%s-%s.json"
+                % (asset_id, image_sha256[:16], engine),
+        "crop_ref": crop_ref,
+        "image_sha256": image_sha256,
+        "engine": engine,
+        "params_sha256": "0123456789abcdef",
+        "evidence_sha256": digest,
+        "label_count": len(labels),
+        "max_confidence": max(confidences) if confidences else None,
+        "min_confidence": min(confidences) if confidences else None,
+        "created_at": created_at,
+        "labels": labels,
+    }
+
+
+OCR_EVIDENCE = ocr_evidence(labels=[
+    {"text": "Compute Express Link", "bbox": [4, 6, 210, 30],
+     "confidence": 0.99},
+    {"text": "CXL 3.1", "bbox": [4, 40, 96, 64], "confidence": 0.96},
+    {"text": "Figure 1-1", "bbox": [4, 72, 140, 96], "confidence": 0.94},
+])
+OCR_EVIDENCE_LOW = ocr_evidence(labels=[
+    {"text": "模糊的图注文字", "bbox": [4, 6, 120, 26], "confidence": 0.55},
+    {"text": "低置信标签", "bbox": [4, 32, 96, 52], "confidence": 0.42},
+])
+OCR_EVIDENCE_EMPTY = ocr_evidence(labels=[])
+
+
+def ocr_figure_item(*, evidence=None, strategies=None, status=None,
+                    candidates=None):
+    """The ``no_native_labels`` figure item with (or without) OCR evidence."""
+    item = copy_json(ITEM_FIGURE)
+    if evidence is not None:
+        item["evidence"]["ocr_evidence"] = [copy_json(evidence)]
+        item["evidence"]["hash"] = hashlib.sha256(json.dumps(
+            item["evidence"], sort_keys=True).encode()).hexdigest()
+    item["status"] = status or ("needs_decision" if evidence is not None
+                                else "pending_evidence")
+    item["strategies"] = (strategies if strategies is not None
+                          else ocr_strategy_options(available=evidence
+                                                    is not None))
+    if candidates is not None:
+        item["candidates"] = copy_json(candidates)
+    elif evidence is not None and (evidence.get("labels") or []):
+        item["candidates"] = [{
+            "strategy": {"id": "use_ocr_labels", "version": 1},
+            "action": {"type": "operation",
+                       "name": "set_asset_labels_from_ocr",
+                       "params": {"labels": copy_json(evidence["labels"])}},
+            "source": "rule",
+            "validator": {"status": "ready", "reasons": []},
+            "evidence_refs": ["asset:figure-1-1",
+                              "ocr:" + evidence["evidence_sha256"]],
+        }]
+    return item
+
+
+def ocr_figure_cluster(item):
+    """The ``no_native_labels`` cluster matching :func:`ocr_figure_item`."""
+    cluster = copy_json(CLUSTER_FIGURE)
+    cluster["strategies"] = copy_json(item.get("strategies")
+                                      or ocr_strategy_options())
+    cluster["item_ids"] = [item["id"]]
+    cluster["representative_item_id"] = item["id"]
+    cluster["states"] = {item.get("status") or "pending_evidence": 1}
+    cluster["suggestions"] = []
+    return cluster
+
+
+def review_ocr_payload(*, capabilities=None, coverage=None, figure_item=None,
+                       report=None, items=None, clusters=None):
+    """A schema-2 review payload with the M2.1 additive OCR keys.
+
+    Defaults to the covered case (OCR configured, one figure item with one
+    evidence file); pass ``coverage``/``figure_item`` for the uncovered,
+    low-confidence or empty variants and ``capabilities`` for no-OCR.
+    """
+    review = copy_json(DEFAULT_REVIEW)
+    review["capabilities"] = copy_json(capabilities or REVIEW_CAPABILITIES_OCR)
+    review["ocr"] = copy_json(coverage or OCR_COVERAGE_COVERED)
+    if figure_item is not None:
+        review["items"] = [copy_json(ITEM_HEADER),
+                           copy_json(figure_item), copy_json(ITEM_STALE)]
+        review["clusters"] = [copy_json(CLUSTER_HEADER),
+                              ocr_figure_cluster(figure_item),
+                              copy_json(CLUSTER_STALE)]
+    if report is not None:
+        review["report"] = copy_json(report)
+    if items is not None:
+        review["items"] = copy_json(items)
+    if clusters is not None:
+        review["clusters"] = copy_json(clusters)
+    return review
+
+
+REVIEW_OCR = review_ocr_payload(figure_item=ocr_figure_item(
+    evidence=OCR_EVIDENCE))
+REVIEW_OCR_UNCOVERED = review_ocr_payload(
+    coverage=OCR_COVERAGE_UNCOVERED,
+    figure_item=ocr_figure_item(
+        strategies=ocr_strategy_options(
+            available=False, reason="需要先运行局部 OCR")))
+REVIEW_OCR_LOW_CONFIDENCE = review_ocr_payload(
+    coverage=OCR_COVERAGE_LOW,
+    figure_item=ocr_figure_item(
+        evidence=OCR_EVIDENCE_LOW, status="needs_decision",
+        strategies=ocr_strategy_options(available=True)))
+REVIEW_OCR_EMPTY = review_ocr_payload(
+    coverage=OCR_COVERAGE_EMPTY,
+    figure_item=ocr_figure_item(
+        evidence=OCR_EVIDENCE_EMPTY, status="pending_evidence",
+        strategies=ocr_strategy_options(
+            available=False, reason="OCR 结果为空")))
+REVIEW_OCR_UNAVAILABLE = review_ocr_payload(
+    capabilities=REVIEW_CAPABILITIES_NO_OCR,
+    coverage=dict(OCR_COVERAGE_UNCOVERED, engine=None,
+                  min_confidence=None),
+    figure_item=ocr_figure_item(
+        strategies=ocr_strategy_options(
+            available=False, reason="缺少能力：局部 OCR（M2.1）",
+            extra=RESOLUTION_STRATEGY_OPTIONS)))
+
+
+
+
 
 class FakePeelfeedCli:
     """A fake ``peelfeed`` executable for tests (no daemon, no HTTP).
@@ -2448,6 +2657,8 @@ class FakePeelfeedCli:
             "state": str(self.state_path),
             "log": str(self.log_path),
             "default_report": DEFAULT_REPORT,
+            "default_review": DEFAULT_REVIEW,
+            "default_plan": DEFAULT_PLAN,
         }
         self.path.write_text(script, encoding="utf-8")
         self.path.chmod(0o755)
