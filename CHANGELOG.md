@@ -36,6 +36,31 @@ version/tag policy.
   `corrections_conflict` becomes a valid extraction state. Run `peekseed migrate`
   (dry-run by default) or `peekseed migrate --apply`.
 
+### Added — review build/publish (M2 CP3)
+
+- New review routes: `POST …/review/reports` (202 job), `POST …/review/batches`
+  (202 job + batch), `GET …/review/batches/{id}`, `POST
+  …/review/batches/{id}/publish|discard`, `POST …/review/rollback` (202 job),
+  `GET …/review/jobs/{id}`. Persisted job ids are stored in each source's
+  `extraction.review_jobs` for restart re-attachment (never rerun
+  automatically); report generation moved from a synchronous call to the job
+  flow.
+- Review UI: candidate estimate, build status, gates and actual diff, publish /
+  discard, published-batch list with rollback, persistent job status (interrupted
+  shows an explicit manual retry and never auto-reruns), `corrections_conflict`
+  banners with the conflicting corrections/source batches, and an explicit
+  `review_schema` mismatch message. Batch-bound plan entries are read-only while
+  building/publishing.
+- Index builds hold a shared reader lease on the resolved immutable build
+  snapshot and re-check `extract/corpus` before flipping the generation; peelfeed
+  cannot delete a build with an active reader. Publishing a new conversion (or a
+  system rebuild) refreshes every dataset that references the peel; only a
+  changed conversion makes existing indexes stale, a chunk-set-only publish does
+  not.
+- `extraction.corrections_conflict` (additive detail) and a poll-race fix: a late
+  request-path refresh can no longer downgrade a terminal extraction state, and a
+  GET refresh persists an already-terminal CLI result.
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:
