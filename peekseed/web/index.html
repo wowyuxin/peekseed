@@ -1326,6 +1326,51 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .ds-conflict button{padding:3px 8px;font-size:10px;min-height:23px;border-radius:6px;}
 .ds-src-reason{flex:1 1 100%;font-size:10px;color:var(--bad);line-height:1.5;
   overflow-wrap:anywhere;}
+/* ---- CP4 (M2.1): on-demand OCR bar, evidence and read-only config -------
+   OCR configuration is env-only (PEELFEED_OCR_*) in M2.1: the bar shows the
+   effective capability/coverage from the review payload, a [检查 OCR] probe and
+   a read-only config dialog; the browser never writes config or secrets. */
+.rr-ocr{display:flex;flex-direction:column;gap:5px;padding:8px 11px;margin:0 0 10px;
+  border:1px solid var(--line);border-radius:11px;background:var(--panel-2);min-width:0;}
+.rr-ocr-h{display:flex;flex-wrap:wrap;gap:5px 10px;align-items:center;min-width:0;}
+.rr-ocr-h button{padding:3px 9px;font-size:10.5px;min-height:24px;border-radius:6px;}
+.rr-ocr-chip{display:inline-flex;align-items:center;font:9.5px var(--mono);line-height:1.7;
+  border:1px solid var(--line);border-radius:5px;padding:0 6px;white-space:nowrap;
+  color:var(--muted);}
+.rr-ocr-chip.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.rr-ocr-chip.warn{color:var(--warn);border-color:rgba(251,191,36,.35);
+  background:var(--warn-soft);}
+.rr-ocr-chip.bad{color:var(--bad);border-color:rgba(251,113,133,.35);
+  background:var(--bad-soft);}
+.rr-ocr-cov{font:10px var(--mono);color:var(--faint);line-height:1.5;
+  overflow-wrap:anywhere;}
+.rr-ocr-detail{font-size:10.5px;color:var(--muted);line-height:1.5;
+  overflow-wrap:anywhere;}
+.rr-ocr-detail:empty{display:none;}
+.rr-ocr-ev{display:flex;flex-direction:column;gap:4px;border-top:1px dashed
+  var(--line-soft);padding-top:5px;min-width:0;}
+.rr-ocr-ev h5{margin:0;font-size:9.5px;text-transform:uppercase;letter-spacing:.06em;
+  color:var(--faint);}
+.rr-ocr-ev-row{display:flex;flex-direction:column;gap:3px;min-width:0;}
+.rr-ocr-ev-h{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;
+  font:9.5px var(--mono);color:var(--faint);line-height:1.5;overflow-wrap:anywhere;}
+.rr-ocr-ev-h a{color:var(--accent);}
+.rr-ocr-labels{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;
+  gap:1px;}
+.rr-ocr-labels li{display:flex;flex-wrap:wrap;gap:3px 8px;align-items:baseline;
+  font-size:10.5px;color:var(--muted);line-height:1.5;overflow-wrap:anywhere;}
+.rr-ocr-label-text{color:var(--text);overflow-wrap:anywhere;}
+.rr-ocr-conf{font:9.5px var(--mono);color:var(--faint);}
+.rr-ocr-row{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;min-width:0;}
+.rr-ocr-config-list{margin:0 0 10px;padding:0;list-style:none;display:flex;
+  flex-direction:column;gap:4px;font-size:11px;line-height:1.55;color:var(--muted);
+  overflow-wrap:anywhere;}
+.rr-ocr-config-list li{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;}
+.rr-ocr-config-list code{font:10px var(--mono);color:var(--text);overflow-wrap:anywhere;}
+.rr-ocr-config-note{font-size:10.5px;line-height:1.6;color:var(--faint);
+  overflow-wrap:anywhere;margin:0 0 8px;}
+.rr-ocr-env{margin:0;padding-left:16px;font:10px var(--mono);color:var(--muted);
+  line-height:1.6;overflow-wrap:anywhere;}
 @media (max-width:860px){
   .rr-grid{grid-template-columns:1fr;}
   .rr-clusters{max-height:32vh;}
@@ -1782,6 +1827,11 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
          batch section: build the batch's candidate, watch the persisted job,
          review estimate/gates/diff, then publish/discard/rollback. -->
     <div class="rr-conflict" id="reviewConflict" hidden></div>
+    <!-- CP4 (M2.1): on-demand OCR bar above the batch section. Status chip and
+         coverage come from GET …/review (capabilities + payload.ocr); the
+         [检查 OCR] probe and the read-only config dialog never write config:
+         M2.1 OCR is configured only by the deploy env PEELFEED_OCR_*. -->
+    <div class="rr-ocr" id="reviewOcr"><span class="hist-empty">正在读取 OCR 能力…</span></div>
     <div class="rr-batch" id="reviewBatch"><span class="hist-empty">正在读取候选批次与后台任务…</span></div>
     <div class="hist-body settings-body">
       <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
@@ -1820,6 +1870,41 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
         <div class="rr-batch-row">
           <button type="button" id="reviewRollbackConfirmBtn">确认回滚并发布</button>
           <button type="button" class="secondary" id="reviewRollbackCancelBtn">取消</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- CP4 (M2.1): read-only OCR config detail. M2.1 config is env-only
+       (PEELFEED_OCR_* resolved by peelfeed), so this dialog lists the effective
+       provider/engine/params/timeout/min_confidence and the env names; there is
+       no input and nothing is ever written from the browser. -->
+  <div class="hist-overlay rr-confirm-overlay" id="reviewOcrConfig" hidden>
+    <div class="hist-dialog rr-confirm" role="dialog" aria-modal="true"
+         aria-label="OCR 配置说明（只读）">
+      <div class="hist-head">
+        <div>
+          <h2>OCR 配置说明（只读）</h2>
+          <p>M2.1 的 OCR 配置只来自部署环境变量，本页只显示当前生效值；
+          不会从浏览器写入任何配置或密钥。</p>
+        </div>
+        <button class="hist-close" id="reviewOcrConfigClose" type="button"
+                aria-label="Close">&#215;</button>
+      </div>
+      <div class="hist-body settings-body">
+        <p class="rr-ocr-config-note">修改 OCR 配置需要编辑部署环境
+        （deploy env，例如 peekseed.env）中的 PEELFEED_OCR_* 变量并重启
+        peelfeed/peekseed；UI 不提供可写配置。</p>
+        <ul class="rr-ocr-config-list" id="reviewOcrConfigList"></ul>
+        <p class="rr-ocr-config-note">环境变量名：</p>
+        <ul class="rr-ocr-env">
+          <li>PEELFEED_OCR_PROVIDER（provider 命令，必填）</li>
+          <li>PEELFEED_OCR_ENGINE（&lt;name&gt;@&lt;version&gt;，必填）</li>
+          <li>PEELFEED_OCR_PARAMS（JSON 对象，可选）</li>
+          <li>PEELFEED_OCR_TIMEOUT（秒，可选，默认 30）</li>
+          <li>PEELFEED_OCR_MIN_CONFIDENCE（0..1，可选，默认 0.6）</li>
+        </ul>
+        <div class="rr-batch-row">
+          <button type="button" id="reviewOcrConfigOk" class="secondary">关闭</button>
         </div>
       </div>
     </div>
@@ -5132,6 +5217,426 @@ function reviewReindexText(reindex){
   }
   return '无需重建索引（conversion 未变，已有索引仍有效）';
 }
+/* ---- CP4 (M2.1): on-demand OCR ------------------------------------------
+   peelfeed owns OCR: the review payload carries capabilities.ocr/ocr_engine/
+   ocr_min_confidence/ocr_status and payload.ocr (coverage), items carry
+   evidence.ocr_evidence. peekseed only proxies: POST …/review/ocr/check probes
+   the provider, POST …/review/ocr/refresh creates one persistent type=ocr job
+   (polled like report/build jobs, never auto-rerun). OCR configuration is
+   env-only in M2.1 (PEELFEED_OCR_*), so the config dialog is read-only.
+   Stable peelfeed OCR reason codes keep the wire spelling in payloads; every
+   Chinese label lives here (unknown codes fall back to the raw text). */
+const REVIEW_OCR_REASON_LABEL={ocr_unavailable:'OCR 未配置或不可用',
+  ocr_config_invalid:'OCR 配置无效', ocr_evidence_missing:'需要先运行局部 OCR',
+  ocr_labels_empty:'OCR 结果为空', ocr_low_confidence:'OCR 置信度低',
+  not_ready:'尚无当前构建', ocr_timeout:'OCR 超时',
+  ocr_bad_output:'OCR 输出无效', ocr_engine_mismatch:'OCR 引擎不匹配'};
+const REVIEW_OCR_ENV_NAMES=['PEELFEED_OCR_PROVIDER','PEELFEED_OCR_ENGINE',
+  'PEELFEED_OCR_PARAMS','PEELFEED_OCR_TIMEOUT','PEELFEED_OCR_MIN_CONFIDENCE'];
+/* The auto-create requirement ("为 no_native_labels 自动创建 OCR 任务") runs
+   once per source on the first review open: if capabilities.ocr is available,
+   payload.ocr.uncovered > 0 and no type=ocr descriptor exists, the UI creates
+   ONE refresh job for the uncovered no_native_labels items. A failed or
+   interrupted job is never auto-retried (the descriptor stays; only the explicit
+   手动重试 / 为选中项重新获取证据 actions create a new job). */
+const REVIEW_OCR_AUTO_TRIED={};
+function reviewOcrReasonLabel(code){
+  return REVIEW_OCR_REASON_LABEL[code]||code||'';
+}
+function reviewOcrCapabilities(){
+  const data=REVIEW_CTX&&REVIEW_CTX.data;
+  const caps=(data&&data.capabilities)||{};
+  return (caps&&typeof caps==='object')?caps:{};
+}
+function reviewOcrCoverage(){
+  const data=REVIEW_CTX&&REVIEW_CTX.data;
+  const cov=(data&&data.ocr)||null;
+  return (cov&&typeof cov==='object')?cov:null;
+}
+/* OCR is usable when configured and the last check did not fail. A stale
+   status (available=false) drives the gray-out like a missing capability. */
+function reviewOcrUsable(caps){
+  caps=caps||reviewOcrCapabilities();
+  if(!caps.ocr) return false;
+  const status=(caps.ocr_status&&typeof caps.ocr_status==='object')
+    ?caps.ocr_status:null;
+  if(status&&status.available===false) return false;
+  return true;
+}
+function reviewOcrStatusText(caps){
+  caps=caps||reviewOcrCapabilities();
+  const engine=String(caps.ocr_engine||'');
+  const status=(caps.ocr_status&&typeof caps.ocr_status==='object')
+    ?caps.ocr_status:null;
+  if(!caps.ocr){
+    /* Unconfigured OCR: a failed check carries an error detail -> 不可用; the
+       plain payload keeps the gray-out message. */
+    const error=(status&&status.error&&typeof status.error==='object')
+      ?status.error:null;
+    if(error){
+      return {cls:'bad',text:'OCR 不可用：'
+        +String(error.message||error.code||caps.ocr_detail||'未知错误')};
+    }
+    return {cls:'warn',text:'OCR 未配置（相关策略置灰）'};
+  }
+  if(status&&status.available===false){
+    const error=(status.error&&typeof status.error==='object')?status.error:null;
+    const detail=String((error&&(error.message||error.code))
+      ||caps.ocr_detail||'未知错误');
+    return {cls:'bad',text:'OCR 不可用：'+detail};
+  }
+  return {cls:'ok',text:'OCR 已配置'+(engine?(' · '+engine):'')};
+}
+function reviewOcrCoverageText(cov){
+  if(!cov||typeof cov!=='object') return 'OCR 覆盖信息不可用';
+  const engine=String(cov.engine||'');
+  const min=(cov.min_confidence!=null)?String(cov.min_confidence):'';
+  return 'OCR 覆盖 '+reviewNum(cov.with_evidence||0)+'/'
+    +reviewNum(cov.items||0)+' · 未覆盖 '+reviewNum(cov.uncovered||0)
+    +' · 低置信 '+reviewNum(cov.low_confidence||0)
+    +' · 空 '+reviewNum(cov.empty||0)
+    +(Number(cov.invalid_evidence||0)
+      ?' · 无效证据 '+reviewNum(cov.invalid_evidence):'')
+    +' · 证据文件 '+reviewNum(cov.evidence_files||0)
+    +(engine?(' · '+engine):'')
+    +(min?(' · 阈值 '+min):'');
+}
+function reviewOcrBarHtml(){
+  const ctx=REVIEW_CTX;
+  if(!ctx||!ctx.data){
+    return '<span class="hist-empty">正在读取 OCR 能力…</span>';
+  }
+  const caps=reviewOcrCapabilities();
+  const status=reviewOcrStatusText(caps);
+  const cov=reviewOcrCoverage();
+  const busy=!!(ctx.ocrBusy||ctx.busy);
+  return '<div class="rr-ocr-h">'
+    +'<span class="rr-ocr-chip '+status.cls+'">'+esc(status.text)+'</span>'
+    +'<button type="button" class="secondary" data-r="ocr-check"'
+    +(busy?' disabled':'')+'>检查 OCR</button>'
+    +'<button type="button" class="secondary" data-r="ocr-config"'
+    +'>OCR 配置说明</button>'
+    +'<span class="rr-ocr-cov">'+esc(reviewOcrCoverageText(cov))+'</span>'
+    +'</div>'
+    +'<div class="rr-ocr-detail" id="reviewOcrResult">'
+    +esc(ctx.ocrCheckText||'')+'</div>';
+}
+function paintReviewOcr(){
+  const el=$('#reviewOcr'); if(!el) return;
+  el.innerHTML=reviewOcrBarHtml();
+}
+/* The gray-out reason of an unavailable strategy: peelfeed's stable OCR codes
+   are mapped to Chinese; older/partial payloads fall back to the raw text, and
+   the OCR strategy gets an item/capability-derived reason when none is sent. */
+function reviewStrategyUnavailableText(strategy,item){
+  const raw=String((strategy&&strategy.unavailable_reason)||'');
+  if(raw&&REVIEW_OCR_REASON_LABEL[raw]) return REVIEW_OCR_REASON_LABEL[raw];
+  if(raw) return raw;
+  if(strategy&&strategy.id==='use_ocr_labels'){
+    const caps=reviewOcrCapabilities();
+    if(!caps.ocr) return 'OCR 未配置（相关策略置灰）';
+    const entries=(((item&&item.evidence)||{}).ocr_evidence||[])
+      .filter(function(entry){ return entry&&typeof entry==='object'; });
+    if(!entries.length) return '需要先运行局部 OCR';
+    if(entries.every(function(entry){
+      return !(((entry.labels)||[]).length);
+    })) return 'OCR 结果为空';
+    return 'OCR 置信度低，需人工确认';
+  }
+  return '';
+}
+function reviewOcrConfigHtml(){
+  const caps=reviewOcrCapabilities();
+  const global=(PF_STATUS&&PF_STATUS.handshake&&PF_STATUS.handshake.ocr
+    &&typeof PF_STATUS.handshake.ocr==='object')?PF_STATUS.handshake.ocr:{};
+  const status=(caps.ocr_status&&typeof caps.ocr_status==='object')
+    ?caps.ocr_status:null;
+  const rows=[
+    ['provider', String(global.provider||'（未配置）')],
+    ['engine', String(caps.ocr_engine||global.engine||'（未配置）')],
+    ['params', (global.params!=null)?reviewJsonBits(global.params):'—'],
+    ['timeout_seconds', (global.timeout_seconds!=null)
+      ?String(global.timeout_seconds):'—'],
+    ['min_confidence', (caps.ocr_min_confidence!=null)
+      ?String(caps.ocr_min_confidence)
+      :((global.min_confidence!=null)?String(global.min_confidence):'—')],
+    ['ocr_status', !status?'未知'
+      :(status.available?'可用':'不可用')
+        +(status.checked_at?(' · 检查于 '+String(status.checked_at)):'')],
+  ];
+  return rows.map(function(row){
+    return '<li><span>'+esc(row[0])+'</span><code>'+esc(row[1])+'</code></li>';
+  }).join('');
+}
+function reviewOcrConfigOpen(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const dialog=$('#reviewOcrConfig'); if(!dialog) return;
+  const list=$('#reviewOcrConfigList');
+  if(list) list.innerHTML=reviewOcrConfigHtml();
+  dialog.hidden=false;
+  const ok=$('#reviewOcrConfigOk'); if(ok) ok.focus();
+}
+function reviewOcrConfigClose(){
+  const dialog=$('#reviewOcrConfig'); if(dialog) dialog.hidden=true;
+}
+/* Per-item OCR evidence: engine/counts/created_at + evidence-file link + the
+   label list (text + confidence) with a low-confidence badge when the newest
+   evidence's max_confidence is below capabilities.ocr_min_confidence. An empty
+   label list is valid OCR output and shows "OCR 未识别到文字". */
+function reviewOcrEvidenceHtml(item){
+  const ev=(item&&item.evidence)||{};
+  const entries=(ev.ocr_evidence||[]).filter(function(entry){
+    return entry&&typeof entry==='object'; });
+  if(!entries.length) return '';
+  const caps=reviewOcrCapabilities();
+  const threshold=Number(caps.ocr_min_confidence||0);
+  return '<div class="rr-ocr-ev"><h5>OCR 证据</h5>'+entries.map(function(entry){
+    const labels=(entry.labels||[]).filter(function(label){
+      return label&&label.text; });
+    const maxConf=(entry.max_confidence!=null)
+      ?Number(entry.max_confidence):null;
+    const minConf=(entry.min_confidence!=null)
+      ?Number(entry.min_confidence):null;
+    const low=(maxConf!=null&&threshold>0&&maxConf<threshold);
+    const meta=['引擎 '+(entry.engine||'?'),
+      '标签 '+reviewNum(entry.label_count!=null
+        ?entry.label_count:labels.length),
+      maxConf!=null?('最高置信 '+maxConf.toFixed(2)):'',
+      minConf!=null?('最低置信 '+minConf.toFixed(2)):'',
+      entry.created_at?('生成于 '+String(entry.created_at)):'']
+      .filter(Boolean);
+    const path=String(entry.path||'');
+    const link=path
+      ?'<a target="_blank" rel="noopener" href="'
+        +escAttr(reviewAssetUrl(path))+'">证据文件</a>'
+      :'';
+    return '<div class="rr-ocr-ev-row">'
+      +'<div class="rr-ocr-ev-h"><span>'+esc(meta.join(' · '))+'</span>'
+      +(low?'<span class="rr-badge warn" title="最高置信低于阈值 '
+        +escAttr(String(threshold))+'">OCR 低置信</span>':'')
+      +(link?link:'')
+      +'</div>'
+      +(labels.length
+        ?'<ul class="rr-ocr-labels">'+labels.map(function(label){
+            const confidence=(label.confidence!=null)
+              ?Number(label.confidence):null;
+            return '<li><span class="rr-ocr-label-text">'
+              +esc(label.text)+'</span>'
+              +(confidence!=null?'<span class="rr-ocr-conf">'
+                +confidence.toFixed(2)+'</span>':'')
+              +(confidence!=null&&threshold>0&&confidence<threshold
+                ?'<span class="rr-badge warn">低置信</span>':'')
+              +'</li>';
+          }).join('')+'</ul>'
+        :'<div class="rr-muted">OCR 未识别到文字</div>')
+      +'</div>';
+  }).join('')+'</div>';
+}
+/* Uncovered items: no_native_labels figure items with no OCR evidence yet. */
+function reviewOcrUncoveredItemIds(data){
+  const items=((data&&data.items)||[]);
+  return items.filter(function(item){
+    if(!item||item.code!=='no_native_labels') return false;
+    const entries=((item.evidence||{}).ocr_evidence||[]);
+    return !entries.length;
+  }).map(function(item){ return String(item.id||''); })
+    .filter(function(itemId){ return !!itemId; });
+}
+function reviewOcrRefreshRowHtml(){
+  const ctx=REVIEW_CTX; if(!ctx) return '';
+  const caps=reviewOcrCapabilities();
+  const usable=reviewOcrUsable(caps);
+  const selected=reviewSelectedItemIds();
+  const busy=!!(ctx.ocrRefreshing||ctx.busy||ctx.building||ctx.publishing);
+  const why=!usable
+    ?(caps.ocr?'OCR 不可用：相关操作置灰；可继续保留原始图/暂缓'
+      :'OCR 未配置（相关策略置灰）；可继续保留原始图/暂缓')
+    :(selected.length
+      ?('用当前勾选的 '+selected.length+' 项创建 OCR 任务；中断后不会自动重跑')
+      :'勾选条目后可创建 OCR 任务；中断后不会自动重跑');
+  return '<div class="rr-batch-row rr-ocr-row">'
+    +'<button type="button" data-r="ocr-refresh"'
+    +(usable&&!busy?'':' disabled')+'>为选中项重新获取证据'
+    +(selected.length?('（'+selected.length+' 项）'):'')+'</button>'
+    +'<span class="rr-cand-meta">'+esc(why)+'</span></div>';
+}
+function reviewSyncOcrRefreshButton(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const box=$('#reviewBatch'); if(!box) return;
+  const btn=box.querySelector('button[data-r="ocr-refresh"]'); if(!btn) return;
+  const count=reviewSelectedItemIds().length;
+  btn.textContent='为选中项重新获取证据'
+    +(count?('（'+count+' 项）'):'');
+}
+/* The OCR job result summary is the frozen §5.1 shape; it lives at
+   extract/review/<result_ref>. Fetch it best-effort through the source-asset
+   route so the done message shows real counts (coverage is the fallback). */
+async function reviewLoadOcrCounts(jobId){
+  const ctx=REVIEW_CTX; if(!ctx) return null;
+  const job=(ctx.jobs&&ctx.jobs[jobId])||null;
+  const record=(job&&job.record)||null;
+  const ref=String((record&&record.result_ref)||'');
+  if(!ref) return null;
+  const candidates=['extract/review/'+ref,ref];
+  for(let index=0;index<candidates.length;index++){
+    try{
+      const summary=await reviewFetchJSON(
+        reviewAssetUrl(candidates[index]));
+      if(summary&&typeof summary==='object'){
+        const counts=summary.counts;
+        return (counts&&typeof counts==='object')?counts:summary;
+      }
+    }catch(e){ /* the counts line is best-effort; coverage still renders */ }
+  }
+  return null;
+}
+function reviewOcrDoneText(counts,requested){
+  if(counts&&typeof counts==='object'){
+    return 'OCR 已刷新：已刷新 '+reviewNum(counts.refreshed||0)
+      +' · 缓存命中 '+reviewNum(counts.cache_hits||0)
+      +' · 失败 '+reviewNum(counts.failed||0)
+      +' · 空 '+reviewNum(counts.empty||0)
+      +' · 低置信 '+reviewNum(counts.low_confidence||0)+'。';
+  }
+  const cov=reviewOcrCoverage();
+  if(cov){
+    return 'OCR 已刷新：覆盖 '+reviewNum(cov.with_evidence||0)+'/'
+      +reviewNum(cov.items||0)+' · 未覆盖 '+reviewNum(cov.uncovered||0)
+      +' · 空 '+reviewNum(cov.empty||0)
+      +' · 低置信 '+reviewNum(cov.low_confidence||0)+'。';
+  }
+  return 'OCR 证据已刷新（'+reviewNum(requested||0)+' 项）。';
+}
+async function reviewStartOcrRefresh(itemIds,options){
+  const ctx=REVIEW_CTX; if(!ctx) return null;
+  const ids=(itemIds||[]).filter(function(itemId){ return !!itemId; });
+  if(!ids.length){
+    reviewMsg('没有需要刷新 OCR 证据的条目。',true);
+    return null;
+  }
+  if(ctx.ocrRefreshing||ctx.busy||ctx.building) return null;
+  const auto=!!(options&&options.auto);
+  ctx.ocrRefreshing=true;
+  paintReviewOcr();
+  paintReviewBatch();
+  reviewMsg((auto
+    ?'首次打开该来源：检测到 '+ids.length+' 个未覆盖 OCR 的图内标签条目，'
+      +'正在自动创建 OCR 任务（仅一次；中断/失败后只能手动重试）…'
+    :'正在为选中项创建 OCR 证据刷新任务（'+ids.length+' 项）…'));
+  try{
+    const result=await reviewFetchJSON(
+      reviewBase(ctx.dataset,ctx.sha)+'/ocr/refresh',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({item_ids:ids,provider:{}})});
+    const jobId=String((result&&result.job_id)||'');
+    if(!jobId){
+      reviewMsg('服务器没有返回 OCR job_id，无法跟踪任务。',true);
+      return null;
+    }
+    ctx.jobs[jobId]={job_id:jobId,type:'ocr',
+      status:String(result.status||'queued'),record:null,
+      descriptor:{type:'ocr',created_at:'',batch_id:null},itemIds:ids};
+    await reviewLoadSource();
+    paintReviewBatch();
+    reviewMsg('OCR 证据刷新任务已提交（'+jobId+'），正在轮询状态…'
+      +(auto?'（任务中断后不会自动重跑）':''));
+    const record=await reviewPollJob(jobId);
+    await reviewLoadSource();
+    await reviewLoadBatches();
+    await refreshReview();
+    if(record&&record.status==='done'){
+      const counts=await reviewLoadOcrCounts(jobId);
+      reviewMsg(reviewOcrDoneText(counts,ids.length)
+        +(auto?'（首次打开自动创建 OCR 任务；中断/失败后只能手动重试）':''),
+        false);
+    }else if(record&&record.status==='interrupted'){
+      reviewMsg('OCR 任务中断，可手动重试（不会自动重跑）。',true);
+    }else if(record&&record.status==='failed'){
+      reviewMsg('OCR 任务失败：'+reviewJobError(record),true);
+    }
+    return record;
+  }catch(e){
+    reviewMsg('创建 OCR 证据刷新任务失败：'+reviewErrText(e),true);
+    await reviewLoadSource();
+    return null;
+  }finally{
+    ctx.ocrRefreshing=false;
+    paintReviewOcr();
+    paintReviewBatch();
+    paintReviewDetail();
+  }
+}
+function reviewOcrRefreshSelected(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const ids=reviewSelectedItemIds();
+  if(!ids.length){
+    reviewMsg('先在条目上勾选要刷新 OCR 证据的项。',true);
+    return;
+  }
+  reviewRunAction(function(){ return reviewStartOcrRefresh(ids,{auto:false}); });
+}
+async function reviewOcrCheck(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return;
+  if(ctx.ocrBusy||ctx.busy) return;
+  ctx.ocrBusy=true;
+  paintReviewOcr();
+  reviewMsg('正在检查 OCR provider（短探测，不写 corpus、不创建任务）…');
+  try{
+    const result=await reviewFetchJSON(
+      reviewBase(ctx.dataset,ctx.sha)+'/ocr/check',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({provider:{}})});
+    const engine=String((result&&result.engine)||'');
+    const probe=(result&&result.probe&&typeof result.probe==='object')
+      ?result.probe:{};
+    const seconds=(probe.seconds!=null)?Number(probe.seconds):null;
+    ctx.ocrCheckText='检查结果：可用'
+      +(engine?(' · '+engine):'')
+      +(seconds!=null?(' · 探测 '+reviewNum(seconds)+'s'):'')
+      +(probe.labels!=null?(' · 标签 '+reviewNum(probe.labels)):'');
+    const caps=reviewOcrCapabilities();
+    caps.ocr=true;
+    if(engine) caps.ocr_engine=engine;
+    caps.ocr_status={available:true,
+      checked_at:(result&&result.checked_at)||null,error:null};
+    reviewMsg('OCR 检查通过：'+(engine||'provider 可用')+'。',false);
+  }catch(e){
+    ctx.ocrCheckText='检查失败：'+reviewErrText(e);
+    const caps=reviewOcrCapabilities();
+    caps.ocr_status={available:false,checked_at:null,
+      error:{code:'ocr_unavailable',
+        message:String((e&&e.message)||e||'')}};
+    reviewMsg('OCR 检查失败：'+reviewErrText(e),true);
+  }finally{
+    ctx.ocrBusy=false;
+    paintReviewOcr();
+    paintReviewDetail();
+  }
+}
+/* Auto-create once per source on the first review open (Lead decision): only
+   when OCR is available, coverage has uncovered items and no type=ocr job
+   descriptor exists. Never retries after a failed/interrupted job. */
+async function reviewMaybeAutoOcr(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return null;
+  const caps=reviewOcrCapabilities();
+  if(!reviewOcrUsable(caps)) return null;
+  const cov=reviewOcrCoverage();
+  if(!cov||Number(cov.uncovered||0)<=0) return null;
+  const ex=reviewSourceExtraction();
+  const descriptors=(ex.review_jobs&&typeof ex.review_jobs==='object')
+    ?ex.review_jobs:{};
+  const hasOcr=Object.keys(descriptors).some(function(jobId){
+    const descriptor=descriptors[jobId];
+    return String((descriptor&&descriptor.type)||'')==='ocr';
+  });
+  if(hasOcr) return null;
+  const key=reviewKey(ctx.dataset,ctx.sha);
+  if(REVIEW_OCR_AUTO_TRIED[key]) return null;
+  REVIEW_OCR_AUTO_TRIED[key]=true;
+  const ids=reviewOcrUncoveredItemIds(ctx.data);
+  if(!ids.length) return null;
+  return await reviewStartOcrRefresh(ids,{auto:true});
+}
 function reviewKey(dsId,sha){ return dsId+'|'+(sha||''); }
 function reviewBase(dsId,sha){
   return '/api/datasets/'+encodeURIComponent(dsId)+'/sources/'+encodeURIComponent(sha)+'/review';
@@ -5241,6 +5746,9 @@ function reviewSummaryHtml(r){
       +esc(value)+'</b></span>';
   };
   const plan=(r&&r.plan)||{};
+  /* CP4: the OCR coverage summary is part of the review summary line
+     (payload.ocr: with_evidence/items/uncovered/low_confidence/empty). */
+  const ocr=(r&&r.ocr&&typeof r.ocr==='object')?r.ocr:null;
   return '<div class="rr-sum-row">'
     +bit('自动归档',reviewNum(c.auto_resolved),'ok')
     +bit('建议',reviewNum(suggest),'accent')
@@ -5255,6 +5763,10 @@ function reviewSummaryHtml(r){
     +' · 簇 '+reviewNum(c.clusters)+' · 项 '+reviewNum(c.items)
     +(Number(c.stale||0)?' · 已过期 '+reviewNum(c.stale):'')
     +(Number(c.unsupported_items||0)?' · 不支持 '+reviewNum(c.unsupported_items):'')
+    +(ocr?(' · OCR 覆盖 '+reviewNum(ocr.with_evidence||0)+'/'
+      +reviewNum(ocr.items||0)+' · 未覆盖 '+reviewNum(ocr.uncovered||0)
+      +' · 低置信 '+reviewNum(ocr.low_confidence||0)
+      +' · 空 '+reviewNum(ocr.empty||0)):'')
     +'</div>';
 }
 function paintReviewSummary(r){
@@ -5552,10 +6064,11 @@ function reviewStrategyOptions(item){
   return strategies.map(function(s){
     const on=cur&&cur.id===s.id&&Number(cur.version)===Number(s.version==null?1:s.version);
     const off=(s.available===false);
+    const reason=off?reviewStrategyUnavailableText(s,item):'';
     const label=(s.name||s.id||'?')+(s.recommended?' ★':'')+(off?'（不可用）':'');
     return '<option value="'+escAttr(s.id||'')+'" data-version="'
       +escAttr(String(s.version==null?1:s.version))+'"'
-      +(off?' title="'+escAttr(s.unavailable_reason||'不可用')+'"':'')
+      +(off?' title="'+escAttr(reason||'不可用')+'"':'')
       +(on?' selected':'')+(off?' disabled':'')+'>'+esc(label)+'</option>';
   }).join('');
 }
@@ -5693,6 +6206,7 @@ function reviewItemHtml(item){
     +'<p class="rr-item-msg">'+esc(item.message||'')+'</p>'
     +'<div class="rr-item-meta">'+esc(meta)+'</div>'
     +reviewEvidenceHtml(item)
+    +reviewOcrEvidenceHtml(item)
     +'<div class="rr-ba"><div class="rr-ba-col"><h5>当前</h5><code>'
     +esc(reviewJsonBits(item.current))+'</code></div>'
     +'<div class="rr-ba-col"><h5>建议</h5>'+reviewCandidateHtml(item)+'</div></div>'
@@ -5731,8 +6245,8 @@ function reviewStrategiesHtml(strategies){
       +bits.join('')+'</div>'
       +(s.description?'<div class="rr-strat-desc">'+esc(s.description)+'</div>':'')
       +(s.risk?'<div class="rr-strat-risk">风险：'+esc(s.risk)+'</div>':'')
-      +(!available&&s.unavailable_reason?'<div class="rr-strat-why">不可用：'
-          +esc(s.unavailable_reason)+'</div>':'')
+      +(!available?('<div class="rr-strat-why">不可用：'
+          +esc(reviewStrategyUnavailableText(s))+'</div>'):'')
       +'</li>';
   }).join('')+'</ul>';
 }
@@ -5975,7 +6489,8 @@ function reviewJobsHtml(){
     return ctx.jobs[jobId]; }).filter(function(job){
       if(!job) return false;
       const type=String(job.type||((job.descriptor||{}).type)||'');
-      return type==='report'||type==='build'||type==='rollback';
+      return type==='report'||type==='build'||type==='rollback'
+        ||type==='ocr';
     });
   if(!jobs.length) return '';
   jobs.sort(function(a,b){
@@ -6160,6 +6675,7 @@ function reviewBatchSectionHtml(){
   const jobsHtml=reviewJobsHtml();
   return '<div class="rr-batch-h"><h4>本批候选</h4>'+reviewCurrentHtml()+'</div>'
     +buildRow
+    +reviewOcrRefreshRowHtml()
     +(jobsHtml?'<div class="rr-cand-sec"><b>后台任务</b></div>'+jobsHtml:'')
     +(candidate?reviewCandidatePanelHtml(candidate):'')
     +reviewPublishedBatchesHtml();
@@ -6504,6 +7020,23 @@ async function reviewRetryJob(btn){
     await reviewBuildCandidate();
     return;
   }
+  if(type==='ocr'){
+    /* Explicit manual retry only (an interrupted OCR job never auto-reruns):
+       reuse the interrupted job's item ids when this session created it, else
+       the currently uncovered no_native_labels items. */
+    const ctx=REVIEW_CTX;
+    const jobId=String((btn&&btn.getAttribute('data-job'))||'');
+    const job=(ctx&&ctx.jobs&&ctx.jobs[jobId])||null;
+    const ids=(job&&job.itemIds&&job.itemIds.length)
+      ?job.itemIds.slice()
+      :reviewOcrUncoveredItemIds(ctx&&ctx.data);
+    if(!ids.length){
+      reviewMsg('没有可重试的 OCR 条目；请勾选条目后点“为选中项重新获取证据”。',true);
+      return;
+    }
+    await reviewStartOcrRefresh(ids,{auto:false});
+    return;
+  }
   reviewMsg('该任务类型暂不支持手动重试。',true);
 }
 function reviewRunAction(fn){
@@ -6525,10 +7058,13 @@ function paintReview(r){
   REVIEW_COUNTS[reviewKey(ctx.dataset,ctx.sha)]=reviewCounts(r);
   paintReviewHead(r);
   paintReviewSummary(r);
+  paintReviewOcr();
   paintReviewConflict();
-  paintReviewBatch();
   paintReviewClusters(r);
   paintReviewDetail(r);
+  /* The OCR refresh row reads the checkbox selection from #reviewDetail, so
+     the batch section is painted after the detail. */
+  paintReviewBatch();
   refreshReviewChip();
 }
 async function refreshReview(successText){
@@ -6545,7 +7081,8 @@ async function openReview(dsId,sha){
   REVIEW_CTX={dataset:dsId,sha:sha,data:null,itemsById:{},selected:null,busy:false,
     source:null,conflict:null,jobs:{},batchesById:{},candidateBatchId:null,
     candidate:null,candidateStale:false,building:false,publishing:false,
-    current:null,lastBuildEntryIds:[]};
+    current:null,lastBuildEntryIds:[],ocrBusy:false,ocrRefreshing:false,
+    ocrCheckText:''};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -6557,6 +7094,9 @@ async function openReview(dsId,sha){
   if(det) det.innerHTML='<span class="hist-empty">正在加载…</span>';
   const batch=$('#reviewBatch');
   if(batch) batch.innerHTML='<span class="hist-empty">正在读取候选批次与后台任务…</span>';
+  const ocr=$('#reviewOcr');
+  if(ocr) ocr.innerHTML='<span class="hist-empty">正在读取 OCR 能力…</span>';
+  reviewOcrConfigClose();
   const conflict=$('#reviewConflict');
   if(conflict){ conflict.hidden=true; conflict.innerHTML=''; }
   try{
@@ -6574,8 +7114,13 @@ async function openReview(dsId,sha){
   await reviewLoadJobs();
   await reviewLoadBatches();
   paintReviewConflict();
-  paintReviewBatch();
+  paintReviewOcr();
   paintReviewDetail();
+  paintReviewBatch();
+  /* CP4 (Lead decision): auto-create one OCR job on the FIRST review open of a
+     source when OCR is available, coverage has uncovered no_native_labels
+     items and no type=ocr descriptor exists. Never auto-retries. */
+  await reviewMaybeAutoOcr();
   setTimeout(function(){ const c=$('#reviewClose'); if(c) c.focus(); },30);
 }
 async function generateReviewReport(){
@@ -6824,7 +7369,7 @@ $('#reviewDetail').addEventListener('click',function(ev){
    CP2 W9: ticking an item checkbox re-evaluates 确认选中项. */
 $('#reviewDetail').addEventListener('change',function(ev){
   const pick=ev.target&&ev.target.closest?ev.target.closest('input[data-r="accept-pick"]'):null;
-  if(pick){ reviewSyncAcceptButton(); return; }
+  if(pick){ reviewSyncAcceptButton(); reviewSyncOcrRefreshButton(); return; }
   const sel=ev.target&&ev.target.closest?ev.target.closest('select[data-r="strategy"]'):null;
   if(!sel) return;
   reviewSyncStrategyParams(sel.closest('.rr-item'),sel.value);
@@ -6843,6 +7388,16 @@ $('#reviewBatch').addEventListener('click',function(ev){
      request is sent by the dialog's explicit confirm button. */
   else if(kind==='rollback') reviewRunAction(function(){ return reviewRollbackConfirmOpen(); });
   else if(kind==='job-retry') reviewRunAction(function(){ return reviewRetryJob(btn); });
+  /* CP4: the explicit per-selection OCR evidence refresh (never automatic). */
+  else if(kind==='ocr-refresh') reviewOcrRefreshSelected();
+});
+/* CP4: the OCR bar's [检查 OCR] probe and the read-only config dialog. */
+$('#reviewOcr').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  const kind=btn.getAttribute('data-r');
+  if(kind==='ocr-check') reviewRunAction(function(){ return reviewOcrCheck(); });
+  else if(kind==='ocr-config') reviewOcrConfigOpen();
 });
 $('#reviewConflict').addEventListener('click',function(ev){
   const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
@@ -6859,13 +7414,19 @@ $('#reviewRollbackConfirmClose').onclick=reviewRollbackConfirmClose;
 $('#reviewRollbackConfirm').addEventListener('click',function(ev){
   if(ev.target===this) reviewRollbackConfirmClose();
 });
+/* CP4 (M2.1): the OCR config dialog is read-only -- close only hides it. */
+$('#reviewOcrConfigOk').onclick=reviewOcrConfigClose;
+$('#reviewOcrConfigClose').onclick=reviewOcrConfigClose;
+$('#reviewOcrConfig').addEventListener('click',function(ev){
+  if(ev.target===this) reviewOcrConfigClose();
+});
 $('#reviewReportBtn').onclick=generateReviewReport;
 $('#reviewRefreshBtn').onclick=refreshReviewFromButton;
 $('#reviewClose').onclick=function(){ const m=$('#reviewModal'); if(m) m.hidden=true;
-  reviewRollbackConfirmClose(); };
+  reviewRollbackConfirmClose(); reviewOcrConfigClose(); };
 $('#reviewModal').addEventListener('click',function(ev){
   if(ev.target===this){ const m=$('#reviewModal'); if(m) m.hidden=true;
-    reviewRollbackConfirmClose(); }
+    reviewRollbackConfirmClose(); reviewOcrConfigClose(); }
 });
 
 /* ---- workspace dialog ----------------------------------------------------
