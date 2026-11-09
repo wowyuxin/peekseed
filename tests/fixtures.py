@@ -730,7 +730,13 @@ DEFAULT_CAPABILITIES = {
     "peel_event_schema": 1,
     "chunker_version": 1,
     "review_schema": 2,
-    "operations": ["inherit_header_from", "set_header_rows"],
+    "operations": ["inherit_header_from", "set_header_rows",
+                   "set_asset_labels_from_ocr"],
+    # M2.1 OCR capabilities (wire §2.8): env-only config resolved by peelfeed.
+    # The fake default is unconfigured; tests override ``capabilities.ocr`` in
+    # the state to advertise a configured provider/engine.
+    "ocr": {"configured": False, "provider": None, "engine": None,
+            "timeout_seconds": None, "min_confidence": None, "params": {}},
     "resolutions": ["confirm_headerless", "confirm_known", "defer",
                     "keep_original_figure", "keep_visual_fallback"],
     "strategies": [{"id": "use_first_row_header", "version": 1,
@@ -742,6 +748,25 @@ DEFAULT_CAPABILITIES = {
     "peel_root": "/tmp/fake-peels",
     "docling": {"python": "/tmp/docling-python", "python_present": True,
                 "models_present": True},
+}
+
+# M2.1 ``ocr-check`` payload (wire §2.8): a successful provider probe.
+DEFAULT_OCR_CHECK = {
+    "schema_version": 1,
+    "available": True,
+    "engine": "rapidocr@1.4.4",
+    "provider": {
+        "configured": True,
+        "command_display": "/tmp/ocr-venv/bin/python "
+                           "/tmp/peelfeed/scripts/ocr_provider_rapidocr.py",
+        "timeout_seconds": 30.0,
+        "min_confidence": 0.6,
+        "params": {},
+        "params_sha256": "0123456789abcdef",
+    },
+    "probe": {"image_sha256": "ab" * 32, "labels": 0, "seconds": 0.85},
+    "checked_at": "2026-11-09T03:10:00Z",
+    "error": None,
 }
 
 # --- schema-2 review payloads (the shapes the real peelfeed CLI prints) ----
@@ -1447,6 +1472,10 @@ def main():
             "argv": argv,
             "peel_shared_dir": os.environ.get("PEELFEED_SHARED_DIR"),
             "pythonpath": os.environ.get("PYTHONPATH"),
+            # M2.1: peekseed forwards every PEELFEED_* env var (the OCR config
+            # is env-only), so the fake records them for the seam tests.
+            "ocr_env": {key: value for key, value in sorted(os.environ.items())
+                        if key.startswith("PEELFEED_OCR_")},
         }) + "\n")
     if not argv:
         return fail("missing command")
@@ -1957,6 +1986,129 @@ def main():
         job = new_job("report", result_ref="report.json",
                       nonce=len(state.get("jobs") or {}))
         state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "status": "queued",
+                     "result_ref": None})
+
+    if command == "ocr-check":
+        # M2.1 wire §2.8: short provider probe; optional peel id persists the
+        # status file. Never writes the corpus, never creates a job.
+        peel_id = first_positional(rest)
+        if peel_id is not None and peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for ocr-check", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            save_state(state)
+            return fail("ocr-check input must be a JSON object", 2,
+                        "ocr_config_invalid")
+        state.setdefault("ocr_check_requests", []).append(copy_json(request))
+        provider = request.get("provider")
+        if provider is not None and not isinstance(provider, dict):
+            save_state(state)
+            return fail("provider must be an object", 2, "ocr_config_invalid")
+        error = state.get("ocr_check_error")
+        if error:
+            save_state(state)
+            return fail(error.get("message") or "OCR provider unavailable",
+                        int(error.get("exit") or 2),
+                        error.get("code") or "ocr_unavailable",
+                        error.get("detail"))
+        payload = copy_json(DEFAULT_OCR_CHECK)
+        payload.update(copy_json(state.get("ocr_check") or {}))
+        payload["checked_at"] = "2026-11-09T03:10:00Z"
+        payload["error"] = None
+        state["ocr_status"] = copy_json(payload)
+        save_state(state)
+        return emit(payload)
+
+    if command == "ocr-refresh":
+        # M2.1 wire §2.8: creates one persistent ``type=ocr`` job. The fake job
+        # is terminal immediately by default (``ocr_job_status`` can simulate
+        # queued/running/failed/interrupted records); the result summary is kept
+        # in ``state["ocr_job_results"]`` for assertions.
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for ocr-refresh", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            save_state(state)
+            return fail("ocr-refresh input must be a JSON object", 2,
+                        "validation")
+        state.setdefault("ocr_refresh_requests", []).append(copy_json(request))
+        item_ids = request.get("item_ids")
+        if not isinstance(item_ids, list) or not item_ids:
+            save_state(state)
+            return fail("item_ids must be a non-empty list of item ids", 2,
+                        "validation")
+        cleaned = []
+        seen = set()
+        for raw in item_ids:
+            if not isinstance(raw, str) or not raw.strip():
+                save_state(state)
+                return fail("item_ids must contain only non-empty strings", 2,
+                            "validation")
+            item_id = raw.strip()
+            if item_id in seen:
+                save_state(state)
+                return fail("item_ids must be unique (duplicate "
+                            + item_id + ")", 2, "validation")
+            seen.add(item_id)
+            cleaned.append(item_id)
+        provider = request.get("provider")
+        if provider is not None and not isinstance(provider, dict):
+            save_state(state)
+            return fail("provider must be an object", 2, "ocr_config_invalid")
+        if state.get("ocr_not_ready"):
+            save_state(state)
+            return fail("no current build; run a build first", 2, "not_ready")
+        error = state.get("ocr_refresh_error")
+        if error:
+            save_state(state)
+            return fail(error.get("message") or "OCR refresh failed",
+                        int(error.get("exit") or 2),
+                        error.get("code") or "ocr_unavailable",
+                        error.get("detail"))
+        status = str(state.get("ocr_job_status") or "done")
+        if status not in ("queued", "running", "done", "failed",
+                          "interrupted"):
+            status = "done"
+        job = new_job("ocr", result_ref=None,
+                      status="running" if status == "interrupted" else status,
+                      error=({"code": "interrupted",
+                              "message": "the job process is no longer running"}
+                             if status == "interrupted" else None),
+                      nonce=len(state.get("jobs") or {}))
+        if status == "done":
+            job["result_ref"] = "jobs/" + job["job_id"] + ".result.json"
+        if status == "interrupted":
+            # The real ``job show`` derives ``interrupted`` from a dead running
+            # job; the fake stores the same marker (contract §8).
+            job["interrupted"] = True
+        elif status == "failed":
+            job["error"] = state.get("ocr_job_error") or {
+                "code": "ocr_unavailable",
+                "message": "OCR provider unavailable"}
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        summary = {
+            "schema_version": 1,
+            "job_id": job["job_id"],
+            "peel_id": peel_id,
+            "build_id": "b20261108T120000-12345678",
+            "engine": "rapidocr@1.4.4",
+            "params_sha256": "0123456789abcdef",
+            "requested_item_ids": cleaned,
+            "items": [],
+            "counts": dict(state.get("ocr_job_counts") or {
+                "requested": len(cleaned), "refreshed": len(cleaned),
+                "cache_hits": 0, "failed": 0, "empty": 0,
+                "low_confidence": 0}),
+            "created_at": "2026-11-09T03:10:00Z",
+        }
+        state.setdefault("ocr_job_results", {})[job["job_id"]] = summary
         save_state(state)
         return emit({"job_id": job["job_id"], "status": "queued",
                      "result_ref": None})

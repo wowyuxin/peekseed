@@ -118,6 +118,15 @@ _ERROR_STATUS = {
     "notfound": 404,
     "not-found": 404,
     "peel_not_found": 404,
+    # M2.1 OCR (contract §4 additions / wire §2.8): the provider being
+    # unconfigured or unrunnable is a 503 (extraction is configured but OCR is
+    # not); ``ocr-refresh`` without a current build is a 409; an invalid
+    # ``PEELFEED_OCR_*`` env config or request provider object is a 400. The
+    # remaining OCR codes (ocr_timeout/ocr_bad_output/ocr_engine_mismatch) are
+    # peelfeed failures -> 502 (the fallback).
+    "ocr_unavailable": 503,
+    "not_ready": 409,
+    "ocr_config_invalid": 400,
 }
 #: ``error [<code>] <message>`` -- peelfeed's stderr first line for an error.
 _ERROR_LINE = re.compile(r"^\s*error\s*\[([A-Za-z0-9_.-]+)\]\s*(.*)$")
@@ -960,6 +969,84 @@ class PeelfeedClient(object):
             stdin_text = json.dumps(request, ensure_ascii=False)
         return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout),
                          stdin_text=stdin_text)
+
+    # --- on-demand OCR (M2.1 CP4; contract §4 additions, wire §2.8) ---
+    @staticmethod
+    def _ocr_provider(provider):
+        """The ``provider`` object sent to peelfeed (``{}`` means "use env").
+
+        M2.1 OCR configuration is env-only (``PEELFEED_OCR_*``); the UI/API
+        always send ``{}``. A non-empty object is accepted for CLI/testing and
+        overrides the env config for that call only (wire §2.8). A non-object
+        provider is a local validation error so it is never forwarded as a
+        malformed request.
+        """
+        if provider is None:
+            return {}
+        if not isinstance(provider, dict):
+            raise ValueError("provider must be a JSON object")
+        return copy.deepcopy(provider)
+
+    def ocr_check(self, peel_id, provider=None, timeout=None):
+        """``peelfeed ocr-check <peel> --input - --json`` (wire §2.8).
+
+        Short probe: validates the effective OCR config and the provider (a
+        generated 64x64 probe image), persists ``extract/ocr/status.json`` under
+        the peel and returns
+        ``{available, engine, provider, probe, checked_at, error}``. It never
+        writes the corpus and never creates a job. ``provider`` defaults to
+        ``{}`` = use the deploy env ``PEELFEED_OCR_*`` config (forwarded by
+        :meth:`_environment`); a non-empty object overrides it for this call
+        only (CLI/testing). Errors: ``ocr_unavailable`` -> 503,
+        ``ocr_config_invalid`` -> 400, other OCR codes -> 502.
+        """
+        peel = str(peel_id or "").strip()
+        if not peel:
+            raise ValueError("ocr-check needs a peel id")
+        request = {"provider": self._ocr_provider(provider)}
+        return self._run(
+            ["ocr-check", peel, "--input", "-"],
+            timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+        )
+
+    def ocr_refresh(self, peel_id, item_ids, provider=None, timeout=None):
+        """``peelfeed ocr-refresh <peel> --input - --json`` (wire §2.8).
+
+        Creates one persistent ``type=ocr`` job for the requested review items
+        and returns ``{"job_id", "status": "queued", "result_ref": null}``; the
+        job refreshes the crops' OCR evidence under ``extract/ocr/`` and
+        re-derives items/report. It takes no operation lock (never blocks
+        builds/publishing) and is never re-run automatically (contract §8).
+        ``item_ids`` must be non-empty, unique non-empty strings. ``provider``
+        defaults to ``{}`` (env config) like :meth:`ocr_check`. Errors:
+        ``not_ready`` -> 409 (no current build), ``validation`` -> 400,
+        ``ocr_config_invalid`` -> 400, ``ocr_unavailable`` -> 503.
+        """
+        peel = str(peel_id or "").strip()
+        if not peel:
+            raise ValueError("ocr-refresh needs a peel id")
+        cleaned = []
+        seen = set()
+        for raw in item_ids or []:
+            if not isinstance(raw, str):
+                raise ValueError("item_ids must contain only strings")
+            item_id = raw.strip()
+            if not item_id:
+                raise ValueError("item_ids must not contain empty ids")
+            if item_id in seen:
+                raise ValueError("item_ids must be unique (duplicate %s)"
+                                 % item_id)
+            seen.add(item_id)
+            cleaned.append(item_id)
+        if not cleaned:
+            raise ValueError("ocr-refresh needs a non-empty item_ids list")
+        request = {"item_ids": cleaned, "provider": self._ocr_provider(provider)}
+        return self._run(
+            ["ocr-refresh", peel, "--input", "-"],
+            timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+        )
 
     # --- ApplyBatch / publish / jobs (M2 CP3; contract §4, wire §2.6) ---
     def apply(self, peel_id, entry_ids):

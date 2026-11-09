@@ -800,6 +800,145 @@ class CliAdapterTests(unittest.TestCase):
                 self.assertIn("--job", job_calls[0])
                 self.assertEqual(job_calls[-1][1:3], ["list", peel_id])
 
+    def test_cp4_ocr_client_argv_stdin_and_env_forwarding(self):
+        """CP4 K1 (wire §2.8): the frozen ``ocr-check``/``ocr-refresh`` shapes.
+
+        ``provider:{}`` means "use the env config"; peekseed forwards every
+        ``PEELFEED_OCR_*`` env var through the existing allowlist seam. A
+        provider object is accepted for CLI/testing and forwarded verbatim.
+        """
+        ocr_keys = ("PEELFEED_OCR_PROVIDER", "PEELFEED_OCR_ENGINE",
+                    "PEELFEED_OCR_PARAMS", "PEELFEED_OCR_TIMEOUT",
+                    "PEELFEED_OCR_MIN_CONFIDENCE")
+        saved = {key: os.environ.get(key) for key in ocr_keys}
+        try:
+            os.environ["PEELFEED_OCR_PROVIDER"] = (
+                "/tmp/ocr-venv/bin/python /tmp/peelfeed/scripts/"
+                "ocr_provider_rapidocr.py")
+            os.environ["PEELFEED_OCR_ENGINE"] = "rapidocr@1.4.4"
+            os.environ["PEELFEED_OCR_PARAMS"] = '{"lang": "en"}'
+            os.environ["PEELFEED_OCR_TIMEOUT"] = "12.5"
+            os.environ["PEELFEED_OCR_MIN_CONFIDENCE"] = "0.7"
+            with temp_data_root() as root:
+                cli = FakePeelfeedCli(root / "fake")
+                source = make_pdf(root / "manual.pdf")
+                with peelfeed_env(CLI=str(cli.path)):
+                    from peekseed import peelfeed
+                    engine = peelfeed.client()
+                    peel_id = engine.ingest(
+                        str(source), llm_mode="off")["peel"]["peel_id"]
+                    checked = engine.ocr_check(peel_id)
+                    self.assertTrue(checked["available"])
+                    self.assertEqual(checked["engine"], "rapidocr@1.4.4")
+                    self.assertIsNone(checked["error"])
+                    # Frozen stdin: provider is ALWAYS present as an object.
+                    self.assertEqual(cli.state()["ocr_check_requests"][-1],
+                                     {"provider": {}})
+                    refreshed = engine.ocr_refresh(peel_id, ["it-a", "it-b"])
+                    self.assertEqual(refreshed["status"], "queued")
+                    self.assertTrue(refreshed["job_id"].startswith("ocr-"))
+                    self.assertIsNone(refreshed["result_ref"])
+                    self.assertEqual(
+                        cli.state()["ocr_refresh_requests"][-1],
+                        {"item_ids": ["it-a", "it-b"], "provider": {}})
+                    # A non-empty provider object overrides the env for one call.
+                    override = {"command": ["/tmp/provider", "--probe"],
+                                "engine": "rapidocr@1.4.4"}
+                    engine.ocr_check(peel_id, provider=override)
+                    self.assertEqual(cli.state()["ocr_check_requests"][-1],
+                                     {"provider": override})
+                    # The job is persisted in the fake peel and re-attachable.
+                    job = engine.job_show(peel_id, refreshed["job_id"])
+                    self.assertEqual(job["type"], "ocr")
+                    self.assertEqual(job["status"], "done")
+                    calls = cli.calls()
+                    check_call = next(call for call in calls
+                                      if call["argv"][0] == "ocr-check")
+                    refresh_call = next(call for call in calls
+                                        if call["argv"][0] == "ocr-refresh")
+                    # ``ocr-check <peel> --input - --root <peels> --json``
+                    self.assertEqual(check_call["argv"][1:3],
+                                     [peel_id, "--input"])
+                    self.assertEqual(check_call["argv"][3], "-")
+                    self.assertIn("--root", check_call["argv"])
+                    self.assertIn("--json", check_call["argv"])
+                    # ``ocr-refresh <peel> --input - --root <peels> --json``
+                    self.assertEqual(refresh_call["argv"][1:3],
+                                     [peel_id, "--input"])
+                    self.assertEqual(refresh_call["argv"][3], "-")
+                    self.assertIn("--root", refresh_call["argv"])
+                    self.assertIn("--json", refresh_call["argv"])
+                    # Env-only OCR config reaches the peelfeed subprocess.
+                    self.assertEqual(check_call["ocr_env"], {
+                        "PEELFEED_OCR_PROVIDER":
+                            os.environ["PEELFEED_OCR_PROVIDER"],
+                        "PEELFEED_OCR_ENGINE": "rapidocr@1.4.4",
+                        "PEELFEED_OCR_PARAMS": '{"lang": "en"}',
+                        "PEELFEED_OCR_TIMEOUT": "12.5",
+                        "PEELFEED_OCR_MIN_CONFIDENCE": "0.7",
+                    })
+                    self.assertEqual(check_call["peel_shared_dir"],
+                                     str(_shared(root)))
+                    # Local validation never invokes the CLI with a bad request.
+                    with self.assertRaises(ValueError):
+                        engine.ocr_check(peel_id, provider=["not", "an",
+                                                            "object"])
+                    with self.assertRaises(ValueError):
+                        engine.ocr_refresh(peel_id, [])
+                    with self.assertRaises(ValueError):
+                        engine.ocr_refresh(peel_id, ["it-a", "it-a"])
+                    with self.assertRaises(ValueError):
+                        engine.ocr_refresh(peel_id, ["it-a", 7])
+                    with self.assertRaises(ValueError):
+                        engine.ocr_refresh(peel_id, ["  "])
+                    self.assertEqual(
+                        len([call for call in cli.calls()
+                             if call["argv"][0] == "ocr-refresh"]), 1)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_cp4_ocr_error_mapping(self):
+        """CP4 K1 (contract §4 additions): OCR codes map to 503/409/400/502."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            source = make_pdf(root / "manual.pdf")
+            with peelfeed_env(CLI=str(cli.path)):
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source),
+                                        llm_mode="off")["peel"]["peel_id"]
+                # ocr_unavailable -> 503 (provider unconfigured/unrunnable)
+                cli.update(ocr_check_error={"code": "ocr_unavailable",
+                                            "message": "no OCR provider"})
+                with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                    engine.ocr_check(peel_id)
+                self.assertEqual(caught.exception.status, 503)
+                self.assertIn("ocr_unavailable", caught.exception.detail)
+                # ocr_config_invalid -> 400 (bad env config/request provider)
+                cli.update(ocr_check_error={"code": "ocr_config_invalid",
+                                            "message": "bad engine"})
+                with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                    engine.ocr_check(peel_id)
+                self.assertEqual(caught.exception.status, 400)
+                # not_ready -> 409 (ocr-refresh without a current build)
+                cli.update(ocr_check_error=None, ocr_not_ready=True)
+                with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                    engine.ocr_refresh(peel_id, ["it-a"])
+                self.assertEqual(caught.exception.status, 409)
+                self.assertIn("not_ready", caught.exception.detail)
+                # Other OCR codes are peelfeed failures -> 502.
+                cli.update(ocr_not_ready=False,
+                           ocr_refresh_error={"code": "ocr_timeout",
+                                              "message": "provider timed out"})
+                with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                    engine.ocr_refresh(peel_id, ["it-a"])
+                self.assertEqual(caught.exception.status, 502)
+                self.assertIn("ocr_timeout", caught.exception.detail)
+
     def test_cp3_error_mapping_for_batch_publish_and_jobs(self):
         """busy→423, stale/conflict/corrections_conflict→409, not found→404."""
         with temp_data_root() as root:
