@@ -88,6 +88,58 @@ version/tag policy.
   `error [validation] …`) and tests cover `../plan`, empty/whitespace and
   slash-containing ids. Dataset schema stays 4 (no other contract changes).
 
+### Added — on-demand OCR (M2.1 CP4)
+
+- **OCR API routes.** `POST …/review/ocr/check` proxies `peelfeed ocr-check`
+  (200 probe payload; 503 `ocr_unavailable`; 400 `ocr_config_invalid`/validation;
+  other OCR codes 502) and `POST …/review/ocr/refresh` validates
+  `{item_ids:[…], provider?}` (non-empty unique strings, no tier/scope/
+  operations) and returns 202 `{job_id, status:"queued", result_ref:null}`,
+  storing `extraction.review_jobs[job_id] = {"type":"ocr","created_at":…,
+  "batch_id":null}` for restart re-attachment. Dataset schema stays 4 (no
+  migration); the OCR job only refreshes evidence, so an existing index stays
+  valid and `needs_reindex` is unchanged until a later OCR batch publish.
+- **OCR client seam.** `PeelfeedClient.ocr_check(peel_id, provider=None)` and
+  `ocr_refresh(peel_id, item_ids, provider=None)` use the frozen
+  `--input - --json` shapes and always send `provider:{}` (env-only config);
+  a provider object is accepted for CLI/testing. `_ERROR_STATUS` adds
+  `ocr_unavailable→503`, `not_ready→409`, `ocr_config_invalid→400`; the
+  `PEELFEED_OCR_*` env vars ride the existing allowlisted subprocess seam.
+- **Review UI.** A header OCR bar shows the capability chip (OCR 已配置 ·
+  `<engine>` / OCR 未配置（相关策略置灰） / OCR 不可用：`<detail>`), a
+  `[检查 OCR]` probe (available/engine/probe seconds/error) and a read-only
+  `[OCR 配置说明]` dialog listing the effective provider/engine/params/
+  timeout/min_confidence and the `PEELFEED_OCR_*` env names. The review summary
+  line carries the coverage summary from `payload.ocr` (覆盖 x/y · 未覆盖 ·
+  低置信 · 空 · 证据文件); per-item cards show `evidence.ocr_evidence` (engine,
+  label count, max/min confidence, created_at, evidence-file link, the label
+  list with confidence and a low-confidence badge below
+  `capabilities.ocr_min_confidence`; empty labels show OCR 未识别到文字).
+  `[为选中项重新获取证据]` creates one job over the current selection, polls
+  `GET …/review/jobs/{id}`, refetches the review/report and shows the result
+  counts (已刷新/缓存命中/失败/空/低置信); interrupted jobs show
+  “任务中断，可手动重试（不会自动重跑）” and only an explicit manual retry
+  creates a new job.
+- **Auto-create on first review open.** When OCR is available,
+  `payload.ocr.uncovered > 0` and no `type=ocr` job descriptor exists, the UI
+  automatically creates ONE refresh job for the uncovered `no_native_labels`
+  items and polls it (visible notice). Re-opening the source never re-creates
+  it, and a failed/interrupted job is never retried automatically. When OCR is
+  unavailable the OCR strategies stay grayed with a Chinese reason while
+  `keep_original_figure`/暂缓 remain selectable and review/report still work.
+- **M2.1 configuration is env-only** (`PEELFEED_OCR_PROVIDER/ENGINE/PARAMS/
+  TIMEOUT/MIN_CONFIDENCE`); the UI is read-only by design. A writable OCR
+  config UI remains deferred (no writable config API or secret handling in
+  M2.1).
+- Fake peelfeed CLI/fixtures implement `ocr-check`/`ocr-refresh`, the
+  `capabilities.ocr` object, OCR review payloads (configured/unconfigured,
+  coverage, `evidence.ocr_evidence`, `use_ocr_labels` availability), persistent
+  `type=ocr` job records and result summaries; tests cover the client
+  argv/stdin/env shapes, route validation/mapping, restart re-attachment,
+  no-OCR fallback, dataset/index non-invalidation and a Node stub-DOM UI
+  behaviour harness (auto-create once, interrupted manual retry, check 503,
+  evidence/low-confidence rendering).
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:
