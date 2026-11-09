@@ -995,7 +995,7 @@ class PeelfeedClient(object):
         if not batch_id:
             raise ValueError("batch show needs a batch id")
         return self._run(
-            ["batch", str(peel_id), "show", "--batch", batch_id],
+            ["batch", "show", str(peel_id), "--batch", batch_id],
             timeout=min(SHORT_TIMEOUT, self.timeout))
 
     def publish(self, peel_id, batch_id):
@@ -1038,12 +1038,12 @@ class PeelfeedClient(object):
         if not job_id:
             raise ValueError("job show needs a job id")
         return self._run(
-            ["job", str(peel_id), "show", "--job", job_id],
+            ["job", "show", str(peel_id), "--job", job_id],
             timeout=min(SHORT_TIMEOUT, self.timeout))
 
     def job_list(self, peel_id, status=None):
         """``job list <peel> [--status …]``: every persisted job record."""
-        args = ["job", str(peel_id), "list"]
+        args = ["job", "list", str(peel_id)]
         if status:
             args.extend(["--status", str(status)])
         return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout))

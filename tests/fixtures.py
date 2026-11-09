@@ -1927,11 +1927,12 @@ def main():
                      "status": "queued"})
 
     if command == "batch":
-        peel_id = first_positional(rest)
+        # Real CLI order is action BEFORE the peel id (wire §2.6).
+        values = positionals(rest)
+        action = values[0] if values else None
+        peel_id = values[1] if len(values) > 1 else ""
         if peel_id not in peels:
             return fail("no such peel", 3, "not_found")
-        values = positionals(rest)
-        action = values[1] if len(values) > 1 else None
         if action != "show":
             return fail("unknown batch action: " + str(action), 2, "validation")
         batch_id = option(rest, "--batch")
@@ -2034,11 +2035,12 @@ def main():
                      "status": "queued"})
 
     if command == "job":
-        peel_id = first_positional(rest)
+        # Real CLI order is action BEFORE the peel id (wire §2.6).
+        values = positionals(rest)
+        action = values[0] if values else None
+        peel_id = values[1] if len(values) > 1 else ""
         if peel_id not in peels:
             return fail("no such peel", 3, "not_found")
-        values = positionals(rest)
-        action = values[1] if len(values) > 1 else None
         jobs = state.get("jobs") or {}
         if action == "show":
             job_id = option(rest, "--job")

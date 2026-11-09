@@ -777,7 +777,8 @@ class CliAdapterTests(unittest.TestCase):
                 self.assertIn("--input", apply_call)
                 self.assertIn("-", apply_call)
                 batch_call = next(call for call in calls if call[0] == "batch")
-                self.assertEqual(batch_call[1:3], [peel_id, "show"])
+                # Real CLI order is action BEFORE the peel id (wire §2.6).
+                self.assertEqual(batch_call[1:3], ["show", peel_id])
                 self.assertEqual(
                     batch_call[batch_call.index("--batch") + 1],
                     applied["batch_id"])
@@ -795,9 +796,9 @@ class CliAdapterTests(unittest.TestCase):
                                      if call[0] == "rollback")
                 self.assertIn("--reason", rollback_call)
                 job_calls = [call for call in calls if call[0] == "job"]
-                self.assertEqual(job_calls[0][1:3], [peel_id, "show"])
+                self.assertEqual(job_calls[0][1:3], ["show", peel_id])
                 self.assertIn("--job", job_calls[0])
-                self.assertEqual(job_calls[-1][1:3], [peel_id, "list"])
+                self.assertEqual(job_calls[-1][1:3], ["list", peel_id])
 
     def test_cp3_error_mapping_for_batch_publish_and_jobs(self):
         """busy→423, stale/conflict/corrections_conflict→409, not found→404."""
