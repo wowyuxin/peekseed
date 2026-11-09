@@ -1260,6 +1260,63 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .rr-impact{margin:0;font-size:10.5px;line-height:1.55;color:var(--faint);
   border-top:1px solid var(--line-soft);padding-top:6px;overflow-wrap:anywhere;}
 .rr-impact b{color:var(--muted);}
+/* ---- CP3 W5: candidate batch, persistent jobs, corrections conflict ------
+   The batch section is the publish gate: estimate -> build status -> gates ->
+   actual diff -> [发布]/[放弃], with the job progress above it. Stable wire
+   codes stay in the payloads; the Chinese labels live in the JS below. */
+.rr-batch{display:flex;flex-direction:column;gap:7px;padding:9px 11px;margin:0 0 10px;
+  border:1px solid var(--line);border-radius:11px;background:var(--panel-2);min-width:0;}
+.rr-batch-h{display:flex;flex-wrap:wrap;gap:5px 12px;align-items:baseline;}
+.rr-batch-h h4,.rr-batch-h h5{margin:0;font-size:10px;letter-spacing:.07em;
+  text-transform:uppercase;color:var(--faint);}
+.rr-batch-row{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;
+  font-size:11px;color:var(--muted);min-width:0;}
+.rr-batch-row button{padding:4px 9px;font-size:10.5px;min-height:25px;border-radius:6px;}
+.rr-noop{font-size:11px;color:var(--muted);line-height:1.55;overflow-wrap:anywhere;}
+.rr-cand{border:1px solid var(--line);border-radius:9px;background:var(--panel);
+  padding:8px 10px;display:flex;flex-direction:column;gap:5px;min-width:0;}
+.rr-cand-h{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;font-size:11.5px;
+  min-width:0;}
+.rr-cand-h b{color:var(--text);overflow-wrap:anywhere;}
+.rr-cand-meta{font:10px var(--mono);color:var(--faint);line-height:1.5;
+  overflow-wrap:anywhere;}
+.rr-cand-sec{font-size:10.5px;color:var(--muted);line-height:1.55;overflow-wrap:anywhere;}
+.rr-cand-sec b{color:var(--text);}
+.rr-gate{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;font-size:10.5px;}
+.rr-gate.ok{color:var(--ok);}
+.rr-gate.bad{color:var(--bad);}
+.rr-gate-list{margin:3px 0 0;padding-left:16px;font-size:10px;color:var(--bad);
+  line-height:1.5;overflow-wrap:anywhere;}
+.rr-samples{margin:4px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;
+  gap:2px;}
+.rr-samples li{font:9.5px var(--mono);color:var(--muted);overflow-wrap:anywhere;}
+.rr-jobs{display:flex;flex-direction:column;gap:4px;}
+.rr-job{border:1px solid var(--line);border-radius:8px;background:var(--panel);
+  padding:5px 8px;display:flex;flex-direction:column;gap:3px;font-size:10.5px;
+  color:var(--muted);min-width:0;}
+.rr-job-h{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;min-width:0;}
+.rr-job-id{font:9.5px var(--mono);color:var(--faint);overflow-wrap:anywhere;}
+.rr-job-hint{font-size:10px;color:var(--bad);line-height:1.5;overflow-wrap:anywhere;}
+.rr-progress{height:4px;border-radius:3px;background:var(--line);overflow:hidden;}
+.rr-progress span{display:block;height:100%;background:var(--accent);}
+.rr-rebuild-hint{font-size:10px;color:var(--warn);line-height:1.5;overflow-wrap:anywhere;}
+.rr-conflict{margin:0 0 10px;padding:8px 10px;border-radius:9px;font-size:11px;
+  line-height:1.55;border:1px solid rgba(251,113,133,.4);background:var(--bad-soft);
+  color:var(--text);min-width:0;}
+.rr-conflict[hidden]{display:none;}
+.rr-conflict h4{margin:0 0 4px;font-size:10.5px;color:var(--bad);text-transform:uppercase;
+  letter-spacing:.06em;}
+.rr-conflict-list{margin:3px 0 0;padding-left:16px;font-size:10px;color:var(--muted);
+  line-height:1.5;overflow-wrap:anywhere;}
+.rr-conflict button{padding:3px 8px;font-size:10px;min-height:23px;border-radius:6px;
+  margin-top:5px;}
+.ds-conflict{margin:6px 0 0;padding:7px 9px;border-radius:9px;
+  border:1px solid rgba(251,113,133,.4);background:var(--bad-soft);font-size:11px;
+  line-height:1.5;color:var(--text);min-width:0;}
+.ds-conflict-row{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:center;}
+.ds-conflict button{padding:3px 8px;font-size:10px;min-height:23px;border-radius:6px;}
+.ds-src-reason{flex:1 1 100%;font-size:10px;color:var(--bad);line-height:1.5;
+  overflow-wrap:anywhere;}
 @media (max-width:860px){
   .rr-grid{grid-template-columns:1fr;}
   .rr-clusters{max-height:32vh;}
@@ -1712,6 +1769,11 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
       <button class="hist-close" id="reviewClose" type="button" aria-label="Close">&#215;</button>
     </div>
     <p class="settings-msg" id="reviewMsg" role="status" aria-live="polite"></p>
+    <!-- CP3 W5: corrections_conflict banner (dataset + review top) and the
+         batch section: build the batch's candidate, watch the persisted job,
+         review estimate/gates/diff, then publish/discard/rollback. -->
+    <div class="rr-conflict" id="reviewConflict" hidden></div>
+    <div class="rr-batch" id="reviewBatch"><span class="hist-empty">正在读取候选批次与后台任务…</span></div>
     <div class="hist-body settings-body">
       <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
       <div class="rr-grid">
@@ -2289,7 +2351,8 @@ let REVIEW_CTX=null;
    one review payload per source on every list poll. */
 const REVIEW_COUNTS={};
 const PEEL_STATE_LABEL={uploaded:'not extracted',not_extracted:'not extracted',
-  queued:'queued',running:'running',extracted:'extracted',failed:'failed',stale:'stale'};
+  queued:'queued',running:'running',extracted:'extracted',failed:'failed',stale:'stale',
+  corrections_conflict:'修正冲突'};
 function peelfeedAvailable(){
   return !!(PF_STATUS&&PF_STATUS.handshake&&PF_STATUS.handshake.available);
 }
@@ -2330,7 +2393,7 @@ function sourceState(src){
 }
 function sourceChipClass(state){
   if(state==='extracted') return 'ok';
-  if(state==='failed') return 'bad';
+  if(state==='failed'||state==='corrections_conflict') return 'bad';
   if(state==='queued'||state==='running'||state==='stale') return 'warn';
   return 'muted';
 }
@@ -2364,7 +2427,8 @@ function sourceRowHtml(dsId,src){
   const available=peelfeedAvailable();
   const busy=(state==='queued'||state==='running');
   const canExtract=available&&src.present&&!busy;
-  const label=(state==='extracted'||state==='stale'||state==='failed')?'Re-extract':'Extract';
+  const label=(state==='extracted'||state==='stale'||state==='failed'
+    ||state==='corrections_conflict')?'Re-extract':'Extract';
   const why=available
     ? (src.present?'Ask peelfeed to build a peel for this file'
                  :'the stored file is missing')
@@ -2372,14 +2436,23 @@ function sourceRowHtml(dsId,src){
   let actions='<button type="button" class="secondary" data-act="extract"'
     +' data-sha="'+escAttr(src.sha256||'')+'"'
     +(canExtract?'':' disabled')+' title="'+escAttr(why)+'">'+esc(label)+'</button>';
-  if(state==='extracted'&&(reviewN>0||(reviewKnown&&Number(reviewKnown.pending||0)>0))){
+  /* CP3: the review entry point stays available for a corrections_conflict
+     source (the peel is readable; only the system rebuild was blocked). */
+  if((state==='extracted'&&(reviewN>0||(reviewKnown&&Number(reviewKnown.pending||0)>0)))
+     ||state==='corrections_conflict'){
     actions+='<button type="button" class="secondary" data-act="review"'
       +' data-sha="'+escAttr(src.sha256||'')+'"'
       +' title="打开审阅报告：按簇查看建议、证据、策略与计划状态">'
       +esc(reviewChip)+'</button>';
   }
+  const conflict=(state==='corrections_conflict'&&ex.corrections_conflict
+    &&typeof ex.corrections_conflict==='object')?ex.corrections_conflict:null;
+  const reason=conflict
+    ? '<div class="ds-src-reason">历史修正失效，构建被阻断（current 未变）：'
+      +esc(reviewConflictSummaryText(conflict))+'</div>'
+    : '';
   return '<div class="ds-src"><span class="src-name">'+esc(src.name||'?')+'</span>'
-    +sourceChipHtml(state)+actions+'</div>';
+    +sourceChipHtml(state)+actions+reason+'</div>';
 }
 async function loadDatasets(){
   const d=await getJSON('/api/datasets');
@@ -4744,6 +4817,7 @@ function datasetRow(ds){
     +'<div class="ds-main">'
     +'<div class="ds-title"><span class="ds-name">'+esc(ds.name||ds.id)+'</span>'
     +'<span class="set-badge">'+esc(ds.id)+'</span></div>'
+    +datasetConflictHtml(ds)
     +'<div class="ds-meta">'
     +(chunks?chunks.toLocaleString()+' chunk'+(chunks===1?'':'s'):'no chunks yet')
     +' · '+names.length+' source'+(names.length===1?'':'s')
@@ -4960,6 +5034,40 @@ const REVIEW_ACCEPT_REASON_LABEL={locked:'已锁定',stale:'已过期',
 /* CP2 E2: strategies whose select call must carry real params instead of {}. */
 const REVIEW_PARAM_STRATEGIES={inherit_parent_header:'parent',
   use_header_rows:'rows'};
+/* CP3 W5 (wire-contract §2.5/§2.7/§2.9): stable batch/job/build codes keep the
+   wire spelling in the payloads; every Chinese label lives here. */
+const REVIEW_BATCH_STATUS_LABEL={estimating:'估算中',building:'构建中',gates:'校验中',
+  ready_to_publish:'待发布',publishing:'发布中',published:'已发布',failed:'失败',
+  discarded:'已放弃',stale:'已过期'};
+const REVIEW_BATCH_ACTIVE=['estimating','building','gates','ready_to_publish','publishing'];
+const REVIEW_BATCH_RELEASED=['failed','discarded','stale'];
+const REVIEW_JOB_STATUS_LABEL={queued:'排队中',running:'运行中',done:'已完成',
+  failed:'失败',interrupted:'已中断'};
+const REVIEW_JOB_TYPE_LABEL={report:'报告',build:'候选构建',rollback:'回滚',
+  ocr:'OCR',discuss:'讨论'};
+const REVIEW_JOB_TERMINAL=['done','failed','interrupted'];
+const REVIEW_BUILD_KIND_LABEL={batch:'批次候选',system:'系统重建',cutover:'布局迁移',
+  ingest:'首次构建'};
+const REVIEW_FAILURE_CODE_LABEL={validation:'校验失败',stale:'已过期',conflict:'冲突',
+  busy:'正忙',interrupted:'已中断'};
+const REVIEW_CONFLICT_REASON_LABEL={history_correction_revalidation:'历史修正失效',
+  evidence_changed:'证据变化',parent_changed:'父表变化',
+  parent_header_not_selected:'父表表头未确认',strategy_changed:'策略已变更',
+  capability_unavailable:'能力不可用',action_invalid:'动作已失效',
+  chain_not_allowed:'禁止链式继承',item_missing:'条目缺失',
+  grid_evidence_mismatch:'网格证据不符',grid_evidence_unverified:'网格证据不可用',
+  grid_merged_columns:'合并列',parent_header_incompatible:'列数不兼容',
+  parent_header_mismatch:'父表表头不符',parent_evidence_mismatch:'父表证据变化',
+  parent_header_not_simple:'父表表头跨列',child_has_header:'子表已有表头',
+  asset_missing:'资产缺失',asset_not_structured:'资产不是结构化表格',
+  parent_missing:'父表缺失',parent_not_structured:'父表不是结构化表格',
+  row_out_of_range:'表头行号越界',header_span_crosses_data:'表头跨入数据行',
+  rows_invalid:'表头行号非法',source_refs_invalid:'证据引用非法',
+  operation_fields_invalid:'操作字段非法',operation_name_unsupported:'操作不支持',
+  operation_schema_unsupported:'操作 schema 不支持',
+  parent_fields_invalid:'父表字段非法',duplicate_operation:'重复操作',
+  conflicting_operations:'操作冲突',duplicate_inheritance:'重复继承',
+  entry_in_batch:'条目已在批次中'};
 function reviewKey(dsId,sha){ return dsId+'|'+(sha||''); }
 function reviewBase(dsId,sha){
   return '/api/datasets/'+encodeURIComponent(dsId)+'/sources/'+encodeURIComponent(sha)+'/review';
@@ -4981,7 +5089,11 @@ async function reviewFetchJSON(path,opts){
 }
 function reviewErrText(e){
   const msg=(e&&e.message)||String(e||'');
-  if(e&&e.status===409) return '冲突：'+msg+'。已刷新最新计划，请重试。';
+  if(e&&e.status===409&&/review[_ ]schema/i.test(msg)){
+    return 'peelfeed review schema 不一致：'+msg
+      +'。请同步升级 peelfeed 与 peekseed 后重试。';
+  }
+  if(e&&e.status===409) return '冲突：'+msg+'。已刷新最新状态，请重试。';
   if(e&&e.status===423) return 'peelfeed 正忙：'+msg+'。请稍后重试。';
   if(e&&e.status===400) return '校验失败：'+msg;
   if(e&&e.status===404) return '找不到该条目或数据：'+msg;
@@ -4992,8 +5104,10 @@ function reviewErrText(e){
    schema differs (the CP1 review_schema gate) rather than a stale plan. */
 function reviewLoadErrText(e){
   const msg=(e&&e.message)||String(e||'');
+  if(e&&e.status===409&&/review[_ ]schema/i.test(msg)) return reviewErrText(e);
   if(e&&e.status===409){
-    return '无法读取审阅报告：'+msg+'（review_schema 不一致时需要同步升级 peelfeed 与 peekseed）';
+    return '无法读取审阅报告：'+msg
+      +'（审阅数据不一致时需要刷新或同步升级 peelfeed 与 peekseed）';
   }
   return reviewErrText(e);
 }
@@ -5437,46 +5551,52 @@ function reviewActionsHtml(item){
   const stale=!!(entry&&entry.stale);
   const busy=!!(REVIEW_CTX&&REVIEW_CTX.busy);
   const batchId=(entry&&entry.batch_id)?String(entry.batch_id):'';
-  /* CP2 W9 clear: enabled only for an entry that is neither locked nor already
-     in a batch (wire §2.6); the item returns to its merged status afterwards. */
-  const canClear=hasEntry&&!locked&&!batchId&&!busy;
+  /* CP3 W5: entries bound to an in-flight/published batch are read-only -- the
+     batch is built from a frozen projection, so plan edits would race it. A
+     failed/stale/discarded batch releases them again. */
+  const batchLocked=reviewBatchEntryLocked(entry);
+  const batchStatus=reviewBatchStatus(batchId);
+  const canClear=hasEntry&&!locked&&!batchLocked&&!busy;
   const refreshable=stale&&reviewStaleRefreshable(entry);
-  /* CP2 E3: confirm stays enabled for non-stale entries and for stale entries
-     whose only reasons are evidence_changed/parent_changed (an explicit
-     re-confirm refreshes the snapshot; locked entries may still confirm). */
-  const canConfirm=hasEntry&&(!stale||refreshable);
+  const canConfirm=hasEntry&&(!stale||refreshable)&&!batchLocked;
   const strategies=(item&&item.strategies)||[];
   const availableN=strategies.filter(function(s){ return s.available!==false; }).length;
   let html='<div class="rr-actions">';
   if(strategies.length){
     html+='<label class="rr-field"><span>策略</span><select data-r="strategy"'
-      +(locked?' disabled title="条目已锁定，先解锁才能换策略"':'')+'>'
+      +(locked||batchLocked?' disabled title="条目已锁定或在批次中，暂不可换策略"':'')+'>'
       +'<option value="">选择策略…</option>'+reviewStrategyOptions(item)+'</select></label>'
       +'<button type="button" class="secondary" data-r="select"'
-      +(locked||!availableN?' disabled':'')+'>选择</button>';
+      +(locked||batchLocked||!availableN?' disabled':'')+'>选择</button>';
   }else{
     html+='<span class="rr-muted">无可用策略：可暂缓并选择原因</span>';
   }
   html+='<button type="button" class="secondary" data-r="confirm"'
     +(canConfirm?'':' disabled')+'>确认</button>'
     +'<button type="button" class="secondary" data-r="'+(locked?'unlock':'lock')+'"'
-    +(hasEntry?'':' disabled')+'>'+(locked?'解锁':'锁定')+'</button>'
+    +(hasEntry&&!batchLocked?'':' disabled')+'>'+(locked?'解锁':'锁定')+'</button>'
     +'<button type="button" class="secondary" data-r="clear"'
     +(canClear?'':' disabled')
-    +' title="'+(locked?'条目已锁定，先解锁才能清除'
-      :(batchId?'条目已在批次中，不能清除':'删除该计划条目（已应用的 R0 会写 revert）'))
+    +' title="'+(batchLocked?'条目已在批次中，构建/发布期间只读'
+      :(locked?'条目已锁定，先解锁才能清除'
+      :(batchId?'条目已在批次中，不能清除':'删除该计划条目（已应用的 R0 会写 revert）')))
     +'">清除选择</button>'
     +(stale&&refreshable
       ?'<span class="rr-stale-hint">重新确认会刷新证据快照</span>':'')
     +(stale&&!refreshable
       ?'<span class="rr-stale-guide">需重新选择策略或先处理父表</span>':'')
+    +(batchLocked
+      ?'<span class="rr-stale-hint">条目在批次 '
+        +(batchStatus?esc(reviewBatchStatusLabel(batchStatus)):'构建中')
+        +'，构建/发布期间只读</span>':'')
     +'</div>';
   if(strategies.length){
     html+='<div class="rr-actions rr-param-row">'
-      +reviewStrategyParamsHtml(item,locked)+'</div>';
+      +reviewStrategyParamsHtml(item,locked||batchLocked)+'</div>';
   }
   html+='<div class="rr-actions rr-defer">'
-    +'<label class="rr-field"><span>暂缓原因</span><select data-r="defer-code">'
+    +'<label class="rr-field"><span>暂缓原因</span><select data-r="defer-code"'
+    +(batchLocked?' disabled':'')+'>'
     +'<option value="">选择原因…</option>'
     +REVIEW_DEFER_CODES.map(function(code){
       return '<option value="'+escAttr(code)+'">'
@@ -5484,24 +5604,27 @@ function reviewActionsHtml(item){
     }).join('')
     +'</select></label>'
     +'<input data-r="defer-reason" type="text" maxlength="200" placeholder="说明（可选）"'
-    +' aria-label="暂缓说明">'
-    +'<button type="button" class="secondary" data-r="defer">暂缓</button></div>';
+    +(batchLocked?' disabled':'')+' aria-label="暂缓说明">'
+    +'<button type="button" class="secondary" data-r="defer"'
+    +(batchLocked?' disabled':'')+'>暂缓</button></div>';
   return html;
 }
 function reviewItemHtml(item){
   const status=item.status||'needs_decision';
   const pages=(item.pages||[]).join(',');
   const busy=!!(REVIEW_CTX&&REVIEW_CTX.busy);
+  const batchLocked=reviewBatchEntryLocked(item&&item.entry);
   const meta=['asset '+(item.asset_id||'?'), pages?('页 p.'+pages):'',
     'code '+(item.code||'')].filter(Boolean).join(' · ');
   return '<article class="rr-item" data-item="'+escAttr(item.id||'')+'">'
     +'<div class="rr-item-h"><span class="rr-item-id">'+esc(item.id||'')+'</span>'
     +'<label class="rr-pick" title="勾选后可点“确认选中项”">'
     +'<input type="checkbox" data-r="accept-pick" value="'+escAttr(item.id||'')+'"'
-    +(busy?' disabled':'')+'>选中</label>'
+    +(busy||batchLocked?' disabled':'')+'>选中</label>'
     +reviewBadge(REVIEW_STATUS_LABEL[status]||status,status)
     +(item.triage?reviewBadge(REVIEW_TRIAGE_LABEL[item.triage]||item.triage,item.triage):'')
     +(item.stale?reviewStaleBadge(item):'')
+    +(batchLocked?reviewBadge('批次中','accent'):'')
     +'</div>'
     +'<p class="rr-item-msg">'+esc(item.message||'')+'</p>'
     +'<div class="rr-item-meta">'+esc(meta)+'</div>'
@@ -5596,6 +5719,694 @@ function paintReviewDetail(r){
 function refreshReviewChip(){
   if(DATASETS.length) paintDatasetDialog();
 }
+/* ---- CP3 W5: candidate batch / persistent jobs / corrections conflict ----
+   Flow (wire-contract §2.6/§2.7/§2.9): POST …/review/batches {entry_ids} ->
+   202 {job_id, batch_id, status}; poll GET …/review/jobs/{id} until a terminal
+   state; GET …/review/batches/{id} for estimate/gates/diff; then publish or
+   discard. Jobs live in peelfeed and are re-attached from
+   extraction.review_jobs after a restart: this UI only polls, it never reruns
+   automatically. A dead running job derives ``interrupted`` and only the
+   explicit 「手动重试」 action starts a new request. */
+function reviewBatchStatusLabel(status){
+  return REVIEW_BATCH_STATUS_LABEL[status]||status||'未知';
+}
+function reviewJobStatusLabel(status){
+  return REVIEW_JOB_STATUS_LABEL[status]||status||'未知';
+}
+function reviewJobTypeLabel(type){ return REVIEW_JOB_TYPE_LABEL[type]||type||'任务'; }
+function reviewFailureLabel(code){ return REVIEW_FAILURE_CODE_LABEL[code]||code||'失败'; }
+function reviewConflictReasonLabel(code){
+  return REVIEW_CONFLICT_REASON_LABEL[code]||code||'';
+}
+function reviewBatchStatus(batchId){
+  const ctx=REVIEW_CTX;
+  const batch=(ctx&&ctx.batchesById&&ctx.batchesById[batchId])||null;
+  return batch?String(batch.status||''):'';
+}
+function reviewBatchActive(batchId){
+  return REVIEW_BATCH_ACTIVE.indexOf(reviewBatchStatus(batchId))>=0;
+}
+/* Entries bound to a batch are read-only while it is in flight (and once it is
+   published); a failed/stale/discarded batch releases them again. */
+function reviewBatchEntryLocked(entry){
+  const batchId=(entry&&entry.batch_id)?String(entry.batch_id):'';
+  if(!batchId) return false;
+  const status=reviewBatchStatus(batchId);
+  return !(status&&REVIEW_BATCH_RELEASED.indexOf(status)>=0);
+}
+function reviewSourceExtraction(){
+  const src=REVIEW_CTX&&REVIEW_CTX.source;
+  return (src&&src.extraction&&typeof src.extraction==='object')?src.extraction:{};
+}
+function reviewJobError(record){
+  const err=(record&&record.error)||null;
+  if(!err||typeof err!=='object') return '未知错误';
+  return reviewFailureLabel(err.code)+'：'+String(err.message||err.code||'未知错误');
+}
+function reviewCurrentHtml(){
+  const ctx=REVIEW_CTX; const cur=ctx&&ctx.current;
+  const ex=reviewSourceExtraction();
+  const buildId=String((cur&&cur.build_id)||'');
+  const conversion=String((cur&&cur.conversion_id)||ex.conversion_id||'');
+  if(!buildId&&!conversion) return '';
+  return '<span class="rr-cand-meta">当前构建 '+(buildId?esc(buildId):'—')
+    +(conversion?' · conversion '+esc(conversion.slice(0,12))+'…':'')+'</span>';
+}
+/* Confirmed corpus-operation entries not yet bound to a batch: exactly the
+   entry_ids POST …/review/batches accepts (no tier/scope, wire §2.6). */
+function reviewConfirmedEntries(){
+  const ctx=REVIEW_CTX; const out=[];
+  if(!ctx) return out;
+  Object.keys(ctx.itemsById||{}).forEach(function(itemId){
+    const item=ctx.itemsById[itemId]||{}; const entry=item.entry;
+    if(!entry||!entry.entry_id) return;
+    if(String(entry.status||'')!=='confirmed') return;
+    if(((entry.action||{}).type)!=='operation') return;
+    if(entry.stale) return;
+    if(entry.batch_id) return;
+    out.push({item_id:itemId,entry_id:String(entry.entry_id)});
+  });
+  out.sort(function(a,b){ return a.entry_id.localeCompare(b.entry_id); });
+  return out;
+}
+/* --- corrections_conflict ------------------------------------------------ */
+function reviewConflictSummaryText(conflict){
+  const conflicting=((conflict&&conflict.conflicting)||[]).filter(Boolean);
+  const batches=((conflict&&conflict.source_batches)||[]).filter(Boolean);
+  const bits=[];
+  if(conflicting.length) bits.push('冲突修正 '+conflicting.join(', '));
+  if(batches.length) bits.push('来源批次 '+batches.join(', '));
+  return bits.length?bits.join(' · '):'请打开审阅报告处理冲突修正';
+}
+function reviewConflictFailuresHtml(conflict){
+  const failures=((conflict&&conflict.failures)||[]).filter(function(f){
+    return f&&typeof f==='object'; });
+  if(!failures.length){
+    return '<div class="rr-cand-meta">冲突详情缺失：请在审阅报告中 revert/supersede '
+      +'冲突修正后重新构建。</div>';
+  }
+  return '<ul class="rr-conflict-list">'+failures.slice(0,10).map(function(f){
+    const reasons=((f.reasons||[])).map(function(code){
+      return reviewConflictReasonLabel(code); }).filter(Boolean);
+    const bits=[f.item_id?'条目 '+f.item_id:'',
+      f.correction_id?'修正 '+f.correction_id:'',
+      f.source_batch_id?'来源批次 '+f.source_batch_id:'',
+      reasons.length?'原因：'+reasons.join('；'):''].filter(Boolean);
+    return '<li>'+esc(bits.join(' · '))
+      +(f.message?' — '+esc(String(f.message)):'')+'</li>';
+  }).join('')+'</ul>';
+}
+function reviewConflictHtml(conflict){
+  if(!conflict||typeof conflict!=='object') return '';
+  const at=String(conflict.at||'');
+  return '<h4>修正冲突（corrections_conflict）</h4>'
+    +'<div>当前构建被阻断：历史修正无法重新校验，未发布，current 保持不变。'
+    +esc(reviewConflictSummaryText(conflict))
+    +(at?' · '+esc(at):'')+'</div>'
+    +reviewConflictFailuresHtml(conflict);
+}
+function reviewConflictJump(itemId){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const item=itemId?ctx.itemsById[itemId]:null;
+  if(!item||!item.cluster_id){
+    reviewMsg('冲突条目不在当前报告里；请对冲突修正执行 revert/supersede '
+      +'（重新选择策略或暂缓）后重新构建。',false);
+    return;
+  }
+  ctx.selected=item.cluster_id;
+  if(ctx.data){ paintReviewClusters(ctx.data); paintReviewDetail(ctx.data); }
+  reviewMsg('已定位到冲突条目 '+itemId+'：可重新选择策略或暂缓，以 '
+    +'revert/supersede 冲突修正。',false);
+}
+function datasetConflictHtml(ds){
+  const rows=(ds&&Array.isArray(ds.corrections_conflict))?ds.corrections_conflict:[];
+  if(!rows.length) return '';
+  return '<div class="ds-conflict">'+rows.map(function(row){
+    if(!row||typeof row!=='object') return '';
+    const conflict=(row.corrections_conflict
+      &&typeof row.corrections_conflict==='object')?row.corrections_conflict:{};
+    return '<div class="ds-conflict-row"><span>修正冲突 · 源 '
+      +esc(String(row.name||row.sha256||'?'))+'：'
+      +esc(reviewConflictSummaryText(conflict))
+      +(row.error?' · '+esc(String(row.error)):'')+'</span>'
+      +'<button type="button" class="secondary" data-act="review"'
+      +' data-sha="'+escAttr(String(row.sha256||''))+'">打开审阅处理</button></div>';
+  }).join('')+'</div>';
+}
+function paintReviewConflict(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const el=$('#reviewConflict'); if(!el) return;
+  const conflict=ctx.conflict;
+  if(!conflict||typeof conflict!=='object'){
+    el.hidden=true; el.innerHTML=''; return;
+  }
+  const failures=(conflict.failures||[]);
+  const jump=failures.map(function(f){ return String((f&&f.item_id)||''); })
+    .filter(function(itemId){ return itemId&&ctx.itemsById[itemId]; })[0]||'';
+  el.hidden=false;
+  el.innerHTML=reviewConflictHtml(conflict)
+    +(jump
+      ?'<button type="button" class="secondary" data-r="conflict-jump" data-item="'
+        +escAttr(jump)+'">定位冲突条目</button>'
+      :'<div class="rr-cand-meta">处理入口：在本页对冲突条目重新选择策略或暂缓，'
+        +'以 revert/supersede 冲突修正后重新构建。</div>');
+}
+/* --- persistent jobs ----------------------------------------------------- */
+function reviewJobRowHtml(job){
+  const record=(job&&job.record)||{};
+  const status=String((job&&job.status)||record.status||'');
+  const type=String((job&&job.type)||record.type||'');
+  const progress=(record&&record.progress)||{};
+  const stage=String(progress.stage||progress.phase||'');
+  const done=(progress.done!=null)?Number(progress.done):null;
+  const total=(progress.total!=null)?Number(progress.total):null;
+  const pct=(done!=null&&total)?Math.round(Math.min(1,Math.max(0,done/total))*100):null;
+  const bits=[reviewJobTypeLabel(type),reviewJobStatusLabel(status),
+    stage?('阶段 '+stage):'',
+    done!=null?('进度 '+done+(total!=null?('/'+total):'')):''].filter(Boolean);
+  let html='<div class="rr-job" data-job="'+escAttr((job&&job.job_id)||'')+'">'
+    +'<div class="rr-job-h">'+esc(bits.join(' · '))
+    +'<span class="rr-job-id">'+esc((job&&job.job_id)||'')+'</span></div>';
+  if(pct!=null){
+    html+='<div class="rr-progress"><span style="width:'+pct+'%"></span></div>';
+  }
+  if(status==='failed'){
+    html+='<div class="rr-job-hint">'+esc(reviewJobError(record))+'</div>';
+  }
+  if(status==='interrupted'){
+    html+='<div class="rr-job-hint">任务中断，可手动重试（不会自动重跑）</div>'
+      +'<div class="rr-batch-row"><button type="button" class="secondary"'
+      +' data-r="job-retry" data-job="'+escAttr((job&&job.job_id)||'')+'"'
+      +' data-type="'+escAttr(type)+'">手动重试</button></div>';
+  }
+  if(status==='done'&&record.result_ref){
+    html+='<div class="rr-cand-meta">结果：'+esc(String(record.result_ref))+'</div>';
+  }
+  html+='</div>';
+  return html;
+}
+function reviewJobsHtml(){
+  const ctx=REVIEW_CTX; if(!ctx) return '';
+  const jobs=Object.keys(ctx.jobs||{}).map(function(jobId){
+    return ctx.jobs[jobId]; }).filter(function(job){
+      if(!job) return false;
+      const type=String(job.type||((job.descriptor||{}).type)||'');
+      return type==='report'||type==='build'||type==='rollback';
+    });
+  if(!jobs.length) return '';
+  jobs.sort(function(a,b){
+    const ta=String((a.descriptor&&a.descriptor.created_at)
+      ||(a.record&&(a.record.updated_at||a.record.started_at))||'');
+    const tb=String((b.descriptor&&b.descriptor.created_at)
+      ||(b.record&&(b.record.updated_at||b.record.started_at))||'');
+    return tb.localeCompare(ta);
+  });
+  return '<div class="rr-jobs">'+jobs.slice(0,6).map(reviewJobRowHtml).join('')+'</div>';
+}
+/* --- candidate panel ----------------------------------------------------- */
+function reviewCandidatePanelHtml(batch){
+  if(!batch||typeof batch!=='object') return '';
+  const ctx=REVIEW_CTX;
+  const status=String(batch.status||'');
+  const estimate=(batch.estimate&&typeof batch.estimate==='object')?batch.estimate:{};
+  const build=(batch.build&&typeof batch.build==='object')?batch.build:{};
+  const gates=(build.gates&&typeof build.gates==='object')?build.gates:{};
+  const diff=(build.diff&&typeof build.diff==='object')?build.diff:{};
+  const publish=(batch.publish&&typeof batch.publish==='object')?batch.publish:{};
+  const failures=(batch.failures||[]).filter(function(f){ return f&&typeof f==='object'; });
+  const planLevel=(batch.plan_level&&typeof batch.plan_level==='object')?batch.plan_level:{};
+  const busy=!!(ctx&&(ctx.building||ctx.publishing));
+  const stale=!!(ctx&&ctx.candidateStale);
+  const statusKind=(status==='published')?'ok'
+    :((status==='failed'||status==='stale')?'bad'
+    :((status==='ready_to_publish')?'accent':'warn'));
+  let html='<div class="rr-cand" data-batch="'+escAttr(String(batch.batch_id||''))+'">'
+    +'<div class="rr-cand-h"><b>'+esc('批次 '+String(batch.batch_id||'—'))+'</b>'
+    +reviewBadge(reviewBatchStatusLabel(status),statusKind)
+    +(planLevel.tier?('<span class="rr-cand-meta">层级 '+esc(String(planLevel.tier))
+      +(((planLevel.reasons||[]).length)?(' · '+esc((planLevel.reasons||[]).join(', '))):'')
+      +'</span>'):'')
+    +(batch.build_kind?('<span class="rr-cand-meta">'
+      +esc(REVIEW_BUILD_KIND_LABEL[batch.build_kind]||batch.build_kind)+'</span>'):'')
+    +'</div>';
+  if(Object.keys(estimate).length){
+    const pages=((estimate.pages||[])).filter(function(page){ return page!=null; });
+    html+='<div class="rr-cand-sec"><b>估算</b>：'+reviewNum(estimate.items||0)+' 项 · '
+      +reviewNum(estimate.assets||0)+' 资产'
+      +(pages.length?' · 页 p.'+esc(pages.join(',')):'')
+      +' · Docling 重跑 '+(estimate.docling_rerun?'是':'否')
+      +(estimate.seconds!=null?' · 预计 ~'+reviewNum(estimate.seconds)+' 秒':'')
+      +(estimate.reindex?' · reindex：'+esc(String(estimate.reindex)):'')+'</div>';
+  }
+  if(build.build_id){
+    html+='<div class="rr-cand-sec"><b>构建</b>：'+esc(String(build.build_id))
+      +(build.candidate_conversion_id?' · conversion '
+        +esc(String(build.candidate_conversion_id).slice(0,12))+'…':'')+'</div>';
+    const checks=(gates.checks!=null)?(' · '+reviewNum(gates.checks)+' 项检查'):'';
+    html+='<div class="rr-gate '+(gates.all_pass?'ok':'bad')+'"><b>gates '
+      +(gates.all_pass?'通过':'未通过')+'</b>'+esc(checks)+'</div>';
+    const gateErrors=((gates.errors||[])).filter(Boolean);
+    if(gateErrors.length){
+      html+='<ul class="rr-gate-list">'+gateErrors.slice(0,10).map(function(err){
+        return '<li>'+esc(reviewStr(err,''))+'</li>'; }).join('')+'</ul>';
+    }
+    const newWarnings=((diff.new_warnings||[])).filter(Boolean);
+    html+='<div class="rr-cand-sec"><b>实际变更</b>：资产 '
+      +reviewNum(diff.assets_changed||0)+' · blocks '+reviewNum(diff.blocks_changed||0)
+      +' · chunks '+reviewNum(diff.chunks_changed||0)
+      +' · 新增 warning '+reviewNum(newWarnings.length)
+      +' · 带入已生效修正 '+reviewNum(build.carried_corrections||0)+'</div>';
+    const changed=((diff.changed_assets||[])).filter(Boolean);
+    if(changed.length){
+      html+='<div class="rr-cand-meta">变更资产：'
+        +esc(changed.slice(0,8).join(', '))
+        +(changed.length>8?(' +'+(changed.length-8)+' more'):'')+'</div>';
+    }
+    if(newWarnings.length){
+      html+='<div class="rr-cand-sec">新增 warning：'
+        +esc(newWarnings.slice(0,6).join('; '))
+        +(newWarnings.length>6?(' … +'+(newWarnings.length-6)):'')+'</div>';
+    }
+    const samples=((diff.samples||[])).filter(function(sample){
+      return sample&&typeof sample==='object'; });
+    if(samples.length){
+      html+='<ul class="rr-samples">'+samples.slice(0,4).map(function(sample){
+        return '<li>'+esc(String(sample.asset_id||''))+': '
+          +esc(reviewStr(sample.before,''))+' → '+esc(reviewStr(sample.after,''))+'</li>';
+      }).join('')+'</ul>';
+    }
+  }
+  if(failures.length){
+    html+='<div class="rr-cand-sec"><b>失败原因</b></div><ul class="rr-gate-list">'
+      +failures.slice(0,8).map(function(failure){
+        const reasons=((failure.reasons||[])).map(function(code){
+          return reviewFailureLabel(code); }).filter(Boolean);
+        return '<li>'+esc(reviewFailureLabel(failure.code)
+          +(reasons.length?('：'+reasons.join('；')):''))
+          +(failure.message?' — '+esc(String(failure.message)):'')+'</li>';
+      }).join('')+'</ul>';
+  }
+  if(publish.committed_at){
+    html+='<div class="rr-cand-sec"><b>已发布</b>：'+esc(String(publish.committed_at))
+      +(publish.current_build_id?' · 当前构建 '+esc(String(publish.current_build_id)):'')
+      +'</div>';
+  }else if(publish.error){
+    html+='<div class="rr-cand-sec"><b>发布错误</b>：'
+      +esc(reviewStr(publish.error,''))+'</div>';
+  }
+  if(status==='ready_to_publish'){
+    html+='<div class="rr-batch-row">'
+      +'<button type="button" data-r="publish"'+(busy||stale?' disabled':'')+'>发布</button>'
+      +'<button type="button" class="secondary" data-r="discard"'
+      +(busy?' disabled':'')+'>放弃</button>'
+      +(stale?'<span class="rr-rebuild-hint">候选已过期，需重新构建</span>':'')
+      +'</div>';
+  }else if(status==='publishing'){
+    html+='<div class="rr-batch-row"><span class="rr-cand-meta">发布中：commit 是 '
+      +'point-of-no-return，之后 current 指针原子切换。</span></div>';
+  }else if(status==='estimating'||status==='building'||status==='gates'){
+    html+='<div class="rr-batch-row"><span class="rr-cand-meta">构建中：本批条目只读，'
+      +'完成后显示 gates 与实际 diff。</span></div>';
+  }else if(status==='failed'||status==='stale'){
+    html+='<div class="rr-batch-row"><span class="rr-rebuild-hint">'
+      +(status==='stale'?'候选已过期，需重新构建':'候选构建失败；修正原因后重新构建')
+      +'</span></div>';
+  }else if(status==='discarded'){
+    html+='<div class="rr-batch-row"><span class="rr-cand-meta">已放弃：current '
+      +'与正式账本未变。</span></div>';
+  }
+  html+='</div>';
+  return html;
+}
+/* --- published batches + rollback --------------------------------------- */
+function reviewPublishedBatches(){
+  const ctx=REVIEW_CTX; if(!ctx) return [];
+  return Object.keys(ctx.batchesById||{}).map(function(batchId){
+    return ctx.batchesById[batchId]; }).filter(function(batch){
+      return batch&&String(batch.status||'')==='published'; })
+    .sort(function(a,b){
+      return String(b.created_at||'').localeCompare(String(a.created_at||'')); });
+}
+function reviewPublishedBatchesHtml(){
+  const ctx=REVIEW_CTX;
+  const list=reviewPublishedBatches();
+  const busy=!!(ctx&&(ctx.building||ctx.publishing));
+  let html='<div class="rr-batch-h"><h5>已发布批次</h5>'
+    +'<button type="button" class="secondary" data-r="rollback"'
+    +(list.length&&!busy?'':' disabled')
+    +' title="'+(list.length?'创建 revert 批次并发布上一构建（仅最近一批）'
+      :'还没有已发布批次')+'">回滚最近一批</button></div>';
+  if(!list.length){
+    return html+'<div class="rr-cand-meta">还没有已发布批次。发布候选后会出现在这里。</div>';
+  }
+  html+='<div class="rr-jobs">'+list.slice(0,8).map(function(batch){
+    const diff=(batch.build&&batch.build.diff)||{};
+    const publish=(batch.publish&&typeof batch.publish==='object')?batch.publish:{};
+    return '<div class="rr-job"><div class="rr-job-h">'
+      +esc(String(batch.batch_id||''))+reviewBadge('已发布','ok')
+      +'<span class="rr-job-id">'+esc(String(publish.committed_at||batch.created_at||''))
+      +'</span></div><div class="rr-cand-meta">资产 '
+      +reviewNum(diff.assets_changed||0)+' · blocks '+reviewNum(diff.blocks_changed||0)
+      +' · chunks '+reviewNum(diff.chunks_changed||0)
+      +(publish.current_build_id?' · 当前构建 '
+        +esc(String(publish.current_build_id)):'')+'</div></div>';
+  }).join('')+'</div>';
+  return html;
+}
+/* --- batch section ------------------------------------------------------- */
+function reviewBatchSectionHtml(){
+  const ctx=REVIEW_CTX; if(!ctx) return '';
+  const entries=reviewConfirmedEntries();
+  const candidate=ctx.candidate;
+  const buildRow=entries.length
+    ?'<div class="rr-batch-row"><button type="button" data-r="build"'
+      +(ctx.building||ctx.busy?' disabled':'')+'>构建本批候选（'+entries.length+' 项）</button>'
+      +'<span class="rr-cand-meta">已确认 operation 条目 '+entries.length
+      +' · 构建/发布期间这些条目只读；发布后按 R2 完整重建</span></div>'
+    :'<div class="rr-noop">无需重建 (R0/no-op)：没有已确认的 operation 条目；'
+      +'R0/暂缓/仅报告不会触发构建，也不会创建批次。</div>';
+  const jobsHtml=reviewJobsHtml();
+  return '<div class="rr-batch-h"><h4>本批候选</h4>'+reviewCurrentHtml()+'</div>'
+    +buildRow
+    +(jobsHtml?'<div class="rr-cand-sec"><b>后台任务</b></div>'+jobsHtml:'')
+    +(candidate?reviewCandidatePanelHtml(candidate):'')
+    +reviewPublishedBatchesHtml();
+}
+function paintReviewBatch(){
+  const el=$('#reviewBatch'); if(!el) return;
+  el.innerHTML=reviewBatchSectionHtml();
+}
+/* --- loading / polling --------------------------------------------------- */
+async function reviewLoadSource(){
+  const ctx=REVIEW_CTX; if(!ctx) return null;
+  try{
+    const r=await getJSON('/api/datasets/'+encodeURIComponent(ctx.dataset)+'/sources');
+    const rows=(r&&r.sources)||[];
+    DATASET_SOURCES[ctx.dataset]=rows;
+    const wanted=String(ctx.sha||'').toLowerCase();
+    ctx.source=rows.find(function(src){
+      return src&&String(src.sha256||'').toLowerCase()===wanted; })||null;
+    const ex=reviewSourceExtraction();
+    ctx.conflict=(ex.corrections_conflict
+      &&typeof ex.corrections_conflict==='object')?ex.corrections_conflict:null;
+    const descriptors=(ex.review_jobs&&typeof ex.review_jobs==='object')
+      ?ex.review_jobs:{};
+    Object.keys(descriptors).forEach(function(jobId){
+      if(ctx.jobs[jobId]) return;
+      const descriptor=descriptors[jobId];
+      ctx.jobs[jobId]={job_id:jobId,descriptor:descriptor,record:null,status:'',
+        type:String((descriptor&&descriptor.type)||'')};
+    });
+    return ctx.source;
+  }catch(e){ return null; }
+}
+async function reviewLoadBatch(batchId){
+  const ctx=REVIEW_CTX; if(!ctx||!batchId) return null;
+  try{
+    const batch=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/batches/'+encodeURIComponent(batchId));
+    ctx.batchesById[batchId]=batch;
+    ctx.candidate=batch;
+    ctx.candidateBatchId=batchId;
+    return batch;
+  }catch(e){ return null; }
+}
+function reviewBatchIds(){
+  const ctx=REVIEW_CTX; const ids=[]; const seen={};
+  if(!ctx) return ids;
+  const add=function(batchId){
+    const value=String(batchId||'');
+    if(value&&!seen[value]){ seen[value]=true; ids.push(value); }
+  };
+  Object.keys(ctx.jobs||{}).forEach(function(jobId){
+    const descriptor=ctx.jobs[jobId]&&ctx.jobs[jobId].descriptor;
+    if(descriptor) add(descriptor.batch_id);
+  });
+  Object.keys(ctx.itemsById||{}).forEach(function(itemId){
+    const entry=(ctx.itemsById[itemId]||{}).entry;
+    if(entry) add(entry.batch_id);
+  });
+  return ids;
+}
+async function reviewLoadBatches(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const ids=reviewBatchIds().slice(0,20);
+  await Promise.all(ids.map(async function(batchId){
+    await reviewLoadBatch(batchId);
+  }));
+  if(!ctx.candidateBatchId){
+    const candidates=Object.keys(ctx.batchesById||{}).map(function(batchId){
+      return ctx.batchesById[batchId]; }).filter(function(batch){
+        return batch&&REVIEW_BATCH_ACTIVE.indexOf(String(batch.status||''))>=0; })
+      .sort(function(a,b){
+        return String(b.created_at||'').localeCompare(String(a.created_at||'')); });
+    if(candidates.length){
+      ctx.candidate=candidates[0];
+      ctx.candidateBatchId=String(candidates[0].batch_id||'');
+    }
+  }
+}
+async function reviewLoadJobs(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const ids=Object.keys(ctx.jobs||{}).slice(0,12);
+  await Promise.all(ids.map(async function(jobId){
+    const job=ctx.jobs[jobId];
+    if(!job||job.record) return;
+    try{
+      const record=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+        +'/jobs/'+encodeURIComponent(jobId));
+      job.record=record;
+      job.status=String((record&&record.status)||'');
+      if(!job.type) job.type=String((record&&record.type)||'');
+    }catch(e){ /* a missing job must never block the review report */ }
+  }));
+}
+async function reviewPollJob(jobId){
+  const ctx=REVIEW_CTX; if(!ctx) return null;
+  const job=ctx.jobs[jobId]||(ctx.jobs[jobId]={job_id:jobId,type:'',
+    status:'queued',record:null,descriptor:null});
+  for(let i=0;i<900;i++){
+    let record=null;
+    try{
+      record=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+        +'/jobs/'+encodeURIComponent(jobId));
+    }catch(e){
+      reviewMsg('无法读取任务状态：'+reviewErrText(e),true);
+      return null;
+    }
+    job.record=record;
+    job.status=String((record&&record.status)||job.status||'');
+    if(!job.type) job.type=String((record&&record.type)||'');
+    paintReviewBatch();
+    if(REVIEW_JOB_TERMINAL.indexOf(job.status)>=0) return record;
+    await sleep(700);
+  }
+  reviewMsg('任务仍在后台运行；不会自动重跑，稍后点“刷新”查看。',false);
+  return null;
+}
+async function reviewRefreshDatasets(){
+  try{ await loadDatasets(); }
+  catch(e){ /* the datasets list refresh is best-effort */ }
+}
+/* --- actions ------------------------------------------------------------- */
+async function reviewBuildCandidate(){
+  const ctx=REVIEW_CTX;
+  if(!ctx||ctx.building||ctx.busy) return;
+  const entries=reviewConfirmedEntries();
+  if(!entries.length){
+    reviewMsg('无需重建 (R0/no-op)：没有已确认的 operation 条目，未创建批次。',true);
+    return;
+  }
+  ctx.building=true;
+  ctx.candidateStale=false;
+  ctx.lastBuildEntryIds=entries.map(function(entry){ return entry.entry_id; });
+  paintReviewBatch();
+  reviewMsg('正在创建批次并排队候选构建（'+entries.length+' 项）…');
+  try{
+    const result=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'/batches',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({entry_ids:ctx.lastBuildEntryIds})});
+    const jobId=String((result&&result.job_id)||'');
+    const batchId=String((result&&result.batch_id)||'');
+    if(!jobId||!batchId){
+      reviewMsg('服务器没有返回 job_id/batch_id，无法跟踪候选构建。',true);
+      return;
+    }
+    ctx.candidateBatchId=batchId;
+    ctx.candidate=null;
+    ctx.jobs[jobId]={job_id:jobId,type:'build',status:String(result.status||'queued'),
+      record:null,descriptor:{type:'build',batch_id:batchId,created_at:''}};
+    await reviewLoadSource();
+    await reviewLoadBatch(batchId);
+    await reviewLoadBatches();
+    /* The plan entries were just bound to the batch: refetch the review payload
+       so the per-item actions turn read-only while the build is in flight. */
+    await refreshReview();
+    paintReviewBatch();
+    reviewMsg('候选构建任务已提交（'+jobId+'），正在轮询状态…');
+    const record=await reviewPollJob(jobId);
+    await reviewLoadSource();
+    await reviewLoadBatch(batchId);
+    await reviewLoadBatches();
+    await refreshReview();
+    if(record&&record.status==='done'){
+      const status=ctx.candidate?String(ctx.candidate.status||''):'';
+      reviewMsg('候选构建完成：'+reviewBatchStatusLabel(status)
+        +(status==='ready_to_publish'?'，可发布。':''),false);
+    }else if(record&&record.status==='interrupted'){
+      reviewMsg('候选构建任务中断，可手动重试（不会自动重跑）。',true);
+    }else if(record&&record.status==='failed'){
+      reviewMsg('候选构建失败：'+reviewJobError(record),true);
+    }
+  }catch(e){
+    reviewMsg('候选构建失败：'+reviewErrText(e),true);
+    await reviewLoadSource();
+    paintReviewConflict();
+  }finally{
+    ctx.building=false;
+    paintReviewBatch();
+    paintReviewDetail();
+  }
+}
+async function reviewPublishBatch(){
+  const ctx=REVIEW_CTX;
+  if(!ctx||ctx.publishing||ctx.building) return;
+  const batchId=String(ctx.candidateBatchId||'');
+  const batch=ctx.candidate;
+  if(!batchId||!batch){
+    reviewMsg('还没有可发布的候选；先点“构建本批候选”。',true);
+    return;
+  }
+  if(String(batch.status||'')!=='ready_to_publish'){
+    reviewMsg('只有“待发布”的候选可以发布（当前：'
+      +reviewBatchStatusLabel(String(batch.status||''))+'）。',true);
+    return;
+  }
+  ctx.publishing=true;
+  paintReviewBatch();
+  reviewMsg('正在发布批次 '+batchId+'…');
+  try{
+    const result=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/batches/'+encodeURIComponent(batchId)+'/publish',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const current=(result&&result.current)||{};
+    ctx.current=current;
+    ctx.candidateStale=false;
+    await reviewRefreshDatasets();
+    await reviewLoadSource();
+    await reviewLoadBatch(batchId);
+    await reviewLoadBatches();
+    await refreshReview('已发布批次 '+batchId+'。');
+    reviewMsg('发布成功：当前构建 '+(current.build_id||'—')
+      +' · conversion '+String(current.conversion_id||'').slice(0,12)
+      +'。所有引用该 peel 的 dataset 已刷新'
+      +'（conversion 变化时索引需要 reindex）。',false);
+  }catch(e){
+    if(e&&e.status===409){
+      ctx.candidateStale=true;
+      reviewMsg('候选已过期，需重新构建：'+reviewErrText(e),true);
+      await reviewLoadSource();
+      await reviewLoadBatches();
+      paintReviewConflict();
+    }else{
+      reviewMsg('发布失败：'+reviewErrText(e),true);
+      await reviewLoadSource();
+      paintReviewConflict();
+    }
+  }finally{
+    ctx.publishing=false;
+    paintReviewBatch();
+    paintReviewDetail();
+  }
+}
+async function reviewDiscardBatch(){
+  const ctx=REVIEW_CTX;
+  if(!ctx||ctx.publishing||ctx.building) return;
+  const batchId=String(ctx.candidateBatchId||'');
+  if(!batchId){ reviewMsg('还没有候选批次可放弃。',true); return; }
+  ctx.building=true;
+  paintReviewBatch();
+  reviewMsg('正在放弃批次 '+batchId+'…');
+  try{
+    await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/batches/'+encodeURIComponent(batchId)+'/discard',{
+        method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    ctx.candidate=null;
+    ctx.candidateBatchId=null;
+    await reviewRefreshDatasets();
+    await reviewLoadSource();
+    await reviewLoadBatches();
+    await refreshReview('已放弃候选批次 '+batchId+'。');
+    reviewMsg('已放弃候选批次 '+batchId+'：current 与正式账本未变。',false);
+  }catch(e){
+    reviewMsg('放弃候选失败：'+reviewErrText(e),true);
+  }finally{
+    ctx.building=false;
+    paintReviewBatch();
+    paintReviewDetail();
+  }
+}
+async function reviewRollback(){
+  const ctx=REVIEW_CTX;
+  if(!ctx||ctx.building||ctx.publishing) return;
+  ctx.building=true;
+  paintReviewBatch();
+  reviewMsg('正在创建回滚批次（revert 最近一批）并排队构建…');
+  try{
+    const result=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'/rollback',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const jobId=String((result&&result.job_id)||'');
+    const batchId=String((result&&result.batch_id)||'');
+    if(!jobId||!batchId){
+      reviewMsg('服务器没有返回 rollback 的 job_id/batch_id。',true);
+      return;
+    }
+    ctx.jobs[jobId]={job_id:jobId,type:'rollback',
+      status:String(result.status||'queued'),record:null,
+      descriptor:{type:'rollback',batch_id:batchId,created_at:''}};
+    await reviewLoadSource();
+    paintReviewBatch();
+    reviewMsg('回滚任务已提交（'+jobId+'），正在轮询状态…');
+    const record=await reviewPollJob(jobId);
+    await reviewRefreshDatasets();
+    await reviewLoadSource();
+    await reviewLoadBatches();
+    await refreshReview();
+    if(record&&record.status==='done'){
+      reviewMsg('回滚完成：revert 批次已自动发布，相关 dataset 已刷新。',false);
+    }else if(record&&record.status==='interrupted'){
+      reviewMsg('回滚任务中断，可手动重试（不会自动重跑）。',true);
+    }else if(record&&record.status==='failed'){
+      reviewMsg('回滚失败：'+reviewJobError(record),true);
+    }
+  }catch(e){
+    reviewMsg('回滚失败：'+reviewErrText(e),true);
+  }finally{
+    ctx.building=false;
+    paintReviewBatch();
+    paintReviewDetail();
+  }
+}
+async function reviewRetryJob(btn){
+  const type=String((btn&&btn.getAttribute('data-type'))||'');
+  if(type==='report'){ await generateReviewReport(); return; }
+  if(type==='rollback'){ await reviewRollback(); return; }
+  if(type==='build'){
+    /* Explicit retry only: recovery may have failed/released the interrupted
+       batch, so refetch the plan and batch records before re-submitting. */
+    await refreshReview();
+    await reviewLoadSource();
+    await reviewLoadBatches();
+    await reviewBuildCandidate();
+    return;
+  }
+  reviewMsg('该任务类型暂不支持手动重试。',true);
+}
+function reviewRunAction(fn){
+  Promise.resolve().then(fn).catch(function(e){
+    reviewMsg('操作失败：'+reviewErrText(e),true);
+  });
+}
 function paintReview(r){
   const ctx=REVIEW_CTX; if(!ctx||!r) return;
   ctx.data=r;
@@ -5610,6 +6421,8 @@ function paintReview(r){
   REVIEW_COUNTS[reviewKey(ctx.dataset,ctx.sha)]=reviewCounts(r);
   paintReviewHead(r);
   paintReviewSummary(r);
+  paintReviewConflict();
+  paintReviewBatch();
   paintReviewClusters(r);
   paintReviewDetail(r);
   refreshReviewChip();
@@ -5625,7 +6438,10 @@ async function refreshReview(successText){
   }
 }
 async function openReview(dsId,sha){
-  REVIEW_CTX={dataset:dsId,sha:sha,data:null,itemsById:{},selected:null,busy:false};
+  REVIEW_CTX={dataset:dsId,sha:sha,data:null,itemsById:{},selected:null,busy:false,
+    source:null,conflict:null,jobs:{},batchesById:{},candidateBatchId:null,
+    candidate:null,candidateStale:false,building:false,publishing:false,
+    current:null,lastBuildEntryIds:[]};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -5635,6 +6451,10 @@ async function openReview(dsId,sha){
   if(cls) cls.innerHTML='<span class="hist-empty">正在加载簇…</span>';
   const det=$('#reviewDetail');
   if(det) det.innerHTML='<span class="hist-empty">正在加载…</span>';
+  const batch=$('#reviewBatch');
+  if(batch) batch.innerHTML='<span class="hist-empty">正在读取候选批次与后台任务…</span>';
+  const conflict=$('#reviewConflict');
+  if(conflict){ conflict.hidden=true; conflict.innerHTML=''; }
   try{
     const r=await reviewFetchJSON(reviewBase(dsId,sha)+'?group=cluster');
     paintReview(r);
@@ -5643,6 +6463,15 @@ async function openReview(dsId,sha){
     if(cls) cls.innerHTML='<span class="hist-empty">无法加载审阅报告：'+esc(e.message||e)+'</span>';
     if(det) det.innerHTML='<span class="hist-empty">先修复 peelfeed 连接或重新抽取，再打开审阅报告。</span>';
   }
+  /* CP3: source extraction (conflict + persisted review_jobs), then batch
+     records and real job states. Every step is best-effort so a missing
+     peelfeed call never blocks the review report itself. */
+  await reviewLoadSource();
+  await reviewLoadJobs();
+  await reviewLoadBatches();
+  paintReviewConflict();
+  paintReviewBatch();
+  paintReviewDetail();
   setTimeout(function(){ const c=$('#reviewClose'); if(c) c.focus(); },30);
 }
 async function generateReviewReport(){
@@ -5651,21 +6480,45 @@ async function generateReviewReport(){
   const btn=$('#reviewReportBtn');
   ctx.busy=true;
   if(btn){ btn.disabled=true; btn.textContent='生成中…'; }
-  reviewMsg('正在运行确定性规则并生成审阅报告…');
+  reviewMsg('正在创建报告任务…');
   try{
     const rep=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)+'/reports',{
       method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({})});
-    const counts=(rep&&rep.counts)||{};
-    await refreshReview();
-    reviewMsg('报告已生成（'+((rep&&rep.status)||'ready')+'）：建议 '
-      +reviewNum(counts.suggestions)+' · 自动归档 '+reviewNum(counts.auto_archived)
-      +' · 需要决定 '+reviewNum(counts.needs_decision)+'。',false);
+    if(rep&&rep.job_id){
+      /* CP3 wire §2.7: reports are persistent jobs now; poll the real state. */
+      const jobId=String(rep.job_id);
+      ctx.jobs[jobId]={job_id:jobId,type:'report',
+        status:String(rep.status||'queued'),record:null,
+        descriptor:{type:'report',created_at:'',batch_id:null}};
+      await reviewLoadSource();
+      paintReviewBatch();
+      reviewMsg('报告任务已提交（'+jobId+'），正在轮询状态…');
+      const record=await reviewPollJob(jobId);
+      if(record&&record.status==='done'){
+        await refreshReview('报告已生成。');
+        reviewMsg('报告已生成（后台任务 '+jobId+' 完成）。',false);
+      }else if(record&&record.status==='interrupted'){
+        reviewMsg('报告任务中断，可手动重试（不会自动重跑）。',true);
+      }else if(record&&record.status==='failed'){
+        reviewMsg('报告生成失败：'+reviewJobError(record),true);
+      }else{
+        reviewMsg('报告任务已提交，稍后刷新查看。',false);
+      }
+    }else{
+      /* Legacy synchronous shape (older peelfeed/fixtures): refresh + report. */
+      const counts=(rep&&rep.counts)||{};
+      await refreshReview();
+      reviewMsg('报告已生成（'+((rep&&rep.status)||'ready')+'）：建议 '
+        +reviewNum(counts.suggestions)+' · 自动归档 '+reviewNum(counts.auto_archived)
+        +' · 需要决定 '+reviewNum(counts.needs_decision)+'。',false);
+    }
   }catch(e){
     reviewMsg('生成报告失败：'+reviewErrText(e),true);
   }finally{
     ctx.busy=false;
     if(btn){ btn.disabled=false; btn.textContent='生成/更新报告'; }
+    paintReviewBatch();
   }
 }
 async function refreshReviewFromButton(){
@@ -5871,6 +6724,26 @@ $('#reviewDetail').addEventListener('change',function(ev){
   const sel=ev.target&&ev.target.closest?ev.target.closest('select[data-r="strategy"]'):null;
   if(!sel) return;
   reviewSyncStrategyParams(sel.closest('.rr-item'),sel.value);
+});
+/* CP3 W5: candidate-batch, job-retry and conflict actions live outside the
+   per-item cards; they call the same frozen routes and never rerun a job on
+   their own (an interrupted job only restarts via the explicit 手动重试). */
+$('#reviewBatch').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  const kind=btn.getAttribute('data-r');
+  if(kind==='build') reviewRunAction(function(){ return reviewBuildCandidate(); });
+  else if(kind==='publish') reviewRunAction(function(){ return reviewPublishBatch(); });
+  else if(kind==='discard') reviewRunAction(function(){ return reviewDiscardBatch(); });
+  else if(kind==='rollback') reviewRunAction(function(){ return reviewRollback(); });
+  else if(kind==='job-retry') reviewRunAction(function(){ return reviewRetryJob(btn); });
+});
+$('#reviewConflict').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  if(btn.getAttribute('data-r')==='conflict-jump'){
+    reviewConflictJump(btn.getAttribute('data-item')||'');
+  }
 });
 $('#reviewReportBtn').onclick=generateReviewReport;
 $('#reviewRefreshBtn').onclick=refreshReviewFromButton;
