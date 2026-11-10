@@ -12,7 +12,7 @@ so the runtime folders are defined in the same place as the files in them)::
 
     $PEEKSEED_HOME/                     private runtime data
         config/links.json               model links; 0600
-        datasets/<dataset>/             dataset.json                   schema 3
+        datasets/<dataset>/             dataset.json                   schema 4
                                         chunks.jsonl                   chunk rows
                                         index/<space>/                 vectors + info.json
         history/
@@ -69,6 +69,8 @@ __all__ = [
     "JOB_STATES",
     "PEEL_CHUNKER_VERSION",
     "PROBE_TEXT",
+    "REVIEW_JOB_STATUSES",
+    "REVIEW_JOB_TYPES",
     "SchemaTooNew",
     "chunk_id",
     "chunker_identity",
@@ -85,6 +87,7 @@ __all__ = [
     "new_job",
     "probe_sha256",
     "read_json",
+    "review_job_descriptor",
     "sha256_bytes",
     "sha256_file",
     "space_identity",
@@ -103,8 +106,11 @@ __all__ = [
 # --- contract versions -----------------------------------------------------
 
 # Schema 3 adds per-source ``extraction`` state (peelfeed peel identity) and the
-# ``peel``/``corpus_digest`` provenance blocks to index metadata.
-DATASET_SCHEMA = 3
+# ``peel``/``corpus_digest`` provenance blocks to index metadata. Schema 4 adds
+# ``extraction.review_jobs`` (persisted peelfeed review job ids for restart
+# re-attachment) and allows the ``corrections_conflict`` extraction state.
+# ``INFO_SCHEMA`` is unchanged: index metadata is not affected by review state.
+DATASET_SCHEMA = 4
 INFO_SCHEMA = 3
 JOB_SCHEMA = 1
 
@@ -126,6 +132,7 @@ FILE_STATUSES = (
     "extracted",
     "failed",
     "stale",
+    "corrections_conflict",
     "new",
     "unchanged",
     "changed",
@@ -138,6 +145,9 @@ FILE_STATUSES = (
 )
 
 #: The per-source extraction states written by the peelfeed extract path.
+#: ``corrections_conflict`` (schema 4) means a system-requested rebuild found a
+#: historical correction that no longer validates; the current corpus is left
+#: untouched and the user must resolve the conflict (M2 Phase 2).
 EXTRACTION_STATES = (
     "not_extracted",
     "queued",
@@ -145,7 +155,14 @@ EXTRACTION_STATES = (
     "extracted",
     "failed",
     "stale",
+    "corrections_conflict",
 )
+
+#: peelfeed persistent job types (contract v1.3 §11.4 / CP3 wire §2.5). ``ocr``
+#: and ``discuss`` are schema-accepted but not exposed until CP4/CP5.
+REVIEW_JOB_TYPES = ("report", "build", "rollback", "ocr", "discuss")
+#: peelfeed persistent job states (CP3 wire §2.5).
+REVIEW_JOB_STATUSES = ("queued", "running", "done", "failed", "interrupted")
 
 # Collection-level states. ``uploaded``/``extracted`` describe storage and peel
 # state; the terminal states are ``indexed``, ``stale`` (the index no longer
@@ -329,18 +346,54 @@ def chunker_label():
 
 
 def extraction_default():
-    """The per-source extraction block of a freshly uploaded file."""
+    """The per-source extraction block of a freshly uploaded file.
+
+    ``review_jobs`` (schema 4) maps a peelfeed review job id to its small
+    recorded descriptor (``{"type": "report|build|rollback|ocr", "created_at":
+    …, "batch_id": …}``); peekseed persists it so a restarted service can
+    re-attach to a running job by id instead of re-running it. It is empty
+    until the first review job is created (M2 Phase 2+).
+
+    ``corrections_conflict`` (CP3 additive, schema 4 unchanged) carries the
+    peelfeed ``status`` payload's conflicting-corrections detail while the
+    source is in the ``corrections_conflict`` state; it is ``None`` otherwise.
+    The key is optional on read (older schema-4 files do not have it).
+    """
     return {
         "state": "not_extracted",
         "peel_id": "",
         "conversion_id": "",
         "profile": "",
         "engine": "",
+        "review_jobs": {},
+        "corrections_conflict": None,
         "validation": {"errors": 0, "review_items": 0},
         "started_at": None,
         "finished_at": None,
         "error": None,
     }
+
+
+def review_job_descriptor(job_type, *, created_at=None, batch_id=None):
+    """The schema-4 ``extraction.review_jobs[job_id]`` descriptor (CP3 wire §2.7).
+
+    ``type`` is one of :data:`REVIEW_JOB_TYPES`; ``batch_id`` is ``None`` for
+    report jobs and the ApplyBatch id for build/rollback jobs. Terminal
+    descriptors stay so the UI can query the job after a restart; peekseed
+    never re-runs a job automatically.
+    """
+    job_type = str(job_type or "").strip().lower()
+    if job_type not in REVIEW_JOB_TYPES:
+        raise ContractError(
+            "unknown review job type %r; expected one of %s"
+            % (job_type, ", ".join(REVIEW_JOB_TYPES))
+        )
+    return {
+        "type": job_type,
+        "created_at": created_at or utc_now(),
+        "batch_id": str(batch_id) if batch_id else None,
+    }
+
 
 
 def extraction_state(entry):
@@ -645,6 +698,25 @@ def _validate_extraction(raw):
         if value is not None:
             out[field] = _require_str(str(value), field, "source extraction",
                                       allow_empty=True)
+    jobs_raw = block.get("review_jobs")
+    if jobs_raw is not None:
+        jobs = _require_dict(jobs_raw, "source extraction field 'review_jobs'")
+        out["review_jobs"] = {}
+        for job_id, descriptor in jobs.items():
+            if not isinstance(descriptor, dict):
+                raise ContractError(
+                    "source extraction review_jobs entry %r must be a JSON "
+                    "object." % str(job_id))
+            out["review_jobs"][str(job_id)] = dict(descriptor)
+    conflict = block.get("corrections_conflict")
+    if isinstance(conflict, (dict, list)):
+        # Additive CP3 detail (wire §2.7/§2.9): the conflicting corrections and
+        # their source batches, surfaced in the source list / dataset info.
+        out["corrections_conflict"] = conflict
+    elif conflict is not None:
+        raise ContractError(
+            "source extraction field 'corrections_conflict' must be an object, "
+            "a list or null.")
     validation = block.get("validation")
     if isinstance(validation, dict):
         out["validation"] = {
@@ -1011,7 +1083,7 @@ def validate_chunk(record, *, derive_id=False):
 
 
 def upgrade_dataset(data, *, sha256_of=None):
-    """Upgrade a legacy ``dataset.json`` (schema 1/2) to schema 3.
+    """Upgrade a legacy ``dataset.json`` (schema 1/2/3) to schema 4.
 
     ``sha256_of`` is a callable taking the dataset-relative source path (for
     example ``"original/CXL.pdf"``) and returning the content hash; when it
@@ -1022,6 +1094,9 @@ def upgrade_dataset(data, *, sha256_of=None):
     extracted by the old in-process pipeline, which peekseed no longer ships:
     its sources are marked ``not_extracted`` (and their old chunks are ignored)
     until a peel is built by peelfeed, which is the honest state after M-1.
+    Schema 4 adds ``extraction.review_jobs`` (an empty mapping for an older
+    dataset) and allows the ``corrections_conflict`` extraction state; existing
+    extraction blocks are kept and normalised by :func:`extraction_default`.
     """
     declared = _declared_schema(data, "dataset.json", DATASET_SCHEMA)
     if declared == DATASET_SCHEMA:

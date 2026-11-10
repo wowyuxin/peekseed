@@ -8,16 +8,20 @@ writes one peel directory per source under ``$PEEKSEED_SHARED_DIR/peels``::
 
     <shared>/peels/<slug>-<sha256[:8]>/
         source/<original.pdf>     hardlink to the shared sources/ copy
-        extract/corpus/{manifest.json,chunks.jsonl,assets.jsonl,
-                        validation.json,review_queue.json,blocks.jsonl,...}
+        extract/corpus -> conversions/<build_id>    current build (CP3 symlink)
+        extract/conversions/<build_id>/…            manifest/chunks/assets/…
+        extract/reader-locks/<build_id>.lock        reader SH lease / cleanup EX
         .peel
 
 :func:`build_index` reads every source whose ``extraction.state`` is
-``"extracted"`` from its peel corpus (gated on the realpath allowlist, the
-source sha256, the recorded ``conversion_id`` and ``validation.errors == 0``),
-maps the corpus chunks onto peekseed's chunk contract, embeds them through the
-configured link and writes the same generation-atomic numpy index as before.
-There is deliberately **no in-process extraction fallback**.
+``"extracted"`` from its peel's **current build directory** (gated on the
+realpath allowlist, the source sha256, the recorded ``conversion_id`` and
+``validation.errors == 0``), leases it with ``flock(LOCK_SH)`` so peelfeed cannot
+delete it mid-build, and rechecks the current conversion/effective hash/build id
+before flipping ``CURRENT`` (CP3 wire-contract §2.8). It maps the corpus chunks
+onto peekseed's chunk contract, embeds them through the configured link and
+writes the same generation-atomic numpy index as before. There is deliberately
+**no in-process extraction fallback**.
 
 A dataset directory owns its metadata, the canonical ``chunks.jsonl`` and one
 index per embedding space; the uploaded bytes live once in the shared pool::
@@ -55,6 +59,8 @@ A link's API key is written only into request headers; it is never embedded in a
 exception message or a returned dictionary.
 """
 
+import errno
+import fcntl
 import hashlib
 import json
 import math
@@ -83,6 +89,8 @@ __all__ = [
     "NoExtractedSources",
     "ProbeMismatch",
     "PROBE_MIN_COSINE",
+    "ReaderLease",
+    "ReaderLeaseBusy",
     "active_job_for",
     "add_source",
     "build_index",
@@ -105,11 +113,17 @@ __all__ = [
     "peel_root",
     "probe_cosine",
     "read_chunks",
+    "read_review_jobs",
+    "reconcile_all_datasets",
+    "reconcile_peel",
+    "reconcile_peels",
+    "record_review_job",
     "release_shared_source",
     "remove_source",
     "read_job",
     "reindex",
     "request_cancel",
+    "resolve_current_build",
     "sanitize_filename",
     "store_shared_source",
     "stored_source_path",
@@ -1723,13 +1737,16 @@ def mark_interrupted_jobs(jobs_dir):
     return interrupted
 
 
-def _collect_corpus_chunks(dataset_dir, dataset, sizes=None):
+def _collect_corpus_chunks(dataset_dir, dataset, sizes=None, builds=None):
     """Read every extracted source's peel corpus into one chunk sequence.
 
-    Returns ``(chunks, set_chunks, peels, skipped)``: the canonical chunks, the
-    rows of the chunk set for ``sizes`` (empty without sizes), the peels read,
-    and every source that could not contribute (with a reason), so callers can
-    report them instead of silently dropping data.
+    ``builds`` maps a source sha256 to the resolved-and-leased current build
+    (CP3 wire §2.8); each source is read from **that** build directory, never by
+    re-resolving the ``extract/corpus`` symlink mid-build. Returns
+    ``(chunks, set_chunks, peels, skipped)``: the canonical chunks, the rows of
+    the chunk set for ``sizes`` (empty without sizes), the peels read, and every
+    source that could not contribute (with a reason), so callers can report them
+    instead of silently dropping data.
     """
     dataset_id = str(dataset.get("id") or Path(dataset_dir).name)
     root = peel_root()
@@ -1749,7 +1766,8 @@ def _collect_corpus_chunks(dataset_dir, dataset, sizes=None):
                 reason = "extraction is %s; re-extract it with peelfeed" % state
             skipped.append({"name": name, "state": state, "reason": reason})
             continue
-        peel = _read_peel(dataset_dir, entry, root, dataset_id, sizes)
+        build = (builds or {}).get(str(entry.get("sha256") or "").lower())
+        peel = _read_peel(dataset_dir, entry, root, dataset_id, sizes, build)
         chunks.extend(peel["records"])
         set_chunks.extend(peel["set_records"])
         peels.append({"name": name, "peel": peel["peel"]})
@@ -1929,6 +1947,516 @@ def _peel_source_file(peel_dir, name):
     return files[0] if len(files) == 1 else None
 
 
+# --- CP3 current build, reader lease and shared dataset reconcile ----------
+
+#: CP3 build layout (wire-contract §2.1): the current pointer is the relative
+#: symlink ``extract/corpus -> conversions/<build_id>``; one build per
+#: directory carries the corpus files plus ``build_summary.json``.
+CONVERSIONS_DIR = "conversions"
+CORPUS_LINK = "corpus"
+READER_LOCKS_DIR = "reader-locks"
+#: ``b<UTC ts>-<sha8>`` and ``cutover-<conversion_id>`` both fit; the cap keeps
+#: a hand-written id from escaping the reader-locks directory.
+_BUILD_ID_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$")
+#: How long a reader waits for a build whose cleanup holds the EX lease.
+READER_LEASE_TIMEOUT = 5.0
+
+
+class ReaderLeaseBusy(IngestError):
+    """A build's reader lock is held exclusively (cleanup in progress)."""
+
+
+def _build_identity(build):
+    """The snapshot fields the CP3 recheck compares (wire §2.8)."""
+    manifest = build.get("manifest") if isinstance(build, dict) else {}
+    manifest = manifest if isinstance(manifest, dict) else {}
+    return {
+        "build_id": str((build or {}).get("build_id") or ""),
+        "conversion_id": str(manifest.get("conversion_id") or ""),
+        "effective_corrections_hash": str(
+            manifest.get("effective_corrections_hash") or ""),
+    }
+
+
+def _cutover_build_id(manifest):
+    """The cutover build id for a pre-CP3 real corpus dir (wire §2.1)."""
+    return "cutover-" + str((manifest or {}).get("conversion_id") or "")
+
+
+def resolve_current_build(peel_dir):
+    """Resolve one peel's current build directory (CP3 wire §2.1/§2.8).
+
+    Returns ``{"peel_dir", "build_id", "build_dir", "manifest",
+    "build_summary", "legacy"}``. ``build_id`` comes from the relative
+    ``extract/corpus`` symlink target; a pre-cutover real ``corpus`` directory is
+    accepted as the legacy layout with ``build_id =
+    cutover-<manifest conversion_id>`` (the id peelfeed's cutover will record).
+
+    Raises :class:`IngestError` with a readable reason when the layout is
+    missing, escapes the peel, or has no readable manifest: guessing would let
+    the indexer read a half-written or unrelated directory.
+    """
+    peel_dir = Path(peel_dir).resolve()
+    extract = peel_dir / "extract"
+    corpus = extract / CORPUS_LINK
+    legacy = False
+    if corpus.is_symlink():
+        try:
+            target = os.readlink(str(corpus))
+        except OSError as exc:
+            raise IngestError(
+                "peel '%s': the extract/corpus symlink is unreadable (%s)."
+                % (peel_dir.name, exc)) from None
+        try:
+            build_dir = corpus.resolve()
+        except OSError as exc:
+            raise IngestError(
+                "peel '%s': the extract/corpus symlink cannot be resolved (%s)."
+                % (peel_dir.name, exc)) from None
+        try:
+            build_dir.relative_to(peel_dir)
+        except ValueError:
+            raise IngestError(
+                "peel '%s': the extract/corpus symlink resolves outside the "
+                "peel directory (target %r); refusing to read it."
+                % (peel_dir.name, str(target))) from None
+        if not build_dir.is_dir():
+            raise IngestError(
+                "peel '%s': the current build directory '%s' does not exist."
+                % (peel_dir.name, build_dir.name))
+        build_id = build_dir.name
+        if not _BUILD_ID_RE.match(build_id):
+            raise IngestError(
+                "peel '%s': the current build directory name %r is not a "
+                "valid build id." % (peel_dir.name, build_id))
+    elif corpus.is_dir():
+        # Legacy layout: peelfeed has not cut over to conversions/<build_id>/ yet.
+        legacy = True
+        build_dir = corpus.resolve()
+        build_id = ""
+    else:
+        raise IngestError(
+            "peel '%s' has no extract/corpus (neither a symlink to a build nor "
+            "a legacy corpus directory); re-extract it with peelfeed."
+            % peel_dir.name)
+    manifest = _read_json(build_dir / "manifest.json", None)
+    if not isinstance(manifest, dict):
+        raise IngestError(
+            "peel '%s': the current build '%s' has no readable manifest.json."
+            % (peel_dir.name, build_dir.name))
+    if legacy:
+        build_id = _cutover_build_id(manifest)
+    summary = _read_json(build_dir / "build_summary.json", None)
+    if not isinstance(summary, dict):
+        summary = {}
+    return {
+        "peel_dir": peel_dir,
+        "build_id": build_id,
+        "build_dir": build_dir,
+        "manifest": manifest,
+        "build_summary": summary,
+        "legacy": legacy,
+    }
+
+
+def reader_lock_path(peel_dir, build_id):
+    """The per-build reader lease path (wire §2.8; inode is never replaced)."""
+    build_id = str(build_id or "").strip()
+    if not _BUILD_ID_RE.match(build_id):
+        raise IngestError("invalid build id '%s'." % build_id)
+    return (Path(peel_dir).resolve() / "extract" / READER_LOCKS_DIR
+            / (build_id + ".lock"))
+
+
+class ReaderLease(object):
+    """A shared (``LOCK_SH``) reader lease on one peelfeed build.
+
+    peelfeed deletes a build only while holding ``LOCK_EX|LOCK_NB`` on the same
+    ``extract/reader-locks/<build_id>.lock`` file, so an active index build keeps
+    its build directory. The lock file is opened with ``O_CREAT`` and the same
+    inode is kept for the whole lease (never temp+rename). Shared readers do not
+    rewrite the diagnostic holder content: several readers share the file.
+    """
+
+    def __init__(self, peel_dir, build_id):
+        self.peel_dir = Path(peel_dir).resolve()
+        self.build_id = str(build_id or "").strip()
+        self.path = reader_lock_path(self.peel_dir, self.build_id)
+        self._fd = None
+
+    def acquire(self, *, blocking=False, timeout=READER_LEASE_TIMEOUT):
+        """Take the shared lease or raise :class:`ReaderLeaseBusy`.
+
+        ``blocking=False`` (the default) fails fast; the index builder re-resolves
+        the current build and retries when cleanup is in flight. The fd is opened
+        before ``flock`` and closed on every failure path.
+        """
+        if self._fd is not None:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o600)
+        flags = fcntl.LOCK_SH | fcntl.LOCK_NB
+        deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
+        while True:
+            try:
+                fcntl.flock(fd, flags)
+                self._fd = fd
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN,
+                                     errno.EWOULDBLOCK):
+                    os.close(fd)
+                    raise IngestError(
+                        "could not take the reader lease on build '%s': %s"
+                        % (self.build_id, exc)) from None
+                if not blocking or time.monotonic() >= deadline:
+                    os.close(fd)
+                    raise ReaderLeaseBusy(
+                        "build '%s' is held by an exclusive reader lease "
+                        "(cleanup in progress); re-resolve the current build."
+                        % self.build_id) from None
+                time.sleep(0.05)
+
+    def release(self):
+        """Release the lease (idempotent); the lock file stays on disk."""
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
+
+
+def _require_build_complete(build):
+    """Refuse to read a build directory that lacks a required corpus file."""
+    build_dir = Path(build["build_dir"])
+    for filename in PEEL_CORPUS_FILES:
+        if not (build_dir / filename).is_file():
+            raise IngestError(
+                "peel '%s': current build '%s' is incomplete (missing %s); "
+                "re-extract or rebuild it with peelfeed."
+                % (Path(build["peel_dir"]).name, build["build_id"], filename))
+
+
+def _acquire_current_build(peel_dir, name, timeout=READER_LEASE_TIMEOUT):
+    """Resolve + lease + recheck one peel's current build (wire §2.8).
+
+    Order: resolve ``extract/corpus`` -> build_id -> SH flock -> recheck that
+    the symlink still names the same build and the build directory is complete.
+    When the current build changed between resolution and the lease, the lease is
+    released and the current is re-resolved (a new reader must never read a
+    deleted/switched build).
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
+    while True:
+        build = resolve_current_build(peel_dir)
+        _require_build_complete(build)
+        lease = ReaderLease(peel_dir, build["build_id"])
+        try:
+            lease.acquire()
+        except ReaderLeaseBusy:
+            if time.monotonic() >= deadline:
+                raise IngestError(
+                    "source '%s': peel '%s' build '%s' is being cleaned up and "
+                    "did not become readable in %.1fs; retry the index build."
+                    % (name, Path(peel_dir).name, build["build_id"], timeout)
+                ) from None
+            time.sleep(0.05)
+            continue
+        try:
+            again = resolve_current_build(peel_dir)
+            _require_build_complete(again)
+        except IngestError:
+            lease.release()
+            raise
+        if (again["build_id"] == build["build_id"]
+                and again["build_dir"] == build["build_dir"]):
+            return again, lease
+        lease.release()
+        if time.monotonic() >= deadline:
+            raise IngestError(
+                "source '%s': peel '%s' current build changed repeatedly while "
+                "the reader lease was being acquired; retry the index build."
+                % (name, Path(peel_dir).name)) from None
+        time.sleep(0.05)
+
+
+def _recheck_build_snapshots(builds):
+    """Abort an index generation when a peel's current build changed (§2.8).
+
+    Called before ``CURRENT`` is flipped: the index was read from a fixed build
+    directory under a reader lease, so a changed current conversion/effective
+    hash/build id means the generation would describe stale inputs. The previous
+    generation keeps serving and the job fails with a readable ``needs_reindex``
+    reason; never flip ``CURRENT`` on stale inputs.
+    """
+    for name, item in (builds or {}).items():
+        snapshot = item.get("snapshot") or {}
+        try:
+            current = resolve_current_build(item["peel_dir"])
+        except IngestError as exc:
+            raise NeedsReindex(
+                "source '%s': peel '%s' became unreadable while the index was "
+                "being built (%s); the previous index keeps serving — rebuild "
+                "the index (needs_reindex)."
+                % (name, Path(item["peel_dir"]).name, exc)) from None
+        if _build_identity(current) != snapshot:
+            now = _build_identity(current)
+            raise NeedsReindex(
+                "source '%s': peel '%s' current build changed while the index "
+                "was being built (was %s/%s, now %s/%s); the previous index "
+                "keeps serving — rebuild the index (needs_reindex)."
+                % (name, Path(item["peel_dir"]).name,
+                   snapshot.get("build_id") or "?",
+                   str(snapshot.get("conversion_id") or "?")[:12],
+                   now.get("build_id") or "?",
+                   str(now.get("conversion_id") or "?")[:12])
+            )
+
+
+def _peel_current_identity(peel_dir):
+    """The current conversion/engine/validation identity of one peel, or None.
+
+    Reads the current build's manifest/build_summary/validation through the
+    ``extract/corpus`` symlink; a broken peel returns ``None`` so a reconcile
+    never fails a dataset read.
+    """
+    try:
+        build = resolve_current_build(peel_dir)
+    except IngestError:
+        return None
+    manifest = build["manifest"]
+    build_dir = Path(build["build_dir"])
+    validation = _read_json(build_dir / "validation.json", None)
+    review_queue = _read_json(build_dir / "review_queue.json", None)
+    summary = build.get("build_summary") if isinstance(
+        build.get("build_summary"), dict) else {}
+    engine_info = summary.get("engine") if isinstance(
+        summary.get("engine"), dict) else {}
+    counts = summary.get("counts") if isinstance(
+        summary.get("counts"), dict) else {}
+    engine = str(
+        engine_info.get("fingerprint")
+        or engine_info.get("version")
+        or manifest.get("engine")
+        or ""
+    )
+    pages = _int(counts.get("pages") or manifest.get("pages") or 0, 0)
+    return {
+        "build_id": str(build["build_id"]),
+        "conversion_id": str(manifest.get("conversion_id") or ""),
+        "effective_corrections_hash": str(
+            manifest.get("effective_corrections_hash") or ""),
+        "profile": str(manifest.get("profile") or ""),
+        "engine": engine,
+        "pages": pages,
+        "validation": {
+            "errors": _validation_error_count(validation),
+            "review_items": _review_item_count(validation, review_queue),
+        },
+    }
+
+
+def _reconcile_extractor_label(sources):
+    """The dataset-level ``extractor`` label implied by the source identities."""
+    versions = set()
+    for entry in sources or []:
+        block = entry.get("extraction") if isinstance(
+            entry.get("extraction"), dict) else {}
+        version = str(block.get("engine") or "")
+        if version:
+            versions.add(version)
+    if len(versions) == 1:
+        return "peelfeed@" + versions.pop()
+    if versions:
+        return "peelfeed@mixed"
+    return None
+
+
+def reconcile_peels(dataset_dir, peel_id=None):
+    """Refresh every peel-backed source of one dataset from the peel's current.
+
+    Shared-dataset refresh (CP3 wire §2.7 / contract v1.3 §5.3): after a publish
+    (or an external CLI publish) **every** dataset that references the peel keeps
+    the current ``conversion_id``/``profile``/``engine``/``validation``, including
+    terminal ``extracted`` sources. Only a changed ``conversion_id`` makes an
+    existing index stale (``index_state`` derives it from ``corpus_digest``); a
+    chunk-set-only publish keeps the same conversion_id, so existing indexes stay
+    valid. Broken/missing peels are left untouched: a read must never fail
+    because one peel is being rebuilt.
+
+    ``peel_id`` limits the refresh to one peel (used after publish/discard/
+    rollback); ``None`` refreshes every source. Returns
+    ``{"dataset", "checked", "updated"}``.
+    """
+    dataset_dir = Path(dataset_dir)
+    result = {"dataset": dataset_dir.name, "checked": 0, "updated": []}
+    try:
+        metadata = _read_dataset_json(dataset_dir)
+    except IngestError:
+        return result
+    sources = _source_entries(metadata.get("sources"))
+    root = peel_root()
+    changed = False
+    for entry in sources:
+        block = entry.get("extraction") if isinstance(
+            entry.get("extraction"), dict) else {}
+        identifier = str(block.get("peel_id") or "")
+        if not identifier or (peel_id is not None and identifier != peel_id):
+            continue
+        result["checked"] += 1
+        try:
+            peel_dir = _resolve_peel_dir(root, identifier)
+        except IngestError:
+            continue  # broken peel: leave the recorded identity, never crash
+        current = _peel_current_identity(peel_dir)
+        if current is None:
+            continue
+        updated = dict(block)
+        for field in ("conversion_id", "profile", "engine"):
+            value = str(current.get(field) or "")
+            if value and str(updated.get(field) or "") != value:
+                updated[field] = value
+        validation = current.get("validation")
+        if isinstance(validation, dict) and updated.get("validation") != validation:
+            updated["validation"] = dict(validation)
+        if updated != block:
+            entry["extraction"] = updated
+            changed = True
+            result["updated"].append(str(entry.get("sha256") or ""))
+    if not changed:
+        return result
+    metadata["schema"] = contracts.DATASET_SCHEMA
+    metadata["sources"] = sources
+    metadata["updated_at"] = _now()
+    label = _reconcile_extractor_label(sources)
+    if label:
+        metadata["extractor"] = label
+    try:
+        validated = contracts.validate_dataset(metadata)
+    except contracts.ContractError:
+        return result  # a broken metadata must not fail the read
+    _write_json_atomic(dataset_dir / "dataset.json", validated, indent=2)
+    result["dataset_json"] = validated
+    return result
+
+
+def _datasets_root(paths):
+    """The datasets directory for a ``config.paths()`` object or a directory."""
+    datasets_dir = getattr(paths, "datasets_dir", None)
+    if datasets_dir is not None:
+        return Path(datasets_dir)
+    path = Path(paths)
+    if (path / "datasets").is_dir():
+        return path / "datasets"
+    return path
+
+
+def reconcile_all_datasets(paths):
+    """Reconcile every dataset under a data root (startup and dataset reads).
+
+    Cheap and fault-tolerant: a broken dataset or peel is skipped, never raised.
+    Returns ``{"datasets": n, "updated": {dataset: [sha256, …]}}``.
+    """
+    root = _datasets_root(paths)
+    result = {"datasets": 0, "updated": {}}
+    try:
+        names = sorted(path.name for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return result
+    for name in names:
+        if name.startswith("."):
+            continue
+        try:
+            one = reconcile_peels(root / name)
+        except Exception:  # noqa: BLE001 - reconcile must never break a read
+            continue
+        result["datasets"] += 1
+        if one.get("updated"):
+            result["updated"][name] = one["updated"]
+    return result
+
+
+def reconcile_peel(peel_id, paths=None):
+    """Reconcile every dataset that references one peel (after publish/rollback).
+
+    ``paths`` is a ``config.paths()`` object (default: the current data root).
+    Returns ``{"peel_id", "datasets", "updated"}``.
+    """
+    from .. import config
+
+    identifier = str(peel_id or "").strip()
+    root = _datasets_root(config.paths() if paths is None else paths)
+    result = {"peel_id": identifier, "datasets": 0, "updated": {}}
+    if not identifier:
+        return result
+    try:
+        names = sorted(path.name for path in root.iterdir() if path.is_dir())
+    except OSError:
+        return result
+    for name in names:
+        if name.startswith("."):
+            continue
+        try:
+            one = reconcile_peels(root / name, peel_id=identifier)
+        except Exception:  # noqa: BLE001 - a refresh must never fail a publish
+            continue
+        if one.get("checked"):
+            result["datasets"] += 1
+        if one.get("updated"):
+            result["updated"][name] = one["updated"]
+    return result
+
+
+def read_review_jobs(dataset_dir, sha):
+    """The persisted ``extraction.review_jobs`` descriptors of one source.
+
+    CP3 wire §2.7: ``{job_id: {"type", "created_at", "batch_id"}}``; terminal
+    descriptors stay so a restarted service can re-attach by id. Returns ``{}``
+    when the source or mapping does not exist.
+    """
+    entry = find_source(Path(dataset_dir), sha)
+    if entry is None:
+        return {}
+    block = entry.get("extraction") if isinstance(
+        entry.get("extraction"), dict) else {}
+    jobs = block.get("review_jobs")
+    return dict(jobs) if isinstance(jobs, dict) else {}
+
+
+def record_review_job(dataset_dir, sha, job_id, *, job_type, batch_id=None,
+                      created_at=None):
+    """Persist one peelfeed job descriptor in ``extraction.review_jobs``.
+
+    Schema-4 mapping ``{job_id: {"type", "created_at", "batch_id"}}`` (CP3 wire
+    §2.7): terminal descriptors stay so a restarted service can re-attach by id;
+    peekseed never re-runs a job automatically.
+    """
+    identifier = str(job_id or "").strip()
+    if not identifier:
+        raise IngestError("a peelfeed review job id is required.")
+    dataset_dir = Path(dataset_dir)
+    entry = find_source(dataset_dir, sha)
+    if entry is None:
+        raise IngestError("no source with sha256 '%s'." % str(sha or "")[:12])
+    descriptor = contracts.review_job_descriptor(
+        job_type, created_at=created_at, batch_id=batch_id)
+    block = dict(entry.get("extraction") or contracts.extraction_default())
+    jobs = dict(block.get("review_jobs") or {})
+    jobs[identifier] = descriptor
+    block["review_jobs"] = jobs
+    update_source(dataset_dir, str(entry.get("sha256") or sha), extraction=block)
+    return descriptor
+
+
 # --- chunk sets ------------------------------------------------------------
 
 _SET_DIR = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$")
@@ -1986,18 +2514,23 @@ def _ensure_chunk_sets(dataset_dir, dataset, sizes, notify=None):
 
     ``peelfeed rebuild`` reuses the Docling evidence, keeps the recorded sets and
     leaves the canonical chunks (and normally the conversion id) unchanged, so no
-    other index goes stale. Returns the dataset, re-read when a peel was rebuilt.
+    other index goes stale. The rebuild may auto-publish a system build (contract
+    §5.3): afterwards **every** dataset that references the peel is reconciled,
+    not just the initiating one. Returns the dataset, re-read when anything was
+    rebuilt. This runs **before** any reader lease is taken (wire §2.8).
     """
     root = peel_root()
     name = chunk_set_name(sizes)
     rebuilt = False
+    rebuilt_peels = []
     for entry in _source_entries(dataset.get("sources")):
         block = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
         peel_id = str(block.get("peel_id") or "")
         if contracts.extraction_state(entry) != "extracted" or not peel_id:
             continue
         try:
-            corpus_dir = _resolve_peel_dir(root, peel_id) / "extract" / "corpus"
+            peel_dir = _resolve_peel_dir(root, peel_id)
+            corpus_dir = peel_dir / "extract" / "corpus"
         except IngestError:
             continue  # _read_peel reports the broken peel with its reason
         if _find_chunk_set(corpus_dir, sizes) is not None:
@@ -2019,14 +2552,18 @@ def _ensure_chunk_sets(dataset_dir, dataset, sizes, notify=None):
             raise IngestError(
                 "source '%s' has no chunk set %s and peelfeed could not build it: %s"
                 % (source, name, detail)) from None
-        manifest = _read_json(corpus_dir / "manifest.json", None)
-        conversion = str((manifest or {}).get("conversion_id") or "") \
-            if isinstance(manifest, dict) else ""
-        if conversion and conversion != str(block.get("conversion_id") or ""):
-            update_source(dataset_dir, str(entry.get("sha256") or ""),
-                          extraction=dict(block, conversion_id=conversion))
         rebuilt = True
-    return _read_dataset_json(Path(dataset_dir)) if rebuilt else dataset
+        rebuilt_peels.append(peel_id)
+    if not rebuilt:
+        return dataset
+    # Shared-dataset refresh: the rebuild may have published a new current build
+    # (new conversion_id) for this peel; all datasets that reference it follow.
+    for peel_id in rebuilt_peels:
+        try:
+            reconcile_peel(peel_id)
+        except Exception:  # noqa: BLE001 - the build path reports its own errors
+            pass
+    return _read_dataset_json(Path(dataset_dir))
 
 
 def _set_chunk_id(set_name, chunk_id):
@@ -2112,7 +2649,7 @@ def _corpus_chunk_record(raw, entry, dataset_id, position, ordinal, block_map,
     return record
 
 
-def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None):
+def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None, build=None):
     """Read one extracted source's corpus, refusing anything that fails a gate.
 
     Gates (design §4.6): the peel dir must resolve under ``peel_root``, the
@@ -2121,6 +2658,11 @@ def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None):
     ``validation.errors`` must be 0. A failure names the source and the reason;
     it never falls back to re-extracting the PDF.
 
+    ``build`` is the resolved current build (``resolve_current_build`` output):
+    CP3 reads **that build directory** for the whole index build, never the
+    ``extract/corpus`` symlink again mid-build (wire §2.8). When omitted the
+    current build is resolved here (internal/test callers).
+
     ``records`` are the canonical chunks (the reading layer). With ``sizes`` the
     matching chunk set is read too: ``set_records`` are what gets embedded, each
     carrying ``reading_ids`` (the canonical chunk ids it covers).
@@ -2128,16 +2670,21 @@ def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None):
     name = str(entry.get("name") or "")
     extraction = entry.get("extraction") if isinstance(entry.get("extraction"), dict) else {}
     peel_id = str(extraction.get("peel_id") or "").strip()
-    peel_dir = _resolve_peel_dir(root, peel_id)
-    corpus_dir = peel_dir / "extract" / "corpus"
+    if build is None:
+        peel_dir = _resolve_peel_dir(root, peel_id)
+        build = resolve_current_build(peel_dir)
+    peel_dir = Path(build["peel_dir"])
+    corpus_dir = Path(build["build_dir"])
+    manifest = build.get("manifest") if isinstance(build.get("manifest"), dict) else {}
+    build_summary = build.get("build_summary") if isinstance(
+        build.get("build_summary"), dict) else {}
     for filename in PEEL_CORPUS_FILES:
         if not (corpus_dir / filename).is_file():
             raise IngestError(
                 "source '%s': peel '%s' has no corpus/%s."
                 % (name, peel_id, filename)
             )
-    manifest = _read_json(corpus_dir / "manifest.json", None)
-    if not isinstance(manifest, dict):
+    if not isinstance(manifest, dict) or not manifest:
         raise IngestError("source '%s': peel '%s' manifest.json is not an object."
                           % (name, peel_id))
     schema = manifest.get("schema_version") or manifest.get("schema")
@@ -2150,9 +2697,6 @@ def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None):
         )
     validation = _read_json(corpus_dir / "validation.json", None)
     review_queue = _read_json(corpus_dir / "review_queue.json", None)
-    build_summary = _read_json(corpus_dir / "build_summary.json", None)
-    if not isinstance(build_summary, dict):
-        build_summary = {}
     assets = _read_jsonl(corpus_dir / "assets.jsonl", "assets.jsonl")
     chunks = _read_jsonl(corpus_dir / "chunks.jsonl", "chunks.jsonl")
     blocks_path = corpus_dir / "blocks.jsonl"
@@ -2194,8 +2738,8 @@ def _read_peel(dataset_dir, entry, root, dataset_id, sizes=None):
         if isinstance(validation, dict) else ""
     if validation_conversion and validation_conversion != manifest_conversion:
         raise IngestError(
-            "source '%s': peel '%s' validation.json does not belong to this "
-            "conversion; re-extract it." % (name, peel_id)
+            "source '%s': peel '%s' validation.json conversion_id does not "
+            "belong to this conversion; re-extract it." % (name, peel_id)
         )
     source_file = _peel_source_file(peel_dir, name)
     if source_file is None:
@@ -2558,6 +3102,55 @@ def _refresh_extraction(dataset_dir, dataset, peels):
     return metadata
 
 
+def _lease_current_builds(dataset, notify=None):
+    """Resolve, lease and snapshot the current build of every extracted source.
+
+    CP3 wire §2.8 order: ``_ensure_chunk_sets`` -> resolve ``extract/corpus`` ->
+    build_id -> ``flock(LOCK_SH)`` on ``extract/reader-locks/<build_id>.lock`` ->
+    recheck current + build completeness. The returned mapping is keyed by source
+    sha256 and carries the fixed build dir, the lease (released by the caller) and
+    the snapshot the pre-``CURRENT`` recheck compares. On a failure mid-way every
+    lease acquired so far is released.
+    """
+    root = peel_root()
+    builds = {}
+    try:
+        for entry in _source_entries(dataset.get("sources")):
+            block = entry.get("extraction") if isinstance(
+                entry.get("extraction"), dict) else {}
+            peel_id = str(block.get("peel_id") or "")
+            if contracts.extraction_state(entry) != "extracted" or not peel_id:
+                continue
+            sha = str(entry.get("sha256") or "").lower()
+            if not sha or sha in builds:
+                continue
+            name = str(entry.get("name") or "")
+            try:
+                peel_dir = _resolve_peel_dir(root, peel_id)
+            except IngestError:
+                continue  # _read_peel reports the broken peel with its reason
+            build, lease = _acquire_current_build(peel_dir, name)
+            if notify is not None:
+                notify(0.01, "Leased current build %s for %s"
+                       % (build["build_id"], name))
+            builds[sha] = {
+                "name": name,
+                "peel_id": peel_id,
+                "peel_dir": peel_dir,
+                "build": build,
+                "lease": lease,
+                "snapshot": _build_identity(build),
+            }
+    except BaseException:
+        for item in builds.values():
+            try:
+                item["lease"].release()
+            except Exception:  # noqa: BLE001 - never mask the real failure
+                pass
+        raise
+    return builds
+
+
 def build_index(
     dataset_dir,
     link,
@@ -2659,11 +3252,25 @@ def build_index(
         legacy_job["status"] = "running"
         legacy_job["message"] = "preparing"
 
+    builds = {}
     try:
+        notify(0.0, "Reconciling dataset sources")
+        # Shared-dataset refresh first: the extraction identity in dataset.json is
+        # what the corpus gates compare, so a publish by another dataset/CLI must
+        # be picked up before this build reads anything (contract §5.3).
+        try:
+            reconcile_peels(dataset_dir)
+        except Exception:  # noqa: BLE001 - the gates below report a broken peel
+            pass
+        dataset = _read_dataset_json(dataset_dir)
         notify(0.0, "Reading peel corpora")
         dataset = _ensure_chunk_sets(dataset_dir, dataset, sizes, notify)
+        # CP3 wire §2.8: lease the current build of every source *after* the
+        # chunk-set rebuild and read that fixed build dir for the whole build.
+        builds = _lease_current_builds(dataset, notify)
         chunks, embedded, peels, skipped = _collect_corpus_chunks(
-            dataset_dir, dataset, sizes)
+            dataset_dir, dataset, sizes,
+            {sha: item["build"] for sha, item in builds.items()})
         dataset = _refresh_extraction(dataset_dir, dataset, peels)
         total = len(embedded)
         notify(0.02, "Read %d chunk(s) of set %s from %d peel(s)"
@@ -2700,6 +3307,9 @@ def build_index(
             current = _current_info_if_up_to_date(
                 dataset_dir, space, total, digest, corpus, chunker, extractor)
             if current is not None:
+                # Even an "up to date" answer must not be returned from a build
+                # that changed under the reader lease.
+                _recheck_build_snapshots(builds)
                 notify(1.0, "Index is up to date: %d chunk(s)" % total)
                 _job_touch(job_record, jobs_dir, state="succeeded", phase="done",
                            done=total, total=total, fraction=1.0)
@@ -2788,6 +3398,12 @@ def build_index(
                            link, sources, chunker, extractor, digest, corpus,
                            peel_list, skipped)
         _write_json_atomic(generation_dir / "info.json", info, indent=2)
+        # CP3 wire §2.8: before the commit point, recheck every peel's current
+        # conversion/effective hash/build id against the lease snapshot. A change
+        # means this generation would describe stale inputs: abort without
+        # flipping CURRENT (the previous generation keeps serving) and fail the
+        # job with a readable needs_reindex reason.
+        _recheck_build_snapshots(builds)
         # The atomic pointer flip is the commit point: before this line the
         # previous generation is live, after it the new one is.
         _write_current(space_dir, generation)
@@ -2810,12 +3426,28 @@ def build_index(
             own_lock.release()
         raise
     except BaseException as exc:
+        if isinstance(exc, NeedsReindex):
+            # The generation was abandoned because the peel moved on; repair the
+            # recorded extraction identity so the dataset reflects the new
+            # current build instead of the lease-time snapshot.
+            try:
+                reconcile_peels(dataset_dir)
+            except Exception:  # noqa: BLE001 - the job error is the real report
+                pass
         _job_touch(job_record, jobs_dir, state="failed", error=str(exc))
         if legacy_job is not None:
             legacy_job["error"] = str(exc)[:500]
         if own_lock is not None:
             own_lock.release()
         raise
+    finally:
+        # The reader lease is released after the CURRENT flip and on every error
+        # path; peelfeed may then clean up the build (wire §2.8).
+        for item in builds.values():
+            try:
+                item["lease"].release()
+            except Exception:  # noqa: BLE001 - release must never mask an error
+                pass
 
 
 # --- reindex / gc ----------------------------------------------------------

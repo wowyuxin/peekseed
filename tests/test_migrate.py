@@ -70,7 +70,9 @@ class MigrateTests(unittest.TestCase):
             self.assertFalse(report["dry_run"])
             self.assertEqual(report["errors"], [])
             dataset = contracts.read_json(root / "datasets/docs/dataset.json")
-            self.assertEqual(dataset["schema"], 3)
+            self.assertEqual(dataset["schema"], 4)
+            self.assertEqual(
+                dataset["sources"][0]["extraction"]["review_jobs"], {})
             self.assertEqual(dataset["sources"][0]["sha256"], contracts.sha256_file(
                 root / "datasets/docs/original/a.pdf"))
             self.assertEqual(dataset["sources"][0]["status"], "uploaded")
@@ -84,6 +86,33 @@ class MigrateTests(unittest.TestCase):
             self.assertFalse(contracts.has_probe(info))
             actions = {action["kind"]: action for action in report["actions"]}
             self.assertIn("probe", actions["info.json"]["note"])
+
+    def test_apply_upgrades_a_schema_3_dataset_to_schema_4(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_dir = root / "datasets" / "docs"
+            dataset_dir.mkdir(parents=True)
+            (dataset_dir / "original").mkdir()
+            (dataset_dir / "original" / "a.pdf").write_bytes(b"%PDF-1.4\nfake")
+            raw = legacy_dataset()
+            raw["schema"] = 3
+            raw["sources"] = [{
+                "name": "a.pdf", "path": "original/a.pdf", "bytes": 5,
+                "pages": 1, "status": "extracted",
+                "extraction": {"state": "extracted", "peel_id": "peel-a",
+                               "conversion_id": "c" * 64, "profile": "generic",
+                               "validation": {"errors": 0, "review_items": 2}},
+            }]
+            (dataset_dir / "dataset.json").write_text(json.dumps(raw),
+                                                      encoding="utf-8")
+            report = migrate.migrate(root, apply=True)
+            self.assertEqual(report["errors"], [])
+            upgraded = contracts.read_json(dataset_dir / "dataset.json")
+            self.assertEqual(upgraded["schema"], 4)
+            extraction = upgraded["sources"][0]["extraction"]
+            self.assertEqual(extraction["review_jobs"], {})
+            self.assertEqual(extraction["peel_id"], "peel-a")
+            self.assertEqual(extraction["validation"]["review_items"], 2)
 
     def test_migration_is_idempotent(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -99,22 +128,22 @@ class MigrateTests(unittest.TestCase):
             root = Path(tmp)
             dataset_dir = build_legacy_root(root)
             raw = json.loads((dataset_dir / "dataset.json").read_text())
-            raw["schema"] = 4
+            raw["schema"] = 5
             (dataset_dir / "dataset.json").write_text(json.dumps(raw), encoding="utf-8")
             report = migrate.migrate(root, apply=True)
             self.assertEqual(len(report["errors"]), 1)
             self.assertIn("newer", report["errors"][0]["error"])
             after = json.loads((dataset_dir / "dataset.json").read_text())
-            self.assertEqual(after["schema"], 4)
+            self.assertEqual(after["schema"], 5)
 
     def test_format_report_mentions_mode_and_errors(self):
         report = {"root": "/tmp/ws", "dry_run": True,
                   "actions": [{"kind": "dataset.json", "from_schema": 1,
-                               "to_schema": 3, "sources": 2, "missing_sources": ["gone.pdf"]}],
+                               "to_schema": 4, "sources": 2, "missing_sources": ["gone.pdf"]}],
                   "errors": []}
         text = migrate.format_report(report)
         self.assertIn("dry-run", text)
-        self.assertIn("schema 1 -> 3", text)
+        self.assertIn("schema 1 -> 4", text)
         self.assertIn("gone.pdf", text)
 
     def test_empty_root_reports_nothing_to_do(self):

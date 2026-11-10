@@ -47,9 +47,12 @@ are not listed.
 | POST | `/api/datasets` | Upload PDFs (storage only), create a dataset |
 | POST | `/api/datasets/{id}/sources` | Upload PDFs into an existing dataset (storage only) |
 | POST | `/api/datasets/{id}/sources/{sha}/extract` | Ask peelfeed to build a peel (503 when unavailable) |
-| GET | `/api/datasets/{id}/sources/{sha}/review` | Proxy peelfeed's review queue |
-| POST | `/api/datasets/{id}/sources/{sha}/review/{item}` | Proxy one review decision |
-| POST | `/api/datasets/{id}/sources/{sha}/rebuild` | Proxy peelfeed's rebuild (apply corrections) |
+| GET | `/api/datasets/{id}/sources/{sha}/review` | Structured review view: clusters/items/counts (peelfeed pass-through) |
+| GET | `/api/datasets/{id}/sources/{sha}/review/items/{item_id}` | One review item with evidence, candidates and strategies |
+| POST | `/api/datasets/{id}/sources/{sha}/review/plan` | Select/confirm/lock/unlock/defer a review plan entry |
+| POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Generate the deterministic review report (synchronous in CP1) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/ocr/check` | Probe the OCR provider (body empty or `{}`; no `provider`) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/ocr/refresh` | Create one `type=ocr` evidence-refresh job (body exactly `{item_ids:[…]}`) |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
 | GET | `/api/datasets/{id}/sources/{sha}/assets/{path}` | Proxy one peel/corpus asset (crop, page image, table) |
 | DELETE | `/api/datasets/{id}/sources/{sha}` | Remove a source; `?peel=keep|delete` |
@@ -148,6 +151,7 @@ on disk:
               "extractor": "", "status": "uploaded",
               "extraction": {"state": "not_extracted", "peel_id": "",
                              "conversion_id": "", "profile": "", "engine": "",
+                             "review_jobs": {},
                              "validation": {"errors": 0, "review_items": 0},
                              "started_at": null, "finished_at": null,
                              "error": null},
@@ -157,8 +161,11 @@ on disk:
 `path` is the stored copy in the shared sources pool (`sources/<sha256>/<name>`
 under `PEEKSEED_SHARED_DIR`); `present` says whether that file is still on disk.
 `status`/`extraction.state` is one of `uploaded|not_extracted|queued|running|
-extracted|failed|stale` (the per-source chip). Extraction is a peelfeed job;
-uploading never parses the file.
+extracted|failed|stale|corrections_conflict` (the per-source chip).
+`extraction.review_jobs` maps a peelfeed review job id to its small descriptor
+(`{type, created_at, batch_id}`) so a restarted service can re-attach to a
+running job (M2 Phase 2+; empty in CP1). Extraction is a peelfeed job; uploading
+never parses the file.
 
 ### `POST /api/datasets`
 
@@ -207,7 +214,13 @@ and never seed it.
             "present": true, "seeded": true},
  "handshake": {"available": true, "engine": "peelfeed", "version": "0.1.0",
                "cli_protocol": 1, "corpus_schema": 2, "chunk_contract": 1,
-               "chunker_version": 1, "formats": ["pdf"],
+               "chunker_version": 1, "review_schema": 2,
+               "operations": ["inherit_header_from", "set_header_rows"],
+               "resolutions": ["confirm_headerless", "confirm_known", "defer",
+                               "keep_original_figure", "keep_visual_fallback"],
+               "strategies": [{"id": "use_first_row_header", "version": 1,
+                               "name": "本表首行作表头"}],
+               "formats": ["pdf"],
                "profiles": ["cxl", "generic", …],
                "chunk_profiles": ["default", "large", "small"],
                "llm_modes": ["off", "review", "aggressive"],
@@ -238,15 +251,77 @@ the peel up by source sha until the id is known). The response is
 arrive. 503 when the CLI is unavailable (the source is marked `failed` with a
 CLI-related error so Retry is honest); 409 when the stored file is missing.
 
-### Review / rebuild / events / assets
+### Review (M2 CP1) / events / assets
 
-- `GET …/review` runs `peelfeed review <peel_id> --json` and returns the queue
-  (`items` with asset crops/evidence, suggestions, LLM availability).
-- `POST …/review/{item}` with `{decision: "accept"|"reject"|"override", note?,
-  evidence?, model?, confidence?}` runs `peelfeed decide` (append-only
-  corrections log).
-- `POST …/rebuild` returns `202` and runs `peelfeed rebuild` in a thread while
-  polling status; the source chip returns to `extracted` when it finishes.
+Review state lives in peelfeed (under the peel's `extract/review/`); peekseed
+only proxies it and never invents a business status. The old per-item
+`POST …/review/{item}` decide route (accept/reject/override) and the old
+`POST …/rebuild` route were **removed** without a compatibility mapping: a
+review is now a plan (choose a strategy, confirm, lock/unlock, defer) and, in
+later milestones, a batch build/publish.
+
+Every review route first requires the handshake to advertise
+`review_schema: 2`; a mismatch is a clear `409` naming the found schema (never a
+silent fallback to the old flat queue). peelfeed errors map to HTTP per the
+frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
+`validation → 400`, not found → `404`, any other peelfeed error → `502`.
+
+- `GET …/review?group=cluster|code&status=…` runs `peelfeed review <peel_id>
+  --json` and returns the structured schema-2 payload unchanged: `review_schema`,
+  `counts`, `triage_counts`, `plan`, the `report` summary (or `null`), `clusters`
+  and `items`. Reading the list never calls an LLM. `group=cluster` (the
+  default) groups item ids by merged cluster, `group=code` by warning code;
+  `status=` filters items and the clusters' `states`; an invalid `group` is
+  `400`. `derived_from.converter_code_hash` is a **diagnostic** hash of the
+  converter code (`sha256(canonical converter_hashes)[:16]`); it is not
+  `normalize.engine_fingerprint()` and is never used for stale/CAS decisions
+  (contract v1.3 §2/§13.8).
+- `GET …/review/items/{item_id}` runs `peelfeed review <peel_id> --item …` and
+  returns `{"peel_id","review_schema","item": {…}}` — one item with evidence,
+  current state, candidates, applicable strategies, its plan `entry` and any
+  `resolution` (a missing item is `404`). peelfeed additionally includes the
+  item's `cluster` object and a `suggestion` summary in that payload; both are
+  additive and passed through unchanged.
+- `POST …/review/plan` accepts exactly one of:
+  `{base_plan_version, action:"select", entry:{item_id, strategy:{id,version},
+  params?, notes?}}`;
+  `{base_plan_version, action:"confirm"|"lock"|"unlock", entry_id}`;
+  `{base_plan_version, action:"defer", item_id, reason_code:
+  "unsupported_evidence"|"grid_conflict"|"not_relevant"|"other", reason?}`.
+  `base_plan_version` is required on every action and must come from the latest
+  plan payload; a stale value is `409` (optimistic concurrency). The response is
+  the complete new plan: `plan_version`, `entries`, the changed `entry` and any
+  R0 `resolution` (a defer writes one). Selecting a resolution strategy
+  (`confirm_no_header`, `keep_visual_fallback`, `keep_original_figure`) creates
+  an `action.type="resolution"` entry; `confirm` writes the resolution and moves
+  the entry straight to `status="applied"` (no batch build and no corpus
+  change). Operation selections (`use_first_row_header`, `inherit_parent_header`,
+  …) confirm to `confirmed` and wait for a future ApplyBatch, so the summary's
+  `counts.confirmed` ("已确认待发布") counts operation entries only.
+- `POST …/review/reports` with optional `{item_ids?, cluster_ids?}` generates
+  the deterministic rule report and returns the ready/partial payload
+  (`status`, `report_path`, `report`, `counts`). CP1 runs it synchronously with
+  `200` and always covers the whole peel (the optional id filters are forwarded
+  but peelfeed ignores them until the Phase 2 report jobs); persisted jobs
+  replace the synchronous call in M2 Phase 2/4 (`202` + job id).
+- `POST …/review/ocr/check` proxies `peelfeed ocr-check` (M2.1; wire §2.8) and
+  returns `200` with the probe payload (`available`, `engine`, `provider`,
+  `probe`, `checked_at`, `error`); `503` when OCR is unconfigured/unrunnable,
+  `400` for `ocr_config_invalid`/validation and `502` for other OCR failures.
+  The request body is optional but must be **empty or `{}`**: the HTTP API does
+  not accept a `provider` object (any field is `400`). OCR configuration is
+  env-only (`PEELFEED_OCR_*`); peekseed always sends `{"provider": {}}`.
+- `POST …/review/ocr/refresh` creates one persistent `type=ocr` evidence-refresh
+  job and returns `202 {job_id, status:"queued", result_ref:null}`, storing the
+  descriptor in `extraction.review_jobs` for restart re-attachment (never
+  rerun). The body is exactly `{item_ids:[…]}` — a non-empty, unique list of
+  non-empty strings — and any extra field (including `provider`) is `400`;
+  `409` `not_ready` when there is no current build. The job takes only a reader
+  lease and never blocks builds/publishing.
+- **No provider override over HTTP (CP4.1 G1).** A caller-supplied `provider`
+  object is executable input in peelfeed (its `command` is spawned as a
+  subprocess), so the HTTP routes never accept or forward one; a provider
+  override exists only in peelfeed's local CLI.
 - `POST …/events` with `{event: "embed"|"feedback", data?}` runs `peelfeed
   event` and appends the event to the peel's `.peel` log.
 - `GET …/assets/{path}` serves a peel-relative (`<root>/<peel_id>/<path>`) or
@@ -265,11 +340,14 @@ staleness.
 ### Per-source extraction state
 
 `GET /api/datasets/{id}/sources` returns each source with
-`extraction={state, peel_id, conversion_id, profile, engine, validation,
-started_at, finished_at, error}` and `indexed`. The state chip is one of
-`not_extracted | queued | running | extracted | failed | stale`; queued/running
-sources are refreshed from `peelfeed status` when the list is read (cheap when
-unavailable: the 60 s handshake cache answers without a CLI call).
+`extraction={state, peel_id, conversion_id, profile, engine, review_jobs,
+validation, started_at, finished_at, error}` and `indexed`. The state chip is
+one of `not_extracted | queued | running | extracted | failed | stale |
+corrections_conflict`; queued/running sources are refreshed from `peelfeed
+status` when the list is read (cheap when unavailable: the 60 s handshake cache
+answers without a CLI call). `corrections_conflict` (schema 4) is set by a
+system rebuild blocked by a historical correction (M2 Phase 2); the current
+corpus is kept and the conflict must be resolved by the user.
 
 ## Jobs
 

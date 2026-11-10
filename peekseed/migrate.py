@@ -9,9 +9,11 @@ prints exactly what would change, and only rewrites files (atomically) with
 Two artifacts are versioned today:
 
 * ``dataset.json`` -- schema 1/2 gains per-source ``sha256``/``bytes``/
-  ``status`` and (schema 3) the ``extraction`` block. The hash is computed from
-  the file on disk, never invented (a source whose file is missing is marked
-  ``new`` with no hash). A legacy source is marked ``not_extracted``: its old
+  ``status``, schema 3 the ``extraction`` block, and schema 4
+  ``extraction.review_jobs`` (empty for an older dataset) plus the
+  ``corrections_conflict`` extraction state. The hash is computed from the file
+  on disk, never invented (a source whose file is missing is marked ``new``
+  with no hash). A legacy source is marked ``not_extracted``: its old
   in-process extraction cannot be reused, so it needs a peelfeed peel before it
   can be indexed again.
 * ``info.json`` -- schema 1/2 gains the full embedding-space identity, chunker

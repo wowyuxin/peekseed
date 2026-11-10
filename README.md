@@ -119,8 +119,10 @@ The core loop is **upload → (Extract) → index → search → ask → researc
    `$PEEKSEED_SHARED_DIR/sources/<sha256>/<name>.pdf`.
 2. **Extract (optional engine).** `POST /api/datasets/{id}/sources/{sha}/extract`
    asks peelfeed to build a peel for that file; the UI polls the per-source state
-   until `extracted`/`failed` and offers Review + Apply & rebuild. With no
-   peelfeed, Extract is disabled (API 503) and uploads still work.
+   until `extracted`/`failed` and offers the structured Review view (clusters,
+   plan selection, deterministic report — the old per-item Accept/Reject and
+   "Apply & rebuild" were removed in M2 CP1). With no peelfeed, Extract is
+   disabled (API 503) and uploads still work.
 3. **Index.** `POST /api/datasets/{id}/index` starts a persisted background job
    that reads each extracted peel corpus (gated on the peel-root allowlist, the
    source sha256, the conversion id and zero validation errors), maps the
@@ -215,8 +217,8 @@ when no index exists for the active space.
 **0.1.0 (this release)** — the upload-driven product:
 
 - Data-folder init/status/doctor, versioned data schemas
-  (`dataset.json`/`info.json` schema 3, job schema 1) with `peekseed migrate`
-  upgrades.
+  (`dataset.json` schema 4, `info.json` schema 3, job schema 1) with `peekseed
+  migrate` upgrades.
 - PDF upload via UI/API or `peekseed index` — **storage only** (no pypdf/docling
   in peekseed; each PDF is stored once in the shared sources pool). Extraction is
   a peelfeed job; with no engine configured uploads, file management and deletes

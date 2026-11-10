@@ -18,7 +18,7 @@ $PEEKSEED_HOME/                     private runtime data (0700)
 ├── config/links.json               model links; 0600; api_key_env names only
 ├── config/settings.json            optional UI title/tagline/examples
 ├── config/peelfeed.json            peelfeed CLI config; 0600; seeded once
-├── datasets/<dataset>/             dataset.json schema 3, chunks.jsonl,
+├── datasets/<dataset>/             dataset.json schema 4, chunks.jsonl,
 │                                   index/<space>/generations/<uuid>/ + CURRENT
 ├── history/                        search + dialog history
 ├── jobs/<id>.json                  job record schema 1
@@ -40,7 +40,7 @@ stored `sources/` copy. There is no `manifest.json`, no `documents/` and no
 
 | Contract | Schema | Notes |
 |---|---|---|
-| `dataset.json` | 3 | `id`, `name`, `sources[{name,path (sources/<sha256>/<name>),sha256,bytes,pages,extractor,status,extraction{state,peel_id,conversion_id,profile,engine,validation,...}}]`, optional collection `status` |
+| `dataset.json` | 4 | `id`, `name`, `sources[{name,path (sources/<sha256>/<name>),sha256,bytes,pages,extractor,status,extraction{state,peel_id,conversion_id,profile,engine,review_jobs,validation,...}}]`, optional collection `status` |
 | chunk row | — | `id` (content-derived 16 hex), `ordinal`, `source`, `source_sha256`, `block_index`, `chunk_index`, `chunker_version`, pages, breadcrumb, `doc`, `text`, `heading_only`; optional peelfeed fields `kind`, `image_paths`, `source_pages`, `char_count`, `parts`/`part`, `prev`/`next`, `canonical_ids`, `engine`, `conversion_id`, `peel_id` |
 | `info.json` | 3 | `space`, `generation`, `n`, `dim`, `embedding{...probe}`, `chunker` (peel contract), `extractor` (peelfeed), `documents_digest`, `corpus_digest`, `peel{peel_id,conversion_id,profile,validation}`, `skipped_sources`, `sources` |
 | job record | 1 | `id`, `kind`, `collection`, `state`, `progress`, `cancel_requested`, timestamps |
@@ -53,6 +53,40 @@ Helpers: `chunk_id()`, `documents_digest()`, `corpus_digest()`,
 
 Rules: readers refuse a **newer** schema (`SchemaTooNew`); older schemas are
 upgraded explicitly (`peekseed migrate`); JSON writes are atomic.
+
+### Schema 4 (M2 CP1) — `extraction.review_jobs` and `corrections_conflict`
+
+The dataset schema went from 3 to 4 in one migration, and `peekseed migrate`
+upgrades older files in place (dry-run by default):
+
+- every source's `extraction` block gains `review_jobs`, a mapping
+  `{"<job_id>": {"type": "report|discuss|build|ocr", "created_at": …, "batch_id": …}}`.
+  peekseed persists the peelfeed job ids here so a restarted service can re-query
+  the real job status instead of re-running it (M2 Phase 2+). An older dataset
+  gets `{}`; the field is validated as an object of objects.
+- `EXTRACTION_STATES` additionally accepts `corrections_conflict`: a system
+  rebuild was blocked because a historical correction no longer validates. The
+  current corpus is left untouched (the source stays readable) and the conflict
+  is surfaced for the user to resolve (M2 Phase 2). No other state changed.
+
+`INFO_SCHEMA` stays 3: index metadata is unaffected by review state. Review
+state itself is owned by peelfeed under `<peel>/extract/review/`; peekseed never
+stores it, only proxies the CLI (see `peekseed/peelfeed.py` below). Review calls
+require peelfeed `capabilities.review_schema == 2` and otherwise return `409`.
+
+### Review plan entries and resolutions (CP1.1, contract v1.3)
+
+A `POST …/review/plan` `select` of an R0 resolution strategy
+(`confirm_no_header`, `keep_visual_fallback`, `keep_original_figure`) creates an
+entry whose `action.type` is `resolution`. Its `confirm` writes the R0
+resolution (the same shape as a defer) and sets the entry status directly to
+`applied`: no batch build, no corpus change, no reindex. Operation entries
+(`use_first_row_header`, `inherit_parent_header`, …) confirm to `confirmed` and
+wait for an ApplyBatch. The review summary's `counts.confirmed`
+("已确认待发布") therefore counts operation entries only; applied R0 entries are
+`counts.applied`. The review payload's `derived_from.converter_code_hash` is a
+diagnostic converter-code hash (`sha256(canonical converter_hashes)[:16]`), not
+`normalize.engine_fingerprint()`, and is never used for stale/CAS.
 
 ## Module interfaces
 
@@ -136,11 +170,13 @@ references it.
 config_path() -> Path       # $PEEKSEED_HOME/config/peelfeed.json (0600, seeded once)
 load() -> dict              # cli, python, repo, root, enabled, timeout, poll,
                             # llm_mode, chunk_profile (env wins over the file)
-handshake(force=False) -> dict   # `peelfeed capabilities`, cached 60 s, never raises
+handshake(force=False) -> dict   # `peelfeed capabilities`, cached 60 s, never raises;
+                                 # also exposes review_schema/operations/resolutions/strategies
 status(probe=False) -> {"config", "handshake"}
 client() -> PeelfeedClient       # capabilities/status/status_all/ingest/review/
-                                 # decide/rebuild/event/archive
+                                 # plan/review-report/rebuild/event/archive
 extraction_state_for_peel(state) / extraction_from_summary(summary, previous=…)
+REVIEW_SCHEMA (=2), REVIEW_GROUPS, PLAN_ACTIONS, DEFER_REASONS
 ```
 
 The engine is invoked as a subprocess (`PEEKSEED_PEELFEED_CLI`, or
@@ -152,6 +188,20 @@ no daemon, HTTP client, base URL or token. The peel root is always
 usual `PATH`/`HOME`/`USER`/`LANG`/`TMPDIR` set plus every `PEELFEED_*` variable
 (and `PYTHONPATH` for the `-m` form); peekseed's token and API keys never reach
 it.
+
+M2 review calls: `review(peel_id, group=…, status=…, item=…, limit=…)` proxies
+the structured schema-2 view; `plan(peel_id, payload)` runs
+`plan <peel_id> <select|confirm|lock|unlock|defer> [--input -] [--entry … --base-plan-version …]`
+and returns the complete ReviewPlan. A resolution entry becomes `applied` on
+confirm while an operation entry becomes `confirmed`; a locked entry rejects
+select/defer with `conflict` (409). `review_report(peel_id, item_ids=…,
+cluster_ids=…)` runs the synchronous CP1 `review-report`. The old `decide()`
+method was **removed**. A failed command's error is parsed from the stdout
+`{"error": {"code", "message", "detail"}}` and/or the stderr
+`error [<code>] <message>` line and mapped to an HTTP status: `busy → 423`,
+`conflict | stale | review_schema | corrections_conflict → 409`,
+`validation | privacy_confirmation_required → 400`, not found (exit 3 or
+`not_found`) → `404`, anything else → `502`.
 
 ### `peekseed.security` (W8)
 
@@ -183,7 +233,7 @@ peelfeed job. CLI wiring lives in `peekseed/__main__.py`.
 | `peekseed/workspace.py` | `init`/`status`/`doctor` over `config.Paths` |
 | `peekseed/ingest/index.py` | Storage-only uploads, shared-source store, peelfeed corpus reader/gate, generation-atomic indexes, probe, jobs, `load_index`/`index_state`/`reindex` |
 | `peekseed/ingest/lock.py` | Per-dataset writer lock with stale-holder detection |
-| `peekseed/peelfeed.py` | peelfeed CLI adapter: env-seeded config, capabilities handshake, ingest/review/decide/rebuild/event/archive subprocess calls |
+| `peekseed/peelfeed.py` | peelfeed CLI adapter: env-seeded config, capabilities handshake (incl. `review_schema`), ingest/review/plan/review-report/rebuild/event/archive subprocess calls |
 | `peekseed/overlap.py` | Top-k ranking overlap for the cutover acceptance record |
 | `peekseed/security.py`, `app.py` | Token/Host/Origin gate, streaming upload limits, inline `/pdf`, peelfeed routes |
 | `peekseed/migrate.py` | Explicit schema migration (dry-run default) |

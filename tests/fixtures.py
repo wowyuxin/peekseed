@@ -418,17 +418,26 @@ def write_chunk_sets(corpus, chunks, chunk_sets, conversion_id):
 
 def make_peel(dataset, *, pages=None, source=None, profile="generic",
               validation_errors=None, peel_root=None, engine="peelfeed-test@1",
-              conversion_salt="1", chunks=None, chunk_sets=(EMBED_CHUNK,)):
+              conversion_salt="1", chunks=None, chunk_sets=(EMBED_CHUNK,),
+              layout="build"):
     """Create a fake peelfeed peel for one dataset source and mark it extracted.
 
-    ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. The peel is
-    written under ``config.paths().peels_dir`` with the files
+    ``dataset`` is a dataset metadata dict (``dir``) or a dataset id. By default
+    the peel uses the CP3 build layout (wire-contract §2.1)::
+
+        extract/corpus -> conversions/<build_id>/     relative symlink
+        extract/conversions/<build_id>/manifest.json  conversion identity
+        extract/conversions/<build_id>/build_summary.json
+
+    ``layout="legacy"`` writes a real ``extract/corpus`` directory instead, which
+    exercises the pre-cutover fallback. The peel is written under
+    ``config.paths().peels_dir`` with the files
     :func:`peekseed.ingest.build_index` consumes: ``manifest.json``,
     ``chunks.jsonl``, ``blocks.jsonl``, ``assets.jsonl``, ``validation.json``,
     ``review_queue.json`` and a copy of the source under ``source/``. The dataset
     source entry is updated to ``status="extracted"`` with the peel identity.
 
-    Returns ``{"peel_id", "peel_dir", "conversion_id"}``.
+    Returns ``{"peel_id", "peel_dir", "conversion_id", "build_id", "build_dir"}``.
     """
     from peekseed import config, contracts, ingest
 
@@ -460,14 +469,34 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     peel_root = Path(peel_root)
     peel_id = "%s-%s" % (_peel_slug(Path(name).stem), sha[:8])
     peel_dir = peel_root / peel_id
-    corpus = peel_dir / "extract" / "corpus"
-    (peel_dir / "source").mkdir(parents=True, exist_ok=True)
-    corpus.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(str(source_file), str(peel_dir / "source" / name))
-
+    extract = peel_dir / "extract"
     conversion_id = hashlib.sha256(
         ("conv|%s|%s|%s" % (sha, profile, conversion_salt)).encode()
     ).hexdigest()
+    build_id = "b20261108T120000-" + hashlib.sha256(
+        ("build|%s|%s" % (conversion_id, layout)).encode()
+    ).hexdigest()[:8]
+    if layout == "legacy":
+        corpus = extract / "corpus"
+        if corpus.is_symlink():
+            corpus.unlink()
+        build_dir = corpus
+        build_id = "cutover-" + conversion_id
+    else:
+        build_dir = extract / "conversions" / build_id
+        corpus = build_dir
+    (peel_dir / "source").mkdir(parents=True, exist_ok=True)
+    build_dir.mkdir(parents=True, exist_ok=True)
+    if layout != "legacy":
+        link = extract / "corpus"
+        if link.is_symlink():
+            link.unlink()
+        elif link.is_dir():
+            shutil.rmtree(str(link))
+        extract.mkdir(parents=True, exist_ok=True)
+        os.symlink(os.path.join("conversions", build_id), str(link))
+    shutil.copyfile(str(source_file), str(peel_dir / "source" / name))
+
     if pages is None:
         pages = [
             "Widget installation. The widget is mounted on the frame with two screws.",
@@ -508,9 +537,13 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
                 "page": int(chunk.get("page_start") or 1),
                 "text": str(chunk.get("text") or ""),
             })
+    empty_hash = hashlib.sha256(b"[]").hexdigest()
     manifest = {
         "schema_version": 2,
         "conversion_id": conversion_id,
+        "effective_corrections_hash": empty_hash,
+        "correction_engine_version": "corr-test0000000000",
+        "uncorrected_identity": conversion_id,
         "title": Path(name).stem,
         "profile": profile,
         "source": name,
@@ -530,7 +563,34 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     }
     review_queue = {"warnings": [], "char_limit_exceptions": [],
                     "outline_reconciliations": []}
+    build_summary = {
+        "schema_version": 1,
+        "peel_id": peel_id,
+        "build_id": build_id,
+        "build_kind": "cutover" if layout == "legacy" else "system",
+        "batch_id": None,
+        "conversion_id": conversion_id,
+        "corrections": {"effective_corrections_hash": empty_hash,
+                        "correction_engine_version": "corr-test0000000000"},
+        "gates": {"all_pass": True, "checks": 1, "errors": []},
+        "diff": {"assets_changed": 0, "blocks_changed": 0, "chunks_changed": 0,
+                 "new_warnings": [], "changed_assets": [], "samples": [],
+                 # CP3.1 F3: a cutover has no current build yet, so the first
+                 # index must be built from scratch; system builds of an
+                 # existing corpus need no reindex.
+                 "reindex": ({"required": True, "reason": "no_current_build",
+                              "chunks": len(chunks)}
+                             if layout == "legacy" else
+                             {"required": False, "reason": None, "chunks": 0})},
+        "counts": {"pages": len(pages), "chunks": len(chunks),
+                   "review_items": 0},
+        "validation_errors": len(validation_errors or []),
+        "engine": {"name": "peelfeed", "version": "0.1.0",
+                   "fingerprint": engine},
+        "created_utc": contracts.utc_now(),
+    }
     contracts.write_json_atomic(corpus / "manifest.json", manifest)
+    contracts.write_json_atomic(corpus / "build_summary.json", build_summary)
     contracts.write_json_atomic(corpus / "validation.json", validation)
     contracts.write_json_atomic(corpus / "review_queue.json", review_queue)
     (corpus / "assets.jsonl").write_text("", encoding="utf-8")
@@ -554,6 +614,8 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
         "conversion_id": conversion_id,
         "profile": profile,
         "engine": engine,
+        "review_jobs": {},
+        "corrections_conflict": None,
         "validation": {"errors": 0, "review_items": 0},
         "started_at": contracts.utc_now(),
         "finished_at": contracts.utc_now(),
@@ -566,7 +628,84 @@ def make_peel(dataset, *, pages=None, source=None, profile="generic",
     metadata["updated_at"] = contracts.utc_now()
     contracts.write_json_atomic(dataset_dir / "dataset.json", metadata)
     return {"peel_id": peel_id, "peel_dir": str(peel_dir),
-            "conversion_id": conversion_id}
+            "conversion_id": conversion_id, "build_id": build_id,
+            "build_dir": str(build_dir)}
+
+
+def write_peel_build(peel, *, conversion_id=None, build_id=None,
+                     chunk_sets=None, engine=None):
+    """Move a fake peel's current pointer to a (possibly new) build dir.
+
+    Simulates a peelfeed publish / system rebuild on the peel filesystem only:
+    the new build directory copies the current corpus, optionally records a new
+    ``conversion_id`` and/or adds chunk sets, and ``extract/corpus`` is replaced
+    with the relative symlink. ``dataset.json`` is deliberately **not** touched,
+    so a reconcile test can prove the shared-dataset refresh updates it.
+
+    A chunk-set-only change keeps ``conversion_id`` (new ``build_id``, same
+    content identity), which must leave existing indexes valid.
+    """
+    from peekseed import contracts
+
+    peel_dir = Path(peel["peel_dir"])
+    extract = peel_dir / "extract"
+    link = extract / "corpus"
+    current_dir = link.resolve()
+    manifest = json.loads((current_dir / "manifest.json").read_text())
+    previous_conversion = str(manifest.get("conversion_id") or "")
+    conversion_id = conversion_id or previous_conversion
+    if build_id is None:
+        build_id = "b20261108T120000-" + hashlib.sha256(
+            ("build|%s|%s" % (conversion_id, chunk_sets)).encode()
+        ).hexdigest()[:8]
+    build_dir = extract / "conversions" / build_id
+    if build_dir.resolve() != current_dir:
+        build_dir.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(str(current_dir), str(build_dir), dirs_exist_ok=True)
+    manifest = dict(manifest, conversion_id=conversion_id)
+    contracts.write_json_atomic(build_dir / "manifest.json", manifest)
+    validation_path = build_dir / "validation.json"
+    if validation_path.is_file():
+        validation = json.loads(validation_path.read_text())
+        validation["conversion_id"] = conversion_id
+        contracts.write_json_atomic(validation_path, validation)
+    summary_path = build_dir / "build_summary.json"
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text())
+        summary.update({"build_id": build_id, "conversion_id": conversion_id})
+        if engine:
+            summary.setdefault("engine", {})["fingerprint"] = engine
+        # CP3.1 F3: keep the fixture's build summary faithful to the additive
+        # ``diff.reindex`` shape when the conversion identity changes.
+        diff = summary.get("diff") if isinstance(summary.get("diff"), dict) else {}
+        required = conversion_id != previous_conversion
+        chunk_count = 0
+        chunks_path = build_dir / "chunks.jsonl"
+        if chunks_path.is_file():
+            chunk_count = sum(1 for line in
+                              chunks_path.read_text(encoding="utf-8").splitlines()
+                              if line.strip())
+        diff["reindex"] = {
+            "required": required,
+            "reason": (("conversion_changed" if previous_conversion
+                        else "no_current_build") if required else None),
+            "chunks": chunk_count if required else 0,
+        }
+        summary["diff"] = diff
+        contracts.write_json_atomic(summary_path, summary)
+    if chunk_sets:
+        chunks = [json.loads(line) for line in
+                  (build_dir / "chunks.jsonl").read_text().splitlines()
+                  if line.strip()]
+        write_chunk_sets(build_dir, chunks, chunk_sets, conversion_id)
+    if link.is_symlink():
+        link.unlink()
+    elif link.exists():
+        shutil.rmtree(str(link))
+    extract.mkdir(parents=True, exist_ok=True)
+    os.symlink(os.path.join("conversions", build_id), str(link))
+    return {"peel_id": peel["peel_id"], "build_id": build_id,
+            "build_dir": str(build_dir), "conversion_id": conversion_id}
 
 
 # --- fake peelfeed CLI -----------------------------------------------------
@@ -590,6 +729,18 @@ DEFAULT_CAPABILITIES = {
     "chunk_contract": 1,
     "peel_event_schema": 1,
     "chunker_version": 1,
+    "review_schema": 2,
+    "operations": ["inherit_header_from", "set_header_rows",
+                   "set_asset_labels_from_ocr"],
+    # M2.1 OCR capabilities (wire §2.8): env-only config resolved by peelfeed.
+    # The fake default is unconfigured; tests override ``capabilities.ocr`` in
+    # the state to advertise a configured provider/engine.
+    "ocr": {"configured": False, "provider": None, "engine": None,
+            "timeout_seconds": None, "min_confidence": None, "params": {}},
+    "resolutions": ["confirm_headerless", "confirm_known", "defer",
+                    "keep_original_figure", "keep_visual_fallback"],
+    "strategies": [{"id": "use_first_row_header", "version": 1,
+                    "name": "本表首行作表头"}],
     "formats": ["pdf"],
     "profiles": ["cxl", "ddr5", "dwc", "generic", "pcie", "pipe"],
     "chunk_profiles": ["default", "large", "small"],
@@ -599,27 +750,31 @@ DEFAULT_CAPABILITIES = {
                 "models_present": True},
 }
 
-DEFAULT_REVIEW = {
-    "peel_id": "peel",
-    "review_items": 2,
-    "items": [
-        {"id": "table-p0001-01/header", "message": "no header cells",
-         "asset": {"id": "table-p0001-01", "kind": "table",
-                   "caption": "Table 1-1", "pages": [1],
-                   "path": "tables/table-1-1.json", "segments": []},
-         "suggestion": None},
-        {"id": "figure-1-1/labels", "message": "no native labels",
-         "asset": {"id": "figure-1-1", "kind": "figure",
-                   "caption": "Figure 1-1", "pages": [2],
-                   "path": "images/fig_1_1.png", "segments": []},
-         "suggestion": None},
-    ],
-    "char_limit_exceptions": [],
-    "outline_reconciliations": [],
-    "asset_stats": {"tables": 1, "figures": 1},
-    "corrections": 0,
-    "llm": {"available": False, "prompt_set": ""},
+# M2.1 ``ocr-check`` payload (wire §2.8): a successful provider probe.
+DEFAULT_OCR_CHECK = {
+    "schema_version": 1,
+    "available": True,
+    "engine": "rapidocr@1.4.4",
+    "provider": {
+        "configured": True,
+        "command_display": "/tmp/ocr-venv/bin/python "
+                           "/tmp/peelfeed/scripts/ocr_provider_rapidocr.py",
+        "timeout_seconds": 30.0,
+        "min_confidence": 0.6,
+        "params": {},
+        "params_sha256": "0123456789abcdef",
+    },
+    "probe": {"image_sha256": "ab" * 32, "labels": 0, "seconds": 0.85},
+    "checked_at": "2026-11-09T03:10:00Z",
+    "error": None,
 }
+
+# The schema-2 review/plan payloads are module-level fixtures (one source
+# of truth shared by the tests and this fake CLI, injected via %%r below).
+DEFAULT_REVIEW = %(default_review)r
+DEFAULT_PLAN = %(default_plan)r
+
+DEFAULT_REPORT = %(default_report)r
 
 
 def load_state():
@@ -640,9 +795,344 @@ def emit(payload):
     return 0
 
 
-def fail(message, code=2):
-    print("error: " + message, file=sys.stderr)
+def copy_json(value):
+    return json.loads(json.dumps(value))
+
+
+def fail(message, code=2, error_code="error", detail=None):
+    """Emit the real peelfeed error protocol: stderr line + JSON error object."""
+    print("error [" + str(error_code) + "] " + str(message), file=sys.stderr)
+    print(json.dumps({"error": {"code": str(error_code),
+                                "message": str(message),
+                                "detail": detail or {}}}))
     return code
+
+
+def read_stdin_json():
+    try:
+        return json.loads(sys.stdin.read() or "null")
+    except ValueError:
+        return None
+
+
+# CP1.1 (contract v1.3 §11.1): selecting an R0 strategy creates a
+# ``type=resolution`` action instead of a corpus operation; confirming that
+# entry writes the resolution and applies it immediately. Operation strategies
+# still produce ``type=operation`` entries that wait for a future ApplyBatch.
+RESOLUTION_STRATEGIES = {
+    "confirm_no_header": "confirm_headerless",
+    "keep_visual_fallback": "keep_visual_fallback",
+    "keep_original_figure": "keep_original_figure",
+}
+OPERATION_STRATEGIES = {
+    "use_first_row_header": "set_header_rows",
+    "use_first_two_rows_header": "set_header_rows",
+    "use_header_rows": "set_header_rows",
+    "inherit_parent_header": "inherit_header_from",
+    "use_ocr_labels": "set_asset_labels_from_ocr",
+}
+
+
+def resolution_record(item_id, name, entry_id=None, revision=0,
+                      reason_code=None, reason=None, evidence_hash=None):
+    """A resolutions.jsonl row (contract §11.6), the shape ``plan defer`` uses."""
+    material = "|".join([str(item_id), str(name), str(entry_id or ""),
+                         str(int(revision or 0))])
+    return {
+        "schema_version": 1,
+        "resolution_id": "r-" + hashlib.sha256(
+            material.encode("utf-8")).hexdigest()[:16],
+        "change": "add",
+        "supersedes": None,
+        "idempotency_key": hashlib.sha256(
+            (material + "|add").encode("utf-8")).hexdigest(),
+        "item_id": str(item_id),
+        "name": str(name),
+        "reason_code": reason_code,
+        "reason": reason,
+        "evidence_hash": evidence_hash,
+        "source": "user",
+        "recorded_at": "2026-11-05T00:00:00Z",
+    }
+
+
+def revert_resolution_record(target):
+    """A ``revert`` resolutions.jsonl row (contract §11.6), written by clear."""
+    row = dict(target)
+    row["change"] = "revert"
+    row["supersedes"] = target.get("resolution_id")
+    material = "%%s|revert" %% target.get("resolution_id")
+    row["resolution_id"] = "r-" + hashlib.sha256(
+        material.encode("utf-8")).hexdigest()[:16]
+    row["idempotency_key"] = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    row["recorded_at"] = "2026-11-05T00:00:00Z"
+    return row
+
+
+def report_suggestions(report_payload):
+    """Flatten a review-report payload into its per-item suggestions."""
+    payload = report_payload if isinstance(report_payload, dict) else {}
+    inner = payload.get("report")
+    report = inner if isinstance(inner, dict) else payload
+    suggestions = []
+    for cluster in report.get("clusters") or []:
+        if not isinstance(cluster, dict):
+            continue
+        for suggestion in cluster.get("suggestions") or []:
+            if isinstance(suggestion, dict):
+                suggestions.append(suggestion)
+    return suggestions
+
+
+def _item_evidence_hash(review, item_id):
+    """The review item's current evidence hash (used for accepted entries)."""
+    for item in review.get("items") or []:
+        if isinstance(item, dict) and item.get("id") == item_id:
+            return (item.get("evidence") or {}).get("hash")
+    return None
+
+
+def _strip_evidence_hashes(value):
+    """Drop ``evidence_hash`` keys so a hash-only refresh compares unchanged."""
+    if isinstance(value, dict):
+        return {key: _strip_evidence_hashes(item) for key, item in value.items()
+                if key != "evidence_hash"}
+    if isinstance(value, list):
+        return [_strip_evidence_hashes(item) for item in value]
+    return value
+
+
+def strategy_action(strategy_id, params):
+    """The plan entry action for one strategy, like ``plan select`` (wire §2.6)."""
+    params = dict(params or {})
+    if strategy_id in RESOLUTION_STRATEGIES:
+        return {"type": "resolution", "name": RESOLUTION_STRATEGIES[strategy_id]}
+    if strategy_id in OPERATION_STRATEGIES:
+        name = OPERATION_STRATEGIES[strategy_id]
+        if name == "set_header_rows" and not params:
+            params = {"rows": [0]}
+        return {"type": "operation", "name": name, "params": params}
+    return None
+
+
+def refresh_stale_entry(match, review):
+    """Refresh one stale entry's fixed parent snapshot (wire §2.7).
+
+    The fake CLI has no real parent table, so it refreshes from the item's
+    ``parent_candidates`` (the source original-case cells). ``changed`` is true
+    only when the refreshed ``action.params``/``source_refs`` content differs
+    from the stored values; a hash-only evidence change keeps the revision.
+    """
+    item = next((candidate for candidate in (review.get("items") or [])
+                 if candidate.get("id") == match.get("item_id")), None)
+    candidates = (item or {}).get("parent_candidates") or []
+    candidate = candidates[0] if candidates else {}
+    action = match.get("action") or {}
+    before_params = copy_json(action.get("params")) if action.get("params") else None
+    after_params = copy_json(before_params) if before_params is not None else None
+    if after_params is not None:
+        if candidate.get("header_cells") is not None:
+            after_params["parent_header_cells"] = copy_json(
+                candidate.get("header_cells"))
+        if candidate.get("source_refs") is not None:
+            after_params["parent_source_refs"] = copy_json(
+                candidate.get("source_refs"))
+        if candidate.get("header_source"):
+            after_params["parent_header_source"] = candidate.get("header_source")
+    before_refs = before_params.get("parent_source_refs") if before_params else None
+    after_refs = after_params.get("parent_source_refs") if after_params else None
+    changed = (_strip_evidence_hashes(before_params)
+               != _strip_evidence_hashes(after_params)
+               or _strip_evidence_hashes(before_refs)
+               != _strip_evidence_hashes(after_refs))
+    revision_before = int(match.get("revision") or 0)
+    revision_after = revision_before + 1 if changed else revision_before
+    match["action"] = dict(action, params=after_params)
+    match["revision"] = revision_after
+    match["stale"] = False
+    match["stale_reasons"] = []
+    match["evidence"] = dict(match.get("evidence") or {},
+                             hash=((item or {}).get("evidence") or {}).get("hash")
+                             or (match.get("evidence") or {}).get("hash"))
+    return {
+        "changed": changed,
+        "revision_before": revision_before,
+        "revision_after": revision_after,
+        "action_params_before": before_params,
+        "action_params_after": after_params,
+        "source_refs_before": before_refs,
+        "source_refs_after": after_refs,
+    }
+
+
+def corpus_operation(action):
+    """The normalized CP3 §2.1 ``corpus_operation`` for one plan action."""
+    action = action if isinstance(action, dict) else {}
+    name = str(action.get("name") or "")
+    params = dict(action.get("params") or {})
+    if name == "set_header_rows":
+        rows = sorted({int(value) for value in params.get("rows") or []}) or [0]
+        cells = ["Header A", "Header B"]
+        semantic = {"rows": rows}
+        refs = [{"segment": 0, "source_row": row, "cells": list(cells),
+                 "evidence_hash": "ev-fake"} for row in rows]
+    elif name == "inherit_header_from":
+        rows = sorted({int(value) for value in params.get("parent_header_rows")
+                       or []}) or [0]
+        cells = params.get("parent_header_cells") or [["Header A", "Header B"]]
+        semantic = {
+            "parent_asset_id": params.get("parent_asset_id") or "table-parent",
+            "parent_header_rows": rows,
+            "parent_header_cells": copy_json(cells),
+            "parent_header_source": params.get("parent_header_source") or "native",
+        }
+        refs = params.get("parent_source_refs") or [{
+            "segment": 0, "source_row": rows[0],
+            "cells": copy_json(cells[0] if cells else ["Header A", "Header B"]),
+            "evidence_hash": "ev-fake"}]
+    else:
+        return None
+    return {"schema_version": 1, "name": name, "semantic": semantic,
+            "source_refs": copy_json(refs)}
+
+
+def new_job(job_type, *, batch_id=None, result_ref=None, status="done",
+            error=None, nonce=""):
+    """A deterministic CP3 §2.5 persistent job record (terminal immediately).
+
+    The fake CLI makes jobs terminal right away (the CP2 flake hardening: a
+    poller never has to wait for a fake process). Tests that need queued/running/
+    failed/interrupted records set ``state["jobs"]`` directly.
+    """
+    job_id = str(job_type) + "-20261108T120000-" + hashlib.sha256(
+        (str(job_type) + "|" + str(batch_id) + "|" + str(result_ref)
+         + "|" + str(nonce)).encode()
+    ).hexdigest()[:4]
+    now = "2026-11-08T12:00:00Z"
+    return {
+        "schema_version": 1,
+        "job_id": job_id,
+        "type": str(job_type),
+        "status": str(status),
+        "progress": {"stage": "done" if status == "done" else status,
+                     "done": 1 if status == "done" else 0,
+                     "total": 1},
+        "result_ref": result_ref,
+        "error": error,
+        "pid": None,
+        "process_started_at": None,
+        "created_at": now,
+        "started_at": now,
+        "updated_at": now,
+        "log_ref": "jobs/" + job_id + ".log",
+        "batch_id": batch_id,
+    }
+
+
+def default_batch(peel_id, entry_ids, entries, state):
+    """A deterministic ready_to_publish ApplyBatch record (CP3 wire §2.3)."""
+    empty_hash = hashlib.sha256(b"[]").hexdigest()
+    changes = []
+    for entry_id in entry_ids:
+        entry = entries.get(str(entry_id)) or {}
+        action = entry.get("action") or {}
+        operation = corpus_operation(action)
+        changes.append({
+            "change": "add",
+            "entry_id": str(entry_id),
+            "item_id": entry.get("item_id"),
+            "operation": operation,
+            "supersedes": None,
+        })
+    batch_id = "batch-20261108T120000-" + hashlib.sha256(
+        "|".join(str(item) for item in entry_ids).encode()).hexdigest()[:4]
+    conversion_id = state.get("batch_conversion_id") or (
+        hashlib.sha256(("batch|" + batch_id).encode()).hexdigest())
+    build_id = "b20261108T120000-" + hashlib.sha256(
+        ("build|" + batch_id).encode()).hexdigest()[:8]
+    # CP3.1 F3 (wire §2.2): the additive ``diff.reindex`` object. ``required``
+    # is true iff the candidate conversion differs from the current one (or
+    # there is no current build yet); ``chunks`` is the full candidate chunk
+    # count (the re-embed scope), not the changed-chunk count.
+    peel = (state.get("peels") or {}).get(peel_id) or {}
+    override_current = state.get("publish_current")
+    if isinstance(override_current, dict):
+        current_conversion = str(override_current.get("conversion_id") or "")
+    else:
+        current_conversion = str(peel.get("conversion_id") or "")
+    reindex = {"required": False, "reason": None, "chunks": 0}
+    if conversion_id != current_conversion:
+        reindex = {
+            "required": True,
+            "reason": ("conversion_changed" if current_conversion
+                       else "no_current_build"),
+            "chunks": int(state.get("reindex_chunks")
+                          or (peel.get("counts") or {}).get("chunks")
+                          or len(changes)),
+        }
+    override_reindex = state.get("batch_reindex")
+    if isinstance(override_reindex, dict):
+        reindex = copy_json(override_reindex)
+    base = {
+        "conversion_id": conversion_id,
+        "effective_corrections_hash": state.get("effective_corrections_hash")
+        or empty_hash,
+        "entry_revisions": {str(entry_id): int(
+            (entries.get(str(entry_id)) or {}).get("revision") or 1)
+            for entry_id in entry_ids},
+        "evidence_hashes": {str(entry_id): (
+            (entries.get(str(entry_id)) or {}).get("evidence") or {}).get("hash")
+            for entry_id in entry_ids},
+        "engine_fingerprint": state.get("engine_fingerprint") or "test-fingerprint",
+        "profile": "generic",
+        "chunk_sets": ["c8000-12000-i3"],
+        "correction_engine_version": "corr-test0000000000",
+    }
+    projected = hashlib.sha256(json.dumps(
+        changes, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":")).encode()).hexdigest()
+    return {
+        "schema_version": 1,
+        "batch_id": batch_id,
+        "status": "ready_to_publish",
+        "created_at": "2026-11-08T12:00:00Z",
+        "updated_at": "2026-11-08T12:00:00Z",
+        "changes": changes,
+        "base": base,
+        "projected_effective_corrections_hash": projected,
+        "plan_level": {"tier": "R2", "reasons": ["corpus_operation"]},
+        "estimate": {"items": len(changes), "assets": len(changes),
+                     "pages": [], "docling_rerun": False, "seconds": 120,
+                     "reindex": None},
+        "build": {
+            "build_id": build_id,
+            "candidate_conversion_id": conversion_id,
+            "gates": {"all_pass": True, "checks": 12, "errors": []},
+            "diff": {"assets_changed": len(changes), "blocks_changed": 0,
+                     "chunks_changed": len(changes), "new_warnings": [],
+                     "changed_assets": [change["item_id"] for change in changes],
+                     "samples": [], "reindex": reindex},
+            "carried_corrections": 0,
+        },
+        "publish": {"committed_at": None, "current_build_id": None,
+                    "error": None},
+        "failures": [],
+    }
+
+
+def batch_current(batch, state):
+    """The ``current`` block a publish/discard response carries (wire §2.6)."""
+    override = state.get("publish_current")
+    if isinstance(override, dict):
+        return copy_json(override)
+    build = batch.get("build") or {}
+    return {
+        "build_id": build.get("build_id") or "",
+        "conversion_id": build.get("candidate_conversion_id") or "",
+        "effective_corrections_hash": (
+            batch.get("projected_effective_corrections_hash") or ""),
+        "published": True,
+    }
 
 
 def option(rest, name):
@@ -652,11 +1142,46 @@ def option(rest, name):
     return None
 
 
+# CP3.1 F5 (contract §14.7): peelfeed validates batch_id/job_id against the
+# generated shape before joining any path; anything else is
+# ``error [validation]``. The fake CLI mirrors that check so peekseed's
+# validation->400 mapping is exercised without a real peelfeed.
+BATCH_ID_PREFIXES = ("batch", "system")
+JOB_ID_PREFIXES = ("report", "build", "rollback", "ocr", "discuss")
+
+
+def _generated_id_shape(value, prefixes):
+    text = str(value or "")
+    if not text or text != text.strip():
+        return False
+    if "/" in text or "\\" in text or ".." in text:
+        return False
+    for prefix in prefixes:
+        if text.startswith(prefix + "-") and len(text) > len(prefix) + 1:
+            return True
+    return False
+
+
+def valid_batch_id(value):
+    text = str(value or "")
+    if not _generated_id_shape(text, BATCH_ID_PREFIXES):
+        return False
+    # System rebuild batches are ``system-<build_id>`` (build ids start with b).
+    if text.startswith("system-"):
+        return text.startswith("system-b") and len(text) > len("system-b")
+    return True
+
+
+def valid_job_id(value):
+    return _generated_id_shape(value, JOB_ID_PREFIXES)
+
+
 VALUE_FLAGS = {
     "--root", "--item", "--decision", "--note", "--evidence", "--model",
     "--confidence", "--event", "--data", "--reason", "--profile",
     "--chunk-profile", "--llm", "--limit", "--pages", "--slug",
-    "--collection", "--device",
+    "--collection", "--device", "--group", "--status", "--entry",
+    "--base-plan-version", "--input", "--batch", "--job",
 }
 
 
@@ -690,12 +1215,23 @@ def main():
             "argv": argv,
             "peel_shared_dir": os.environ.get("PEELFEED_SHARED_DIR"),
             "pythonpath": os.environ.get("PYTHONPATH"),
+            # M2.1: peekseed forwards every PEELFEED_* env var (the OCR config
+            # is env-only), so the fake records them for the seam tests.
+            "ocr_env": {key: value for key, value in sorted(os.environ.items())
+                        if key.startswith("PEELFEED_OCR_")},
         }) + "\n")
     if not argv:
         return fail("missing command")
     command, rest = argv[0], argv[1:]
     state = load_state()
     root = option(rest, "--root")
+
+    forced_error = (state.get("errors") or {}).get(command)
+    if forced_error:
+        return fail(forced_error.get("message") or "simulated failure",
+                    int(forced_error.get("exit") or 2),
+                    forced_error.get("code") or "error",
+                    forced_error.get("detail"))
 
     if command == "capabilities":
         delay = float(state.get("capabilities_delay") or 0)
@@ -744,22 +1280,30 @@ def main():
         pages = int(state.get("ingest_pages") or 2)
         review_items = int(state.get("ingest_review_items") or 0)
         errors = list(state.get("ingest_errors") or [])
+        delay = float(state.get("ingest_seconds") or 0)
         peels[peel_id] = {
             "peel_id": peel_id,
-            "state": "converting",
+            # CP3 flake hardening: with no simulated delay the terminal state is
+            # observable immediately (no intermediate "converting" write for a
+            # 0.05s poller to catch and persist late).
+            "state": "converting" if delay else (
+                "failed" if errors else "ready"),
             "source": {"name": os.path.basename(source),
                        "size": os.path.getsize(source),
                        "sha256": sha, "pages": pages},
             "profile": state.get("ingest_profile") or "generic",
-            "conversion_id": "",
+            "conversion_id": "" if delay else hashlib.sha256(
+                ("conv|" + sha).encode()).hexdigest(),
             "counts": {"pages": pages, "chunks": pages},
-            "validation": {"errors": [], "review_items": review_items},
+            "validation": {"errors": [] if delay else errors,
+                           "review_items": review_items},
             "review_items": review_items,
-            "error": None,
+            "error": None if delay or not errors else "validation failed",
         }
         state["peels"] = peels
         save_state(state)
-        time.sleep(float(state.get("ingest_seconds") or 0))
+        if delay:
+            time.sleep(delay)
         conversion_id = hashlib.sha256(("conv|" + sha).encode()).hexdigest()
         summary = dict(peels[peel_id])
         summary.update({
@@ -789,32 +1333,726 @@ def main():
     if command == "review":
         peel_id = first_positional(rest)
         if peel_id not in peels:
-            return fail("no such peel", 3)
-        payload = dict(state.get("review") or DEFAULT_REVIEW)
+            return fail("no such peel", 3, "not_found")
+        payload = copy_json(state.get("review") or DEFAULT_REVIEW)
         payload["peel_id"] = peel_id
+        item_id = option(rest, "--item")
+        if item_id:
+            item = next((candidate for candidate in payload.get("items") or []
+                         if candidate.get("id") == item_id), None)
+            if item is None:
+                return fail("no such review item", 3, "not_found")
+            return emit({"peel_id": peel_id,
+                         "review_schema": payload.get("review_schema", 2),
+                         "item": item})
+        status_filter = option(rest, "--status")
+        if status_filter:
+            items = [candidate for candidate in payload.get("items") or []
+                     if candidate.get("status") == status_filter]
+            cluster_ids = {candidate.get("cluster_id") for candidate in items}
+            payload["items"] = items
+            clusters = []
+            for cluster in payload.get("clusters") or []:
+                if cluster.get("cluster_id") not in cluster_ids:
+                    continue
+                states = {}
+                for candidate in items:
+                    if candidate.get("cluster_id") == cluster.get("cluster_id"):
+                        state_name = candidate.get("status")
+                        states[state_name] = states.get(state_name, 0) + 1
+                cluster = copy_json(cluster)
+                cluster["states"] = states
+                clusters.append(cluster)
+            payload["clusters"] = clusters
         return emit(payload)
 
-    if command == "decide":
+    if command == "plan":
         peel_id = first_positional(rest)
         if peel_id not in peels:
-            return fail("no such peel", 3)
-        item = option(rest, "--item")
-        decision = option(rest, "--decision")
-        if decision not in ("accept", "reject", "override"):
-            return fail("decision must be accept|reject|override")
-        state.setdefault("decisions", []).append({
-            "peel_id": peel_id,
-            "item": item,
-            "decision": decision,
-            "note": option(rest, "--note"),
-            "evidence": option(rest, "--evidence"),
-            "model": option(rest, "--model"),
-            "confidence": option(rest, "--confidence"),
-        })
+            return fail("no such peel", 3, "not_found")
+        plan = copy_json(state.get("plan") or DEFAULT_PLAN)
+        plan["peel_id"] = peel_id
+        plan.setdefault("review_schema", 2)
+        values = positionals(rest)
+        action = values[1] if len(values) > 1 else "show"
+        if action == "show":
+            return emit(plan)
+        if action not in ("select", "confirm", "lock", "unlock", "defer",
+                          "accept", "clear"):
+            return fail("unknown plan action: " + str(action), 2, "validation")
+        entries = plan.get("entries") or []
+        entry = None
+        resolution = None
+        refresh = None
+        accepted = None
+        cleared = None
+        review = copy_json(state.get("review") or DEFAULT_REVIEW)
+        report = copy_json(state.get("review_report") or DEFAULT_REPORT)
+        if action in ("select", "defer"):
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                return fail("plan input must be a JSON object", 2, "validation")
+            base = request.get("base_plan_version")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            item_id = request.get("item_id")
+            if not item_id:
+                return fail("plan item_id is required", 2, "validation")
+            if action == "select":
+                strategy = request.get("strategy") or {}
+                strategy_id = str(strategy.get("id") or "")
+                entry_id = "e-" + hashlib.sha256(
+                    str(item_id).encode("utf-8")).hexdigest()[:16]
+                match = next((candidate for candidate in entries
+                              if candidate.get("entry_id") == entry_id), None)
+                # Locked entries are read-only: select is conflict, never a
+                # silent replacement (contract v1.3 §11.1; CP1.1 A3).
+                if match is not None and match.get("locked"):
+                    return fail("entry " + entry_id + " is locked; unlock it "
+                                "first", 2, "conflict")
+                params = request.get("params") or {}
+                if strategy_id in RESOLUTION_STRATEGIES:
+                    created_action = {
+                        "type": "resolution",
+                        "name": RESOLUTION_STRATEGIES[strategy_id],
+                    }
+                elif strategy_id in OPERATION_STRATEGIES:
+                    name = OPERATION_STRATEGIES[strategy_id]
+                    if name == "set_header_rows" and not params:
+                        params = {"rows": [0]}
+                    # Strategy id and params are passed through verbatim; for
+                    # inherit_header_from that keeps the fixed parent header
+                    # evidence the caller selected.
+                    created_action = {"type": "operation", "name": name,
+                                      "params": dict(params)}
+                else:
+                    return fail("unknown strategy: " + strategy_id,
+                                2, "validation")
+                revision = 1
+                if match is not None:
+                    revision = int(match.get("revision") or 0) + 1
+                    entries = [candidate for candidate in entries
+                               if candidate.get("entry_id") != entry_id]
+                entry = {
+                    "entry_id": entry_id,
+                    "item_id": str(item_id),
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": int(strategy.get("version") or 1)},
+                    "action": created_action,
+                    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                                 "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": "user",
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": request.get("notes"),
+                }
+                entries.append(entry)
+            else:
+                # Defer is an R0 resolution; a locked entry cannot be deferred
+                # and is never deleted (contract v1.3 §11.1; CP1.1 A3).
+                match = next((candidate for candidate in entries
+                              if candidate.get("item_id") == str(item_id)),
+                             None)
+                if match is not None and match.get("locked"):
+                    return fail("entry " + str(match.get("entry_id"))
+                                + " is locked; unlock it before deferring",
+                                2, "conflict")
+                resolution = resolution_record(
+                    item_id, "defer",
+                    reason_code=request.get("reason_code"),
+                    reason=request.get("reason"))
+                state.setdefault("resolutions", []).append(resolution)
+        elif action == "accept":
+            # Wire §2.6: all-or-nothing. Adopt each item's own ``ready`` report
+            # suggestion, fail the whole request with per-item ``detail.reasons``
+            # when any item is locked/stale/unsuggested/invalid, and bump
+            # ``plan_version`` exactly once.
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                return fail("plan input must be a JSON object", 2, "validation")
+            base = request.get("base_plan_version")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            item_ids = request.get("item_ids")
+            if not isinstance(item_ids, list) or not item_ids:
+                return fail("item_ids is required", 2, "validation")
+            state.setdefault("accept_requests", []).append(copy_json(request))
+            items_by_id = {item.get("id"): item
+                           for item in review.get("items") or []
+                           if isinstance(item, dict)}
+            ready = {}
+            failed = {}
+            for suggestion in report_suggestions(report):
+                item_id = suggestion.get("item_id")
+                status = (suggestion.get("validator") or {}).get("status")
+                if status == "ready":
+                    ready.setdefault(item_id, suggestion)
+                elif status == "failed_check":
+                    failed.setdefault(item_id, suggestion)
+            reasons = []
+            resolved = []
+            for raw_id in item_ids:
+                item_id = str(raw_id)
+                item = items_by_id.get(item_id)
+                if item is None:
+                    reasons.append({"item_id": item_id, "code": "item_missing",
+                                    "message": "review item not found"})
+                    continue
+                match = next((candidate for candidate in entries
+                              if candidate.get("item_id") == item_id), None)
+                if match is not None and match.get("locked"):
+                    reasons.append({"item_id": item_id, "code": "locked",
+                                    "message": "entry is locked"})
+                    continue
+                item_entry = item.get("entry") or {}
+                stale_reasons = (item_entry.get("stale_reasons")
+                                 or item.get("stale_reasons") or [])
+                if item.get("stale") or item_entry.get("stale"):
+                    reasons.append({
+                        "item_id": item_id, "code": "stale",
+                        "message": "item is stale: " + ", ".join(
+                            str(code) for code in stale_reasons)})
+                    continue
+                suggestion = ready.get(item_id)
+                if suggestion is None:
+                    if item_id in failed:
+                        failed_reasons = ((failed[item_id].get("validator") or {})
+                                          .get("reasons") or [])
+                        reasons.append({
+                            "item_id": item_id, "code": "validator_failed",
+                            "message": "ready suggestion failed validation: "
+                                       + "; ".join(str(reason)
+                                                   for reason in failed_reasons)})
+                    else:
+                        reasons.append({
+                            "item_id": item_id, "code": "no_ready_suggestion",
+                            "message": "report has no ready suggestion for "
+                                       "this item"})
+                    continue
+                resolved.append((item_id, suggestion))
+            if reasons:
+                return fail(
+                    "plan accept failed: %%d item(s) are not acceptable"
+                    %% len(reasons), 2, "validation",
+                    {"item_ids": [str(raw) for raw in item_ids],
+                     "reasons": reasons})
+            accepted = []
+            for item_id, suggestion in resolved:
+                strategy = suggestion.get("strategy") or {}
+                strategy_id = str(strategy.get("id") or "")
+                created_action = strategy_action(
+                    strategy_id, suggestion.get("params") or {})
+                if created_action is None:
+                    return fail("unknown strategy: " + strategy_id,
+                                2, "validation")
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                match = next((candidate for candidate in entries
+                              if candidate.get("entry_id") == entry_id), None)
+                replaced = match is not None
+                revision = 1
+                if match is not None:
+                    revision = int(match.get("revision") or 0) + 1
+                    entries = [candidate for candidate in entries
+                               if candidate.get("entry_id") != entry_id]
+                match = {
+                    "entry_id": entry_id,
+                    "item_id": item_id,
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": int(strategy.get("version") or 1)},
+                    "action": created_action,
+                    "evidence": {"hash": _item_evidence_hash(review, item_id),
+                                 "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": suggestion.get("source") or "rule",
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": None,
+                }
+                # Confirm immediately, like ``plan select`` + ``plan confirm``:
+                # a resolution becomes ``applied`` (R0 written now); an operation
+                # becomes ``confirmed`` and waits for a batch.
+                if created_action.get("type") == "resolution":
+                    resolution = resolution_record(
+                        item_id, created_action.get("name"),
+                        entry_id=entry_id, revision=revision,
+                        evidence_hash=match["evidence"]["hash"])
+                    state.setdefault("resolutions", []).append(resolution)
+                    match["status"] = "applied"
+                else:
+                    match["status"] = "confirmed"
+                entries.append(match)
+                accepted.append({
+                    "item_id": item_id,
+                    "entry_id": entry_id,
+                    "strategy": match["strategy"],
+                    "action": created_action,
+                    "status": match["status"],
+                    "revision": revision,
+                    "replaced_existing": replaced,
+                })
+            # Accept reports applied R0 rows through ``accepted``; the top-level
+            # ``resolution`` stays null (wire §2.6).
+            resolution = None
+        elif action == "clear":
+            # Wire §2.6: delete one entry; locked/batch-bound entries are a
+            # conflict and an applied R0 entry writes a ``revert`` resolution.
+            entry_id = option(rest, "--entry")
+            base_raw = option(rest, "--base-plan-version")
+            try:
+                base = int(base_raw)
+            except (TypeError, ValueError):
+                return fail("--base-plan-version is required", 2, "validation")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            state.setdefault("clear_requests", []).append(
+                {"entry_id": entry_id, "base_plan_version": base})
+            match = next((candidate for candidate in entries
+                          if candidate.get("entry_id") == entry_id), None)
+            if match is None:
+                return fail("no such plan entry", 3, "not_found")
+            if match.get("locked"):
+                return fail("entry " + str(entry_id) + " is locked", 2,
+                            "conflict")
+            if match.get("batch_id"):
+                return fail("entry " + str(entry_id) + " is in a batch", 2,
+                            "conflict")
+            status_before = match.get("status")
+            reverted = None
+            created_action = match.get("action") or {}
+            if (status_before == "applied"
+                    and created_action.get("type") == "resolution"):
+                target = None
+                for candidate in reversed(state.get("resolutions") or []):
+                    if (candidate.get("change") != "revert"
+                            and candidate.get("item_id") == match.get("item_id")
+                            and candidate.get("name")
+                            == created_action.get("name")):
+                        target = candidate
+                        break
+                if target is not None:
+                    reverted = revert_resolution_record(target)
+                    state.setdefault("resolutions", []).append(reverted)
+            entries = [candidate for candidate in entries
+                       if candidate.get("entry_id") != entry_id]
+            cleared = {"entry_id": entry_id,
+                       "item_id": match.get("item_id"),
+                       "status_before": status_before,
+                       "reverted_resolution": reverted}
+        else:
+            entry_id = option(rest, "--entry")
+            base_raw = option(rest, "--base-plan-version")
+            try:
+                base = int(base_raw)
+            except (TypeError, ValueError):
+                return fail("--base-plan-version is required", 2, "validation")
+            if base != plan.get("plan_version"):
+                return fail("base_plan_version mismatch", 2, "conflict")
+            match = next((candidate for candidate in entries
+                          if candidate.get("entry_id") == entry_id), None)
+            if match is None:
+                return fail("no such plan entry", 3, "not_found")
+            if action == "confirm":
+                # Wire §2.7: a stale entry whose only reasons are
+                # evidence_changed/parent_changed is re-confirmed with a refresh
+                # (revision +1 only when the content changed; hash-only keeps
+                # the revision). Any other stale reason is a conflict.
+                if match.get("stale"):
+                    codes = list(match.get("stale_reasons") or [])
+                    refreshable = bool(codes) and all(
+                        code in ("evidence_changed", "parent_changed")
+                        for code in codes)
+                    if not refreshable:
+                        return fail("entry is stale", 2, "conflict")
+                    refresh = refresh_stale_entry(match, review)
+                # R0 entries apply on confirm (contract v1.3 §11.1): write the
+                # resolution and move straight to ``applied``. Only operation
+                # entries become ``confirmed`` and wait for an ApplyBatch.
+                created_action = match.get("action") or {}
+                if created_action.get("type") == "resolution":
+                    resolution = resolution_record(
+                        match.get("item_id"), created_action.get("name"),
+                        entry_id=match.get("entry_id"),
+                        revision=match.get("revision"),
+                        evidence_hash=(match.get("evidence") or {}).get("hash"))
+                    state.setdefault("resolutions", []).append(resolution)
+                    match["status"] = "applied"
+                else:
+                    match["status"] = "confirmed"
+            elif action == "lock":
+                match["locked"] = True
+            else:
+                match["locked"] = False
+            entry = match
+        plan["entries"] = entries
+        plan["entry"] = entry
+        plan["resolution"] = resolution
+        plan["plan_version"] = int(plan.get("plan_version") or 0) + 1
+        plan["updated_at"] = "2026-11-05T00:00:00Z"
+        state["plan"] = plan
+        response = copy_json(plan)
+        # Additive CP2 response objects live only in the response (wire §2.6/§2.7).
+        response["refresh"] = refresh
+        if accepted is not None:
+            response["accepted"] = accepted
+        if cleared is not None:
+            response["cleared"] = cleared
         save_state(state)
-        return emit({"ok": True, "peel_id": peel_id, "item_id": item,
-                     "decision": decision, "corrections": 1,
-                     "note": "corrections are append-only; run peelfeed rebuild"})
+        return emit(response)
+
+    if command == "review-report":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if "--with-vlm" in rest:
+            return fail("VLM reports are not available in CP3", 2, "validation")
+        request = {}
+        if option(rest, "--input") is not None:
+            request = read_stdin_json() or {}
+            state.setdefault("review_report_requests", []).append(request)
+        # CP3: a persistent ``report`` job; the fake job is terminal immediately
+        # (the poller never waits for a fake process) and the report payload is
+        # still available in ``state["review_report"]`` for assertions.
+        job = new_job("report", result_ref="report.json",
+                      nonce=len(state.get("jobs") or {}))
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "status": "queued",
+                     "result_ref": None})
+
+    if command == "ocr-check":
+        # M2.1 wire §2.8: short provider probe; optional peel id persists the
+        # status file. Never writes the corpus, never creates a job.
+        peel_id = first_positional(rest)
+        if peel_id is not None and peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for ocr-check", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            save_state(state)
+            return fail("ocr-check input must be a JSON object", 2,
+                        "ocr_config_invalid")
+        state.setdefault("ocr_check_requests", []).append(copy_json(request))
+        provider = request.get("provider")
+        if provider is not None and not isinstance(provider, dict):
+            save_state(state)
+            return fail("provider must be an object", 2, "ocr_config_invalid")
+        error = state.get("ocr_check_error")
+        if error:
+            save_state(state)
+            return fail(error.get("message") or "OCR provider unavailable",
+                        int(error.get("exit") or 2),
+                        error.get("code") or "ocr_unavailable",
+                        error.get("detail"))
+        payload = copy_json(DEFAULT_OCR_CHECK)
+        payload.update(copy_json(state.get("ocr_check") or {}))
+        payload["checked_at"] = "2026-11-09T03:10:00Z"
+        payload["error"] = None
+        state["ocr_status"] = copy_json(payload)
+        save_state(state)
+        return emit(payload)
+
+    if command == "ocr-refresh":
+        # M2.1 wire §2.8: creates one persistent ``type=ocr`` job. The fake job
+        # is terminal immediately by default (``ocr_job_status`` can simulate
+        # queued/running/failed/interrupted records); the result summary is kept
+        # in ``state["ocr_job_results"]`` for assertions.
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for ocr-refresh", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            save_state(state)
+            return fail("ocr-refresh input must be a JSON object", 2,
+                        "validation")
+        state.setdefault("ocr_refresh_requests", []).append(copy_json(request))
+        item_ids = request.get("item_ids")
+        if not isinstance(item_ids, list) or not item_ids:
+            save_state(state)
+            return fail("item_ids must be a non-empty list of item ids", 2,
+                        "validation")
+        cleaned = []
+        seen = set()
+        for raw in item_ids:
+            if not isinstance(raw, str) or not raw.strip():
+                save_state(state)
+                return fail("item_ids must contain only non-empty strings", 2,
+                            "validation")
+            item_id = raw.strip()
+            if item_id in seen:
+                save_state(state)
+                return fail("item_ids must be unique (duplicate "
+                            + item_id + ")", 2, "validation")
+            seen.add(item_id)
+            cleaned.append(item_id)
+        provider = request.get("provider")
+        if provider is not None and not isinstance(provider, dict):
+            save_state(state)
+            return fail("provider must be an object", 2, "ocr_config_invalid")
+        if state.get("ocr_not_ready"):
+            save_state(state)
+            return fail("no current build; run a build first", 2, "not_ready")
+        error = state.get("ocr_refresh_error")
+        if error:
+            save_state(state)
+            return fail(error.get("message") or "OCR refresh failed",
+                        int(error.get("exit") or 2),
+                        error.get("code") or "ocr_unavailable",
+                        error.get("detail"))
+        status = str(state.get("ocr_job_status") or "done")
+        if status not in ("queued", "running", "done", "failed",
+                          "interrupted"):
+            status = "done"
+        job = new_job("ocr", result_ref=None,
+                      status="running" if status == "interrupted" else status,
+                      error=({"code": "interrupted",
+                              "message": "the job process is no longer running"}
+                             if status == "interrupted" else None),
+                      nonce=len(state.get("jobs") or {}))
+        if status == "done":
+            job["result_ref"] = "jobs/" + job["job_id"] + ".result.json"
+        if status == "interrupted":
+            # The real ``job show`` derives ``interrupted`` from a dead running
+            # job; the fake stores the same marker (contract §8).
+            job["interrupted"] = True
+        elif status == "failed":
+            job["error"] = state.get("ocr_job_error") or {
+                "code": "ocr_unavailable",
+                "message": "OCR provider unavailable"}
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        summary = {
+            "schema_version": 1,
+            "job_id": job["job_id"],
+            "peel_id": peel_id,
+            "build_id": "b20261108T120000-12345678",
+            "engine": "rapidocr@1.4.4",
+            "params_sha256": "0123456789abcdef",
+            "requested_item_ids": cleaned,
+            "items": [],
+            "counts": dict(state.get("ocr_job_counts") or {
+                "requested": len(cleaned), "refreshed": len(cleaned),
+                "cache_hits": 0, "failed": 0, "empty": 0,
+                "low_confidence": 0}),
+            "created_at": "2026-11-09T03:10:00Z",
+        }
+        state.setdefault("ocr_job_results", {})[job["job_id"]] = summary
+        # The real OCR job re-derives items/report when it finishes; tests can
+        # install the post-refresh review payload to assert the coverage update.
+        if state.get("ocr_review_after_refresh"):
+            state["review"] = copy_json(state["ocr_review_after_refresh"])
+        save_state(state)
+        return emit({"job_id": job["job_id"], "status": "queued",
+                     "result_ref": None})
+
+    if command == "apply":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for apply", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            return fail("apply input must be a JSON object", 2, "validation")
+        for forbidden in ("tier", "scope", "operations"):
+            if forbidden in request:
+                return fail("apply accepts only entry_ids; " + forbidden
+                            + " is chosen by the planner and cannot be passed",
+                            2, "validation")
+        entry_ids = request.get("entry_ids")
+        if not isinstance(entry_ids, list) or not entry_ids:
+            return fail("entry_ids must be a non-empty list of entry ids",
+                        2, "validation")
+        state.setdefault("apply_requests", []).append(copy_json(request))
+        plan = copy_json(state.get("plan") or DEFAULT_PLAN)
+        entries = {entry.get("entry_id"): entry
+                   for entry in plan.get("entries") or []
+                   if isinstance(entry, dict)}
+        for entry_id in entry_ids:
+            entry = entries.get(str(entry_id))
+            if entry is None:
+                return fail("no such plan entry: " + str(entry_id), 3,
+                            "not_found")
+            if entry.get("locked") or entry.get("batch_id"):
+                return fail("entry " + str(entry_id) + " is locked or already "
+                            "in a batch", 2, "conflict")
+            if str(entry.get("status") or "") != "confirmed":
+                return fail("entry " + str(entry_id) + " is not confirmed",
+                            2, "validation")
+            if (entry.get("action") or {}).get("type") != "operation":
+                return fail("only operation entries enter a batch", 2,
+                            "validation")
+        batch = default_batch(peel_id, [str(item) for item in entry_ids],
+                              entries, state)
+        state.setdefault("batches", {})[batch["batch_id"]] = batch
+        job = new_job("build", batch_id=batch["batch_id"],
+                      result_ref="batches/" + batch["batch_id"] + ".json")
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "batch_id": batch["batch_id"],
+                     "status": "queued"})
+
+    if command == "batch":
+        # Real CLI order is action BEFORE the peel id (wire §2.6).
+        values = positionals(rest)
+        action = values[0] if values else None
+        peel_id = values[1] if len(values) > 1 else ""
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if action != "show":
+            return fail("unknown batch action: " + str(action), 2, "validation")
+        batch_id = option(rest, "--batch")
+        if not batch_id:
+            return fail("--batch is required for batch show", 2, "validation")
+        if not valid_batch_id(batch_id):
+            return fail("invalid batch id: " + str(batch_id), 2, "validation")
+        batch = (state.get("batches") or {}).get(str(batch_id))
+        if not isinstance(batch, dict):
+            return fail("unknown batch: " + str(batch_id), 3, "not_found")
+        return emit(copy_json(batch))
+
+    if command == "publish":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        batch_id = option(rest, "--batch")
+        if not batch_id:
+            return fail("--batch is required for publish", 2, "validation")
+        if not valid_batch_id(batch_id):
+            return fail("invalid batch id: " + str(batch_id), 2, "validation")
+        batch = (state.get("batches") or {}).get(str(batch_id))
+        if not isinstance(batch, dict):
+            return fail("unknown batch: " + str(batch_id), 3, "not_found")
+        status = str(batch.get("status") or "")
+        if status not in ("ready_to_publish", "publishing"):
+            return fail("batch is not ready to publish (status " + status + ")",
+                        2, "conflict")
+        current = batch_current(batch, state)
+        batch = copy_json(batch)
+        batch["status"] = "published"
+        batch["updated_at"] = "2026-11-08T12:00:05Z"
+        batch["publish"] = {"committed_at": "2026-11-08T12:00:05Z",
+                            "current_build_id": current.get("build_id"),
+                            "error": None}
+        state.setdefault("batches", {})[str(batch_id)] = batch
+        state.setdefault("published_batches", []).append(str(batch_id))
+        save_state(state)
+        return emit({"batch": batch, "current": current})
+
+    if command == "discard":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        batch_id = option(rest, "--batch")
+        if not batch_id:
+            return fail("--batch is required for discard", 2, "validation")
+        if not valid_batch_id(batch_id):
+            return fail("invalid batch id: " + str(batch_id), 2, "validation")
+        batch = (state.get("batches") or {}).get(str(batch_id))
+        if not isinstance(batch, dict):
+            return fail("unknown batch: " + str(batch_id), 3, "not_found")
+        if str(batch.get("status") or "") in ("published", "publishing"):
+            return fail("batch is already published", 2, "conflict")
+        batch = copy_json(batch)
+        batch["status"] = "discarded"
+        batch["updated_at"] = "2026-11-08T12:00:05Z"
+        state.setdefault("batches", {})[str(batch_id)] = batch
+        current = state.get("publish_current") or {
+            "build_id": "", "conversion_id": "",
+            "effective_corrections_hash": "", "published": False}
+        save_state(state)
+        return emit({"batch": batch, "current": copy_json(current)})
+
+    if command == "rollback":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        state.setdefault("rollback_requests", []).append(
+            {"peel_id": peel_id, "reason": option(rest, "--reason")})
+        batch_id = "batch-20261108T120000-" + hashlib.sha256(
+            ("rollback|" + peel_id + "|" + str(len(
+                state.get("rollback_requests") or []))).encode()
+        ).hexdigest()[:4]
+        batch = {
+            "schema_version": 1,
+            "batch_id": batch_id,
+            "status": "ready_to_publish",
+            "created_at": "2026-11-08T12:00:00Z",
+            "updated_at": "2026-11-08T12:00:00Z",
+            "changes": [{"change": "revert", "entry_id": "e-revert",
+                         "item_id": "it-revert", "operation": None,
+                         "supersedes": "c-revert"}],
+            "base": {"conversion_id": "", "effective_corrections_hash": "",
+                     "entry_revisions": {}, "evidence_hashes": {},
+                     "engine_fingerprint": "test-fingerprint",
+                     "profile": "generic", "chunk_sets": ["c8000-12000-i3"],
+                     "correction_engine_version": "corr-test0000000000"},
+            "projected_effective_corrections_hash": hashlib.sha256(
+                b"[]").hexdigest(),
+            "plan_level": {"tier": "R2", "reasons": ["corpus_operation"]},
+            "estimate": {"items": 1, "assets": 1, "pages": [],
+                         "docling_rerun": False, "seconds": 120,
+                         "reindex": None},
+            "build": None,
+            "publish": {"committed_at": None, "current_build_id": None,
+                        "error": None},
+            "failures": [],
+        }
+        state.setdefault("batches", {})[batch_id] = batch
+        job = new_job("rollback", batch_id=batch_id,
+                      result_ref="batches/" + batch_id + ".json")
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "batch_id": batch_id,
+                     "status": "queued"})
+
+    if command == "job":
+        # Real CLI order is action BEFORE the peel id (wire §2.6).
+        values = positionals(rest)
+        action = values[0] if values else None
+        peel_id = values[1] if len(values) > 1 else ""
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        jobs = state.get("jobs") or {}
+        if action == "show":
+            job_id = option(rest, "--job")
+            if not job_id:
+                return fail("--job is required for job show", 2, "validation")
+            if not valid_job_id(job_id):
+                return fail("invalid job id: " + str(job_id), 2, "validation")
+            job = jobs.get(str(job_id))
+            if not isinstance(job, dict):
+                return fail("unknown job: " + str(job_id), 3, "not_found")
+            payload = copy_json(job)
+            if payload.get("status") == "running" and payload.get("interrupted"):
+                payload["status"] = "interrupted"
+                payload["result_ref"] = None
+                payload["error"] = {
+                    "code": "interrupted",
+                    "message": "the job process is no longer running"}
+                payload["derived_interrupted"] = True
+            return emit(payload)
+        if action == "list":
+            status_filter = option(rest, "--status")
+            rows = [copy_json(job) for job in jobs.values()
+                    if not status_filter or job.get("status") == status_filter]
+            return emit(rows)
+        return fail("unknown job action: " + str(action), 2, "validation")
 
     if command == "rebuild":
         peel_id = first_positional(rest)
@@ -867,6 +2105,533 @@ if __name__ == "__main__":
 '''
 
 
+
+DEFAULT_REPORT = {
+    "peel_id": "peel",
+    "status": "ready",
+    "report_path": "extract/review/report.json",
+    "report": {
+        "schema_version": 1,
+        "status": "ready",
+        "stale": False,
+        "generated_at": "2026-11-05T00:00:00Z",
+        "provider": {"kind": "rule", "model": None, "prompt_version": None},
+        "clusters": [{
+            "cluster_id": "cl-0f1e2d3c4b5a",
+            "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+            "conclusion": "规则建议把第 0 行作为表头。",
+            "suggestions": [{
+                "item_id": "it-3f9c2a4b6d8e0f1a",
+                "strategy": {"id": "use_first_row_header", "version": 1},
+                "params": {},
+                "evidence_refs": ["asset:table-3-19"],
+                "validator": {"status": "ready", "reasons": []},
+                "in_plan": False,
+                "state": "ready",
+            }],
+            "clarifications": [],
+        }, {
+            "cluster_id": "cl-9a8b7c6d5e4f",
+            "item_ids": ["it-8b7a6c5d4e3f2a10"],
+            "conclusion": "图内无 native 文本：保留原始图（R0 resolution）。",
+            "suggestions": [{
+                "item_id": "it-8b7a6c5d4e3f2a10",
+                "strategy": {"id": "keep_visual_fallback", "version": 1},
+                "params": {},
+                "evidence_refs": ["asset:figure-1-1"],
+                "validator": {"status": "ready", "reasons": []},
+                "in_plan": False,
+                "state": "ready",
+            }],
+            "clarifications": [],
+        }, {
+            "cluster_id": "cl-1a2b3c4d5e6f",
+            "item_ids": ["it-5a7c8b9d0e1f2a3b"],
+            "conclusion": "父表证据变化，候选校验未通过。",
+            "suggestions": [{
+                "item_id": "it-5a7c8b9d0e1f2a3b",
+                "strategy": {"id": "inherit_parent_header", "version": 1},
+                "params": {"parent_asset_id": "table-p1041-01"},
+                "evidence_refs": ["asset:table-p1041-01"],
+                "validator": {"status": "failed_check",
+                              "reasons": ["parent_evidence_changed"]},
+                "in_plan": False,
+                "state": "failed_check",
+            }],
+            "clarifications": [],
+        }],
+        "auto_archived": [],
+        "unsupported": [],
+    },
+    "counts": {"suggestions": 3, "auto_archived": 0, "unsupported": 0,
+               "needs_decision": 1},
+}
+
+
+
+# --- schema-2 review payloads (the shapes the real peelfeed CLI prints) --
+# Module-level so tests can import them and the fake CLI receives them via
+# %r substitutions (one source of truth).
+
+def copy_json(value):
+    return json.loads(json.dumps(value))
+
+
+# --- schema-2 review payloads (the shapes the real peelfeed CLI prints) ----
+
+STRATEGY_OPTIONS = [
+    {"id": "use_first_row_header", "version": 1, "name": "本表首行作表头",
+     "description": "把本表第 0 行作为表头；文本来自本表 native cells。",
+     "recommended": True, "available": True, "unavailable_reason": None,
+     "capabilities": ["native_lines"], "params_schema": {},
+     "action": {"type": "operation", "name": "set_header_rows"},
+     "min_tier": "R2", "batch_safe": True,
+     "risk": "误把数据行作表头；须过签名阈值和逐表 validator"},
+    {"id": "use_ocr_labels", "version": 1, "name": "OCR 标签",
+     "description": "用按需 OCR 恢复标签（需要 OCR）。",
+     "recommended": False, "available": False,
+     "unavailable_reason": "OCR is not configured",
+     "capabilities": ["ocr"], "params_schema": {},
+     "action": {"type": "operation", "name": "set_asset_labels_from_ocr"},
+     "min_tier": "R2", "batch_safe": False,
+     "risk": "OCR 文本不是 native evidence"},
+]
+
+CLUSTER_HEADER = {
+    "cluster_id": "cl-0f1e2d3c4b5a",
+    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
+                    "profile": "generic", "operation": "set_header_rows",
+                    "layout": "structured|cols=2|rows=6-11|caption=yes|pages=1",
+                    "evidence": "native_lines"},
+    "code": "table_header_absent",
+    "title": "表格缺少表头",
+    "kind": "table",
+    "item_count": 1,
+    "human_pending": 1,
+    "representative_item_id": "it-3f9c2a4b6d8e0f1a",
+    "states": {"needs_decision": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+}
+
+CLUSTER_FIGURE = {
+    "cluster_id": "cl-9a8b7c6d5e4f",
+    "cluster_key": {"code": "no_native_labels", "asset_kind": "figure",
+                    "profile": "generic", "operation": None,
+                    "layout": "figure|pages=2", "evidence": "page_image"},
+    "code": "no_native_labels",
+    "title": "图内没有 native 文本",
+    "kind": "figure",
+    "item_count": 1,
+    "human_pending": 0,
+    "representative_item_id": "it-8b7a6c5d4e3f2a10",
+    "states": {"pending_evidence": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-8b7a6c5d4e3f2a10"],
+}
+
+ITEM_HEADER = {
+    "id": "it-3f9c2a4b6d8e0f1a",
+    "code": "table_header_absent",
+    "kind": "table",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "table-3-19",
+    "pages": [109],
+    "cluster_id": "cl-0f1e2d3c4b5a",
+    "message": "table_header_absent: table-3-19; only explicit column "
+               "positions are named.",
+    "triage": "deterministic_candidate",
+    "status": "needs_decision",
+    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                 "crops": ["tables/table-3-19_p0109.png"],
+                 "native_line_ids": [123], "ocr_evidence": []},
+    "current": {"status": "structured", "row_count": 5, "col_count": 2,
+                "header_rows": []},
+    "candidates": [{
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "action": {"type": "operation", "name": "set_header_rows",
+                   "params": {"rows": [0]}},
+        "source": "rule",
+        "validator": {"status": "ready", "reasons": []},
+        "evidence_refs": ["asset:table-3-19", "row:0"],
+    }],
+    "parent_candidates": [{
+        "asset_id": "table-p1041-01",
+        "pages": [1041],
+        "col_count": 2,
+        "header_rows": [0],
+        "header_cells": [["Bits", "Variable"]],
+        "header_signature": "bits|variable",
+        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
+                         "cells": ["Bits", "Variable"],
+                         "evidence_hash": "ev-p1041"}],
+        "parent_evidence_hash": "ev-p1041",
+        "header_source": "native",
+    }],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": None,
+    "resolution": None,
+    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
+               "caption": "Table 3-19. RSP_PRE Encodings"},
+    "stale": False,
+}
+
+ITEM_FIGURE = {
+    "id": "it-8b7a6c5d4e3f2a10",
+    "code": "no_native_labels",
+    "kind": "figure",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "figure-1-1",
+    "pages": [2],
+    "cluster_id": "cl-9a8b7c6d5e4f",
+    "message": "no_native_labels: figure-1-1; use OCR evidence or keep the "
+               "original figure.",
+    "triage": "needs_ocr",
+    "status": "pending_evidence",
+    "evidence": {"hash": "0f1e2d3c4b5a69788796a5b4c3d2e1f0",
+                 "crops": ["images/fig_1_1.png"], "native_line_ids": [],
+                 "ocr_evidence": []},
+    "current": {"status": "visual_fallback", "row_count": 0, "col_count": 0,
+                "header_rows": []},
+    "candidates": [],
+    "parent_candidates": [],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": None,
+    "resolution": None,
+    "layout": {"cols": 0, "rows_bucket": "0", "page_span": 1,
+               "caption": "Figure 1-1. Widget frame"},
+    "stale": False,
+}
+
+# CP2 W9: a stale ``inherit_header_from`` entry. The stored snapshot keeps the
+# old lower-case parent cells; the parent candidate carries the source original
+# case ("Bits"/"Variable"), so re-confirm changes content and bumps revision
+# (wire §2.7). A hash-only refresh test keeps the cells identical and changes
+# only ``evidence_hash`` (no revision bump).
+STALE_ENTRY = {
+    "entry_id": "e-5a7c8b9d0e1f2a3b",
+    "item_id": "it-5a7c8b9d0e1f2a3b",
+    "status": "confirmed",
+    "stale": True,
+    "stale_reasons": ["evidence_changed", "parent_changed"],
+    "locked": False,
+    "strategy": {"id": "inherit_parent_header", "version": 1},
+    "action": {"type": "operation", "name": "inherit_header_from",
+               "params": {
+                   "parent_asset_id": "table-p1041-01",
+                   "parent_header_rows": [0],
+                   "parent_header_cells": [["bits", "variable"]],
+                   "parent_source_refs": [{"segment": "table-p1041-01",
+                                           "source_row": 0,
+                                           "cells": ["bits", "variable"],
+                                           "evidence_hash": "ev-p1041-old"}],
+                   "parent_header_source": "rule"}},
+    "evidence": {"hash": "5d6e7f8091a2b3c4", "refs": []},
+    "dependencies": [{"parent_asset_id": "table-p1041-01",
+                      "parent_evidence_hash": "ev-p1041-old",
+                      "item_id": None, "correction_hash": None}],
+    "capability_snapshot": {"native_lines": True, "ocr": None, "vlm": None},
+    "source": "user", "revision": 2, "batch_id": None, "notes": None,
+}
+
+ITEM_STALE = {
+    "id": "it-5a7c8b9d0e1f2a3b",
+    "code": "table_header_absent",
+    "kind": "table",
+    "severity": "warning",
+    "blocking": False,
+    "asset_id": "table-4-07",
+    "pages": [204],
+    "cluster_id": "cl-1a2b3c4d5e6f",
+    "message": "table_header_absent: table-4-07; inherited parent evidence "
+               "changed.",
+    "triage": "needs_decision",
+    "status": "stale",
+    "evidence": {"hash": "5d6e7f8091a2b3c4",
+                 "crops": ["tables/table-4-07_p0204.png"],
+                 "native_line_ids": [7], "ocr_evidence": []},
+    "current": {"status": "structured", "row_count": 4, "col_count": 2,
+                "header_rows": []},
+    "candidates": [],
+    "parent_candidates": [{
+        "asset_id": "table-p1041-01",
+        "pages": [1041],
+        "col_count": 2,
+        "header_rows": [0],
+        "header_cells": [["Bits", "Variable"]],
+        "header_signature": "bits|variable",
+        "source_refs": [{"segment": "table-p1041-01", "source_row": 0,
+                         "cells": ["Bits", "Variable"],
+                         "evidence_hash": "ev-p1041-new"}],
+        "parent_evidence_hash": "ev-p1041-new",
+        "header_source": "rule",
+    }],
+    "strategies": STRATEGY_OPTIONS,
+    "entry": STALE_ENTRY,
+    "resolution": None,
+    "layout": {"cols": 2, "rows_bucket": "2-5", "page_span": 1,
+               "caption": "Table 4-07. Inherited header"},
+    "stale": True,
+}
+
+CLUSTER_STALE = {
+    "cluster_id": "cl-1a2b3c4d5e6f",
+    "cluster_key": {"code": "table_header_absent", "asset_kind": "table",
+                    "profile": "generic", "operation": "inherit_header_from",
+                    "layout": "table|pages=204", "evidence": "native"},
+    "code": "table_header_absent",
+    "title": "表头缺失（继承父表后父表证据变化）",
+    "kind": "table",
+    "item_count": 1,
+    "human_pending": 1,
+    "representative_item_id": "it-5a7c8b9d0e1f2a3b",
+    "states": {"stale": 1},
+    "conclusion": None,
+    "suggestions": [],
+    "strategies": STRATEGY_OPTIONS,
+    "item_ids": ["it-5a7c8b9d0e1f2a3b"],
+}
+
+DEFAULT_REVIEW = {
+    "peel_id": "peel",
+    "review_schema": 2,
+    "generated_at": "2026-11-05T00:00:00Z",
+    "profile": "generic",
+    # ``converter_code_hash`` is a diagnostic hash of the converter code
+    # (``sha256(canonical converter_hashes)[:16]``). It is NOT
+    # ``normalize.engine_fingerprint()`` and must never drive stale/CAS
+    # decisions (contract v1.3 §2/§13.8; renamed from ``engine_fingerprint``
+    # in CP1.1). The real CXL value is d6ef5d97b7865966.
+    "derived_from": {
+        "uncorrected_identity": "55959d86" + "0" * 56,
+        "converter_code_hash": "d6ef5d97b7865966",
+        "derivation_version": 1,
+    },
+    "capabilities": {"review_schema": 2, "native_lines": True, "ocr": False,
+                     "ocr_detail": None, "vlm": False},
+    "counts": {"raw_items": 3, "items": 3, "clusters": 3, "human_pending": 2,
+               "human_pending_clusters": 2, "pending_evidence": 1,
+               "auto_resolved": 0, "needs_decision": 1, "draft": 0,
+               "confirmed": 0, "applied": 0, "deferred": 0, "failed_check": 1,
+               "stale": 1, "unsupported_items": 0},
+    "triage_counts": {"deterministic_candidate": 1, "needs_decision": 1,
+                      "needs_ocr": 1, "informational": 0, "unsupported": 0},
+    "plan": {"plan_version": 0, "entries": 0, "draft": 0, "confirmed": 0,
+             "locked": 0, "stale": 0},
+    "report": None,
+    "clusters": [CLUSTER_HEADER, CLUSTER_FIGURE, CLUSTER_STALE],
+    "items": [ITEM_HEADER, ITEM_FIGURE, ITEM_STALE],
+}
+
+DEFAULT_PLAN = {
+    "peel_id": "peel",
+    "review_schema": 2,
+    "plan_version": 0,
+    "updated_at": "2026-11-05T00:00:00Z",
+    "entries": [],
+    "entry": None,
+    "resolution": None,
+}
+
+
+# --- M2.1 CP4: OCR review payload fixtures (wire §2.8, plan §5.3/§5.5) ------
+# ``review.capabilities`` additive OCR keys for a configured / unconfigured
+# provider (env-only ``PEELFEED_OCR_*`` resolved by peelfeed), the frozen
+# ``payload.ocr`` coverage summary, and the per-item ``evidence.ocr_evidence``
+# entries. The additive ``labels`` list is what the Review UI renders inline;
+# the evidence file itself keeps the frozen §11.8 shape.
+
+REVIEW_CAPABILITIES_OCR = {
+    "review_schema": 2, "native_lines": True,
+    "ocr": True, "ocr_configured": True, "ocr_detail": None,
+    "ocr_engine": "rapidocr@1.4.4", "ocr_min_confidence": 0.6,
+    "ocr_status": {"available": True, "checked_at": "2026-11-09T03:10:00Z",
+                   "error": None},
+    "vlm": False, "vlm_detail": "VLM 报告未实现（M2.2）",
+}
+REVIEW_CAPABILITIES_NO_OCR = {
+    "review_schema": 2, "native_lines": True,
+    "ocr": False, "ocr_configured": False,
+    "ocr_detail": "OCR 未配置：设置 PEELFEED_OCR_PROVIDER/ENGINE",
+    "ocr_engine": None, "ocr_min_confidence": None,
+    "ocr_status": {"available": False, "checked_at": None, "error": None},
+    "vlm": False, "vlm_detail": "VLM 报告未实现（M2.2）",
+}
+OCR_COVERAGE_COVERED = {
+    "items": 1, "with_evidence": 1, "empty": 0, "low_confidence": 0,
+    "uncovered": 0, "invalid_evidence": 0, "evidence_files": 1,
+    "engine": "rapidocr@1.4.4", "min_confidence": 0.6,
+}
+OCR_COVERAGE_UNCOVERED = dict(OCR_COVERAGE_COVERED, with_evidence=0,
+                              uncovered=1, evidence_files=0)
+OCR_COVERAGE_LOW = dict(OCR_COVERAGE_COVERED, low_confidence=1)
+OCR_COVERAGE_EMPTY = dict(OCR_COVERAGE_COVERED, empty=1)
+# The R0 resolution strategies stay selectable when OCR is unavailable.
+RESOLUTION_STRATEGY_OPTIONS = [{
+    "id": "keep_original_figure", "version": 1, "name": "保留原始图",
+    "description": "不改变 corpus，保留原始图与视觉回退。",
+    "recommended": True, "available": True, "unavailable_reason": None,
+    "capabilities": [], "params_schema": {},
+    "action": {"type": "resolution", "name": "keep_original_figure"},
+    "min_tier": "R0", "batch_safe": False,
+    "risk": "图内文字不会进入检索",
+}]
+
+
+def ocr_strategy_options(*, available=True, reason=None, extra=None):
+    """``item.strategies`` with ``use_ocr_labels`` available/grayed with reason."""
+    options = copy_json(STRATEGY_OPTIONS)
+    for option in options:
+        if option["id"] == "use_ocr_labels":
+            option["available"] = bool(available)
+            option["unavailable_reason"] = reason
+            option["recommended"] = bool(available)
+    if extra:
+        options.extend(copy_json(extra))
+    return options
+
+
+def ocr_evidence(*, labels=None, engine="rapidocr@1.4.4",
+                 asset_id="figure-1-1", crop_ref="images/fig_1_1.png",
+                 image_sha256="ab" * 32, created_at="2026-11-09T03:10:00Z"):
+    """One ``evidence.ocr_evidence`` entry (plan §3.2) incl. display labels."""
+    labels = copy_json(labels or [])
+    digest = hashlib.sha256(
+        json.dumps(labels, sort_keys=True).encode()).hexdigest()
+    confidences = [float(label.get("confidence") or 0) for label in labels]
+    return {
+        "path": "extract/ocr/%s/%s-%s.json"
+                % (asset_id, image_sha256[:16], engine),
+        "crop_ref": crop_ref,
+        "image_sha256": image_sha256,
+        "engine": engine,
+        "params_sha256": "0123456789abcdef",
+        "evidence_sha256": digest,
+        "label_count": len(labels),
+        "max_confidence": max(confidences) if confidences else None,
+        "min_confidence": min(confidences) if confidences else None,
+        "created_at": created_at,
+        "labels": labels,
+    }
+
+
+OCR_EVIDENCE = ocr_evidence(labels=[
+    {"text": "Compute Express Link", "bbox": [4, 6, 210, 30],
+     "confidence": 0.99},
+    {"text": "CXL 3.1", "bbox": [4, 40, 96, 64], "confidence": 0.96},
+    {"text": "Figure 1-1", "bbox": [4, 72, 140, 96], "confidence": 0.94},
+])
+OCR_EVIDENCE_LOW = ocr_evidence(labels=[
+    {"text": "模糊的图注文字", "bbox": [4, 6, 120, 26], "confidence": 0.55},
+    {"text": "低置信标签", "bbox": [4, 32, 96, 52], "confidence": 0.42},
+])
+OCR_EVIDENCE_EMPTY = ocr_evidence(labels=[])
+
+
+def ocr_figure_item(*, evidence=None, strategies=None, status=None,
+                    candidates=None):
+    """The ``no_native_labels`` figure item with (or without) OCR evidence."""
+    item = copy_json(ITEM_FIGURE)
+    if evidence is not None:
+        item["evidence"]["ocr_evidence"] = [copy_json(evidence)]
+        item["evidence"]["hash"] = hashlib.sha256(json.dumps(
+            item["evidence"], sort_keys=True).encode()).hexdigest()
+    item["status"] = status or ("needs_decision" if evidence is not None
+                                else "pending_evidence")
+    item["strategies"] = (strategies if strategies is not None
+                          else ocr_strategy_options(available=evidence
+                                                    is not None))
+    if candidates is not None:
+        item["candidates"] = copy_json(candidates)
+    elif evidence is not None and (evidence.get("labels") or []):
+        item["candidates"] = [{
+            "strategy": {"id": "use_ocr_labels", "version": 1},
+            "action": {"type": "operation",
+                       "name": "set_asset_labels_from_ocr",
+                       "params": {"labels": copy_json(evidence["labels"])}},
+            "source": "rule",
+            "validator": {"status": "ready", "reasons": []},
+            "evidence_refs": ["asset:figure-1-1",
+                              "ocr:" + evidence["evidence_sha256"]],
+        }]
+    return item
+
+
+def ocr_figure_cluster(item):
+    """The ``no_native_labels`` cluster matching :func:`ocr_figure_item`."""
+    cluster = copy_json(CLUSTER_FIGURE)
+    cluster["strategies"] = copy_json(item.get("strategies")
+                                      or ocr_strategy_options())
+    cluster["item_ids"] = [item["id"]]
+    cluster["representative_item_id"] = item["id"]
+    cluster["states"] = {item.get("status") or "pending_evidence": 1}
+    cluster["suggestions"] = []
+    return cluster
+
+
+def review_ocr_payload(*, capabilities=None, coverage=None, figure_item=None,
+                       report=None, items=None, clusters=None):
+    """A schema-2 review payload with the M2.1 additive OCR keys.
+
+    Defaults to the covered case (OCR configured, one figure item with one
+    evidence file); pass ``coverage``/``figure_item`` for the uncovered,
+    low-confidence or empty variants and ``capabilities`` for no-OCR.
+    """
+    review = copy_json(DEFAULT_REVIEW)
+    review["capabilities"] = copy_json(capabilities or REVIEW_CAPABILITIES_OCR)
+    review["ocr"] = copy_json(coverage or OCR_COVERAGE_COVERED)
+    if figure_item is not None:
+        review["items"] = [copy_json(ITEM_HEADER),
+                           copy_json(figure_item), copy_json(ITEM_STALE)]
+        review["clusters"] = [copy_json(CLUSTER_HEADER),
+                              ocr_figure_cluster(figure_item),
+                              copy_json(CLUSTER_STALE)]
+    if report is not None:
+        review["report"] = copy_json(report)
+    if items is not None:
+        review["items"] = copy_json(items)
+    if clusters is not None:
+        review["clusters"] = copy_json(clusters)
+    return review
+
+
+REVIEW_OCR = review_ocr_payload(figure_item=ocr_figure_item(
+    evidence=OCR_EVIDENCE))
+REVIEW_OCR_UNCOVERED = review_ocr_payload(
+    coverage=OCR_COVERAGE_UNCOVERED,
+    figure_item=ocr_figure_item(
+        strategies=ocr_strategy_options(
+            available=False, reason="需要先运行局部 OCR")))
+REVIEW_OCR_LOW_CONFIDENCE = review_ocr_payload(
+    coverage=OCR_COVERAGE_LOW,
+    figure_item=ocr_figure_item(
+        evidence=OCR_EVIDENCE_LOW, status="needs_decision",
+        strategies=ocr_strategy_options(available=True)))
+REVIEW_OCR_EMPTY = review_ocr_payload(
+    coverage=OCR_COVERAGE_EMPTY,
+    figure_item=ocr_figure_item(
+        evidence=OCR_EVIDENCE_EMPTY, status="pending_evidence",
+        strategies=ocr_strategy_options(
+            available=False, reason="OCR 结果为空")))
+REVIEW_OCR_UNAVAILABLE = review_ocr_payload(
+    capabilities=REVIEW_CAPABILITIES_NO_OCR,
+    coverage=dict(OCR_COVERAGE_UNCOVERED, engine=None,
+                  min_confidence=None),
+    figure_item=ocr_figure_item(
+        strategies=ocr_strategy_options(
+            available=False, reason="缺少能力：局部 OCR（M2.1）",
+            extra=RESOLUTION_STRATEGY_OPTIONS)))
+
+
+
+
+
 class FakePeelfeedCli:
     """A fake ``peelfeed`` executable for tests (no daemon, no HTTP).
 
@@ -891,6 +2656,9 @@ class FakePeelfeedCli:
             "python": sys.executable,
             "state": str(self.state_path),
             "log": str(self.log_path),
+            "default_report": DEFAULT_REPORT,
+            "default_review": DEFAULT_REVIEW,
+            "default_plan": DEFAULT_PLAN,
         }
         self.path.write_text(script, encoding="utf-8")
         self.path.chmod(0o755)

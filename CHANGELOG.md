@@ -23,10 +23,202 @@ version/tag policy.
   and a `links.json` that still holds a key fails to load until it is migrated.
 - Env seeding (`PEEKSEED_EMBED_*`, `PEEKSEED_ANSWER_BASE`, `_PROTOCOL`, `_MODEL`,
   `PEEKSEED_RERANK_BASE`) is removed.
+- **Review API replaced (M2 CP1), with no compatibility mapping.** The per-item
+  `POST /api/datasets/{id}/sources/{sha}/review/{item}` decide route
+  (`accept|reject|override`), the old flat review payload
+  (`review_items`/`items[].asset`/`suggestion`), `PeelfeedClient.decide()` and
+  the `POST …/rebuild` route are gone. The Review UI no longer offers
+  Accept/Reject or "Apply & rebuild"; review data requires peelfeed
+  `capabilities.review_schema == 2` (otherwise the API returns `409`).
+- **Dataset schema 4.** `dataset.json` bumps from schema 3 to 4 in one
+  migration: each source's `extraction` block gains `review_jobs` (peelfeed review
+  job ids for restart re-attachment; `{}` for older datasets) and
+  `corrections_conflict` becomes a valid extraction state. Run `peekseed migrate`
+  (dry-run by default) or `peekseed migrate --apply`.
+
+### Added — review build/publish (M2 CP3)
+
+- New review routes: `POST …/review/reports` (202 job), `POST …/review/batches`
+  (202 job + batch), `GET …/review/batches/{id}`, `POST
+  …/review/batches/{id}/publish|discard`, `POST …/review/rollback` (202 job),
+  `GET …/review/jobs/{id}`. Persisted job ids are stored in each source's
+  `extraction.review_jobs` for restart re-attachment (never rerun
+  automatically); report generation moved from a synchronous call to the job
+  flow.
+- Review UI: candidate estimate, build status, gates and actual diff, publish /
+  discard, published-batch list with rollback, persistent job status (interrupted
+  shows an explicit manual retry and never auto-reruns), `corrections_conflict`
+  banners with the conflicting corrections/source batches, and an explicit
+  `review_schema` mismatch message. Batch-bound plan entries are read-only while
+  building/publishing.
+- Index builds hold a shared reader lease on the resolved immutable build
+  snapshot and re-check `extract/corpus` before flipping the generation; peelfeed
+  cannot delete a build with an active reader. Publishing a new conversion (or a
+  system rebuild) refreshes every dataset that references the peel; only a
+  changed conversion makes existing indexes stale, a chunk-set-only publish does
+  not.
+- `extraction.corrections_conflict` (additive detail) and a poll-race fix: a late
+  request-path refresh can no longer downgrade a terminal extraction state, and a
+  GET refresh persists an already-terminal CLI result.
+
+### Changed — CP3.1 review fixes (M2 CP3.1)
+
+- **F3 candidate diff + reindex display.** The review candidate panel now labels
+  the actual change line as a **content diff** (`assets_changed`,
+  `blocks_changed`, `chunks_changed`, excluding `conversion_id`/`build_id`
+  identity) and renders the additive `build.diff.reindex` object
+  (`{required, reason, chunks}`) as a separate 索引影响 line with Chinese reason
+  labels (conversion 变化 / 尚无当前构建): “需要重建索引：全量 N chunks” or
+  “无需重建索引（conversion 未变，已有索引仍有效）”. The published-batch list
+  marks batches whose publish made existing indexes stale. The fake peelfeed CLI
+  and fixtures carry the new shape (`build_summary.json.diff.reindex` included).
+- **F4 rollback confirmation.** “回滚最近一批” no longer creates and publishes a
+  revert batch on one click: it opens a confirmation dialog explaining that the
+  most recent still-effective correction batch will be reverted and
+  auto-published, that existing indexes become stale and need a rebuild, and
+  that only the most recent batch can be rolled back. Cancel (or backdrop/close)
+  sends no request and leaves current/ledger unchanged; the explicit
+  “确认回滚并发布” button sends the existing `POST …/review/rollback` request.
+  An interrupted rollback job's manual retry goes through the same confirmation.
+- **F5 batch/job id validation.** peelfeed validates `batch_id`/`job_id` against
+  the generated formats (`batch-…`, `system-b…`, `<type>-…`) before any path
+  join and returns `error [validation]` otherwise; peekseed's frozen error
+  mapping turns that into HTTP `400` on the review batch/job routes. The fake
+  CLI mirrors the validation (malformed ids exit `2` with
+  `error [validation] …`) and tests cover `../plan`, empty/whitespace and
+  slash-containing ids. Dataset schema stays 4 (no other contract changes).
+
+### Added — on-demand OCR (M2.1 CP4)
+
+- **OCR API routes.** `POST …/review/ocr/check` proxies `peelfeed ocr-check`
+  (200 probe payload; 503 `ocr_unavailable`; 400 `ocr_config_invalid`/validation;
+  other OCR codes 502) and `POST …/review/ocr/refresh` validates
+  `{item_ids:[…]}` (non-empty unique strings, no tier/scope/operations/provider)
+  and returns 202 `{job_id, status:"queued", result_ref:null}`,
+  storing `extraction.review_jobs[job_id] = {"type":"ocr","created_at":…,
+  "batch_id":null}` for restart re-attachment. Dataset schema stays 4 (no
+  migration); the OCR job only refreshes evidence, so an existing index stays
+  valid and `needs_reindex` is unchanged until a later OCR batch publish.
+- **OCR client seam.** `PeelfeedClient.ocr_check(peel_id)` and
+  `ocr_refresh(peel_id, item_ids)` use the frozen `--input - --json` shapes and
+  send `{"provider": {}}` (check) / `{"item_ids": […]}` (refresh) only — the
+  client never accepts or sends a provider override (CP4.1 G1). `_ERROR_STATUS`
+  adds `ocr_unavailable→503`, `not_ready→409`, `ocr_config_invalid→400`; the
+  `PEELFEED_OCR_*` env vars ride the existing allowlisted subprocess seam.
+- **Review UI.** A header OCR bar shows the capability chip (OCR 已配置 ·
+  `<engine>` / OCR 未配置（相关策略置灰） / OCR 不可用：`<detail>`), a
+  `[检查 OCR]` probe (available/engine/probe seconds/error) and a read-only
+  `[OCR 配置说明]` dialog listing the effective provider/engine/params/
+  timeout/min_confidence and the `PEELFEED_OCR_*` env names. The review summary
+  line carries the coverage summary from `payload.ocr` (覆盖 x/y · 未覆盖 ·
+  低置信 · 空 · 证据文件); per-item cards show `evidence.ocr_evidence` (engine,
+  label count, max/min confidence, created_at, evidence-file link, the label
+  list with confidence and a low-confidence badge below
+  `capabilities.ocr_min_confidence`; empty labels show OCR 未识别到文字).
+  `[为选中项重新获取证据]` creates one job over the current selection, polls
+  `GET …/review/jobs/{id}`, refetches the review/report and shows the result
+  counts (已刷新/缓存命中/失败/空/低置信); interrupted jobs show
+  “任务中断，可手动重试（不会自动重跑）” and only an explicit manual retry
+  creates a new job.
+- **Auto-create on first review open.** When OCR is available,
+  `payload.ocr.uncovered > 0` and no `type=ocr` job descriptor exists, the UI
+  automatically creates ONE refresh job for the uncovered `no_native_labels`
+  items and polls it (visible notice). Re-opening the source never re-creates
+  it, and a failed/interrupted job is never retried automatically. When OCR is
+  unavailable the OCR strategies stay grayed with a Chinese reason while
+  `keep_original_figure`/暂缓 remain selectable and review/report still work.
+- **M2.1 configuration is env-only** (`PEELFEED_OCR_PROVIDER/ENGINE/PARAMS/
+  TIMEOUT/MIN_CONFIDENCE`); the UI is read-only by design. A writable OCR
+  config UI remains deferred (no writable config API or secret handling in
+  M2.1).
+- Fake peelfeed CLI/fixtures implement `ocr-check`/`ocr-refresh`, the
+  `capabilities.ocr` object, OCR review payloads (configured/unconfigured,
+  coverage, `evidence.ocr_evidence`, `use_ocr_labels` availability), persistent
+  `type=ocr` job records and result summaries; tests cover the client
+  argv/stdin/env shapes, route validation/mapping, restart re-attachment,
+  no-OCR fallback, dataset/index non-invalidation and a Node stub-DOM UI
+  behaviour harness (auto-create once, interrupted manual retry, check 503,
+  evidence/low-confidence rendering).
+
+### Added
+
+- **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:
+  `GET …/review?group=cluster|code&status=` returns the schema-2 review view
+  (counts, triage, plan, report summary, clusters, items) and never calls an
+  LLM; `GET …/review/items/{item_id}` returns one item with evidence, candidates
+  and strategies; `POST …/review/plan` runs a `select|confirm|lock|unlock|defer`
+  plan action (optimistic `base_plan_version`); `POST …/review/reports`
+  generates the deterministic rule report (synchronous `200` in CP1).
+- peelfeed error-code mapping for every reviewed call: `busy → 423`,
+  `conflict | stale | review_schema | corrections_conflict → 409`,
+  `validation → 400`, not found → `404`, other engine errors → `502`.
+- `capabilities`/handshake now expose `review_schema`, `operations`,
+  `resolutions` and `strategies` (frozen strategy catalog).
+- **CP2 E2/E3 review UI.** Strategy selection now sends real params:
+  `inherit_parent_header` renders a parent-table selector from
+  `item.parent_candidates` (page, original `header_cells` joined with ` | `,
+  header source) and posts `params:{"parent_asset_id":…}`; `use_header_rows`
+  renders 1–2 numeric 0-based global row inputs and posts `params:{"rows":[…]}`,
+  with client-side validation that shows a clear message instead of posting an
+  unusable request. Other strategies keep `params:{}`. Stale reason codes render
+  in Chinese (证据变化/父表变化/父表表头未确认/策略已变更/能力不可用/动作已失效/
+  禁止链式继承/条目缺失); a stale entry whose only reasons are
+  `evidence_changed`/`parent_changed` can be explicitly re-confirmed (locked
+  entries included, refreshing the evidence snapshot), while any other stale
+  reason disables 确认 with the guidance “需重新选择策略或先处理父表”.
+- **CP2 W9 review accept/clear.** `POST …/review/plan` now also accepts
+  `action:"accept"` (`{base_plan_version, item_ids:[…]}`, sent to peelfeed via
+  `plan accept --input -`) and `action:"clear"` (`{base_plan_version,
+  entry_id}`, sent via `plan clear --entry <id> --base-plan-version <n>`). The
+  adapter `PLAN_ACTIONS` gains `accept`/`clear`; peekseed validates a non-empty,
+  unique string `item_ids` list and a string `entry_id`, and keeps the frozen
+  error mapping (`busy → 423`, `conflict/stale/review_schema →
+  409`, `validation → 400`, not found → `404`, other → `502`). Accept is
+  all-or-nothing: a failure returns `400` with the per-item `detail.reasons`
+  (`locked`, `stale`, `no_ready_suggestion`, `validator_failed`, `item_missing`)
+  and leaves the plan unchanged; a success bumps `plan_version` exactly once,
+  reports `accepted[]` (each entry confirmed with its own revision, R0 ready
+  suggestions applied immediately) and `refresh: null`. Clear returns
+  `cleared{entry_id,item_id,status_before,reverted_resolution}` and rejects
+  locked or batch-bound entries with `409`.
+- **CP2 W9 review UI: 确认选中项 / 清除选择 / re-confirm refresh display.** The
+  cluster detail renders a per-item checkbox and a cluster-level
+  “确认选中项” button (disabled when nothing is ticked or the plan is busy);
+  a `400` shows each failing item in Chinese (已锁定/已过期/无就绪建议/
+  校验未通过/条目缺失). Each entry gets “清除选择” (enabled only when the entry
+  is not locked and has no `batch_id`); a successful clear shows “已撤销 R0 记录”
+  when `cleared.reverted_resolution` is present. After a successful `confirm`
+  with `refresh != null`, the UI shows “已重新确认（revision rX → rY）” with a
+  before→after diff of `action_params`/`source_refs` when `changed`, and
+  “证据已刷新（revision 不变）” for a hash-only refresh (wire §2.7).
+
+### Fixed
+
+- **CP1.1 review-contract sync.** An R0 plan entry (selecting
+  `confirm_no_header`, `keep_visual_fallback` or `keep_original_figure`) is now
+  `applied` once confirmed (the R0 resolution is written immediately, no corpus
+  change) instead of `confirmed`; "已确认待发布" (`counts.confirmed`) counts
+  operation entries only. The review payload's diagnostic
+  `derived_from.engine_fingerprint` is renamed to
+  `derived_from.converter_code_hash` — a converter-code hash that is **not**
+  `normalize.engine_fingerprint()` and is never used for stale/CAS. Inherit
+  (`inherit_parent_header`) suggestions stay `needs_decision` and no longer
+  count as ready suggestions (peelfeed side); locked entries reject
+  select/defer with `conflict`.
 
 ### Security
 
 - The peelfeed subprocess gets an allowlisted environment.
+- **OCR HTTP routes no longer accept provider overrides (CP4.1 G1).**
+  `POST …/review/ocr/check` accepts only an empty body or `{}` and
+  `POST …/review/ocr/refresh` accepts exactly `{item_ids:[…]}`; any extra field,
+  including `provider`, is `400` and the peelfeed CLI is never invoked. A
+  caller-supplied provider object reached peelfeed's OCR provider `command`,
+  which it executes as a subprocess, so any API-token holder could run arbitrary
+  commands on the host. The `PeelfeedClient` no longer has a `provider`
+  parameter and always sends `{"provider": {}}` for the check; the Review UI
+  sends no provider in either OCR request. A provider override remains available
+  only in peelfeed's local CLI.
 
 ## 0.1.0 - 2026-10-23
 

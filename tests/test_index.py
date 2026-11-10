@@ -9,7 +9,9 @@ Indexes are built from fake peelfeed corpora (``tests.fixtures.make_peel``);
 there is no in-process extraction path any more.
 """
 
+import fcntl
 import json
+import os
 import unittest
 from pathlib import Path
 
@@ -17,7 +19,7 @@ import numpy as np
 
 from peekseed import contracts, ingest
 from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
-                            temp_data_root)
+                            temp_data_root, write_peel_build)
 
 
 def embed_link(fake, model="test-embed", **extra):
@@ -453,6 +455,200 @@ class JobTests(unittest.TestCase):
             index_module.RETRY_BASE_DELAY = original_delay
         self.assertEqual(calls["count"], 2)
         self.assertEqual(len(vectors), 1)
+
+
+class ReaderLeaseTests(unittest.TestCase):
+    """CP3 wire §2.8: an index build leases the current build with flock SH."""
+
+    def test_a_build_holds_the_shared_reader_lease_and_releases_it(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed.ingest import index as index_module
+
+            dataset = build_dataset(root, fake)
+            peel = make_peel(dataset)
+            lock_path = (Path(peel["peel_dir"]) / "extract" / "reader-locks"
+                         / (peel["build_id"] + ".lock"))
+            observed = {}
+
+            def exclusive_probe():
+                fd = os.open(str(lock_path), os.O_RDWR)
+                try:
+                    with self.assertRaises(OSError):
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
+
+            original = index_module.embed_query
+
+            def probing_query(link, text, *, timeout=None):
+                if not observed:
+                    observed["exists"] = lock_path.is_file()
+                    exclusive_probe()
+                return original(link, text, timeout=timeout)
+
+            index_module.embed_query = probing_query
+            try:
+                info = ingest.build_index(dataset["dir"], embed_link(fake))
+            finally:
+                index_module.embed_query = original
+            self.assertTrue(observed.get("exists"), "no reader lock file created")
+            # Released after the CURRENT flip: peelfeed cleanup can take EX.
+            fd = os.open(str(lock_path), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+            self.assertEqual((Path(dataset["dir"]) / "index" / info["space"]
+                              / "CURRENT").read_text().strip(),
+                             info["generation"])
+
+    def test_a_build_aborts_before_current_flip_when_the_peel_moved_on(self):
+        """CP3 wire §2.8: a mid-build publish aborts the generation (no flip)."""
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed.ingest import index as index_module
+
+            dataset = build_dataset(root, fake)
+            peel = make_peel(dataset)
+            link = embed_link(fake)
+            first = ingest.build_index(dataset["dir"], link)
+            space_dir = Path(dataset["dir"]) / "index" / first["space"]
+            self.assertEqual((space_dir / "CURRENT").read_text().strip(),
+                             first["generation"])
+            new_conversion = "f" * 64
+            original = index_module.embed_query
+
+            def publishing_query(link_arg, text, *, timeout=None):
+                vector = original(link_arg, text, timeout=timeout)
+                write_peel_build(peel, conversion_id=new_conversion)
+                return vector
+
+            index_module.embed_query = publishing_query
+            try:
+                with self.assertRaises(ingest.NeedsReindex) as caught:
+                    ingest.build_index(dataset["dir"], link, force=True)
+            finally:
+                index_module.embed_query = original
+            message = str(caught.exception)
+            self.assertIn("needs_reindex", message)
+            self.assertIn("changed", message)
+            # The previous generation keeps serving; CURRENT was never flipped.
+            self.assertEqual((space_dir / "CURRENT").read_text().strip(),
+                             first["generation"])
+            still_serving = ingest.load_index(dataset["dir"], first["space"])
+            self.assertEqual(still_serving["info"]["generation"],
+                             first["generation"])
+            # The failed job carries the readable reason.
+            jobs = [json.loads(path.read_text())
+                    for path in (Path(root) / "jobs").glob("*.json")]
+            failed = [job for job in jobs if job["state"] == "failed"]
+            self.assertTrue(failed, jobs)
+            self.assertIn("needs_reindex", failed[-1]["error"])
+            # The dataset extraction identity is reconciled to the new current
+            # instead of keeping the lease-time snapshot.
+            metadata = json.loads((Path(dataset["dir"]) / "dataset.json").read_text())
+            self.assertEqual(
+                metadata["sources"][0]["extraction"]["conversion_id"],
+                new_conversion)
+
+    def test_legacy_real_corpus_dir_resolves_to_the_cutover_build(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            dataset = build_dataset(root, fake)
+            peel = make_peel(dataset, layout="legacy")
+            build = ingest.resolve_current_build(Path(peel["peel_dir"]))
+            self.assertTrue(build["legacy"])
+            self.assertEqual(build["build_id"],
+                             "cutover-" + peel["conversion_id"])
+            info = ingest.build_index(dataset["dir"], embed_link(fake))
+            self.assertGreaterEqual(info["n"], 2)
+            lock_path = (Path(peel["peel_dir"]) / "extract" / "reader-locks"
+                         / (build["build_id"] + ".lock"))
+            self.assertTrue(lock_path.is_file())
+
+
+class SharedDatasetRefreshTests(unittest.TestCase):
+    """CP3 wire §2.7 / contract §5.3: every dataset referencing a peel follows."""
+
+    def _two_datasets(self, root):
+        from peekseed import config
+
+        pdf = make_pdf(root / "shared.pdf",
+                       pages=["Widget page one about buttons.",
+                              "Widget page two about screws."])
+        first = ingest.create_dataset(config.paths(), "First")
+        ingest.add_source(first, pdf)
+        second = ingest.create_dataset(config.paths(), "Second")
+        ingest.add_source(second, pdf)
+        peel = make_peel(first)
+        make_peel(second)
+        return first, second, peel
+
+    def test_reconcile_refreshes_all_datasets_and_conversion_change_stalens(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed import config
+
+            first, second, peel = self._two_datasets(root)
+            link = embed_link(fake)
+            info = ingest.build_index(first["dir"], link)
+            state = ingest.index_state(first["dir"], info["space"],
+                                       chunker=contracts.chunker_identity())
+            self.assertEqual(state["status"], "indexed")
+            new_conversion = "a" * 64
+            write_peel_build(peel, conversion_id=new_conversion)
+            result = ingest.reconcile_all_datasets(config.paths())
+            self.assertEqual(set(result["updated"]),
+                             {first["id"], second["id"]})
+            for dataset in (first, second):
+                metadata = json.loads(
+                    (Path(dataset["dir"]) / "dataset.json").read_text())
+                extraction = metadata["sources"][0]["extraction"]
+                self.assertEqual(extraction["conversion_id"], new_conversion)
+                self.assertEqual(extraction["state"], "extracted")
+            stale = ingest.index_state(first["dir"], info["space"],
+                                       chunker=contracts.chunker_identity())
+            self.assertEqual(stale["status"], "stale")
+            self.assertTrue(any("peel corpus changed" in reason
+                                for reason in stale["reasons"]), stale)
+
+    def test_chunk_set_only_publish_keeps_indexes_valid(self):
+        """Same conversion_id + new build_id must not stale any index."""
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed import config
+
+            first, second, peel = self._two_datasets(root)
+            link = embed_link(fake)
+            info = ingest.build_index(first["dir"], link)
+            small = {"target_chars": 1500, "max_chars": 2000, "image_cap": 1}
+            write_peel_build(peel, conversion_id=peel["conversion_id"],
+                             build_id="b20261108T120000-chunkonly",
+                             chunk_sets=(EMBED_CHUNK, small))
+            result = ingest.reconcile_all_datasets(config.paths())
+            self.assertEqual(result["updated"], {})
+            for dataset in (first, second):
+                metadata = json.loads(
+                    (Path(dataset["dir"]) / "dataset.json").read_text())
+                self.assertEqual(metadata["sources"][0]["extraction"]
+                                 ["conversion_id"], peel["conversion_id"])
+            state = ingest.index_state(first["dir"], info["space"],
+                                       chunker=contracts.chunker_identity())
+            self.assertEqual(state["status"], "indexed", state)
+
+    def test_reconcile_is_fault_tolerant_for_a_broken_peel(self):
+        with temp_data_root() as root, FakeModelServer(dim=8) as fake:
+            from peekseed import config
+
+            dataset = build_dataset(root, fake)
+            directory = Path(dataset["dir"])
+            metadata = json.loads((directory / "dataset.json").read_text())
+            metadata["sources"][0]["extraction"]["peel_id"] = "missing-peel"
+            contracts.write_json_atomic(directory / "dataset.json", metadata)
+            result = ingest.reconcile_all_datasets(config.paths())
+            self.assertIsInstance(result, dict)
+            metadata = json.loads((directory / "dataset.json").read_text())
+            self.assertEqual(metadata["sources"][0]["extraction"]["peel_id"],
+                             "missing-peel")
+            self.assertEqual(metadata["sources"][0]["extraction"]["state"],
+                             "extracted")
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -5,8 +6,8 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.fixtures import (EMBED_CHUNK, FakeModelServer, make_pdf, make_peel,
-                            temp_data_root)
+from tests.fixtures import (EMBED_CHUNK, FakeModelServer, FakePeelfeedCli,
+                            make_pdf, make_peel, temp_data_root)
 
 
 class ApiTests(unittest.TestCase):
@@ -357,6 +358,101 @@ class ApiTests(unittest.TestCase):
             self.assertFalse((config.paths().sources_dir / sha).exists())
             self.assertEqual(list(config.paths().datasets_dir.iterdir()), [])
 
+
+    def test_dataset_schema_4_carries_an_ocr_review_job_without_migration(self):
+        """CP4: the schema-4 ``extraction.review_jobs`` accepts ``type=ocr``.
+
+        The OCR routes persist a descriptor exactly like report/build jobs; no
+        dataset schema bump is needed, so an old schema-4 dataset still loads
+        (``review_jobs`` defaults to ``{}``) and validates after the write.
+        """
+        with temp_data_root() as root:
+            self.root = root
+            client = self._client()
+            dataset = self._upload(client)
+            sha = hashlib.sha256(
+                (root / "manual.pdf.tmp").read_bytes()).hexdigest()
+            make_peel(dataset["id"])
+            from peekseed import config, contracts, ingest
+
+            directory = config.paths().datasets_dir / dataset["id"]
+            job_id = "ocr-20261109T031000-a1b2"
+            descriptor = ingest.record_review_job(
+                directory, sha, job_id, job_type="ocr")
+            self.assertEqual(descriptor["type"], "ocr")
+            self.assertIsNone(descriptor["batch_id"])
+            self.assertTrue(descriptor["created_at"])
+            rows = client.get(
+                "/api/datasets/%s/sources" % dataset["id"]).json()["sources"]
+            self.assertEqual(rows[0]["extraction"]["review_jobs"][job_id],
+                             descriptor)
+            raw = contracts.read_json(directory / "dataset.json")
+            self.assertEqual(raw["schema"], contracts.DATASET_SCHEMA)
+            self.assertEqual(contracts.DATASET_SCHEMA, 4)
+            # The schema-4 document still validates with the ocr descriptor.
+            validated = contracts.validate_dataset(raw)
+            self.assertEqual(
+                validated["sources"][0]["extraction"]["review_jobs"][job_id]
+                ["type"], "ocr")
+
+    def test_ocr_routes_reject_provider_overrides_before_peelfeed(self):
+        """CP4.1 G1: the OCR HTTP routes never forward a caller ``provider``.
+
+        peelfeed executes ``provider.command`` as a subprocess, so an API token
+        holder could otherwise run arbitrary commands. Both routes must answer
+        400 for any provider field and must not invoke the peelfeed CLI.
+        """
+        saved = {key: os.environ.get(key) for key in
+                 ("PEEKSEED_PEELFEED_CLI", "PEEKSEED_PEELFEED_POLL")}
+        with temp_data_root() as root:
+            self.root = root
+            cli = FakePeelfeedCli(root / "fake")
+            os.environ["PEEKSEED_PEELFEED_CLI"] = str(cli.path)
+            os.environ["PEEKSEED_PEELFEED_POLL"] = "0.01"
+            try:
+                from peekseed import peelfeed
+
+                peelfeed.reset_cache()
+                client = self._client()
+                dataset = self._upload(client)
+                sha = hashlib.sha256(
+                    (root / "manual.pdf.tmp").read_bytes()).hexdigest()
+                peel = make_peel(dataset["id"])
+                # The fake CLI keeps its own peel registry; mirror the peel so
+                # the warm-up ocr-check is a 200 (filesystem peel files are
+                # irrelevant to the CLI's short probe).
+                cli.update(peels={peel["peel_id"]: {
+                    "peel_id": peel["peel_id"], "state": "extracted",
+                    "peel_dir": str(peel["peel_dir"])}})
+                base = "/api/datasets/%s/sources/%s/review/ocr" % (
+                    dataset["id"], sha)
+                # Warm the cached handshake so the 400s below are pure
+                # validation and cannot call the CLI for capabilities.
+                warmed = client.post(base + "/check", json={})
+                self.assertEqual(warmed.status_code, 200, warmed.text)
+                cli.clear_calls()
+                provider = {"command": ["/bin/sh", "-c", "touch %s"
+                                        % (root / "cp41-pwned")]}
+                for route, body in (
+                        (base + "/check", {"provider": provider}),
+                        (base + "/refresh",
+                         {"item_ids": ["it-1"], "provider": provider})):
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("provider", response.json()["detail"])
+                # No rejected request invoked peelfeed, and no command ran.
+                self.assertEqual(cli.calls(), [])
+                self.assertEqual(cli.commands(), [])
+                self.assertFalse((root / "cp41-pwned").exists())
+            finally:
+                for key, value in saved.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+                from peekseed import peelfeed
+
+                peelfeed.reset_cache()
 
 class IndexGateTests(unittest.TestCase):
     def _client(self):
