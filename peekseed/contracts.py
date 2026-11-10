@@ -374,13 +374,16 @@ def extraction_default():
     }
 
 
-def review_job_descriptor(job_type, *, created_at=None, batch_id=None):
+def review_job_descriptor(job_type, *, created_at=None, batch_id=None,
+                          conversation_id=None):
     """The schema-4 ``extraction.review_jobs[job_id]`` descriptor (CP3 wire §2.7).
 
     ``type`` is one of :data:`REVIEW_JOB_TYPES`; ``batch_id`` is ``None`` for
-    report jobs and the ApplyBatch id for build/rollback jobs. Terminal
-    descriptors stay so the UI can query the job after a restart; peekseed
-    never re-runs a job automatically.
+    report/ocr/discuss jobs and the ApplyBatch id for build/rollback jobs.
+    CP5 (wire §6.4) adds the additive ``conversation_id`` for ``discuss`` jobs
+    (schema 4's dict is open, so there is no schema bump). Terminal descriptors
+    stay so the UI can query the job after a restart; peekseed never re-runs a
+    job automatically.
     """
     job_type = str(job_type or "").strip().lower()
     if job_type not in REVIEW_JOB_TYPES:
@@ -392,6 +395,7 @@ def review_job_descriptor(job_type, *, created_at=None, batch_id=None):
         "type": job_type,
         "created_at": created_at or utc_now(),
         "batch_id": str(batch_id) if batch_id else None,
+        "conversation_id": str(conversation_id) if conversation_id else None,
     }
 
 

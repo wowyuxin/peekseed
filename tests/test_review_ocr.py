@@ -238,10 +238,14 @@ class ReviewOcrRouteTests(unittest.TestCase):
                 descriptors = _review_jobs(client, dataset_id, sha)
                 self.assertIn(created["job_id"], descriptors)
                 descriptor = descriptors[created["job_id"]]
+                # CP5 adds the additive ``conversation_id`` (None for non-
+                # discuss jobs) to the open schema-4 descriptor.
                 self.assertEqual(set(descriptor),
-                                 {"type", "created_at", "batch_id"})
+                                 {"type", "created_at", "batch_id",
+                                  "conversation_id"})
                 self.assertEqual(descriptor["type"], "ocr")
                 self.assertIsNone(descriptor["batch_id"])
+                self.assertIsNone(descriptor["conversation_id"])
                 self.assertTrue(descriptor["created_at"])
                 # GET …/review/jobs/{id} re-attaches by id (poll, never rerun).
                 job = _wait_review_job(client, base, created["job_id"])

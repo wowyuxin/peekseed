@@ -50,7 +50,9 @@ are not listed.
 | GET | `/api/datasets/{id}/sources/{sha}/review` | Structured review view: clusters/items/counts (peelfeed pass-through) |
 | GET | `/api/datasets/{id}/sources/{sha}/review/items/{item_id}` | One review item with evidence, candidates and strategies |
 | POST | `/api/datasets/{id}/sources/{sha}/review/plan` | Select/confirm/lock/unlock/defer a review plan entry |
-| POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Generate the deterministic review report (synchronous in CP1) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Create a `report` job: rules body `{item_ids?, cluster_ids?}`, VLM body `{mode:"vlm", confirmation, item_ids?, cluster_ids?}` (202) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/discussions` | Create a `discuss` job: `{conversation_id?, scope, message, base_plan_version, confirmation}` (202) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/plan/patches` | Proxy the synchronous targeted plan patch: `{base_plan_version, patch, source, conversation_id?}` (200 plan + diff; never confirms/applies) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/check` | Probe the OCR provider (body empty or `{}`; no `provider`) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/refresh` | Create one `type=ocr` evidence-refresh job (body exactly `{item_ids:[…]}`) |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
@@ -163,9 +165,11 @@ under `PEEKSEED_SHARED_DIR`); `present` says whether that file is still on disk.
 `status`/`extraction.state` is one of `uploaded|not_extracted|queued|running|
 extracted|failed|stale|corrections_conflict` (the per-source chip).
 `extraction.review_jobs` maps a peelfeed review job id to its small descriptor
-(`{type, created_at, batch_id}`) so a restarted service can re-attach to a
-running job (M2 Phase 2+; empty in CP1). Extraction is a peelfeed job; uploading
-never parses the file.
+(`{type, created_at, batch_id, conversation_id}`) so a restarted service can
+re-attach to a running job (never re-run it automatically). `conversation_id` is
+additive for `type=discuss` jobs (`null` otherwise); dataset schema stays 4
+(the dict is open). Extraction is a peelfeed job; uploading never parses the
+file.
 
 ### `POST /api/datasets`
 
@@ -298,12 +302,56 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   change). Operation selections (`use_first_row_header`, `inherit_parent_header`,
   …) confirm to `confirmed` and wait for a future ApplyBatch, so the summary's
   `counts.confirmed` ("已确认待发布") counts operation entries only.
-- `POST …/review/reports` with optional `{item_ids?, cluster_ids?}` generates
-  the deterministic rule report and returns the ready/partial payload
-  (`status`, `report_path`, `report`, `counts`). CP1 runs it synchronously with
-  `200` and always covers the whole peel (the optional id filters are forwarded
-  but peelfeed ignores them until the Phase 2 report jobs); persisted jobs
-  replace the synchronous call in M2 Phase 2/4 (`202` + job id).
+- `POST …/review/reports` creates a persistent peelfeed `report` job and
+  returns `202 {job_id, status:"queued"}`; poll it through
+  `GET …/review/jobs/{id}`. The **rules** body is unchanged
+  (`{item_ids?, cluster_ids?}`). The **VLM** body is
+  `{mode:"vlm", confirmation:{…}, item_ids?, cluster_ids?}`; `mode` other than
+  `"vlm"` and any unknown field are `400`. `confirmation` is the frozen privacy
+  object (wire §1.2): `{confirmed:true, provider:"answer_link"|"env", link_id,
+  model, scope:{item_ids, cluster_ids, include_crop, include_original_page,
+  include_adjacent_pages, include_native, include_ocr}}` — every field is
+  required, `confirmed` must be exactly `true`, and the scope id lists are
+  sorted unique strings. peekseed re-resolves the VLM provider and compares
+  `provider`/`link_id`/`model` **before any CLI call or job is created**; a
+  mismatch is `400 privacy_confirmation_required`. When no provider is usable
+  (no enabled answer link / missing key, or an incomplete
+  `PEELFEED_LLM_BASE/MODEL/TOKEN` env) the route is `503 vlm_unavailable` and
+  creates no job. The job descriptor is stored in `extraction.review_jobs`
+  (`type:"report"`) for restart re-attachment; the report only updates
+  suggestions and never edits the plan.
+- **VLM provider resolution and child-only env (CP5).** peekseed's own
+  `PEELFEED_LLM_BASE`/`PEELFEED_LLM_MODEL`/`PEELFEED_LLM_TOKEN` env wins;
+  otherwise the default answer link (first enabled answer link, same as the Q&A
+  page) is used. Only the user-confirmed `review-report --with-vlm` and
+  `discuss` children receive `PEELFEED_LLM_BASE/MODEL/TOKEN/LINK_ID` in their
+  **environment**; every other peelfeed child gets the LLM env stripped, and
+  the token is never placed in argv, stdin, `dataset.json`, a job descriptor, a
+  log line or an error message. Audit records only `link_id` + `model`. Because
+  peelfeed's read-only `capabilities` child never sees that env, `GET …/review`
+  (and `GET …/review/items/{id}`) overlay the resolved truth onto the payload:
+  `capabilities` gains `vlm`, `vlm_detail` (Chinese reason when false),
+  `vlm_provider` (`answer_link`/`env`), `vlm_model`, `vlm_link_id`, preserving
+  any peelfeed-provided `vlm_vision`/budget fields.
+- `POST …/review/discussions` creates one persistent peelfeed `discuss` job:
+  `{conversation_id?, scope:{item_id?|cluster_id?|peel:true}, message,
+  base_plan_version, confirmation}`. Exactly one scope selector is required
+  (`peel` must be `true`), `message` is non-empty (≤ 4000 chars),
+  `base_plan_version` is an int ≥ 0, and the same privacy confirmation
+  validation/comparison applies (400 `privacy_confirmation_required`, 503
+  `vlm_unavailable`, no job on rejection). Returns `202 {job_id,
+  conversation_id, status:"queued"}`; the descriptor is stored with
+  `type:"discuss"` and the additive `conversation_id` (schema 4 unchanged).
+  Follow-up turns reuse the conversation id; the job returns explanations and a
+  **draft** plan patch only — it never confirms or applies anything.
+- `POST …/review/plan/patches` proxies the synchronous targeted plan patch
+  (`{base_plan_version, patch, source:"vlm"|"user", conversation_id?}`) and
+  returns `200` with the new plan plus the targeted `diff`
+  (`added`/`changed`/`removed`/`unchanged`). Errors map per contract §4: `409`
+  for a base mismatch or locked/batch-bound entries (the conflicting item ids
+  are included in the readable error), `400` for invalid strategy/params/
+  evidence, `404` for an unknown conversation. This route never confirms,
+  applies, builds or publishes: adopting a patch only edits the draft plan.
 - `POST …/review/ocr/check` proxies `peelfeed ocr-check` (M2.1; wire §2.8) and
   returns `200` with the probe payload (`available`, `engine`, `provider`,
   `probe`, `checked_at`, `error`); `503` when OCR is unconfigured/unrunnable,

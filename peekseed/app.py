@@ -1347,7 +1347,9 @@ def create_app():
         if not isinstance(body, dict):
             raise HTTPException(400, "a review plan request must be a JSON object")
         action = str(body.get("action") or "").strip().lower()
-        if action not in peelfeed.PLAN_ACTIONS or action == "show":
+        if action not in peelfeed.PLAN_ACTIONS or action in ("show", "patch"):
+            # CP5: the targeted plan patch has its own frozen route
+            # (POST …/review/plan/patches); it is never an action here.
             raise HTTPException(
                 400, "action must be one of select, confirm, lock, unlock, "
                      "defer, accept, clear")
@@ -1434,25 +1436,176 @@ def create_app():
             request["reason"] = str(reason)
         return action, request
 
-    def _review_report_request(body):
-        """Validate ``POST …/review/reports`` (CP3 wire §2.7).
+    # --- CP5 VLM privacy confirmation (wire §1.2/§6.1/§6.2) ----------------
+    # Every report/discuss provider call is preceded by an explicit user
+    # confirmation. peekseed validates the frozen shape field-by-field, then
+    # re-resolves the default answer link and compares provider/link_id/model
+    # before any CLI call or job is created. The resolved scope sets are
+    # re-checked by peelfeed (wire §1.2/§6.2); peekseed passes them through.
+    _CONFIRMATION_KEYS = {"confirmed", "provider", "link_id", "model", "scope"}
+    _CONFIRMATION_SCOPE_KEYS = {
+        "item_ids", "cluster_ids", "include_crop", "include_original_page",
+        "include_adjacent_pages", "include_native", "include_ocr",
+    }
+    _CONFIRMATION_FLAGS = ("include_crop", "include_original_page",
+                           "include_adjacent_pages", "include_native",
+                           "include_ocr")
 
-        CP3 reports are rules-only persistent jobs: ``{item_ids?, cluster_ids?}``.
-        A VLM request (``mode``/``confirmation``) is not available until M2.2 and
-        is a 400 validation error, never a silent rules-only downgrade.
+    def _privacy_confirmation_required(message):
+        raise HTTPException(400, "privacy_confirmation_required: %s" % message)
+
+    def _review_id_list(value, field):
+        """A sorted-unique list of non-empty strings (confirmation scope sets)."""
+        if not isinstance(value, list):
+            raise HTTPException(400, "%s must be a list of ids" % field)
+        cleaned = []
+        seen = set()
+        for raw in value:
+            if not isinstance(raw, str):
+                raise HTTPException(400, "%s must contain only strings" % field)
+            item = raw.strip()
+            if not item:
+                raise HTTPException(400, "%s must not contain empty ids" % field)
+            if item in seen:
+                raise HTTPException(400, "%s must be unique (duplicate %s)"
+                                    % (field, item))
+            seen.add(item)
+            cleaned.append(item)
+        if cleaned != sorted(cleaned):
+            raise HTTPException(400, "%s must be sorted unique strings" % field)
+        return cleaned
+
+    def _review_confirmation(value, *, what):
+        """Validate the frozen privacy confirmation object (wire §1.2).
+
+        Every field is required, unknown fields anywhere are a 400 and
+        ``confirmed`` must be exactly ``true``. Returns the normalised object
+        that is sent to peelfeed as the job payload (never a token).
         """
-        if body is None:
-            body = {}
-        if not isinstance(body, dict):
-            raise HTTPException(400, "a review report request must be a JSON object")
-        if "mode" in body or "confirmation" in body:
-            raise HTTPException(
-                400, "VLM reports are not available in CP3 (rules-only); "
-                     "mode/confirmation are not accepted")
-        unknown = sorted(set(body) - {"item_ids", "cluster_ids"})
+        if not isinstance(value, dict):
+            raise HTTPException(400, "%s needs a confirmation object" % what)
+        unknown = sorted(set(value) - _CONFIRMATION_KEYS)
         if unknown:
-            raise HTTPException(400, "unknown review report field(s): %s"
-                                % ", ".join(unknown))
+            raise HTTPException(
+                400, "unknown confirmation field(s): %s" % ", ".join(unknown))
+        missing = sorted(_CONFIRMATION_KEYS - set(value))
+        if missing:
+            raise HTTPException(
+                400, "confirmation is missing field(s): %s" % ", ".join(missing))
+        if value.get("confirmed") is not True:
+            _privacy_confirmation_required(
+                "confirmation.confirmed must be true; nothing is sent without "
+                "an explicit confirmation")
+        provider = value.get("provider")
+        if provider not in ("answer_link", "env"):
+            raise HTTPException(
+                400, "confirmation.provider must be 'answer_link' or 'env'")
+        link_id = value.get("link_id")
+        if not isinstance(link_id, str) or not link_id.strip():
+            raise HTTPException(
+                400, "confirmation.link_id must be a non-empty string")
+        model = value.get("model")
+        if not isinstance(model, str) or not model.strip():
+            raise HTTPException(
+                400, "confirmation.model must be a non-empty string")
+        scope = value.get("scope")
+        if not isinstance(scope, dict):
+            raise HTTPException(400, "confirmation.scope must be an object")
+        unknown_scope = sorted(set(scope) - _CONFIRMATION_SCOPE_KEYS)
+        if unknown_scope:
+            raise HTTPException(
+                400, "unknown confirmation.scope field(s): %s"
+                     % ", ".join(unknown_scope))
+        missing_scope = sorted(_CONFIRMATION_SCOPE_KEYS - set(scope))
+        if missing_scope:
+            raise HTTPException(
+                400, "confirmation.scope is missing field(s): %s"
+                     % ", ".join(missing_scope))
+        flags = {}
+        for flag in _CONFIRMATION_FLAGS:
+            if scope.get(flag) is not True and scope.get(flag) is not False:
+                raise HTTPException(
+                    400, "confirmation.scope.%s must be a boolean" % flag)
+            flags[flag] = bool(scope[flag])
+        return {
+            "confirmed": True,
+            "provider": provider,
+            "link_id": link_id.strip(),
+            "model": model.strip(),
+            "scope": {
+                "item_ids": _review_id_list(scope.get("item_ids"),
+                                            "confirmation.scope.item_ids"),
+                "cluster_ids": _review_id_list(scope.get("cluster_ids"),
+                                               "confirmation.scope.cluster_ids"),
+                **flags,
+            },
+        }
+
+    def _review_vlm_provider(confirmation):
+        """Re-resolve the VLM provider and compare the confirmation.
+
+        Resolution order (design §3.2, Phase 4): peekseed's own
+        ``PEELFEED_LLM_BASE/MODEL/TOKEN`` env wins; otherwise the default answer
+        link (first enabled). A missing/unusable provider is a 503
+        ``vlm_unavailable`` (no job, no CLI call); a provider/link/model
+        mismatch is a 400 ``privacy_confirmation_required`` before any data
+        could be sent (wire §1.2/§1.3). Returns the public provider descriptor
+        (never the token).
+        """
+        provider = peelfeed.vlm_provider()
+        if not provider.get("available"):
+            raise HTTPException(
+                503, "VLM is unavailable: error [vlm_unavailable] %s"
+                     % (provider.get("reason") or "the provider is not configured"))
+        if confirmation["provider"] != provider["provider"]:
+            _privacy_confirmation_required(
+                "the confirmed provider (%s) does not match the resolved "
+                "provider (%s); re-confirm the provider shown in the dialog"
+                % (confirmation["provider"], provider["provider"]))
+        if confirmation["link_id"] != str(provider.get("link_id") or ""):
+            _privacy_confirmation_required(
+                "the confirmed link_id does not match the resolved provider; "
+                "re-confirm the provider/link/model")
+        if confirmation["model"] != str(provider.get("model") or ""):
+            _privacy_confirmation_required(
+                "the confirmed model does not match the resolved provider; "
+                "re-confirm the provider/link/model")
+        return provider
+
+    def _review_vlm_capabilities(payload):
+        """Overlay peekseed-resolved VLM fields on a review payload (CP5 §2.3).
+
+        peelfeed's ``capabilities`` command is a read-only child that never gets
+        the provider env (only report/discuss children do), so its
+        ``capabilities.vlm`` cannot know about peekseed's env-first provider or
+        the default answer link. peekseed therefore reports the truth here,
+        preserving any peelfeed-provided probe/budget fields (``vlm_vision``,
+        ``vlm_budget_usd``, ``vlm_spent_usd``, ``vlm_calls``,
+        ``vlm_vision_checked_at``). Additive ``vlm_provider`` names the resolved
+        provider (``answer_link``/``env``) for the confirmation dialog.
+        """
+        if not isinstance(payload, dict):
+            return payload
+        caps = payload.get("capabilities")
+        overlay = dict(caps) if isinstance(caps, dict) else {}
+        provider = peelfeed.vlm_provider()
+        available = bool(provider.get("available"))
+        overlay["vlm"] = available
+        overlay["vlm_provider"] = provider.get("provider")
+        overlay["vlm_model"] = (str(provider.get("model") or "")
+                                if available else None)
+        overlay["vlm_link_id"] = (str(provider.get("link_id") or "")
+                                  if available else None)
+        overlay["vlm_detail"] = None if available else (
+            "VLM 不可用：%s" % (provider.get("reason") or "未配置"))
+        # The vision probe belongs to peelfeed; keep its value (null = unknown)
+        # instead of guessing.
+        overlay.setdefault("vlm_vision", None)
+        payload["capabilities"] = overlay
+        return payload
+
+    def _review_report_filters(body):
+        """The optional ``item_ids``/``cluster_ids`` report filters."""
         filters = {}
         for field in ("item_ids", "cluster_ids"):
             value = body.get(field)
@@ -1464,6 +1617,194 @@ def create_app():
             if cleaned:
                 filters[field] = cleaned
         return filters
+
+    def _review_report_request(body):
+        """Validate ``POST …/review/reports`` (CP5 wire §6.1).
+
+        Rules body is unchanged: ``{item_ids?, cluster_ids?}`` (no ``mode``/
+        ``confirmation``). VLM body is ``{mode:"vlm", confirmation:{…},
+        item_ids?, cluster_ids?}``; ``mode`` other than ``"vlm"`` is a 400 and
+        the confirmation is validated field-by-field here and re-resolved
+        against the default answer link by the route before any CLI call.
+        Returns ``{mode, confirmation, item_ids, cluster_ids}``.
+        """
+        if body is None:
+            body = {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "a review report request must be a JSON object")
+        unknown = sorted(set(body) - {"mode", "confirmation", "item_ids",
+                                      "cluster_ids"})
+        if unknown:
+            raise HTTPException(400, "unknown review report field(s): %s"
+                                % ", ".join(unknown))
+        filters = _review_report_filters(body)
+        has_mode = "mode" in body
+        has_confirmation = "confirmation" in body
+        if not has_mode and not has_confirmation:
+            return {"mode": "rules", "confirmation": None,
+                    "item_ids": filters.get("item_ids"),
+                    "cluster_ids": filters.get("cluster_ids")}
+        if not has_mode:
+            raise HTTPException(
+                400, "confirmation is only accepted with mode:\"vlm\"")
+        mode = str(body.get("mode") or "").strip().lower()
+        if mode != "vlm":
+            raise HTTPException(400, "mode must be \"vlm\" (or omitted for a "
+                                     "rules-only report)")
+        if not has_confirmation:
+            raise HTTPException(
+                400, "a VLM report needs a confirmation object")
+        confirmation = _review_confirmation(
+            body.get("confirmation"), what="a VLM report")
+        return {"mode": "vlm", "confirmation": confirmation,
+                "item_ids": filters.get("item_ids"),
+                "cluster_ids": filters.get("cluster_ids")}
+
+    _DISCUSSION_KEYS = {"conversation_id", "scope", "message",
+                        "base_plan_version", "confirmation"}
+    _DISCUSSION_SCOPE_KEYS = {"item_id", "cluster_id", "peel"}
+
+    def _review_discussion_scope(value):
+        """Validate the frozen discussion scope (wire §4.1/§6.2).
+
+        Exactly one of ``item_id``, ``cluster_id`` or ``peel:true``; the scope
+        defaults to the current item/cluster in the UI, and full-peel discussion
+        is allowed but never executes a batch (peelfeed returns a preview only).
+        """
+        if not isinstance(value, dict):
+            raise HTTPException(400, "a review discussion needs a scope object")
+        unknown = sorted(set(value) - _DISCUSSION_SCOPE_KEYS)
+        if unknown:
+            raise HTTPException(400, "unknown discussion scope field(s): %s"
+                                % ", ".join(unknown))
+        selectors = 0
+        cleaned = {}
+        item_id = value.get("item_id")
+        if item_id is not None:
+            if not isinstance(item_id, str) or not item_id.strip():
+                raise HTTPException(
+                    400, "scope.item_id must be a non-empty string")
+            cleaned["item_id"] = item_id.strip()
+            selectors += 1
+        cluster_id = value.get("cluster_id")
+        if cluster_id is not None:
+            if not isinstance(cluster_id, str) or not cluster_id.strip():
+                raise HTTPException(
+                    400, "scope.cluster_id must be a non-empty string")
+            cleaned["cluster_id"] = cluster_id.strip()
+            selectors += 1
+        peel = value.get("peel")
+        if peel is not None:
+            if peel is not True:
+                raise HTTPException(400, "scope.peel must be true when present")
+            cleaned["peel"] = True
+            selectors += 1
+        if selectors != 1:
+            raise HTTPException(
+                400, "a discussion scope needs exactly one of item_id, "
+                     "cluster_id or peel:true")
+        return cleaned
+
+    def _review_discussion_request(body):
+        """Validate ``POST …/review/discussions`` (CP5 wire §6.2).
+
+        Body is exactly ``{conversation_id?, scope:{item_id?|cluster_id?|
+        peel:true}, message, base_plan_version, confirmation:{…}}``; unknown
+        fields are a 400. ``message`` is non-empty (≤ 4000 chars),
+        ``base_plan_version`` is an int ≥ 0, the confirmation is validated and
+        compared against the default answer link before the CLI runs. Returns
+        the frozen peelfeed stdin request.
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(
+                400, "a review discussion request must be a JSON object")
+        unknown = sorted(set(body) - _DISCUSSION_KEYS)
+        if unknown:
+            raise HTTPException(400, "unknown review discussion field(s): %s"
+                                % ", ".join(unknown))
+        missing = sorted({"scope", "message", "base_plan_version",
+                          "confirmation"} - set(body))
+        if missing:
+            raise HTTPException(400, "a review discussion is missing field(s): %s"
+                                % ", ".join(missing))
+        scope = _review_discussion_scope(body.get("scope"))
+        message = body.get("message")
+        if not isinstance(message, str):
+            raise HTTPException(400, "message must be a non-empty string")
+        message = message.strip()
+        if not message:
+            raise HTTPException(400, "message must be a non-empty string")
+        if len(message) > 4000:
+            raise HTTPException(400, "message is longer than 4000 characters")
+        base = body.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            raise HTTPException(
+                400, "base_plan_version is required and must be an integer >= 0")
+        conversation_id = body.get("conversation_id")
+        if conversation_id is not None:
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                raise HTTPException(
+                    400, "conversation_id must be a non-empty string")
+            conversation_id = conversation_id.strip()
+        confirmation = _review_confirmation(
+            body.get("confirmation"), what="a review discussion")
+        return {
+            "conversation_id": conversation_id,
+            "scope": scope,
+            "message": message,
+            "base_plan_version": base,
+            "confirmation": confirmation,
+        }
+
+    _PLAN_PATCH_KEYS = {"base_plan_version", "patch", "source",
+                        "conversation_id"}
+
+    def _review_plan_patch_request(body):
+        """Validate ``POST …/review/plan/patches`` (CP5 wire §6.3).
+
+        Body is ``{base_plan_version, patch, source:"vlm|user",
+        conversation_id?}``; unknown fields are a 400. peekseed checks the
+        envelope only -- the patch content (scope/members/exclusions/changes)
+        is validated all-or-nothing by peelfeed (wire §5), which returns
+        ``validation`` 400 / ``conflict`` 409 / ``not_found`` 404. The route is
+        synchronous and never confirms or applies anything.
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(
+                400, "a review plan patch request must be a JSON object")
+        unknown = sorted(set(body) - _PLAN_PATCH_KEYS)
+        if unknown:
+            raise HTTPException(400, "unknown review plan patch field(s): %s"
+                                % ", ".join(unknown))
+        missing = sorted({"base_plan_version", "patch", "source"} - set(body))
+        if missing:
+            raise HTTPException(
+                400, "a review plan patch is missing field(s): %s"
+                     % ", ".join(missing))
+        base = body.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            raise HTTPException(
+                400, "base_plan_version is required and must be an integer >= 0")
+        patch = body.get("patch")
+        if not isinstance(patch, dict):
+            raise HTTPException(400, "patch must be a JSON object")
+        source = str(body.get("source") or "").strip().lower()
+        if source not in ("vlm", "user"):
+            raise HTTPException(400, "source must be 'vlm' or 'user'")
+        conversation_id = body.get("conversation_id")
+        if conversation_id is not None:
+            if not isinstance(conversation_id, str) or not conversation_id.strip():
+                raise HTTPException(
+                    400, "conversation_id must be a non-empty string")
+            conversation_id = conversation_id.strip()
+        request = {
+            "base_plan_version": base,
+            "patch": patch,
+            "source": source,
+        }
+        if conversation_id is not None:
+            request["conversation_id"] = conversation_id
+        return request
 
     def _review_ocr_check_request(body):
         """Validate ``POST …/review/ocr/check`` (contract §4 / wire §2.8).
@@ -1571,7 +1912,8 @@ def create_app():
                      "batch id is in the URL")
         return {}
 
-    def _record_review_job(directory, sha, job_id, *, job_type, batch_id=None):
+    def _record_review_job(directory, sha, job_id, *, job_type, batch_id=None,
+                           conversation_id=None):
         """Persist a peelfeed job descriptor in ``extraction.review_jobs``.
 
         Best-effort: the job already exists in the peel; losing the descriptor
@@ -1579,7 +1921,8 @@ def create_app():
         """
         try:
             ingest.record_review_job(directory, sha, job_id, job_type=job_type,
-                                     batch_id=batch_id)
+                                     batch_id=batch_id,
+                                     conversation_id=conversation_id)
         except (ingest.IngestError, contracts.ContractError) as exc:
             LOG.warning("could not persist review job %s for source %s: %s",
                         job_id, str(sha)[:8], _http_detail(exc))
@@ -2020,10 +2363,15 @@ def create_app():
         if group_value is not None and group_value not in peelfeed.REVIEW_GROUPS:
             raise HTTPException(400, "group must be 'cluster' or 'code'")
         status_value = str(status or "").strip() or None
-        return _call_peelfeed(
+        payload = _call_peelfeed(
             "review",
             lambda: peelfeed.client().review(
                 peel_id, group=group_value, status=status_value))
+        # CP5: the review payload carries the VLM capability block the UI needs
+        # to enable/disable report/discuss actions; peelfeed's read-only
+        # capabilities child never sees the provider env, so overlay the
+        # provider peekseed resolved (env-first, else default answer link).
+        return _review_vlm_capabilities(payload)
 
     @app.get("/api/datasets/{dataset_id}/sources/{sha}/review/items/{item_id}")
     def source_review_item(dataset_id: str, sha: str, item_id: str):
@@ -2035,9 +2383,12 @@ def create_app():
         identifier = str(item_id or "").strip()
         if not identifier:
             raise HTTPException(400, "invalid review item id")
-        return _call_peelfeed(
+        payload = _call_peelfeed(
             "review item",
             lambda: peelfeed.client().review(peel_id, item=identifier))
+        # CP5: an item view opened directly also needs the VLM capability
+        # overlay (additive ``capabilities``) for the bar/confirmation dialog.
+        return _review_vlm_capabilities(payload)
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/plan")
     def source_review_plan(dataset_id: str, sha: str,
@@ -2066,24 +2417,33 @@ def create_app():
               status_code=202)
     def source_review_reports(dataset_id: str, sha: str,
                               payload: Optional[dict] = None):
-        """Create a persistent peelfeed ``report`` job (CP3 wire §2.7).
+        """Create a persistent peelfeed ``report`` job (CP3/CP5 wire §2.7/§6.1).
 
-        Body (both optional): ``{item_ids?: [...], cluster_ids?: [...]}``; VLM
-        mode is not available in CP3 (400). Returns 202
-        ``{job_id, status: "queued"}``; the job writes ``report.json`` and is
-        polled through ``GET …/review/jobs/{id}``. The descriptor is stored in
-        ``extraction.review_jobs`` so a restart re-attaches by id (never reruns).
+        Rules body is unchanged: ``{item_ids?, cluster_ids?}``. VLM body is
+        ``{mode:"vlm", confirmation:{…}, item_ids?, cluster_ids?}``: the
+        confirmation is validated field-by-field, the default answer link is
+        re-resolved and provider/link_id/model are compared **before** any CLI
+        call (mismatch -> 400 ``privacy_confirmation_required``); an
+        unconfigured link/key is 503 ``vlm_unavailable`` and creates no job.
+        Returns 202 ``{job_id, status: "queued"}``; the job writes
+        ``report.json`` and is polled through ``GET …/review/jobs/{id}``. The
+        descriptor is stored in ``extraction.review_jobs`` so a restart
+        re-attaches by id (never reruns).
         """
         directory = _dataset_dir(dataset_id)
         entry = _source_by_sha(directory, sha)
         peel_id = _peel_id_of(entry)
         _require_review_schema()
-        filters = _review_report_request(payload or {})
+        request = _review_report_request(payload or {})
+        confirmation = request["confirmation"]
+        if confirmation is not None:
+            _review_vlm_provider(confirmation)
         result = _call_peelfeed(
             "review report",
             lambda: peelfeed.client().review_report(
-                peel_id, item_ids=filters.get("item_ids"),
-                cluster_ids=filters.get("cluster_ids")))
+                peel_id, item_ids=request.get("item_ids"),
+                cluster_ids=request.get("cluster_ids"),
+                mode=request["mode"], confirmation=confirmation))
         job_id = str((result or {}).get("job_id") or "")
         if not job_id:
             raise HTTPException(502, "peelfeed review-report returned no job_id")
@@ -2091,6 +2451,65 @@ def create_app():
                            job_type="report")
         return {"job_id": job_id,
                 "status": str(result.get("status") or "queued")}
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/discussions",
+              status_code=202)
+    def source_review_discussions(dataset_id: str, sha: str,
+                                  payload: Optional[dict] = None):
+        """Create one persistent peelfeed ``discuss`` job (CP5 wire §6.2).
+
+        Body is ``{conversation_id?, scope:{item_id?|cluster_id?|peel:true},
+        message, base_plan_version, confirmation:{…}}``; exactly one scope
+        selector, ``message`` non-empty ≤ 4000 chars, ``base_plan_version`` int
+        ≥ 0, and the privacy confirmation validated/compared exactly like the
+        VLM report route (400 ``privacy_confirmation_required``, 503
+        ``vlm_unavailable``, no job/CLI call on rejection). Returns 202
+        ``{job_id, conversation_id, status:"queued"}`` and persists the
+        additive ``conversation_id`` in ``extraction.review_jobs`` for restart
+        re-attachment (never auto-rerun). The job returns explanations and a
+        draft patch only; it never applies a plan change.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        request = _review_discussion_request(payload or {})
+        _review_vlm_provider(request["confirmation"])
+        result = _call_peelfeed(
+            "review discussion",
+            lambda: peelfeed.client().discuss(peel_id, request))
+        job_id = str((result or {}).get("job_id") or "")
+        conversation_id = str((result or {}).get("conversation_id") or "")
+        if not job_id or not conversation_id:
+            raise HTTPException(
+                502, "peelfeed discuss returned no job_id/conversation_id")
+        _record_review_job(directory, str(entry.get("sha256") or ""), job_id,
+                           job_type="discuss",
+                           conversation_id=conversation_id)
+        return {"job_id": job_id, "conversation_id": conversation_id,
+                "status": str(result.get("status") or "queued")}
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/plan/patches")
+    def source_review_plan_patches(dataset_id: str, sha: str,
+                                   payload: Optional[dict] = None):
+        """Proxy the synchronous targeted plan patch (CP5 wire §5/§6.3).
+
+        Body is ``{base_plan_version, patch, source:"vlm|user",
+        conversation_id?}``. Returns 200 with the new plan plus the targeted
+        ``diff`` (added/changed/removed/unchanged). Errors map per contract §4:
+        409 ``conflict``/``stale`` for a base mismatch or locked/batch-bound
+        entries, 400 ``validation`` for invalid strategy/params/evidence,
+        404 for an unknown ``conversation_id``. This route never confirms or
+        applies anything: adopting a patch only edits the draft plan.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        request = _review_plan_patch_request(payload or {})
+        return _call_peelfeed(
+            "plan patch",
+            lambda: peelfeed.client().plan_patch(peel_id, request))
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/ocr/check")
     def source_review_ocr_check(dataset_id: str, sha: str,

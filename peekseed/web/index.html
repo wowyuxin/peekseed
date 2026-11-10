@@ -1371,6 +1371,81 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   overflow-wrap:anywhere;margin:0 0 8px;}
 .rr-ocr-env{margin:0;padding-left:16px;font:10px var(--mono);color:var(--muted);
   line-height:1.6;overflow-wrap:anywhere;}
+/* ---- CP5 (M2.2): VLM report bar, confirmation dialog, discussion panel ----
+   VLM is never implicit: the bar only offers actions, the confirmation dialog
+   gates every report/discuss provider call, and a discussion reply's draft
+   patch is adopted only through the synchronous plan/patches route. */
+.rr-vlm{display:flex;flex-direction:column;gap:5px;padding:8px 11px;margin:0 0 10px;
+  border:1px solid var(--line);border-radius:11px;background:var(--panel-2);min-width:0;}
+.rr-vlm-h{display:flex;flex-wrap:wrap;gap:5px 10px;align-items:center;min-width:0;}
+.rr-vlm-h button{padding:3px 9px;font-size:10.5px;min-height:24px;border-radius:6px;}
+.rr-vlm-chip{display:inline-flex;align-items:center;font:9.5px var(--mono);line-height:1.7;
+  border:1px solid var(--line);border-radius:5px;padding:0 6px;white-space:nowrap;
+  color:var(--muted);}
+.rr-vlm-chip.ok{color:var(--ok);border-color:var(--ok-line);background:var(--ok-soft);}
+.rr-vlm-chip.warn{color:var(--warn);border-color:rgba(251,191,36,.35);
+  background:var(--warn-soft);}
+.rr-vlm-chip.bad{color:var(--bad);border-color:rgba(251,113,133,.35);
+  background:var(--bad-soft);}
+.rr-vlm-chip.vlm{color:var(--accent);border-color:var(--accent-line);
+  background:var(--accent-soft);}
+.rr-vlm-detail{font-size:10.5px;color:var(--muted);line-height:1.5;
+  overflow-wrap:anywhere;}
+.rr-vlm-job{padding:8px 11px;margin:0 0 10px;border:1px solid var(--line);
+  border-radius:11px;background:var(--panel-2);min-width:0;}
+.rr-provider{display:flex;flex-direction:column;gap:4px;padding:8px 11px;
+  margin:0 0 10px;border:1px solid var(--line);border-radius:11px;
+  background:var(--panel-2);min-width:0;}
+.rr-provider-h{display:flex;flex-wrap:wrap;gap:4px 9px;align-items:baseline;min-width:0;}
+.rr-provider-meta{font:9.5px var(--mono);color:var(--faint);line-height:1.5;
+  overflow-wrap:anywhere;}
+.rr-provider-fail{margin:0;padding-left:16px;font-size:10.5px;line-height:1.5;
+  color:var(--warn);overflow-wrap:anywhere;}
+.rr-clar{display:flex;flex-direction:column;gap:6px;padding:8px 11px;
+  margin:0 0 10px;border:1px solid var(--line);border-radius:11px;
+  background:var(--panel-2);min-width:0;}
+.rr-clar-q{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;
+  font-size:11px;line-height:1.5;color:var(--text);min-width:0;}
+.rr-clar-q .rr-clar-item{font:9.5px var(--mono);color:var(--faint);}
+.rr-clar-opts{display:flex;flex-wrap:wrap;gap:4px;}
+.rr-clar-opts button{padding:2px 8px;font-size:10px;min-height:22px;border-radius:6px;}
+.rr-discuss{display:flex;flex-direction:column;gap:7px;padding:9px 11px;
+  margin:10px 0 0;border:1px solid var(--line);border-radius:11px;
+  background:var(--panel-2);min-width:0;}
+.rr-discuss-controls{display:flex;flex-wrap:wrap;gap:6px 10px;align-items:flex-end;
+  min-width:0;}
+.rr-discuss-controls input{flex:1 1 240px;min-width:0;padding:5px 8px;font-size:11px;
+  border-radius:7px;border:1px solid var(--line);background:var(--panel);
+  color:var(--text);}
+.rr-discuss-controls button{padding:4px 10px;font-size:11px;min-height:26px;
+  border-radius:7px;}
+.rr-discuss-turns{display:flex;flex-direction:column;gap:6px;min-width:0;}
+.rr-turn{display:flex;flex-direction:column;gap:3px;padding:6px 9px;
+  border-radius:9px;border:1px solid var(--line-soft);background:var(--panel);
+  font-size:11px;line-height:1.55;overflow-wrap:anywhere;min-width:0;}
+.rr-turn.user{border-color:var(--line);}
+.rr-turn.assistant{border-color:var(--accent-line);background:var(--accent-soft);}
+.rr-turn-h{display:flex;flex-wrap:wrap;gap:4px 8px;align-items:baseline;
+  font:9.5px var(--mono);color:var(--faint);}
+.rr-turn-intent{font:9.5px var(--mono);color:var(--accent);}
+.rr-discuss-patch{display:flex;flex-direction:column;gap:5px;padding:8px 10px;
+  border:1px dashed var(--accent-line);border-radius:9px;background:var(--panel);
+  font-size:10.5px;line-height:1.55;color:var(--muted);overflow-wrap:anywhere;}
+.rr-patch-diff{display:flex;flex-direction:column;gap:4px;font-size:10.5px;
+  line-height:1.5;color:var(--muted);overflow-wrap:anywhere;}
+.rr-patch-diff ul{margin:0;padding-left:16px;}
+.rr-patch-conflict{padding:7px 10px;border-radius:9px;border:1px solid
+  rgba(251,113,133,.4);background:var(--bad-soft);font-size:10.5px;line-height:1.55;
+  color:var(--bad);overflow-wrap:anywhere;}
+.rr-vlm-provider{margin:0 0 8px;padding:0;list-style:none;display:flex;
+  flex-direction:column;gap:3px;font:10px var(--mono);color:var(--muted);
+  overflow-wrap:anywhere;}
+.rr-vlm-provider li{display:flex;flex-wrap:wrap;gap:4px 10px;align-items:baseline;}
+.rr-vlm-provider code{color:var(--text);}
+.rr-vlm-scope{display:flex;flex-wrap:wrap;gap:5px 12px;margin:0 0 8px;
+  font-size:11px;color:var(--muted);}
+.rr-vlm-scope label{display:inline-flex;gap:5px;align-items:center;cursor:pointer;}
+.rr-vlm-target{font-size:11px;line-height:1.55;color:var(--text);margin:0 0 6px;}
 @media (max-width:860px){
   .rr-grid{grid-template-columns:1fr;}
   .rr-clusters{max-height:32vh;}
@@ -1823,6 +1898,13 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
       <button class="hist-close" id="reviewClose" type="button" aria-label="Close">&#215;</button>
     </div>
     <p class="settings-msg" id="reviewMsg" role="status" aria-live="polite"></p>
+    <!-- CP5 (M2.2): VLM report/discussion bar. Provider status comes from the
+         review payload's additive capabilities.vlm* fields; both actions are
+         disabled with a Chinese reason when capabilities.vlm is false, and the
+         rules-only report button stays fully usable. No VLM call is ever made
+         implicitly: every provider request goes through #reviewVlmConfirm. -->
+    <div class="rr-vlm" id="reviewVlmBar"><span class="hist-empty">正在读取 VLM 能力…</span></div>
+    <div class="rr-vlm-job" id="reviewVlmJob" hidden></div>
     <!-- CP3 W5: corrections_conflict banner (dataset + review top) and the
          batch section: build the batch's candidate, watch the persisted job,
          review estimate/gates/diff, then publish/discard/rollback. -->
@@ -1835,9 +1917,44 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
     <div class="rr-batch" id="reviewBatch"><span class="hist-empty">正在读取候选批次与后台任务…</span></div>
     <div class="hist-body settings-body">
       <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
+      <!-- CP5: report provider kind/model/vision/cached/text-only, partial
+           failures and clarification counts (additive report fields §3.5). -->
+      <div class="rr-provider" id="reviewReportProvider" hidden></div>
+      <!-- CP5: per-cluster/item clarification questions; an option button sends
+           a discussion message, never an operation. -->
+      <div class="rr-clar" id="reviewClarifications" hidden></div>
       <div class="rr-grid">
         <div class="rr-clusters" id="reviewClusters"><span class="hist-empty">正在加载簇…</span></div>
         <div class="rr-detail" id="reviewDetail"><span class="hist-empty">选择一个簇查看结论、证据与动作。</span></div>
+      </div>
+      <!-- CP5: discussion panel anchored to the current item/cluster; the
+           scope selector can switch to the whole peel. A VLM reply may carry a
+           draft plan patch which is previewed here and adopted only via the
+           synchronous plan/patches route. -->
+      <div class="rr-discuss" id="reviewDiscuss" hidden>
+        <div class="rr-batch-h"><h4>与 VLM 讨论</h4>
+          <span class="rr-cand-meta" id="reviewDiscussAnchor"></span></div>
+        <div class="rr-discuss-controls">
+          <label class="rr-field"><span>范围</span>
+            <select id="reviewDiscussScope">
+              <option value="item">当前项</option>
+              <option value="cluster">当前簇</option>
+              <option value="peel">全 peel</option>
+            </select></label>
+          <input id="reviewDiscussInput" type="text" maxlength="4000"
+                 placeholder="说明你想询问、修改或应用到相似项的内容（≤4000 字）"
+                 aria-label="讨论消息">
+          <button type="button" id="reviewDiscussSend">发送讨论消息</button>
+        </div>
+        <div class="rr-discuss-members" id="reviewDiscussMembers" hidden></div>
+        <div class="rr-discuss-turns" id="reviewDiscussTurns"></div>
+        <div class="rr-discuss-patch" id="reviewDiscussPatch" hidden></div>
+        <div class="rr-patch-diff" id="reviewPatchDiff" hidden></div>
+        <div class="rr-patch-conflict" id="reviewPatchConflict" hidden></div>
+        <div class="rr-batch-row">
+          <button type="button" id="reviewDiscussAdoptPatch" disabled>采纳该计划 patch（不确认/不应用）</button>
+          <span class="rr-cand-meta">采纳只编辑 draft 计划；确认条目与发布仍需你单独操作。</span>
+        </div>
       </div>
     </div>
   </div>
@@ -1905,6 +2022,49 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
         </ul>
         <div class="rr-batch-row">
           <button type="button" id="reviewOcrConfigOk" class="secondary">关闭</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- CP5 (M2.2) privacy confirmation: shown before EVERY report/discuss
+       provider call. It displays the resolved provider/link/model and the
+       evidence scope; nothing is sent until the explicit #reviewVlmConfirmGo
+       click builds confirmed:true. Cancel/backdrop sends no request. -->
+  <div class="hist-overlay rr-confirm-overlay" id="reviewVlmConfirm" hidden>
+    <div class="hist-dialog rr-confirm" role="alertdialog" aria-modal="true"
+         aria-label="确认发送 VLM 审阅请求">
+      <div class="hist-head">
+        <div>
+          <h2 id="reviewVlmConfirmTitle">确认发送审阅证据给 VLM？</h2>
+          <p>只有你显式确认后才会创建报告/讨论任务；取消不会发送任何请求。
+          远端模型会接触 PDF crop 与证据，请核对 provider、link、model 和
+          发送范围。</p>
+        </div>
+        <button class="hist-close" id="reviewVlmConfirmCancel" type="button"
+                aria-label="Close">&#215;</button>
+      </div>
+      <div class="hist-body settings-body">
+        <div class="rr-vlm-target" id="reviewVlmConfirmTarget"></div>
+        <ul class="rr-vlm-provider" id="reviewVlmConfirmInfo"></ul>
+        <div class="rr-vlm-scope">
+          <label><input type="checkbox" id="reviewVlmScopeCrop" checked>
+            crop 图片</label>
+          <label><input type="checkbox" id="reviewVlmScopeOriginalPage" checked>
+            原页图片</label>
+          <label><input type="checkbox" id="reviewVlmScopeAdjacentPages" checked>
+            相邻页图片</label>
+          <label><input type="checkbox" id="reviewVlmScopeNative" checked>
+            native 文本</label>
+          <label><input type="checkbox" id="reviewVlmScopeOcr" checked>
+            OCR 文本</label>
+          <label><input type="checkbox" id="reviewVlmTextOnly">
+            仅文本（不发送图片）</label>
+        </div>
+        <div class="rr-cand-meta" id="reviewVlmConfirmScope"></div>
+        <div class="rr-batch-row">
+          <button type="button" id="reviewVlmConfirmGo">确认并发送</button>
+          <button type="button" class="secondary"
+                  id="reviewVlmConfirmCancelBtn">取消</button>
         </div>
       </div>
     </div>
@@ -5639,6 +5799,782 @@ async function reviewMaybeAutoOcr(){
   if(!ids.length) return null;
   return await reviewStartOcrRefresh(ids,{auto:true});
 }
+/* ---- CP5 (M2.2): VLM report bar, privacy confirmation, discussion ---------
+   peelfeed owns the VLM provider: capabilities.vlm/vlm_detail/vlm_vision/
+   vlm_model/vlm_link_id/vlm_budget_usd/vlm_spent_usd drive this bar, and the
+   payload's additive report fields (§3.5) drive the provider summary. VLM is
+   NEVER implicit: every report/discuss provider call is preceded by the
+   explicit #reviewVlmConfirm dialog (confirmed:true only on the Go click), and
+   the child-only token never reaches the browser (peekseed passes it in the
+   subprocess env; the UI only shows link id/model). A discussion reply may
+   carry a draft plan patch; adopting it calls the synchronous plan/patches
+   route and only edits the draft plan -- it never confirms/applies/builds. */
+const REVIEW_VLM_INTENT_LABEL={explain:'询问原因',reanalyze:'重新分析',
+  modify:'修改决定',apply_similar:'应用到相似项'};
+const REVIEW_VLM_JOB_TYPES=['report','discuss'];
+function reviewVlmCapabilities(){
+  const data=REVIEW_CTX&&REVIEW_CTX.data;
+  const caps=(data&&data.capabilities&&typeof data.capabilities==='object')
+    ?data.capabilities:{};
+  return caps;
+}
+function reviewVlmUsable(caps){
+  return !!(caps&&caps.vlm===true&&caps.vlm_link_id&&caps.vlm_model);
+}
+function reviewVlmReason(caps){
+  const detail=String((caps&&caps.vlm_detail)||'').trim();
+  return detail||'VLM 未配置：添加一个启用的 answer link，并在部署环境设置其 api_key_env';
+}
+function reviewVlmProviderLabel(caps){
+  const provider=String((caps&&caps.vlm_provider)||'answer_link');
+  if(provider==='env') return 'env（PEELFEED_LLM_*）';
+  return 'answer_link';
+}
+function reviewVlmVisionText(caps){
+  const vision=(caps&&caps.vlm_vision);
+  if(vision===true) return '支持图片';
+  if(vision===false) return '仅文本（不支持图片）';
+  return '图片能力未知（首次调用探测）';
+}
+function reviewVlmBudgetText(caps){
+  if(caps.vlm_budget_usd==null&&caps.vlm_spent_usd==null) return '';
+  return '预算 $'+Number(caps.vlm_budget_usd||0).toFixed(2)
+    +' · 已用 $'+Number(caps.vlm_spent_usd||0).toFixed(2)
+    +(caps.vlm_calls!=null?(' · 调用 '+reviewNum(caps.vlm_calls)):'');
+}
+function reviewVlmBarHtml(){
+  const ctx=REVIEW_CTX; if(!ctx) return '';
+  const caps=reviewVlmCapabilities();
+  const usable=reviewVlmUsable(caps);
+  const reason=reviewVlmReason(caps);
+  const busy=!!(ctx.vlmBusy||ctx.busy);
+  const chips=[];
+  chips.push('<span class="rr-vlm-chip '+(usable?'ok':'warn')+'">'
+    +(usable?'VLM 已配置':'VLM 未配置')+'</span>');
+  if(caps.vlm_provider) chips.push('<span class="rr-vlm-chip">provider '
+    +esc(reviewVlmProviderLabel(caps))+'</span>');
+  if(caps.vlm_model) chips.push('<span class="rr-vlm-chip">model '
+    +esc(String(caps.vlm_model))+'</span>');
+  if(caps.vlm_link_id) chips.push('<span class="rr-vlm-chip">link '
+    +esc(String(caps.vlm_link_id))+'</span>');
+  chips.push('<span class="rr-vlm-chip">'+esc(reviewVlmVisionText(caps))+'</span>');
+  if(caps.vlm_vision===false) chips.push('<span class="rr-vlm-chip warn">text-only</span>');
+  const budget=reviewVlmBudgetText(caps);
+  if(budget) chips.push('<span class="rr-vlm-chip">'+esc(budget)+'</span>');
+  const disabled=(usable&&!busy)?'':' disabled';
+  const tip=usable?'（需显式隐私确认）':('不可用：'+reason);
+  return '<div class="rr-vlm-h">'+chips.join('')
+    +'<button type="button" id="reviewVlmGenerate" data-r="vlm-generate"'+disabled
+    +' title="'+escAttr('生成/更新 VLM 报告'+tip)+'">生成/更新 VLM 报告</button>'
+    +'<button type="button" class="secondary" id="reviewVlmDiscuss" data-r="vlm-discuss"'+disabled
+    +' title="'+escAttr('与 VLM 讨论'+tip)+'">与 VLM 讨论</button>'
+    +'</div>'
+    +(usable?'':'<div class="rr-vlm-detail">'+esc(reason)
+      +'；规则报告仍可用，选择/确认/发布不受影响。</div>');
+}
+function paintReviewVlmBar(){
+  const el=$('#reviewVlmBar'); if(!el) return;
+  if(!REVIEW_CTX){ el.innerHTML=''; return; }
+  el.innerHTML=reviewVlmBarHtml();
+}
+function reviewReportProviderInfo(r){
+  const rep=(r&&r.report&&typeof r.report==='object')?r.report:null;
+  if(!rep) return null;
+  const inner=(rep.report&&typeof rep.report==='object')?rep.report:rep;
+  const provider=(rep.provider&&typeof rep.provider==='object')
+    ?rep.provider:((inner&&inner.provider)||{});
+  const counts=(rep.counts&&typeof rep.counts==='object')
+    ?rep.counts:((inner&&inner.counts)||{});
+  return {rep:rep,inner:inner,provider:provider,counts:counts};
+}
+function reviewReportProviderHtml(r){
+  const info=reviewReportProviderInfo(r);
+  if(!info) return '';
+  const provider=info.provider||{};
+  const kind=String(provider.kind||'rule');
+  const bits=[];
+  bits.push(reviewBadge(kind==='vlm'?'VLM':'规则',kind==='vlm'?'vlm':'rule'));
+  if(provider.model) bits.push('<span class="rr-provider-meta">model '
+    +esc(String(provider.model))+'</span>');
+  if(provider.prompt_version) bits.push('<span class="rr-provider-meta">prompt '
+    +esc(String(provider.prompt_version))+'</span>');
+  if(provider.link_id) bits.push('<span class="rr-provider-meta">link '
+    +esc(String(provider.link_id))+'</span>');
+  const vision=(provider.vision===true)?'支持图片'
+    :((provider.vision===false)?'仅文本':'图片未知');
+  bits.push('<span class="rr-provider-meta">'+esc(vision)+'</span>');
+  if(provider.cached) bits.push('<span class="rr-provider-meta">缓存命中</span>');
+  if(provider.text_only) bits.push('<span class="rr-vlm-chip warn">text-only</span>');
+  if(info.rep.stale) bits.push('<span class="rr-vlm-chip warn">报告已过期</span>');
+  const counts=info.counts||{};
+  const usage=(info.inner&&info.inner.llm_usage)
+    ||(info.rep&&info.rep.llm_usage)||null;
+  const failures=((info.inner&&info.inner.partial_failures)
+    ||(info.rep&&info.rep.partial_failures)||[]).filter(function(f){
+      return f&&typeof f==='object'; });
+  let html='<div class="rr-provider-h">'+bits.join(' ')+'</div>'
+    +'<div class="rr-provider-meta">VLM 建议 '+reviewNum(counts.vlm_suggestions||0)
+    +' · 澄清问题 '+reviewNum(counts.clarifications||0)
+    +' · 校验失败 '+reviewNum(counts.failed_checks||0)
+    +(usage?(' · 调用 '+reviewNum(usage.calls||0)
+      +' · tokens '+reviewNum(Number(usage.tokens_input||0)
+        +Number(usage.tokens_output||0))
+      +' · 费用 $'+esc(String(usage.cost_usd||'0.00'))):'')
+    +'</div>';
+  if(failures.length){
+    html+='<div class="rr-provider-meta">部分簇失败（保留上一份报告与人工修改）：</div>'
+      +'<ul class="rr-provider-fail">'+failures.slice(0,6).map(function(f){
+        return '<li>'+esc(String(f.cluster_id||'')+' · '
+          +reviewFailureLabel(f.code)+' — '+String(f.message||''))+'</li>';
+      }).join('')+'</ul>';
+  }
+  return html;
+}
+function paintReviewReportProvider(r){
+  const el=$('#reviewReportProvider'); if(!el) return;
+  const html=reviewReportProviderHtml(r||(REVIEW_CTX&&REVIEW_CTX.data));
+  el.hidden=!html;
+  el.innerHTML=html;
+}
+function reviewClarifications(r){
+  const out=[]; const seen={};
+  const clusters=((r||(REVIEW_CTX&&REVIEW_CTX.data))||{}).clusters||[];
+  clusters.forEach(function(cl){
+    if(!cl||typeof cl!=='object') return;
+    ((cl.clarifications||[])).forEach(function(question){
+      if(!question||typeof question!=='object') return;
+      const text=String(question.question||'');
+      if(!text||seen[text]) return;
+      seen[text]=true;
+      out.push({question:text,
+        options:(question.options||[]).filter(function(option){
+          return option!=null&&String(option).trim(); }),
+        item_id:String(question.item_id||''),
+        cluster_id:String(cl.cluster_id||'')});
+    });
+  });
+  return out;
+}
+function reviewClarificationsHtml(r){
+  const list=reviewClarifications(r);
+  if(!list.length) return '';
+  return '<div class="rr-provider-meta">需要你回答的澄清问题（点击候选答案会发送一条讨论消息，'
+    +'不会直接产生 operation）</div>'
+    +list.map(function(clar){
+      return '<div class="rr-clar-q"><span>'+esc(clar.question)+'</span>'
+        +(clar.item_id?'<span class="rr-clar-item">'+esc(clar.item_id)+'</span>':'')
+        +'<span class="rr-clar-opts">'+(clar.options||[]).map(function(option){
+          return '<button type="button" class="secondary" data-r="clarify-answer"'
+            +' data-question="'+escAttr(clar.question)+'"'
+            +' data-item="'+escAttr(clar.item_id)+'"'
+            +' data-cluster="'+escAttr(clar.cluster_id)+'"'
+            +' data-option="'+escAttr(String(option))+'">'+esc(String(option))+'</button>';
+        }).join('')+'</span></div>';
+    }).join('');
+}
+function paintReviewClarifications(r){
+  const el=$('#reviewClarifications'); if(!el) return;
+  const html=reviewClarificationsHtml(r||(REVIEW_CTX&&REVIEW_CTX.data));
+  el.hidden=!html;
+  el.innerHTML=html;
+}
+function reviewVlmJobs(){
+  const ctx=REVIEW_CTX; if(!ctx) return [];
+  return Object.keys(ctx.jobs||{}).map(function(jobId){
+    return ctx.jobs[jobId]; }).filter(function(job){
+      if(!job) return false;
+      const type=String(job.type||((job.descriptor||{}).type)||'');
+      return REVIEW_VLM_JOB_TYPES.indexOf(type)>=0;
+    }).sort(function(a,b){
+      return String((b.descriptor&&b.descriptor.created_at)||'')
+        .localeCompare(String((a.descriptor&&a.descriptor.created_at)||''));
+    });
+}
+function reviewVlmJobRowHtml(job){
+  const record=(job&&job.record)||{};
+  const status=String((job&&job.status)||record.status||'');
+  const type=String((job&&job.type)||record.type||'');
+  const progress=(record&&record.progress)||{};
+  const bits=[reviewJobTypeLabel(type),reviewJobStatusLabel(status)];
+  if(progress.stage) bits.push('阶段 '+progress.stage);
+  if(progress.done!=null) bits.push('进度 '+progress.done
+    +(progress.total!=null?('/'+progress.total):''));
+  let html='<div class="rr-job" data-vlm-job="'+escAttr((job&&job.job_id)||'')+'">'
+    +'<div class="rr-job-h">'+esc(bits.join(' · '))
+    +'<span class="rr-job-id">'+esc((job&&job.job_id)||'')+'</span></div>';
+  if(status==='failed') html+='<div class="rr-job-hint">'
+    +esc(reviewJobError(record))+'</div>';
+  if(status==='interrupted'){
+    html+='<div class="rr-job-hint">任务中断，可手动重试（不会自动重跑；'
+      +'重试会再次要求隐私确认）</div>'
+      +'<div class="rr-batch-row"><button type="button" class="secondary"'
+      +' data-r="vlm-retry" data-job="'+escAttr((job&&job.job_id)||'')+'"'
+      +' data-type="'+escAttr(type)+'">手动重试</button></div>';
+  }
+  if(status==='done'&&record.result_ref) html+='<div class="rr-cand-meta">结果：'
+    +esc(String(record.result_ref))+'</div>';
+  html+='</div>';
+  return html;
+}
+function paintReviewVlmJob(){
+  const ctx=REVIEW_CTX; const el=$('#reviewVlmJob'); if(!el) return;
+  const jobs=reviewVlmJobs();
+  if(!jobs.length){ el.hidden=true; el.innerHTML=''; return; }
+  el.hidden=false;
+  el.innerHTML='<div class="rr-batch-h"><h4>VLM 后台任务</h4>'
+    +'<span class="rr-cand-meta">报告/讨论 job；中断后只能手动重试</span></div>'
+    +jobs.slice(0,6).map(reviewVlmJobRowHtml).join('');
+}
+async function reviewVlmPollJob(jobId,type){
+  const ctx=REVIEW_CTX; if(!ctx) return null;
+  const job=ctx.jobs[jobId]||(ctx.jobs[jobId]={job_id:jobId,type:type||'',
+    status:'queued',record:null,descriptor:null});
+  for(let i=0;i<900;i++){
+    let record=null;
+    try{
+      record=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+        +'/jobs/'+encodeURIComponent(jobId));
+    }catch(e){
+      reviewMsg('无法读取 VLM 任务状态：'+reviewErrText(e),true);
+      return null;
+    }
+    job.record=record;
+    job.status=String((record&&record.status)||job.status||'');
+    if(!job.type) job.type=String((record&&record.type)||'');
+    paintReviewVlmJob();
+    if(REVIEW_JOB_TERMINAL.indexOf(job.status)>=0) return record;
+    await sleep(700);
+  }
+  reviewMsg('VLM 任务仍在后台运行；不会自动重跑，稍后点“刷新”查看。',false);
+  return null;
+}
+async function reviewVlmResultSummary(jobId){
+  const ctx=REVIEW_CTX; if(!ctx||!jobId) return null;
+  try{
+    const path='extract/review/jobs/'+jobId+'.result.json';
+    const url='/api/datasets/'+encodeURIComponent(ctx.dataset)+'/sources/'
+      +encodeURIComponent(ctx.sha)+'/assets/'
+      +String(path).split('/').map(encodeURIComponent).join('/');
+    const response=await fetch(url);
+    if(!response.ok) return null;
+    return await response.json();
+  }catch(e){ return null; }
+}
+/* --- explicit privacy confirmation (before EVERY provider call) ---------- */
+function setReviewVlmScope(textOnly,forceTextOnly){
+  const imageIds=['reviewVlmScopeCrop','reviewVlmScopeOriginalPage',
+    'reviewVlmScopeAdjacentPages'];
+  imageIds.forEach(function(id){
+    const el=$('#'+id); if(!el) return;
+    el.disabled=!!textOnly; el.checked=!textOnly;
+  });
+  const native=$('#reviewVlmScopeNative'); if(native) native.checked=true;
+  const ocr=$('#reviewVlmScopeOcr'); if(ocr) ocr.checked=true;
+  const textOnlyEl=$('#reviewVlmTextOnly');
+  if(textOnlyEl){ textOnlyEl.checked=!!forceTextOnly; textOnlyEl.disabled=false; }
+}
+function reviewVlmScopeFlags(){
+  const checked=function(id){ const el=$('#'+id); return !!(el&&el.checked); };
+  const textOnly=!!(($('#reviewVlmTextOnly')||{}).checked);
+  return {
+    include_crop:!textOnly&&checked('reviewVlmScopeCrop'),
+    include_original_page:!textOnly&&checked('reviewVlmScopeOriginalPage'),
+    include_adjacent_pages:!textOnly&&checked('reviewVlmScopeAdjacentPages'),
+    include_native:checked('reviewVlmScopeNative'),
+    include_ocr:checked('reviewVlmScopeOcr'),
+  };
+}
+function paintReviewVlmConfirmScope(){
+  const el=$('#reviewVlmConfirmScope'); if(!el) return;
+  const flags=reviewVlmScopeFlags();
+  el.textContent='将发送：crop '+(flags.include_crop?'✓':'×')
+    +' · 原页 '+(flags.include_original_page?'✓':'×')
+    +' · 相邻页 '+(flags.include_adjacent_pages?'✓':'×')
+    +' · native '+(flags.include_native?'✓':'×')
+    +' · OCR '+(flags.include_ocr?'✓':'×')
+    +'；只有点“确认并发送”才会创建任务。';
+}
+function reviewVlmConfirmOpen(kind,payload){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const caps=reviewVlmCapabilities();
+  if(!reviewVlmUsable(caps)){
+    reviewMsg(reviewVlmReason(caps)+'；规则报告仍可用。',true);
+    return;
+  }
+  const dialog=$('#reviewVlmConfirm'); if(!dialog) return;
+  ctx.vlmConfirm={kind:kind,payload:payload||{}};
+  const title=$('#reviewVlmConfirmTitle');
+  if(title) title.textContent=(kind==='report'
+    ?'确认生成/更新 VLM 报告？'
+    :(kind==='clarify'?'确认发送澄清回答（讨论消息）？'
+      :'确认发送讨论消息给 VLM？'));
+  const target=$('#reviewVlmConfirmTarget');
+  if(target) target.textContent=String((payload&&payload.target)||'');
+  const info=$('#reviewVlmConfirmInfo');
+  if(info){
+    info.innerHTML='<li>provider <code>'+esc(reviewVlmProviderLabel(caps))+'</code></li>'
+      +'<li>link <code>'+esc(String(caps.vlm_link_id||'—'))+'</code></li>'
+      +'<li>model <code>'+esc(String(caps.vlm_model||'—'))+'</code></li>'
+      +'<li>图片能力 <code>'+esc(reviewVlmVisionText(caps))+'</code></li>'
+      +'<li>证据范围 <code>项 '
+      +reviewNum(((payload&&payload.resolved&&payload.resolved.item_ids)||[]).length)
+      +' / 簇 '
+      +reviewNum(((payload&&payload.resolved&&payload.resolved.cluster_ids)||[]).length)
+      +'</code></li>';
+  }
+  setReviewVlmScope(caps.vlm_vision===false,!!(payload&&payload.textOnly));
+  paintReviewVlmConfirmScope();
+  dialog.hidden=false;
+  const go=$('#reviewVlmConfirmGo'); if(go) go.focus();
+}
+function reviewVlmConfirmClose(){
+  const dialog=$('#reviewVlmConfirm'); if(dialog) dialog.hidden=true;
+  const ctx=REVIEW_CTX; if(ctx) ctx.vlmConfirm=null;
+}
+function reviewVlmConfirmed(){
+  const ctx=REVIEW_CTX; const pending=ctx&&ctx.vlmConfirm;
+  if(!pending) return;
+  const caps=reviewVlmCapabilities()||{};
+  const payload=pending.payload||{};
+  const linkId=String(caps.vlm_link_id||'');
+  const model=String(caps.vlm_model||'');
+  if(!linkId||!model){
+    reviewMsg('VLM 配置不完整（缺少 link/model）；请先在设置里配置 answer link。',true);
+    return;
+  }
+  const flags=reviewVlmScopeFlags();
+  const resolved=(payload&&payload.resolved)||{};
+  const confirmation={
+    confirmed:true,
+    provider:String(caps.vlm_provider||'answer_link'),
+    link_id:linkId,
+    model:model,
+    scope:{
+      item_ids:((resolved.item_ids)||[]).slice().sort(),
+      cluster_ids:((resolved.cluster_ids)||[]).slice().sort(),
+      include_crop:flags.include_crop,
+      include_original_page:flags.include_original_page,
+      include_adjacent_pages:flags.include_adjacent_pages,
+      include_native:flags.include_native,
+      include_ocr:flags.include_ocr,
+    },
+  };
+  const kind=pending.kind;
+  reviewVlmConfirmClose();
+  if(kind==='report') return reviewVlmStartReport(payload,confirmation);
+  return reviewVlmStartDiscuss(payload,confirmation);
+}
+async function reviewVlmStartReport(payload,confirmation){
+  const ctx=REVIEW_CTX; if(!ctx||ctx.vlmBusy) return;
+  ctx.vlmBusy=true; paintReviewVlmBar(); paintReviewDiscuss();
+  reviewMsg('正在创建 VLM 报告任务（已确认发送范围）…');
+  try{
+    const rep=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/reports',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({mode:'vlm',confirmation:confirmation})});
+    const jobId=String((rep&&rep.job_id)||'');
+    if(!jobId){ reviewMsg('服务器没有返回 VLM 报告 job_id。',true); return; }
+    ctx.jobs[jobId]={job_id:jobId,type:'report',
+      status:String(rep.status||'queued'),record:null,
+      descriptor:{type:'report',created_at:'',batch_id:null,conversation_id:null}};
+    paintReviewVlmJob(); paintReviewBatch();
+    await reviewLoadSource();
+    reviewMsg('VLM 报告任务已提交（'+jobId+'），正在轮询状态…');
+    const record=await reviewVlmPollJob(jobId,'report');
+    if(record&&record.status==='done'){
+      await refreshReview();
+      reviewMsg('VLM 报告已生成；报告只更新建议，未覆盖编辑中的 draft 计划'
+        +'（确认/发布仍需你单独操作）。',false);
+    }else if(record&&record.status==='interrupted'){
+      reviewMsg('VLM 报告任务中断，可手动重试（不会自动重跑）。',true);
+    }else if(record&&record.status==='failed'){
+      reviewMsg('VLM 报告失败：'+reviewJobError(record),true);
+    }
+  }catch(e){
+    reviewMsg('生成 VLM 报告失败：'+reviewErrText(e),true);
+    await reviewLoadSource(); paintReviewVlmJob();
+  }finally{
+    ctx.vlmBusy=false; paintReviewVlmBar(); paintReviewVlmJob();
+  }
+}
+async function reviewVlmStartDiscuss(payload,confirmation){
+  const ctx=REVIEW_CTX; if(!ctx||ctx.vlmBusy) return;
+  const body={scope:payload.scope,message:payload.message,
+    base_plan_version:Number(payload.base_plan_version||0),
+    confirmation:confirmation};
+  if(ctx.discussConversationId) body.conversation_id=ctx.discussConversationId;
+  ctx.vlmBusy=true; paintReviewVlmBar(); paintReviewDiscuss();
+  reviewMsg('正在创建讨论任务（已确认发送范围）…');
+  try{
+    const rep=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/discussions',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    const jobId=String((rep&&rep.job_id)||'');
+    const conversationId=String((rep&&rep.conversation_id)||'');
+    if(!jobId||!conversationId){
+      reviewMsg('服务器没有返回讨论 job_id/conversation_id。',true); return;
+    }
+    ctx.discussConversationId=conversationId;
+    ctx.discussTurns.push({role:'user',message:String(payload.message||''),at:''});
+    ctx.jobs[jobId]={job_id:jobId,type:'discuss',
+      status:String(rep.status||'queued'),record:null,
+      descriptor:{type:'discuss',created_at:'',batch_id:null,
+        conversation_id:conversationId}};
+    paintReviewDiscuss(); paintReviewVlmJob();
+    await reviewLoadSource();
+    reviewMsg('讨论任务已提交（'+jobId+'），正在轮询状态…');
+    const record=await reviewVlmPollJob(jobId,'discuss');
+    if(record&&record.status==='done'){
+      const turn=await reviewVlmResultSummary(jobId);
+      if(turn){
+        ctx.discussTurns.push({role:'assistant',reply:turn.reply,
+          intent:turn.intent,at:turn.at,uncertainties:turn.uncertainties,
+          clarifications:turn.clarifications,patch:turn.patch});
+        if(turn.patch){ ctx.pendingPatch=turn.patch; ctx.patchDiff=null;
+          ctx.patchConflict=''; }
+        paintReviewDiscuss();
+      }
+      await refreshReview();
+      reviewMsg('VLM 已回复；若返回计划 patch，可预览成员/边界并在下方显式采纳'
+        +'（只编辑 draft，不确认/不应用）。',false);
+    }else if(record&&record.status==='interrupted'){
+      reviewMsg('讨论任务中断，可手动重试（不会自动重跑）。',true);
+    }else if(record&&record.status==='failed'){
+      reviewMsg('讨论失败：'+reviewJobError(record),true);
+    }
+  }catch(e){
+    reviewMsg('发送讨论失败：'+reviewErrText(e),true);
+    await reviewLoadSource(); paintReviewVlmJob();
+  }finally{
+    ctx.vlmBusy=false; paintReviewVlmBar(); paintReviewDiscuss();
+  }
+}
+function reviewDiscussAnchorItem(){
+  const ctx=REVIEW_CTX; if(!ctx) return null;
+  const checked=reviewSelectedItemIds();
+  if(checked.length) return ctx.itemsById[checked[0]]||null;
+  const clusters=((ctx.data&&ctx.data.clusters)||[]);
+  const cl=clusters.find(function(candidate){
+    return candidate.cluster_id===ctx.selected; });
+  if(cl&&cl.representative_item_id) return ctx.itemsById[cl.representative_item_id]||null;
+  return null;
+}
+function reviewDiscussAnchorClusterId(){
+  const ctx=REVIEW_CTX; if(!ctx) return '';
+  const item=reviewDiscussAnchorItem();
+  if(item&&item.cluster_id) return String(item.cluster_id);
+  return String(ctx.selected||'');
+}
+function reviewDiscussScopeValue(){
+  const el=$('#reviewDiscussScope');
+  return el?String(el.value||'cluster'):'cluster';
+}
+function reviewDiscussResolvedScope(scopeValue){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return null;
+  const data=ctx.data;
+  const allItems=(data.items||[]).map(function(item){
+    return String(item.id||''); }).filter(Boolean);
+  const allClusters=(data.clusters||[]).map(function(cl){
+    return String(cl.cluster_id||''); }).filter(Boolean);
+  if(scopeValue==='item'){
+    const item=reviewDiscussAnchorItem();
+    if(!item) return null;
+    return {scope:{item_id:String(item.id)},
+      item_ids:[String(item.id)],cluster_ids:[]};
+  }
+  if(scopeValue==='cluster'){
+    const clusterId=reviewDiscussAnchorClusterId();
+    if(!clusterId) return null;
+    const cl=(data.clusters||[]).find(function(candidate){
+      return candidate.cluster_id===clusterId; });
+    const ids=(((cl&&cl.item_ids)||[]).length
+      ?(cl.item_ids||[])
+      :allItems.filter(function(id){
+        const item=ctx.itemsById[id];
+        return item&&item.cluster_id===clusterId; }))
+      .map(String).sort();
+    return {scope:{cluster_id:clusterId},
+      item_ids:ids,cluster_ids:[clusterId]};
+  }
+  return {scope:{peel:true},
+    item_ids:allItems.slice().sort(),cluster_ids:allClusters.slice().sort()};
+}
+function reviewDiscussAnchorText(){
+  const scopeValue=reviewDiscussScopeValue();
+  const resolved=reviewDiscussResolvedScope(scopeValue);
+  if(!resolved) return '范围不可用：先选择一个簇或勾选条目，或切换到全 peel。';
+  if(scopeValue==='item') return '锚定当前项 '+resolved.scope.item_id;
+  if(scopeValue==='cluster'){
+    return '锚定当前簇 '+resolved.scope.cluster_id
+      +'（'+resolved.item_ids.length+' 项）';
+  }
+  return '全 peel（'+resolved.item_ids.length+' 项 / '
+    +resolved.cluster_ids.length+' 簇；只返回成员预览与 patch，不批量执行）';
+}
+function reviewDiscussTurnHtml(turn){
+  if(!turn||typeof turn!=='object') return '';
+  const role=String(turn.role||'assistant');
+  const intent=String(turn.intent||'');
+  const bits=[role==='user'?'你':'VLM'];
+  if(intent) bits.push(REVIEW_VLM_INTENT_LABEL[intent]||intent);
+  if(turn.at) bits.push(String(turn.at));
+  const text=String(turn.message||turn.reply||'');
+  const uncertainties=(turn.uncertainties||[]).filter(Boolean);
+  const clarifications=(turn.clarifications||[]).filter(function(question){
+    return question&&question.question; });
+  return '<div class="rr-turn '+escAttr(role)+'">'
+    +'<div class="rr-turn-h">'+esc(bits.join(' · '))+'</div>'
+    +'<div>'+esc(text)+'</div>'
+    +(uncertainties.length?'<div class="rr-provider-meta">不确定点：'
+      +esc(uncertainties.join('；'))+'</div>':'')
+    +(clarifications.length?'<div class="rr-provider-meta">澄清问题：'
+      +esc(clarifications.map(function(question){
+        return String(question.question); }).join('；'))+'</div>':'')
+    +(turn.patch?'<div class="rr-turn-intent">返回了计划 patch（draft，未应用）</div>':'')
+    +'</div>';
+}
+function paintReviewDiscussMembers(){
+  const ctx=REVIEW_CTX; const el=$('#reviewDiscussMembers'); if(!el) return;
+  const patch=ctx&&ctx.pendingPatch;
+  if(!patch||typeof patch!=='object'){ el.hidden=true; el.innerHTML=''; return; }
+  const members=(patch.members||[]).filter(Boolean);
+  const exclusions=(patch.exclusions||[]).filter(Boolean);
+  const boundary=(patch.boundary_cases||[]).filter(Boolean);
+  el.hidden=false;
+  el.innerHTML='<div class="rr-provider-meta">成员预览（只读；CP5 不执行批量）：</div>'
+    +'<div>正例 '+reviewNum(members.length)+'：'
+    +esc(members.slice(0,12).join(', ')||'—')
+    +(members.length>12?' …':'')+'</div>'
+    +(boundary.length?'<div>边界例 '+reviewNum(boundary.length)+'：'
+      +esc(boundary.slice(0,8).join(', '))+'</div>':'')
+    +(exclusions.length?'<div>排除项 '+reviewNum(exclusions.length)+'：'
+      +esc(exclusions.slice(0,8).join(', '))+'</div>':'');
+}
+function reviewPatchChangesText(patch){
+  return ((patch&&patch.changes)||[]).slice(0,10).map(function(change){
+    const op=String(change.op||'');
+    const item=String(change.item_id||'');
+    const strategy=String((change.strategy&&change.strategy.id)||'');
+    return op+' '+item+(strategy?(' · '+strategy):'');
+  }).join('；');
+}
+function paintReviewDiscussPatch(){
+  const ctx=REVIEW_CTX; const el=$('#reviewDiscussPatch'); if(!el) return;
+  const patch=ctx&&ctx.pendingPatch;
+  if(!patch||typeof patch!=='object'){ el.hidden=true; el.innerHTML=''; return; }
+  el.hidden=false;
+  const scope=(patch.scope&&typeof patch.scope==='object')?patch.scope:{};
+  el.innerHTML='<div><b>VLM 计划 patch 预览</b>（draft；采纳只编辑计划，不确认/不应用）</div>'
+    +'<div>范围 '+esc(String(scope.kind||''))
+    +(scope.item_id?' · 项 '+esc(String(scope.item_id)):'')
+    +(scope.cluster_id?' · 簇 '+esc(String(scope.cluster_id)):'')+'</div>'
+    +'<div>变更 '+reviewNum(((patch.changes)||[]).length)+'：'
+    +esc(reviewPatchChangesText(patch))+'</div>';
+}
+function paintReviewDiscuss(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const panel=$('#reviewDiscuss'); if(!panel) return;
+  const anchor=$('#reviewDiscussAnchor');
+  if(anchor) anchor.textContent=reviewDiscussAnchorText();
+  const select=$('#reviewDiscussScope');
+  const item=reviewDiscussAnchorItem();
+  const clusterId=reviewDiscussAnchorClusterId();
+  if(select){
+    const itemOption=select.querySelector('option[value="item"]');
+    const clusterOption=select.querySelector('option[value="cluster"]');
+    if(itemOption) itemOption.disabled=!item;
+    if(clusterOption) clusterOption.disabled=!clusterId;
+    if(select.value==='item'&&!item) select.value=clusterId?'cluster':'peel';
+    if(select.value==='cluster'&&!clusterId) select.value='peel';
+  }
+  const turns=$('#reviewDiscussTurns');
+  if(turns){
+    turns.innerHTML=(ctx.discussTurns||[]).map(reviewDiscussTurnHtml).join('')
+      ||'<span class="hist-empty">还没有讨论回合。发送消息后，VLM 的解释、'
+        +'澄清问题和计划 patch 会显示在这里。</span>';
+  }
+  paintReviewDiscussMembers();
+  paintReviewDiscussPatch();
+  paintReviewPatchDiff();
+  paintReviewPatchConflict();
+  const adopt=$('#reviewDiscussAdoptPatch');
+  if(adopt) adopt.disabled=!(ctx.pendingPatch&&!ctx.patchConflict&&!ctx.vlmBusy);
+}
+function paintReviewPatchDiff(){
+  const ctx=REVIEW_CTX; const el=$('#reviewPatchDiff'); if(!el) return;
+  const diff=ctx&&ctx.patchDiff;
+  if(!diff||typeof diff!=='object'){ el.hidden=true; el.innerHTML=''; return; }
+  const added=(diff.added||[]).filter(Boolean);
+  const changed=(diff.changed||[]).filter(function(change){
+    return change&&typeof change==='object'; });
+  const removed=(diff.removed||[]).filter(Boolean);
+  el.hidden=false;
+  let html='<div><b>计划 diff</b>（服务器定向 diff；未确认、未应用）</div>';
+  if(added.length){
+    html+='<div>新增 '+reviewNum(added.length)+'：'
+      +esc(added.slice(0,10).map(function(entry){
+        return String(entry.item_id||''); }).join(', '))+'</div>';
+  }
+  if(changed.length){
+    html+='<div>变更 '+reviewNum(changed.length)+'：'
+      +esc(changed.slice(0,10).map(function(change){
+        const before=String(((change.before||{}).strategy||{}).id||'');
+        const after=String(((change.after||{}).strategy||{}).id||'');
+        return String(change.item_id||'')
+          +(before||after?(' '+before+'→'+after):'');
+      }).join('；'))+'</div>';
+  }
+  if(removed.length){
+    html+='<div>删除 '+reviewNum(removed.length)+'：'
+      +esc(removed.slice(0,10).map(function(entry){
+        return String(entry.item_id||''); }).join(', '))+'</div>';
+  }
+  html+='<div>未变化 '+reviewNum(diff.unchanged||0)+'</div>';
+  el.innerHTML=html;
+}
+function paintReviewPatchConflict(){
+  const ctx=REVIEW_CTX; const el=$('#reviewPatchConflict'); if(!el) return;
+  const text=ctx&&ctx.patchConflict;
+  if(!text){ el.hidden=true; el.innerHTML=''; return; }
+  el.hidden=false;
+  el.innerHTML='<b>采纳冲突（409）</b>：'+esc(String(text))
+    +'。采纳按钮已禁用；请先解锁/处理冲突条目，或重新讨论生成 patch。';
+}
+function reviewVlmGenerateOpen(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return;
+  const caps=reviewVlmCapabilities();
+  if(!reviewVlmUsable(caps)){
+    reviewMsg(reviewVlmReason(caps)+'；规则报告仍可用。',true); return;
+  }
+  const itemIds=((ctx.data.items||[]).map(function(item){
+    return String(item.id||''); }).filter(Boolean)).sort();
+  const clusterIds=((ctx.data.clusters||[]).map(function(cl){
+    return String(cl.cluster_id||''); }).filter(Boolean)).sort();
+  reviewVlmConfirmOpen('report',{
+    target:'生成/更新全 peel VLM 报告（'+itemIds.length+' 项 / '
+      +clusterIds.length+' 簇）',
+    scope:{},
+    resolved:{item_ids:itemIds,cluster_ids:clusterIds},
+    textOnly:caps.vlm_vision===false,
+  });
+}
+function reviewDiscussOpen(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const caps=reviewVlmCapabilities();
+  const panel=$('#reviewDiscuss'); if(!panel) return;
+  panel.hidden=false;
+  if(!reviewVlmUsable(caps)){
+    reviewMsg(reviewVlmReason(caps)+'；规则报告仍可用。',true);
+  }
+  paintReviewDiscuss();
+}
+function reviewDiscussSendOpen(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return;
+  const caps=reviewVlmCapabilities();
+  if(!reviewVlmUsable(caps)){
+    reviewMsg(reviewVlmReason(caps)+'；规则报告仍可用。',true); return;
+  }
+  const input=$('#reviewDiscussInput');
+  const message=String((input&&input.value)||'').trim();
+  if(!message){ reviewMsg('先输入讨论消息（≤4000 字）。',true); return; }
+  if(message.length>4000){
+    reviewMsg('讨论消息不能超过 4000 字。',true); return;
+  }
+  const scopeValue=reviewDiscussScopeValue();
+  const resolved=reviewDiscussResolvedScope(scopeValue);
+  if(!resolved){
+    reviewMsg('当前范围不可用：先选择一个簇或勾选条目，或切换到全 peel。',
+      true); return;
+  }
+  const plan=(ctx.data.plan&&typeof ctx.data.plan==='object')?ctx.data.plan:{};
+  reviewVlmConfirmOpen('discuss',{
+    target:'与 VLM 讨论 · '+reviewDiscussAnchorText(),
+    message:message,
+    scope:resolved.scope,
+    resolved:{item_ids:resolved.item_ids,cluster_ids:resolved.cluster_ids},
+    base_plan_version:Number(plan.plan_version||0),
+    textOnly:caps.vlm_vision===false,
+  });
+}
+function reviewClarificationAnswer(btn){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const caps=reviewVlmCapabilities();
+  if(!reviewVlmUsable(caps)){
+    reviewMsg(reviewVlmReason(caps)+'；规则报告仍可用。',true); return;
+  }
+  const option=String(btn.getAttribute('data-option')||'');
+  const question=String(btn.getAttribute('data-question')||'');
+  const itemId=String(btn.getAttribute('data-item')||'');
+  const clusterId=String(btn.getAttribute('data-cluster')||'');
+  if(!option){ reviewMsg('该澄清问题没有候选答案。',true); return; }
+  const message=option+(question?('（回答：'+question+'）'):'');
+  const scope=itemId?{item_id:itemId}
+    :(clusterId?{cluster_id:clusterId}:{peel:true});
+  const plan=(ctx.data&&ctx.data.plan&&typeof ctx.data.plan==='object')
+    ?ctx.data.plan:{};
+  reviewDiscussOpen();
+  const input=$('#reviewDiscussInput');
+  if(input) input.value=message;
+  reviewVlmConfirmOpen('clarify',{
+    target:'澄清回答（讨论消息）'+(itemId?' · 项 '+itemId:'')
+      +(clusterId&&!itemId?' · 簇 '+clusterId:''),
+    message:message,
+    scope:scope,
+    resolved:{item_ids:itemId?[itemId]:[],
+      cluster_ids:clusterId?[clusterId]:[]},
+    base_plan_version:Number(plan.plan_version||0),
+    textOnly:caps.vlm_vision===false,
+  });
+}
+async function reviewDiscussAdoptPatch(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.pendingPatch) return;
+  if(ctx.patchConflict){
+    reviewMsg('该 patch 存在冲突，采纳已禁用；请先处理冲突条目。',true); return;
+  }
+  if(ctx.vlmBusy) return;
+  const plan=(ctx.data&&ctx.data.plan&&typeof ctx.data.plan==='object')
+    ?ctx.data.plan:{};
+  const body={base_plan_version:Number(plan.plan_version||0),
+    patch:ctx.pendingPatch,source:'vlm'};
+  if(ctx.discussConversationId) body.conversation_id=ctx.discussConversationId;
+  ctx.vlmBusy=true; paintReviewDiscuss(); paintReviewVlmBar();
+  reviewMsg('正在采纳计划 patch（同步校验，不确认/不应用）…');
+  try{
+    const result=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/plan/patches',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(body)});
+    ctx.patchDiff=(result&&result.diff)||null;
+    ctx.patchConflict='';
+    const version=Number((result&&result.plan_version)||0);
+    await refreshReview('计划 patch 已采纳（draft，计划 v'+version+'）。');
+    reviewMsg('patch 已进入 draft 计划（v'+version
+      +'）；未确认、未应用、未触发构建。',false);
+  }catch(e){
+    if(e&&e.status===409){
+      ctx.patchConflict=String((e&&e.message)||'冲突');
+      ctx.patchDiff=null;
+      reviewMsg('采纳 patch 冲突：'+reviewErrText(e),true);
+      await refreshReview();
+    }else{
+      reviewMsg('采纳 patch 失败：'+reviewErrText(e),true);
+    }
+  }finally{
+    ctx.vlmBusy=false; paintReviewDiscuss(); paintReviewVlmBar();
+  }
+}
+function reviewVlmRetry(btn){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const type=String((btn&&btn.getAttribute('data-type'))||'');
+  if(type==='report'){ reviewVlmGenerateOpen(); return; }
+  if(type==='discuss'){
+    reviewDiscussOpen();
+    const input=$('#reviewDiscussInput');
+    if(input&&String(input.value||'').trim()) reviewDiscussSendOpen();
+    else reviewMsg('重试讨论需要先输入消息；中断的任务不会自动重跑。',true);
+    return;
+  }
+  reviewMsg('该 VLM 任务类型暂不支持手动重试。',true);
+}
 function reviewKey(dsId,sha){ return dsId+'|'+(sha||''); }
 function reviewBase(dsId,sha){
   return '/api/datasets/'+encodeURIComponent(dsId)+'/sources/'+encodeURIComponent(sha)+'/review';
@@ -5702,8 +6638,16 @@ function reviewStatusClass(status){
   if(s==='needs_decision'||s==='deferred'||s==='pending_evidence'||s==='pending_report'
      ||s==='partial'||s==='needs_ocr') return 'warn';
   if(s==='failed_check'||s==='stale'||s==='unsupported') return 'bad';
-  if(s==='draft'||s==='deterministic_candidate') return 'accent';
+  if(s==='draft'||s==='deterministic_candidate'||s==='vlm') return 'accent';
   return 'muted';
+}
+/* CP5: report suggestions carry an additive source badge (规则/VLM) so a VLM
+   suggestion is never mistaken for a deterministic rule suggestion. */
+function reviewSuggestionSourceBadge(suggestion){
+  const source=String((suggestion&&suggestion.source)||'');
+  if(source==='vlm') return reviewBadge('VLM','vlm');
+  if(source==='rule') return reviewBadge('规则','rule');
+  return '';
 }
 function reviewBadge(label,status){
   return '<span class="rr-badge '+reviewStatusClass(status)+'">'+esc(label)+'</span>';
@@ -6225,6 +7169,7 @@ function reviewSuggestionsHtml(suggestions){
     const state=s.state||((s.validator&&s.validator.status)||'');
     const reasons=(s.validator&&(s.validator.reasons||[]))||[];
     return '<li class="rr-sug"><span class="rr-sug-item">'+esc(s.item_id||'')+'</span>'
+      +reviewSuggestionSourceBadge(s)
       +(strat?' · '+esc(strat)+(s.strategy&&s.strategy.version!=null
           ?' @v'+esc(String(s.strategy.version)):''):'')
       +(state?' '+reviewBadge(REVIEW_STATUS_LABEL[state]||state,state):'')
@@ -6492,7 +7437,7 @@ function reviewJobsHtml(){
       if(!job) return false;
       const type=String(job.type||((job.descriptor||{}).type)||'');
       return type==='report'||type==='build'||type==='rollback'
-        ||type==='ocr';
+        ||type==='ocr'||type==='discuss';
     });
   if(!jobs.length) return '';
   jobs.sort(function(a,b){
@@ -7060,6 +8005,9 @@ function paintReview(r){
   REVIEW_COUNTS[reviewKey(ctx.dataset,ctx.sha)]=reviewCounts(r);
   paintReviewHead(r);
   paintReviewSummary(r);
+  paintReviewVlmBar();
+  paintReviewReportProvider(r);
+  paintReviewClarifications(r);
   paintReviewOcr();
   paintReviewConflict();
   paintReviewClusters(r);
@@ -7067,6 +8015,10 @@ function paintReview(r){
   /* The OCR refresh row reads the checkbox selection from #reviewDetail, so
      the batch section is painted after the detail. */
   paintReviewBatch();
+  /* CP5: the discussion panel anchor depends on the current cluster/item and
+     the VLM job panel re-attaches persisted report/discuss descriptors. */
+  paintReviewDiscuss();
+  paintReviewVlmJob();
   refreshReviewChip();
 }
 async function refreshReview(successText){
@@ -7084,7 +8036,10 @@ async function openReview(dsId,sha){
     source:null,conflict:null,jobs:{},batchesById:{},candidateBatchId:null,
     candidate:null,candidateStale:false,building:false,publishing:false,
     current:null,lastBuildEntryIds:[],ocrBusy:false,ocrRefreshing:false,
-    ocrCheckText:''};
+    ocrCheckText:'',
+    /* CP5: VLM state. Nothing here triggers a provider call on open. */
+    vlmBusy:false,vlmConfirm:null,discussTurns:[],discussConversationId:'',
+    pendingPatch:null,patchDiff:null,patchConflict:''};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -7099,6 +8054,19 @@ async function openReview(dsId,sha){
   const ocr=$('#reviewOcr');
   if(ocr) ocr.innerHTML='<span class="hist-empty">正在读取 OCR 能力…</span>';
   reviewOcrConfigClose();
+  /* CP5: reset the VLM panels; the bar/provider/clarification paints below
+     read only the review payload (never an implicit provider call). */
+  reviewVlmConfirmClose();
+  const vlmBar=$('#reviewVlmBar');
+  if(vlmBar) vlmBar.innerHTML='<span class="hist-empty">正在读取 VLM 能力…</span>';
+  const vlmJob=$('#reviewVlmJob');
+  if(vlmJob){ vlmJob.hidden=true; vlmJob.innerHTML=''; }
+  const provider=$('#reviewReportProvider');
+  if(provider){ provider.hidden=true; provider.innerHTML=''; }
+  const clar=$('#reviewClarifications');
+  if(clar){ clar.hidden=true; clar.innerHTML=''; }
+  const discuss=$('#reviewDiscuss');
+  if(discuss) discuss.hidden=true;
   const conflict=$('#reviewConflict');
   if(conflict){ conflict.hidden=true; conflict.innerHTML=''; }
   try{
@@ -7119,6 +8087,14 @@ async function openReview(dsId,sha){
   paintReviewOcr();
   paintReviewDetail();
   paintReviewBatch();
+  /* CP5: re-attach VLM report/discuss jobs from extraction.review_jobs and
+     render the VLM bar/provider/clarifications/discussion panels. This is
+     read-only: opening the review never starts a VLM job. */
+  paintReviewVlmBar();
+  paintReviewReportProvider();
+  paintReviewClarifications();
+  paintReviewVlmJob();
+  paintReviewDiscuss();
   /* CP4 (Lead decision): auto-create one OCR job on the FIRST review open of a
      source when OCR is available, coverage has uncovered no_native_labels
      items and no type=ocr descriptor exists. Never auto-retries. */
@@ -7281,6 +8257,8 @@ function selectReviewCluster(clusterId){
   ctx.selected=clusterId;
   paintReviewClusters(ctx.data);
   paintReviewDetail(ctx.data);
+  /* CP5: the discussion panel is anchored to the current item/cluster. */
+  paintReviewDiscuss();
 }
 async function addDataset(ev){
   ev.preventDefault();
@@ -7422,13 +8400,65 @@ $('#reviewOcrConfigClose').onclick=reviewOcrConfigClose;
 $('#reviewOcrConfig').addEventListener('click',function(ev){
   if(ev.target===this) reviewOcrConfigClose();
 });
+/* CP5 (M2.2): VLM report/discussion actions. Both entry points only OPEN the
+   explicit privacy-confirmation dialog -- no provider call happens here. */
+$('#reviewVlmBar').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  const kind=btn.getAttribute('data-r');
+  if(kind==='vlm-generate') reviewVlmGenerateOpen();
+  else if(kind==='vlm-discuss') reviewDiscussOpen();
+});
+/* CP5: an interrupted report/discuss job never auto-reruns; the explicit retry
+   opens the privacy confirmation again (a retry is a new provider call). */
+$('#reviewVlmJob').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  if(btn.getAttribute('data-r')==='vlm-retry') reviewVlmRetry(btn);
+});
+/* CP5: clarification option buttons send a DISCUSSION message (never an
+   operation); the actual send still goes through the privacy confirmation. */
+$('#reviewClarifications').addEventListener('click',function(ev){
+  const btn=ev.target&&ev.target.closest?ev.target.closest('button[data-r]'):null;
+  if(!btn) return;
+  if(btn.getAttribute('data-r')==='clarify-answer') reviewClarificationAnswer(btn);
+});
+/* CP5: discussion scope selector updates the anchored-scope preview; the send
+   and patch-adopt buttons are explicit actions (patch adopt is synchronous and
+   only edits the draft plan). */
+$('#reviewDiscussScope').addEventListener('change',function(){ paintReviewDiscuss(); });
+$('#reviewDiscussSend').onclick=reviewDiscussSendOpen;
+$('#reviewDiscussAdoptPatch').onclick=function(){
+  reviewRunAction(function(){ return reviewDiscussAdoptPatch(); }); };
+$('#reviewDiscussInput').addEventListener('keydown',function(ev){
+  if(ev&&ev.key==='Enter'){ ev.preventDefault(); reviewDiscussSendOpen(); }
+});
+/* CP5: the privacy-confirmation dialog. Only #reviewVlmConfirmGo sends a
+   request; cancel/backdrop/close hide it and send nothing. The text-only toggle
+   disables the image scopes; every checkbox change updates the send summary. */
+$('#reviewVlmConfirmGo').onclick=reviewVlmConfirmed;
+$('#reviewVlmConfirmCancelBtn').onclick=reviewVlmConfirmClose;
+$('#reviewVlmConfirmCancel').onclick=reviewVlmConfirmClose;
+$('#reviewVlmConfirm').addEventListener('click',function(ev){
+  if(ev.target===this) reviewVlmConfirmClose();
+});
+$('#reviewVlmTextOnly').addEventListener('change',function(ev){
+  setReviewVlmScope(!!(ev.target&&ev.target.checked),
+    !!(ev.target&&ev.target.checked));
+  paintReviewVlmConfirmScope();
+});
+['reviewVlmScopeCrop','reviewVlmScopeOriginalPage','reviewVlmScopeAdjacentPages',
+ 'reviewVlmScopeNative','reviewVlmScopeOcr'].forEach(function(id){
+  const el=$('#'+id);
+  if(el&&el.addEventListener) el.addEventListener('change',paintReviewVlmConfirmScope);
+});
 $('#reviewReportBtn').onclick=generateReviewReport;
 $('#reviewRefreshBtn').onclick=refreshReviewFromButton;
 $('#reviewClose').onclick=function(){ const m=$('#reviewModal'); if(m) m.hidden=true;
-  reviewRollbackConfirmClose(); reviewOcrConfigClose(); };
+  reviewRollbackConfirmClose(); reviewOcrConfigClose(); reviewVlmConfirmClose(); };
 $('#reviewModal').addEventListener('click',function(ev){
   if(ev.target===this){ const m=$('#reviewModal'); if(m) m.hidden=true;
-    reviewRollbackConfirmClose(); reviewOcrConfigClose(); }
+    reviewRollbackConfirmClose(); reviewOcrConfigClose(); reviewVlmConfirmClose(); }
 });
 
 /* ---- workspace dialog ----------------------------------------------------

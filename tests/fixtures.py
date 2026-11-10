@@ -1219,6 +1219,11 @@ def main():
             # is env-only), so the fake records them for the seam tests.
             "ocr_env": {key: value for key, value in sorted(os.environ.items())
                         if key.startswith("PEELFEED_OCR_")},
+            # CP5: the VLM provider env is child-only (report/discuss). The fake
+            # records it so tests can prove the token reaches exactly those
+            # children and never a rules report/plan/job call.
+            "llm_env": {key: value for key, value in sorted(os.environ.items())
+                        if key.startswith("PEELFEED_LLM_")},
         }) + "\n")
     if not argv:
         return fail("missing command")
@@ -1377,6 +1382,220 @@ def main():
         action = values[1] if len(values) > 1 else "show"
         if action == "show":
             return emit(plan)
+        if action == "patch":
+            # CP5 wire §5: synchronous targeted plan patch (no model call).
+            # stdin {base_plan_version, patch, source:"vlm|user",
+            # conversation_id?}; returns the new plan + targeted diff.
+            if option(rest, "--input") is None:
+                save_state(state)
+                return fail("--input is required for plan patch", 2,
+                            "validation")
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                save_state(state)
+                return fail("plan patch input must be a JSON object", 2,
+                            "validation")
+            state.setdefault("plan_patch_requests", []).append(
+                copy_json(request))
+            base = request.get("base_plan_version")
+            if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+                save_state(state)
+                return fail("base_plan_version must be an integer >= 0", 2,
+                            "validation")
+            patch = request.get("patch")
+            if not isinstance(patch, dict):
+                save_state(state)
+                return fail("patch must be a JSON object", 2, "validation")
+            source = request.get("source")
+            if source not in ("vlm", "user"):
+                save_state(state)
+                return fail("source must be 'vlm' or 'user'", 2, "validation")
+            conversation_id = request.get("conversation_id")
+            if conversation_id:
+                conversations = state.get("conversations") or {}
+                if conversation_id not in conversations:
+                    save_state(state)
+                    return fail("unknown conversation: "
+                                + str(conversation_id), 3, "not_found")
+            if base != plan.get("plan_version"):
+                save_state(state)
+                return fail("base_plan_version mismatch", 2, "conflict")
+            error = state.get("plan_patch_error")
+            if error:
+                save_state(state)
+                return fail(error.get("message") or "plan patch rejected",
+                            int(error.get("exit") or 2),
+                            error.get("code") or "validation",
+                            error.get("detail"))
+            review = copy_json(state.get("review") or DEFAULT_REVIEW)
+            item_cluster = {}
+            all_item_ids = []
+            for item in review.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                all_item_ids.append(item_id)
+                item_cluster[item_id] = str(item.get("cluster_id") or "")
+            scope = patch.get("scope") if isinstance(
+                patch.get("scope"), dict) else {}
+            kind = str(scope.get("kind") or "")
+            if kind == "item":
+                members = [str(scope.get("item_id") or "")]
+            elif kind == "cluster":
+                cluster_id = str(scope.get("cluster_id") or "")
+                members = [item_id for item_id in all_item_ids
+                           if item_cluster.get(item_id) == cluster_id]
+            elif kind == "peel":
+                members = list(all_item_ids)
+            else:
+                save_state(state)
+                return fail("patch.scope.kind must be item, cluster or peel",
+                            2, "validation")
+            members = [item_id for item_id in members if item_id]
+            exclusions = [str(item_id) for item_id in
+                          (patch.get("exclusions") or [])]
+            target = sorted(set(members) - set(exclusions))
+            declared = patch.get("members")
+            if declared is not None and sorted(
+                    str(item_id) for item_id in declared) != target:
+                save_state(state)
+                return fail("patch.members must equal the resolved target set",
+                            2, "validation")
+            changes = patch.get("changes")
+            if not isinstance(changes, list):
+                save_state(state)
+                return fail("patch.changes must be a list", 2, "validation")
+            by_item = {}
+            for change in changes:
+                if not isinstance(change, dict):
+                    save_state(state)
+                    return fail("patch change must be an object", 2,
+                                "validation")
+                item_id = str(change.get("item_id") or "")
+                if not item_id or item_id not in target:
+                    save_state(state)
+                    return fail("patch change item is not in the target set: "
+                                + str(item_id), 2, "validation")
+                if item_id in by_item:
+                    save_state(state)
+                    return fail("duplicate patch change for " + item_id, 2,
+                                "validation")
+                op = change.get("op")
+                if op not in ("select", "remove"):
+                    save_state(state)
+                    return fail("unknown patch op: " + str(op), 2,
+                                "validation")
+                by_item[item_id] = change
+            missing = [item_id for item_id in target
+                       if item_id not in by_item]
+            if missing:
+                save_state(state)
+                return fail("patch is missing a change for " + missing[0], 2,
+                            "validation")
+            existing = {entry.get("entry_id"): entry
+                        for entry in plan.get("entries") or []
+                        if isinstance(entry, dict)}
+            entries = [copy_json(entry) for entry in
+                       (plan.get("entries") or [])]
+            conflicts = []
+            for item_id, change in by_item.items():
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                current = next((entry for entry in entries
+                                if entry.get("entry_id") == entry_id), None)
+                if current is not None and (current.get("locked")
+                                            or current.get("batch_id")):
+                    conflicts.append(item_id)
+            if conflicts:
+                save_state(state)
+                return fail("patch touches locked/batch-bound entries", 2,
+                            "conflict", {"conflicts": sorted(conflicts)})
+            added = []
+            changed = []
+            removed = []
+            unchanged = 0
+            bumped = False
+            for item_id, change in by_item.items():
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                current = next((entry for entry in entries
+                                if entry.get("entry_id") == entry_id), None)
+                if change.get("op") == "remove":
+                    if current is None:
+                        unchanged += 1
+                        continue
+                    entries = [entry for entry in entries
+                               if entry.get("entry_id") != entry_id]
+                    removed.append(copy_json(current))
+                    bumped = True
+                    continue
+                strategy = change.get("strategy") or {}
+                strategy_id = str(strategy.get("id") or "")
+                action_entry = strategy_action(
+                    strategy_id, change.get("params") or {})
+                if action_entry is None:
+                    save_state(state)
+                    return fail("unknown strategy: " + strategy_id, 2,
+                                "validation")
+                params = dict(change.get("params") or {})
+                if (current is not None
+                        and current.get("strategy", {}).get("id") == strategy_id
+                        and (current.get("action") or {}).get("params")
+                        == params):
+                    # No-op select: keep the entry and do not bump the version.
+                    unchanged += 1
+                    continue
+                revision = 1
+                if current is not None:
+                    revision = int(current.get("revision") or 0) + 1
+                after = {
+                    "entry_id": entry_id,
+                    "item_id": item_id,
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": int(strategy.get("version") or 1)},
+                    "action": action_entry,
+                    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                                 "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": source,
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": change.get("notes"),
+                }
+                entries = [entry for entry in entries
+                           if entry.get("entry_id") != entry_id]
+                entries.append(after)
+                if current is None:
+                    added.append(copy_json(after))
+                else:
+                    changed.append({"item_id": item_id,
+                                    "before": copy_json(current),
+                                    "after": copy_json(after)})
+                bumped = True
+            entries.sort(key=lambda entry: str(entry.get("entry_id") or ""))
+            if bumped:
+                plan["plan_version"] = int(plan.get("plan_version") or 0) + 1
+                plan["updated_at"] = "2026-11-09T03:10:00Z"
+            plan["entries"] = entries
+            state["plan"] = plan
+            response = {
+                "peel_id": peel_id,
+                "review_schema": 2,
+                "plan_version": int(plan.get("plan_version") or 0),
+                "entries": entries,
+                "diff": {"added": added, "changed": changed,
+                         "removed": removed, "unchanged": unchanged},
+            }
+            save_state(state)
+            return emit(response)
         if action not in ("select", "confirm", "lock", "unlock", "defer",
                           "accept", "clear"):
             return fail("unknown plan action: " + str(action), 2, "validation")
@@ -1717,12 +1936,46 @@ def main():
         peel_id = first_positional(rest)
         if peel_id not in peels:
             return fail("no such peel", 3, "not_found")
-        if "--with-vlm" in rest:
-            return fail("VLM reports are not available in CP3", 2, "validation")
+        with_vlm = "--with-vlm" in rest
         request = {}
         if option(rest, "--input") is not None:
             request = read_stdin_json() or {}
-            state.setdefault("review_report_requests", []).append(request)
+            if with_vlm:
+                state.setdefault("review_vlm_requests", []).append(
+                    copy_json(request))
+            else:
+                state.setdefault("review_report_requests", []).append(request)
+        if with_vlm:
+            # CP5 wire §2.1: ``--with-vlm`` requires the frozen VLM request
+            # {mode:"vlm", confirmation:{…}}; the real peelfeed re-checks the
+            # confirmation against its env and the resolved scope.
+            if not isinstance(request, dict) or request.get("mode") != "vlm":
+                save_state(state)
+                return fail("--with-vlm needs {mode:'vlm', confirmation:{…}}",
+                            2, "validation")
+            confirmation = request.get("confirmation")
+            if (not isinstance(confirmation, dict)
+                    or confirmation.get("confirmed") is not True):
+                save_state(state)
+                return fail("privacy confirmation is required",
+                            2, "privacy_confirmation_required")
+            error = state.get("review_vlm_error")
+            if error:
+                save_state(state)
+                return fail(error.get("message") or "VLM report failed",
+                            int(error.get("exit") or 2),
+                            error.get("code") or "vlm_unavailable",
+                            error.get("detail"))
+            job = new_job("report", result_ref="report.json",
+                          nonce=len(state.get("jobs") or {}))
+            state.setdefault("jobs", {})[job["job_id"]] = job
+            # The real job replaces report.json with the VLM report; tests can
+            # install the post-job review payload to assert the UI render.
+            if state.get("review_after_vlm_report"):
+                state["review"] = copy_json(state["review_after_vlm_report"])
+            save_state(state)
+            return emit({"job_id": job["job_id"], "status": "queued",
+                         "result_ref": None})
         # CP3: a persistent ``report`` job; the fake job is terminal immediately
         # (the poller never waits for a fake process) and the report payload is
         # still available in ``state["review_report"]`` for assertions.
@@ -1732,6 +1985,109 @@ def main():
         save_state(state)
         return emit({"job_id": job["job_id"], "status": "queued",
                      "result_ref": None})
+
+    if command == "discuss":
+        # CP5 wire §2.1/§4: one persistent ``discuss`` job; stdin is the frozen
+        # {conversation_id?, scope, message, base_plan_version, confirmation}.
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for discuss", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            save_state(state)
+            return fail("discuss input must be a JSON object", 2, "validation")
+        state.setdefault("discuss_requests", []).append(copy_json(request))
+        confirmation = request.get("confirmation")
+        if (not isinstance(confirmation, dict)
+                or confirmation.get("confirmed") is not True):
+            save_state(state)
+            return fail("privacy confirmation is required",
+                        2, "privacy_confirmation_required")
+        scope = request.get("scope")
+        if not isinstance(scope, dict):
+            save_state(state)
+            return fail("scope is required", 2, "validation")
+        selectors = 0
+        for key in ("item_id", "cluster_id"):
+            if scope.get(key) is not None:
+                selectors += 1
+        if scope.get("peel") is not None:
+            if scope.get("peel") is not True:
+                save_state(state)
+                return fail("scope.peel must be true", 2, "validation")
+            selectors += 1
+        if selectors != 1:
+            save_state(state)
+            return fail("scope needs exactly one selector", 2, "validation")
+        message = request.get("message")
+        if not isinstance(message, str) or not message.strip():
+            save_state(state)
+            return fail("message must be non-empty", 2, "validation")
+        if len(message.strip()) > 4000:
+            save_state(state)
+            return fail("message is longer than 4000 characters", 2,
+                        "validation")
+        base = request.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            save_state(state)
+            return fail("base_plan_version must be an integer >= 0", 2,
+                        "validation")
+        error = state.get("discuss_error")
+        if error:
+            save_state(state)
+            return fail(error.get("message") or "discussion failed",
+                        int(error.get("exit") or 2),
+                        error.get("code") or "vlm_unavailable",
+                        error.get("detail"))
+        conversations = state.setdefault("conversations", {})
+        conversation_id = request.get("conversation_id")
+        if conversation_id:
+            if conversation_id not in conversations:
+                save_state(state)
+                return fail("unknown conversation: " + str(conversation_id),
+                            3, "not_found")
+        else:
+            conversation_id = "conv-20261109T031000-" + hashlib.sha256(
+                ("conv|" + peel_id + "|" + str(len(conversations))).encode()
+            ).hexdigest()[:4]
+            conversations[conversation_id] = {
+                "schema_version": 1, "type": "conversation",
+                "conversation_id": conversation_id, "peel_id": peel_id,
+                "scope": copy_json(scope), "base_plan_version": base}
+        job = new_job("discuss",
+                      result_ref="conversations/" + conversation_id + ".jsonl",
+                      nonce=len(state.get("jobs") or {}))
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        # Additive assistant-turn result summary (wire §4.3) served through the
+        # peel asset route (GET …/assets/extract/review/jobs/<id>.result.json).
+        result = {
+            "schema_version": 1, "job_id": job["job_id"], "peel_id": peel_id,
+            "build_id": "b20261109T031000-abcdef12",
+            "conversation_id": conversation_id,
+            "turn": 2, "role": "assistant", "at": "2026-11-09T03:10:00Z",
+            "intent": "explain", "reply": "按当前报告，该簇的规则建议是可靠的。",
+            "uncertainties": [], "clarifications": [],
+            "patch": None,
+            "model": os.environ.get("PEELFEED_LLM_MODEL") or "fake-model",
+            "link_id": os.environ.get("PEELFEED_LLM_LINK_ID") or "env",
+            "prompt_version": "peel-reviews@1", "vision": False,
+            "cached": False,
+            "usage": {"input_tokens": 10, "output_tokens": 20,
+                      "cost_usd": "0.00"},
+            "evidence_hashes": {}, "base_plan_version": base,
+            "diff": None,
+        }
+        override = state.get("discuss_result")
+        if isinstance(override, dict):
+            result.update(copy_json(override))
+        state.setdefault("discuss_job_results", {})[job["job_id"]] = result
+        if state.get("review_after_discuss"):
+            state["review"] = copy_json(state["review_after_discuss"])
+        save_state(state)
+        return emit({"job_id": job["job_id"],
+                     "conversation_id": conversation_id, "status": "queued"})
 
     if command == "ocr-check":
         # M2.1 wire §2.8: short provider probe; optional peel id persists the
@@ -2630,6 +2986,136 @@ REVIEW_OCR_UNAVAILABLE = review_ocr_payload(
 
 
 
+
+
+# --- M2.2 CP5: VLM report/discussion fixtures (wire §2.3/§3.5/§4.2/§7) -----
+# The answer link peekseed resolves for report/discuss children (wire §1.3).
+VLM_LINK_ID = "answer-main"
+VLM_MODEL = "qwen2.5-vl-72b"
+VLM_LINK_BASE = "http://127.0.0.1:11434/v1"
+VLM_LINK_KEY_ENV = "PEEKSEED_ANSWER_API_KEY"
+VLM_LINK_KEY = "sk-test-vlm-secret"
+
+# The frozen privacy confirmation (wire §1.2); scope sets are the resolved
+# target item/cluster ids, sorted unique.
+VLM_CONFIRMATION = {
+    "confirmed": True,
+    "provider": "answer_link",
+    "link_id": VLM_LINK_ID,
+    "model": VLM_MODEL,
+    "scope": {
+        "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+        "cluster_ids": ["cl-0f1e2d3c4b5a"],
+        "include_crop": True,
+        "include_original_page": True,
+        "include_adjacent_pages": True,
+        "include_native": True,
+        "include_ocr": True,
+    },
+}
+
+# ``review.capabilities`` additive VLM fields (wire §2.3).
+REVIEW_CAPABILITIES_VLM = {
+    "review_schema": 2, "native_lines": True,
+    "ocr": True, "ocr_configured": True, "ocr_detail": None,
+    "ocr_engine": "rapidocr@1.4.4", "ocr_min_confidence": 0.6,
+    "ocr_status": {"available": True, "checked_at": "2026-11-09T03:10:00Z",
+                   "error": None},
+    "vlm": True, "vlm_detail": None, "vlm_vision": True,
+    "vlm_model": VLM_MODEL, "vlm_link_id": VLM_LINK_ID,
+    "vlm_budget_usd": 2.0, "vlm_spent_usd": 0.0, "vlm_calls": 0,
+    "vlm_vision_checked_at": "2026-11-09T03:10:00Z",
+}
+
+# The additive report object fields (wire §3.5) merged over DEFAULT_REPORT's
+# report object: a VLM report with one partial failure and clarifications.
+DEFAULT_VLM_REPORT = copy_json(DEFAULT_REPORT["report"])
+DEFAULT_VLM_REPORT.update({
+    "status": "partial",
+    "provider": {"kind": "vlm", "model": VLM_MODEL,
+                 "prompt_version": "peel-reviews@1",
+                 "link_id": VLM_LINK_ID, "vision": True, "cached": False,
+                 "text_only": False},
+    "counts": {"suggestions": 2, "auto_archived": 0, "unsupported": 0,
+               "needs_decision": 0, "vlm_suggestions": 2,
+               "clarifications": 1, "failed_checks": 0},
+    "partial_failures": [{"cluster_id": "cl-1a2b3c4d5e6f",
+                          "code": "vlm_bad_response",
+                          "message": "cluster response was void"}],
+    "llm_usage": {"calls": 2, "tokens_input": 1200, "tokens_output": 400,
+                  "cost_usd": "0.00"},
+})
+DEFAULT_VLM_REPORT["clusters"][0]["clarifications"] = [{
+    "question": "第 0 行是否是表头？",
+    "options": ["是，第 0 行", "是，前两行", "不是表头"],
+    "item_id": "it-3f9c2a4b6d8e0f1a",
+}]
+
+# A discuss job's assistant-turn patch (wire §4.2): draft only, never applied.
+VLM_DISCUSS_PATCH = {
+    "scope": {"kind": "cluster", "item_id": None,
+              "cluster_id": "cl-0f1e2d3c4b5a"},
+    "members": ["it-3f9c2a4b6d8e0f1a"],
+    "exclusions": [],
+    "boundary_cases": ["it-8b7a6c5d4e3f2a10"],
+    "changes": [{
+        "op": "select",
+        "item_id": "it-3f9c2a4b6d8e0f1a",
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "params": {"rows": [0]},
+        "evidence_refs": ["asset:table-3-19"],
+        "uncertainties": ["row 0 是否为表头"],
+    }],
+}
+
+# A discuss job's result summary (wire §4.3); the fake CLI merges overrides.
+DEFAULT_VLM_DISCUSS = {
+    "schema_version": 1,
+    "intent": "modify",
+    "reply": "按你的说明，建议把第 0 行作为表头，并保留其他条目不变。",
+    "uncertainties": ["row 0 与数据行相似"],
+    "clarifications": [],
+    "patch": VLM_DISCUSS_PATCH,
+    "model": VLM_MODEL,
+    "link_id": VLM_LINK_ID,
+    "prompt_version": "peel-reviews@1",
+    "vision": True,
+    "cached": False,
+    "usage": {"input_tokens": 900, "output_tokens": 200,
+              "cost_usd": "0.00"},
+    "evidence_hashes": {"it-3f9c2a4b6d8e0f1a": "h"},
+    "base_plan_version": 0,
+    "diff": None,
+}
+
+
+def review_vlm_payload(*, capabilities=None, report=None, items=None,
+                       clusters=None):
+    """A schema-2 review payload with the CP5 additive VLM keys."""
+    review = copy_json(DEFAULT_REVIEW)
+    review["capabilities"] = copy_json(
+        capabilities or REVIEW_CAPABILITIES_VLM)
+    if report is not None:
+        review["report"] = copy_json(report)
+    else:
+        review["report"] = {
+            "status": "ready", "generated_at": "2026-11-09T03:10:00Z",
+            "stale": False,
+            "provider": copy_json(DEFAULT_VLM_REPORT["provider"]),
+            "report": copy_json(DEFAULT_VLM_REPORT),
+        }
+    if items is not None:
+        review["items"] = copy_json(items)
+    if clusters is not None:
+        review["clusters"] = copy_json(clusters)
+    return review
+
+
+REVIEW_VLM = review_vlm_payload()
+REVIEW_VLM_NO_PROVIDER = review_vlm_payload(capabilities=dict(
+    REVIEW_CAPABILITIES_VLM, vlm=False,
+    vlm_detail="VLM 未配置：添加一个启用的 answer link 并设置其 api_key_env",
+    vlm_model=None, vlm_link_id=None, vlm_vision=None))
 
 
 class FakePeelfeedCli:

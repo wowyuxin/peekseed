@@ -140,6 +140,68 @@ version/tag policy.
   behaviour harness (auto-create once, interrupted manual retry, check 503,
   evidence/low-confidence rendering).
 
+### Added — VLM report, discussion and plan patches (M2.2 CP5)
+
+- **VLM report route.** `POST …/review/reports` now accepts
+  `{mode:"vlm", confirmation, item_ids?, cluster_ids?}` in addition to the
+  unchanged rules body. The frozen privacy confirmation
+  (`{confirmed:true, provider:"answer_link"|"env", link_id, model,
+  scope:{item_ids, cluster_ids, include_crop, include_original_page,
+  include_adjacent_pages, include_native, include_ocr}}`) is validated
+  field-by-field (unknown/missing fields and `confirmed != true` are `400`) and
+  re-resolved against the actual provider: `provider`/`link_id`/`model`
+  mismatch is `400 privacy_confirmation_required`; no usable provider is
+  `503 vlm_unavailable` — in both cases no job is created and no provider call
+  happens. Returns `202 {job_id, status:"queued"}` with a `type:"report"`
+  descriptor in `extraction.review_jobs`.
+- **Discussion route.** `POST …/review/discussions` creates one persistent
+  `discuss` job from `{conversation_id?, scope:{item_id?|cluster_id?|peel:true},
+  message, base_plan_version, confirmation}` (exactly one scope selector,
+  message 1..4000 chars, base int ≥ 0, the same privacy confirmation gate) and
+  returns `202 {job_id, conversation_id, status:"queued"}`. The descriptor is
+  stored with the additive `conversation_id` (dataset schema stays 4); the job
+  returns explanations and a **draft** patch only and never confirms/applies a
+  plan change.
+- **Targeted plan patch route.** `POST …/review/plan/patches` proxies the
+  synchronous `plan patch` command (`{base_plan_version, patch,
+  source:"vlm"|"user", conversation_id?}`) and returns `200` with the new plan
+  and targeted diff (`added`/`changed`/`removed`/`unchanged`); `409` for a base
+  mismatch or locked/batch-bound entries (conflicting item ids surfaced),
+  `400` validation, `404` unknown conversation. It never confirms, applies,
+  builds or publishes.
+- **Answer-link / env provider seam.** Only the user-confirmed
+  `review-report --with-vlm` and `discuss` children receive
+  `PEELFEED_LLM_BASE/MODEL/TOKEN/LINK_ID` in their environment; every other
+  peelfeed child gets the LLM env stripped, and the token is never in argv,
+  stdin, `dataset.json`, a job descriptor, a log line or an error message.
+  peekseed's own `PEELFEED_LLM_BASE/MODEL/TOKEN` env wins over the default
+  answer link (first enabled answer link, same as the Q&A page); missing
+  link/key is `503 vlm_unavailable`. Because peelfeed's read-only
+  `capabilities` child never sees that env, `GET …/review` and
+  `GET …/review/items/{id}` overlay the resolved truth on `capabilities`
+  (`vlm`, `vlm_detail`, `vlm_provider`, `vlm_model`, `vlm_link_id`, preserving
+  peelfeed's `vlm_vision`/budget fields).
+- **Review UI.** A `#reviewVlmBar` shows the provider (answer link/env),
+  model/link, vision, budget and text-only state plus `生成/更新 VLM 报告` and
+  `与 VLM 讨论`; both are disabled with a Chinese reason when
+  `capabilities.vlm` is false while the rules-only report stays usable. Every
+  provider call is gated by the explicit `#reviewVlmConfirm` dialog (provider/
+  link/model, resolved item/cluster counts, five evidence-scope checkboxes and
+  a text-only toggle); nothing is sent without `confirmed:true` (cancel sends
+  no request). `#reviewVlmJob` polls report/discuss jobs, re-attaches persisted
+  descriptors after a reload, and shows interrupted jobs with an explicit
+  manual retry only (never auto-rerun). `#reviewReportProvider` renders the
+  report provider kind/model/vision/cached/text-only, partial failures,
+  clarification counts and usage; VLM suggestions carry a 规则/VLM source
+  badge. `#reviewClarifications` option buttons send a discussion message
+  (never an operation). `#reviewDiscuss` is anchored to the current
+  item/cluster (or whole peel), renders turns/intent, the draft patch,
+  `#reviewDiscussMembers` (positive/boundary/exclusion preview, preview only)
+  and adopts through the synchronous plan/patches route; `#reviewPatchDiff`
+  shows the server diff and `#reviewPatchConflict` shows a 409 conflict list
+  with adopt disabled. A new report never overwrites an editing draft, and no
+  VLM call is implicit anywhere.
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:

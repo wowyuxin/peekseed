@@ -1475,3 +1475,883 @@ class ReviewUiOcrBehaviorTests(unittest.TestCase):
         self.assertIn("0.55", evidence["low"], evidence)
         self.assertIn("OCR 未识别到文字", evidence["empty"], evidence)
         self.assertEqual(evidence["uncoveredIds"], ["it-fig"], evidence)
+
+
+# ---------------------------------------------------------------------------
+# CP5 (M2.2) served-HTML assertions: the VLM bar, the explicit privacy
+# confirmation dialog, the VLM job panel, the report provider summary, the
+# clarifications and the discussion/patch panel all ship with the frozen stable
+# ids and Chinese labels (wire-contract §7).
+# ---------------------------------------------------------------------------
+
+class ReviewUiCp5Tests(unittest.TestCase):
+    def test_review_modal_ships_the_cp5_vlm_containers(self):
+        text = _ui()
+        for marker in (
+                'id="reviewVlmBar"', 'id="reviewVlmJob"',
+                'id="reviewReportProvider"', 'id="reviewClarifications"',
+                'id="reviewDiscuss"', 'id="reviewVlmConfirm"',
+                'id="reviewVlmConfirmGo"', 'id="reviewVlmConfirmCancel"',
+                'id="reviewVlmConfirmCancelBtn"',
+                'id="reviewVlmScopeCrop"', 'id="reviewVlmScopeOriginalPage"',
+                'id="reviewVlmScopeAdjacentPages"', 'id="reviewVlmScopeNative"',
+                'id="reviewVlmScopeOcr"', 'id="reviewVlmTextOnly"',
+                'id="reviewDiscussScope"', 'id="reviewDiscussInput"',
+                'id="reviewDiscussSend"', 'id="reviewDiscussTurns"',
+                'id="reviewDiscussPatch"', 'id="reviewDiscussAdoptPatch"',
+                'id="reviewDiscussMembers"', 'id="reviewPatchDiff"',
+                'id="reviewPatchConflict"'):
+            self.assertIn(marker, text)
+        # The generated bar buttons carry the frozen stable ids.
+        self.assertIn('id="reviewVlmGenerate"', text)
+        self.assertIn('id="reviewVlmDiscuss"', text)
+        # Dialog lives inside the review modal, before the workspace modal.
+        modal = text.index('id="reviewModal"')
+        confirm = text.index('id="reviewVlmConfirm"')
+        workspace = text.index('id="workspaceModal"')
+        self.assertLess(modal, confirm)
+        self.assertLess(confirm, workspace)
+
+    def test_vlm_actions_are_gated_and_never_implicit(self):
+        text = _ui()
+        for marker in (
+                "function reviewVlmBarHtml", "function paintReviewVlmBar",
+                "function reviewVlmGenerateOpen", "function reviewVlmConfirmOpen",
+                "function reviewVlmConfirmClose", "function reviewVlmConfirmed",
+                "function reviewVlmStartReport", "function reviewVlmStartDiscuss",
+                "function reviewVlmPollJob", "function reviewVlmRetry",
+                "function reviewVlmResultSummary", "function reviewVlmJobs",
+                "function paintReviewVlmJob", "function paintReviewReportProvider",
+                "function paintReviewClarifications", "function reviewDiscussOpen",
+                "function reviewDiscussSendOpen", "function reviewDiscussAdoptPatch",
+                "function reviewClarificationAnswer", "function paintReviewPatchDiff",
+                "function paintReviewPatchConflict", "function reviewVlmProviderLabel",
+                "REVIEW_VLM_INTENT_LABEL", "REVIEW_VLM_JOB_TYPES"):
+            self.assertIn(marker, text)
+        # Painting the bar/provider/clarifications never issues a request.
+        bar_start = text.index("function reviewVlmBarHtml")
+        bar_end = text.index("function reviewReportProviderInfo")
+        bar_body = text[bar_start:bar_end]
+        for forbidden in ("reviewFetchJSON", "/reports", "/discussions",
+                          "fetch("):
+            self.assertNotIn(forbidden, bar_body)
+        provider_start = text.index("function reviewReportProviderHtml")
+        provider_end = text.index("function paintReviewClarifications")
+        self.assertNotIn("reviewFetchJSON",
+                         text[provider_start:provider_end])
+        # Explicit confirmation gate: the only confirmed:true is built in
+        # reviewVlmConfirmed, and both start functions are called from there.
+        confirmed_start = text.index("function reviewVlmConfirmed")
+        confirmed_end = text.index("async function reviewVlmStartReport")
+        confirmed_body = text[confirmed_start:confirmed_end]
+        self.assertIn("confirmed:true", confirmed_body)
+        self.assertIn("reviewVlmStartReport(payload,confirmation)",
+                      confirmed_body)
+        self.assertIn("reviewVlmStartDiscuss(payload,confirmation)",
+                      confirmed_body)
+        # Every provider call uses the frozen routes.
+        self.assertIn("+'/reports'", text)
+        self.assertIn("+'/discussions'", text)
+        self.assertIn("+'/plan/patches'", text)
+        # Patch adoption is synchronous and never a /review/plan action.
+        adopt_start = text.index("async function reviewDiscussAdoptPatch")
+        adopt_end = text.index("function reviewVlmRetry")
+        adopt_body = text[adopt_start:adopt_end]
+        self.assertNotIn("reviewVlmPollJob", adopt_body)
+        self.assertNotIn("+'/plan'", adopt_body)
+        self.assertIn("source:'vlm'", adopt_body)
+        self.assertIn("patchConflict", adopt_body)
+        self.assertIn("采纳按钮已禁用", text)
+        # A clarification option sends a discussion message, never an
+        # operation: it only opens the confirmation dialog.
+        clar_start = text.index("function reviewClarificationAnswer")
+        clar_end = text.index("async function reviewDiscussAdoptPatch")
+        clar_body = text[clar_start:clar_end]
+        self.assertIn("reviewVlmConfirmOpen('clarify'", clar_body)
+        self.assertNotIn("+'/plan'", clar_body)
+        self.assertNotIn("+'/batches'", clar_body)
+        # Interrupted report/discuss jobs only retry on an explicit action.
+        self.assertIn('data-r="vlm-retry"', text)
+        self.assertIn("任务中断，可手动重试", text)
+        self.assertIn("不会自动重跑", text)
+        self.assertIn("function reviewVlmRetry", text)
+        # No-VLM degradation stays fully usable and shows a Chinese reason.
+        self.assertIn("VLM 未配置", text)
+        self.assertIn("规则报告仍可用", text)
+        self.assertIn("reviewVlmUsable", text)
+        # Report provider / source badge / partial failures.
+        self.assertIn("reviewSuggestionSourceBadge", text)
+        self.assertIn("VLM 建议", text)
+        self.assertIn("部分簇失败", text)
+        self.assertIn("partial_failures", text)
+        self.assertIn("text-only", text)
+        self.assertIn("vlm_provider", text)
+        self.assertIn("VLM 后台任务", text)
+        # Discussion scope selector labels (current item / current cluster /
+        # whole peel) and the member/boundary/exclusion preview.
+        for label in ("当前项", "当前簇", "全 peel", "成员预览", "正例",
+                      "边界例", "排除项"):
+            self.assertIn(label, text)
+        # Nothing in the UI sends a provider override or a token.
+        self.assertNotIn("PEELFEED_LLM_TOKEN", text)
+        self.assertNotIn("api_key", text[text.index("function reviewVlmBarHtml"):
+                                        text.index("/* ---- workspace dialog")])
+
+    def test_served_page_ships_cp5_vlm_controls(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+
+            response = TestClient(app_module.create_app()).get("/")
+            self.assertEqual(response.status_code, 200, response.text)
+            page = response.text
+        for marker in ('id="reviewVlmBar"', 'id="reviewVlmJob"',
+                       'id="reviewVlmConfirm"', 'id="reviewVlmConfirmGo"',
+                       'id="reviewReportProvider"', 'id="reviewClarifications"',
+                       'id="reviewDiscuss"', 'id="reviewPatchDiff"',
+                       'id="reviewPatchConflict"',
+                       "生成/更新 VLM 报告", "与 VLM 讨论",
+                       "确认发送审阅证据给 VLM？", "确认并发送",
+                       "仅文本（不发送图片）", "VLM 后台任务",
+                       "任务中断，可手动重试", "不会自动重跑",
+                       "VLM 未配置", "规则报告仍可用",
+                       "reviewVlmGenerateOpen", "reviewVlmConfirmed",
+                       "reviewDiscussSendOpen", "reviewDiscussAdoptPatch",
+                       "reviewClarificationAnswer", "paintReviewVlmBar",
+                       "paintReviewReportProvider", "paintReviewClarifications",
+                       "paintReviewVlmJob", "paintReviewDiscuss",
+                       "'/reports'", "'/discussions'", "'/plan/patches'"):
+            self.assertIn(marker, page)
+        # CP5: the confirmation dialog is the only path to a provider call; the
+        # UI never carries the child-only token.
+        self.assertNotIn("PEELFEED_LLM_TOKEN", page)
+        self.assertNotIn("PEELFEED_LLM_BASE", page)
+
+
+# ---------------------------------------------------------------------------
+# CP5 Node stub-DOM behaviour harness: runs the real review JS block against
+# canned fetch responses (no browser, no network) and proves:
+#   * opening the review paints the VLM bar from capabilities.vlm/vlm_provider
+#     without any implicit provider call;
+#   * the confirmation dialog is a hard gate: cancel sends nothing, only the
+#     explicit Go click builds confirmed:true and POSTs the frozen bodies;
+#   * a VLM report job polls to done, refreshes the report and renders the
+#     provider summary (kind/model/vision/cached/text-only/partial failures);
+#   * a discussion send polls to done, reads the result summary through the
+#     asset route, renders turns + the draft patch and adopts it through the
+#     synchronous plan/patches route (never a /review/plan action);
+#   * a 409 patch conflict shows the conflict list and disables adopt;
+#   * a clarification option opens the discussion confirmation (never a plan
+#     operation);
+#   * capabilities.vlm=false disables both actions with a Chinese reason while
+#     the rules report still works;
+#   * persisted report/discuss descriptors re-attach after a reload, an
+#     interrupted job shows an explicit retry, and nothing auto-reruns.
+# ---------------------------------------------------------------------------
+
+NODE_CP5_HARNESS = r"""
+/*
+ * Drive the real review JS block with a stub DOM + canned fetch. No browser, no
+ * network: every request is recorded and answered from the scenario tables.
+ */
+const fs = require("fs");
+const vm = require("vm");
+
+const html = fs.readFileSync(process.argv[2], "utf8");
+const start = html.indexOf("/* ---- review report dialog", 150000);
+const end = html.indexOf("/* ---- workspace dialog", start);
+if (start < 0 || end < 0) throw new Error("review block markers not found");
+const block = html.slice(start, end);
+
+const elements = new Map();
+function element(key) {
+  if (elements.has(key)) return elements.get(key);
+  const listeners = {};
+  const value = {
+    id: key, innerHTML: "", textContent: "", hidden: true, disabled: false,
+    value: "", files: [], checked: false, listeners, onclick: null,
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    addEventListener(type, fn) {
+      (listeners[type] = listeners[type] || []).push(fn);
+    },
+    appendChild() {}, focus() {}, blur() {}, closest() { return null; },
+    remove() {}, querySelector() { return element(key + ":child"); },
+    querySelectorAll() { return []; }, getAttribute() { return null; },
+    setAttribute() {}, style: {}, dataset: {}, scrollIntoView() {},
+    isConnected: true,
+  };
+  elements.set(key, value);
+  return value;
+}
+const document = {
+  querySelector(selector) { return element(selector); },
+  querySelectorAll() { return []; },
+  addEventListener() {}, getElementById(id) { return element("#" + id); },
+  createElement() { return element("created"); },
+  createTextNode() { return {}; },
+  body: { style: {}, classList: { toggle() {} }, appendChild() {} },
+  documentElement: { style: {}, classList: { toggle() {} } },
+  head: { appendChild() {} },
+};
+
+const calls = [];
+const reportVlmPosts = [];
+const reportRulesPosts = [];
+const discussPosts = [];
+const patchPosts = [];
+let planActionPosts = 0;
+let reviewPayloadCurrent = null;
+let sourcesPayload = { sources: [] };
+let conflictMode = false;
+const sha = "a".repeat(64);
+
+function item(id, clusterId) {
+  return { id: id, code: "table_header_absent", kind: "table",
+    severity: "warning", blocking: false, asset_id: "table-" + id, pages: [1],
+    cluster_id: clusterId, message: "m", triage: "deterministic_candidate",
+    status: "needs_decision",
+    evidence: { hash: "h", crops: [], native_line_ids: [], ocr_evidence: [] },
+    current: {}, candidates: [], strategies: [], entry: null, resolution: null,
+    stale: false };
+}
+function cluster(cid, ids) {
+  return { cluster_id: cid, code: "table_header_absent", title: "t",
+    kind: "table", item_count: ids.length, human_pending: ids.length,
+    representative_item_id: ids[0], states: { needs_decision: ids.length },
+    conclusion: "c",
+    suggestions: [{ item_id: ids[0],
+      strategy: { id: "use_first_row_header", version: 1 }, params: {},
+      evidence_refs: [], validator: { status: "ready", reasons: [] },
+      in_plan: false, state: "ready", source: "vlm" }],
+    clarifications: [{ question: "第 0 行是否是表头？",
+      options: ["是", "否"], item_id: ids[0] }],
+    strategies: [], item_ids: ids };
+}
+const ITEMS = [item("it-a", "cl-a"), item("it-b", "cl-b")];
+const CLUSTERS = [cluster("cl-a", ["it-a"]), cluster("cl-b", ["it-b"])];
+
+const VLM_CAPS = {
+  review_schema: 2, native_lines: true,
+  ocr: false, ocr_configured: false, ocr_detail: null,
+  ocr_status: { available: false, checked_at: null, error: null },
+  vlm: true, vlm_detail: null, vlm_provider: "answer_link",
+  vlm_vision: true, vlm_model: "qwen2.5-vl-72b",
+  vlm_link_id: "answer-main", vlm_budget_usd: 2.0, vlm_spent_usd: 0.35,
+  vlm_calls: 1, vlm_vision_checked_at: "2026-11-09T03:10:00Z",
+};
+const VLM_CAPS_OFF = Object.assign({}, VLM_CAPS, {
+  vlm: false,
+  vlm_detail: "VLM 不可用：no enabled answer link",
+  vlm_model: null, vlm_link_id: null, vlm_vision: null,
+});
+const VLM_REPORT = {
+  status: "partial", generated_at: "2026-11-09T03:10:00Z", stale: false,
+  provider: { kind: "vlm", model: "qwen2.5-vl-72b",
+    prompt_version: "peel-reviews@1", link_id: "answer-main",
+    vision: true, cached: true, text_only: false },
+  report: {
+    schema_version: 1, status: "partial", stale: false,
+    generated_at: "2026-11-09T03:10:00Z",
+    provider: { kind: "vlm", model: "qwen2.5-vl-72b",
+      prompt_version: "peel-reviews@1", link_id: "answer-main",
+      vision: true, cached: true, text_only: false },
+    counts: { vlm_suggestions: 2, clarifications: 1, failed_checks: 0 },
+    partial_failures: [{ cluster_id: "cl-b", code: "vlm_bad_response",
+      message: "cluster response was void" }],
+    llm_usage: { calls: 2, tokens_input: 1200, tokens_output: 400,
+      cost_usd: "0.00" },
+    clusters: [],
+  },
+};
+function reviewPayload(caps, report, planVersion) {
+  return {
+    peel_id: "peel", review_schema: 2,
+    generated_at: "2026-11-09T03:10:00Z", profile: "generic",
+    capabilities: caps, report: report || null, ocr: null,
+    counts: { raw_items: 2, items: 2, clusters: 2, human_pending: 2,
+      human_pending_clusters: 2, pending_evidence: 0, auto_resolved: 0,
+      needs_decision: 2, draft: 0, confirmed: 0, applied: 0, deferred: 0,
+      failed_check: 0, stale: 0, unsupported_items: 0 },
+    triage_counts: { deterministic_candidate: 2, needs_decision: 0,
+      needs_ocr: 0, informational: 0, unsupported: 0 },
+    plan: { plan_version: planVersion || 0, entries: 0, draft: 0,
+      confirmed: 0, locked: 0, stale: 0 },
+    clusters: CLUSTERS, items: ITEMS,
+  };
+}
+const REVIEW_VLM = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
+const REVIEW_VLM_DONE = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
+const REVIEW_VLM_PLAN1 = reviewPayload(VLM_CAPS, VLM_REPORT, 1);
+const REVIEW_VLM_OFF = reviewPayload(VLM_CAPS_OFF, null, 0);
+const VLM_PATCH = {
+  scope: { kind: "cluster", item_id: null, cluster_id: "cl-a" },
+  members: ["it-a"], exclusions: ["it-b"], boundary_cases: ["it-b"],
+  changes: [{ op: "select", item_id: "it-a",
+    strategy: { id: "use_first_row_header", version: 1 },
+    params: { rows: [0] }, evidence_refs: ["asset:table-it-a"],
+    uncertainties: ["row 0"] }],
+};
+const DISCUSS_RESULT = {
+  schema_version: 1, intent: "modify",
+  reply: "建议把第 0 行作为表头。", uncertainties: ["row 0 与数据行相似"],
+  clarifications: [], patch: VLM_PATCH,
+  model: "qwen2.5-vl-72b", link_id: "answer-main",
+  prompt_version: "peel-reviews@1", vision: true, cached: false,
+  at: "2026-11-09T03:10:02Z",
+  usage: { input_tokens: 900, output_tokens: 200, cost_usd: "0.00" },
+  evidence_hashes: {}, base_plan_version: 0,
+};
+
+function sourceRow(jobs) {
+  return { name: "manual.pdf", sha256: sha, status: "extracted",
+    extraction: { state: "extracted", peel_id: "peel",
+      conversion_id: "c", review_jobs: jobs || {} } };
+}
+function response(status, payload) {
+  return { ok: status >= 200 && status < 300, status: status,
+           json: async function () { return payload; },
+           text: async function () { return JSON.stringify(payload); } };
+}
+function jobRecord(type, id, status, resultRef) {
+  return { job_id: id, type: type, status: status,
+    progress: { stage: "done", done: 1, total: 1 },
+    result_ref: resultRef || null,
+    error: status === "failed"
+      ? { code: "vlm_bad_response", message: "void" }
+      : (status === "interrupted"
+        ? { code: "interrupted",
+            message: "the job process is no longer running" }
+        : null) };
+}
+function fetchStub(url, opts) {
+  const method = String((opts || {}).method || "GET").toUpperCase();
+  const body = String((opts || {}).body || "");
+  calls.push({ url: String(url), method: method, body: body });
+  const u = String(url);
+  /* Asset URLs contain "/review/jobs/" too, so match assets first. */
+  if (u.indexOf("/assets/") >= 0) {
+    return Promise.resolve(response(200, DISCUSS_RESULT));
+  }
+  if (method === "POST" && u.indexOf("/review/plan/patches") >= 0) {
+    patchPosts.push(JSON.parse(body || "{}"));
+    if (conflictMode) {
+      return Promise.resolve(response(409, {
+        detail: "peelfeed plan patch failed: error [conflict] patch touches "
+          + "locked/batch-bound entries (conflicts: it-a)" }));
+    }
+    reviewPayloadCurrent = REVIEW_VLM_PLAN1;
+    return Promise.resolve(response(200, {
+      peel_id: "peel", review_schema: 2, plan_version: 1, entries: [],
+      diff: { added: [{ item_id: "it-a" }], changed: [],
+              removed: [], unchanged: 0 } }));
+  }
+  if (method === "POST" && u.indexOf("/review/reports") >= 0) {
+    const parsed = JSON.parse(body || "{}");
+    if (parsed.mode === "vlm") {
+      reportVlmPosts.push(parsed);
+      return Promise.resolve(response(202,
+        { job_id: "report-vlm-1", status: "queued" }));
+    }
+    reportRulesPosts.push(parsed);
+    return Promise.resolve(response(202,
+      { job_id: "report-rules-1", status: "queued" }));
+  }
+  if (method === "POST" && u.indexOf("/review/discussions") >= 0) {
+    discussPosts.push(JSON.parse(body || "{}"));
+    return Promise.resolve(response(202, { job_id: "discuss-1",
+      conversation_id: "conv-1", status: "queued" }));
+  }
+  if (u.indexOf("/review/jobs/") >= 0) {
+    if (u.indexOf("report-vlm-1") >= 0) {
+      reviewPayloadCurrent = REVIEW_VLM_DONE;
+      return Promise.resolve(response(200,
+        jobRecord("report", "report-vlm-1", "done", "report.json")));
+    }
+    if (u.indexOf("report-rules-1") >= 0) {
+      reviewPayloadCurrent = REVIEW_VLM;
+      return Promise.resolve(response(200,
+        jobRecord("report", "report-rules-1", "done", "report.json")));
+    }
+    if (u.indexOf("discuss-1") >= 0) {
+      return Promise.resolve(response(200, jobRecord("discuss", "discuss-1",
+        "done", "conversations/conv-1.jsonl")));
+    }
+    if (u.indexOf("report-old") >= 0) {
+      return Promise.resolve(response(200,
+        jobRecord("report", "report-old", "interrupted")));
+    }
+    if (u.indexOf("discuss-old") >= 0) {
+      return Promise.resolve(response(200, jobRecord("discuss", "discuss-old",
+        "done", "conversations/conv-old.jsonl")));
+    }
+    return Promise.resolve(response(404, { detail: "unknown job" }));
+  }
+  if (method === "POST" && (u.endsWith("/review/plan")
+                            || u.indexOf("/review/plan?") >= 0)) {
+    planActionPosts += 1;
+    return Promise.resolve(response(200, { plan_version: 0, entries: [] }));
+  }
+  if (u.indexOf("/review?") >= 0 || u.endsWith("/review")) {
+    return Promise.resolve(response(200, reviewPayloadCurrent));
+  }
+  if (u.indexOf("/sources") >= 0) {
+    return Promise.resolve(response(200, sourcesPayload));
+  }
+  return Promise.reject(new Error("unexpected fetch " + method + " " + u));
+}
+
+const PF_STATUS = {
+  handshake: { available: true, version: "0.1.0", review_schema: 2,
+    ocr: { configured: false } },
+  config: { configured: true },
+};
+function esc(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function escAttr(value) { return esc(value); }
+function toast() {}
+function fmtBytes(value) { return String(value) + " B"; }
+function fmtTime(value) { return String(value || ""); }
+function $(selector) { return element(selector); }
+function getJSON(path) {
+  return fetchStub(path).then(function (r) {
+    if (!r.ok) throw new Error(path + " returned HTTP " + r.status);
+    return r.json();
+  });
+}
+function callJSON() { throw new Error("callJSON not used in the harness"); }
+async function loadDatasets() { return []; }
+
+const sandbox = {
+  document, window: {}, DATASETS: [], DATASET_SOURCES: {},
+  REVIEW_COUNTS: {}, REVIEW_CTX: null, PF_STATUS: PF_STATUS,
+  $, esc, escAttr, callJSON, getJSON, toast, fmtBytes, fmtTime,
+  loadDatasets, console, setTimeout, clearTimeout, setInterval, clearInterval,
+  Promise, Number, String, JSON, Math, Date, Error, RegExp, Array, Object,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat, isNaN,
+  fetch: fetchStub,
+  location: { hash: "", origin: "http://127.0.0.1:0", href: "" },
+  history: { replaceState() {}, pushState() {} },
+  localStorage: { getItem() { return ""; }, setItem() {}, removeItem() {} },
+  sessionStorage: { getItem() { return ""; }, setItem() {}, removeItem() {} },
+  navigator: { clipboard: { writeText() { return Promise.resolve(); } } },
+  requestAnimationFrame(fn) { return setTimeout(fn, 0); },
+  matchMedia() { return { matches: false, addEventListener() {} }; },
+  alert() {}, confirm() { return true; }, prompt() { return ""; },
+  innerWidth: 1400, innerHeight: 900,
+  addEventListener() {}, removeEventListener() {},
+};
+sandbox.globalThis = sandbox;
+
+const code = block
+  + "\n;globalThis.__review = {"
+  + " openReview: openReview,"
+  + " reviewVlmGenerateOpen: reviewVlmGenerateOpen,"
+  + " reviewVlmConfirmClose: reviewVlmConfirmClose,"
+  + " reviewVlmConfirmed: reviewVlmConfirmed,"
+  + " reviewDiscussOpen: reviewDiscussOpen,"
+  + " reviewDiscussSendOpen: reviewDiscussSendOpen,"
+  + " reviewDiscussAdoptPatch: reviewDiscussAdoptPatch,"
+  + " reviewClarificationAnswer: reviewClarificationAnswer,"
+  + " reviewVlmRetry: reviewVlmRetry,"
+  + " generateReviewReport: generateReviewReport,"
+  + " reviewLoadSource: reviewLoadSource,"
+  + " paintReviewVlmJob: paintReviewVlmJob,"
+  + " paintReviewVlmConfirmScope: paintReviewVlmConfirmScope,"
+  + " getContext: function(){ return REVIEW_CTX; },"
+  + " setData: function(data){ REVIEW_CTX={dataset:'docs',sha:'" + sha
+  + "',data:data}; },"
+  + " element: function(key){ return element(key); },"
+  + " calls: function(){ return calls; } };";
+const context = vm.createContext(sandbox);
+vm.runInContext(code, context, { filename: "index.html#review-block" });
+
+function tick(ms) { return new Promise((resolve) => setTimeout(resolve, ms || 80)); }
+function htmlOf(selector) { return element(selector).innerHTML; }
+function vlmPosts() {
+  return calls.filter(function (call) {
+    return call.method === "POST" && (call.url.indexOf("/review/reports") >= 0
+      || call.url.indexOf("/review/discussions") >= 0
+      || call.url.indexOf("/review/plan/patches") >= 0);
+  });
+}
+function resetCounters() {
+  calls.length = 0;
+  reportVlmPosts.length = 0;
+  reportRulesPosts.length = 0;
+  discussPosts.length = 0;
+  patchPosts.length = 0;
+  planActionPosts = 0;
+  conflictMode = false;
+}
+function button(attrs) {
+  return { getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(attrs, name)
+      ? attrs[name] : null;
+  } };
+}
+
+async function runVlmFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  steps.push({ step: "vlm-open",
+    bar: htmlOf("#reviewVlmBar"),
+    provider: htmlOf("#reviewReportProvider"),
+    clarifications: htmlOf("#reviewClarifications"),
+    vlmPosts: vlmPosts().length,
+    planPosts: planActionPosts });
+  /* Opening the confirmation dialog must not send anything. */
+  sandbox.__review.reviewVlmGenerateOpen();
+  await tick(20);
+  steps.push({ step: "vlm-confirm-open",
+    hidden: element("#reviewVlmConfirm").hidden,
+    info: htmlOf("#reviewVlmConfirmInfo"),
+    target: element("#reviewVlmConfirmTarget").textContent,
+    scope: element("#reviewVlmConfirmScope").textContent,
+    vlmPosts: vlmPosts().length });
+  sandbox.__review.reviewVlmConfirmClose();
+  await tick(20);
+  steps.push({ step: "vlm-confirm-cancel",
+    hidden: element("#reviewVlmConfirm").hidden,
+    vlmPosts: vlmPosts().length });
+  /* Explicit Go: report body + confirmation gate. */
+  sandbox.__review.reviewVlmGenerateOpen();
+  sandbox.__review.reviewVlmConfirmed();
+  await tick(160);
+  steps.push({ step: "vlm-report-sent",
+    posts: reportVlmPosts.slice(),
+    bar: htmlOf("#reviewVlmBar"),
+    provider: htmlOf("#reviewReportProvider"),
+    vlmJob: htmlOf("#reviewVlmJob"),
+    msg: htmlOf("#reviewMsg"),
+    vlmPosts: vlmPosts().length,
+    planPosts: planActionPosts });
+  /* Discussion: open panel, scope cluster, send via confirmation. */
+  sandbox.__review.reviewDiscussOpen();
+  element("#reviewDiscussScope").value = "cluster";
+  element("#reviewDiscussInput").value = "为什么把第 0 行作为表头？";
+  sandbox.__review.reviewDiscussSendOpen();
+  await tick(20);
+  steps.push({ step: "discuss-confirm",
+    hidden: element("#reviewVlmConfirm").hidden,
+    info: htmlOf("#reviewVlmConfirmInfo"),
+    target: element("#reviewVlmConfirmTarget").textContent,
+    discussPosts: discussPosts.length });
+  sandbox.__review.reviewVlmConfirmed();
+  await tick(200);
+  steps.push({ step: "discuss-sent",
+    posts: discussPosts.slice(),
+    turns: htmlOf("#reviewDiscussTurns"),
+    patch: htmlOf("#reviewDiscussPatch"),
+    members: htmlOf("#reviewDiscussMembers"),
+    adoptDisabled: element("#reviewDiscussAdoptPatch").disabled,
+    msg: htmlOf("#reviewMsg"),
+    planPosts: planActionPosts });
+  /* Adopt the draft patch through the synchronous plan/patches route. */
+  await sandbox.__review.reviewDiscussAdoptPatch();
+  await tick(120);
+  steps.push({ step: "patch-adopted",
+    posts: patchPosts.slice(),
+    diff: htmlOf("#reviewPatchDiff"),
+    conflict: htmlOf("#reviewPatchConflict"),
+    adoptDisabled: element("#reviewDiscussAdoptPatch").disabled,
+    msg: htmlOf("#reviewMsg"),
+    planPosts: planActionPosts });
+  /* A 409 conflict disables adopt and shows the conflict list. */
+  conflictMode = true;
+  await sandbox.__review.reviewDiscussAdoptPatch();
+  await tick(120);
+  steps.push({ step: "patch-conflict",
+    posts: patchPosts.slice(),
+    conflict: htmlOf("#reviewPatchConflict"),
+    adoptDisabled: element("#reviewDiscussAdoptPatch").disabled,
+    msg: htmlOf("#reviewMsg") });
+  /* A clarification option opens the discussion confirmation; no operation. */
+  const postsBefore = vlmPosts().length;
+  sandbox.__review.reviewClarificationAnswer(button({
+    "data-option": "是", "data-question": "第 0 行是否是表头？",
+    "data-item": "it-a", "data-cluster": "cl-a" }));
+  await tick(20);
+  steps.push({ step: "clarify-answer",
+    hidden: element("#reviewVlmConfirm").hidden,
+    target: element("#reviewVlmConfirmTarget").textContent,
+    input: element("#reviewDiscussInput").value,
+    newPosts: vlmPosts().length - postsBefore,
+    planPosts: planActionPosts });
+  sandbox.__review.reviewVlmConfirmClose();
+  return steps;
+}
+
+async function runTextOnlyFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  sandbox.__review.reviewVlmGenerateOpen();
+  element("#reviewVlmTextOnly").checked = true;
+  sandbox.__review.paintReviewVlmConfirmScope();
+  sandbox.__review.reviewVlmConfirmed();
+  await tick(160);
+  return [{ step: "text-only",
+    posts: reportVlmPosts.slice(),
+    scope: element("#reviewVlmConfirmScope").textContent,
+    msg: htmlOf("#reviewMsg") }];
+}
+
+async function runNoVlmFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM_OFF;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  steps.push({ step: "novlm-open",
+    bar: htmlOf("#reviewVlmBar"),
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  sandbox.__review.reviewVlmGenerateOpen();
+  await tick(20);
+  steps.push({ step: "novlm-generate-blocked",
+    hidden: element("#reviewVlmConfirm").hidden,
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  await sandbox.__review.generateReviewReport();
+  await tick(160);
+  steps.push({ step: "novlm-rules-report",
+    posts: reportRulesPosts.slice(),
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  return steps;
+}
+
+async function runReattachFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({
+    "report-old": { type: "report", created_at: "2026-11-09T03:00:00Z",
+      batch_id: null, conversation_id: null },
+    "discuss-old": { type: "discuss", created_at: "2026-11-09T03:05:00Z",
+      batch_id: null, conversation_id: "conv-old" },
+  })] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick(120);
+  steps.push({ step: "reattach-open",
+    vlmJob: htmlOf("#reviewVlmJob"),
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  sandbox.__review.reviewVlmRetry(button({ "data-type": "report",
+    "data-job": "report-old" }));
+  await tick(20);
+  steps.push({ step: "reattach-retry",
+    hidden: element("#reviewVlmConfirm").hidden,
+    title: element("#reviewVlmConfirmTitle").textContent,
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  sandbox.__review.reviewVlmConfirmClose();
+  return steps;
+}
+
+async function main() {
+  const results = [];
+  results.push(...await runVlmFlow());
+  results.push(...await runTextOnlyFlow());
+  results.push(...await runNoVlmFlow());
+  results.push(...await runReattachFlow());
+  console.log(JSON.stringify(results));
+}
+
+main().catch(function (error) {
+  console.error((error && error.stack) || error);
+  process.exit(1);
+});
+"""
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed for the CP5 DOM behaviour harness")
+class ReviewUiCp5BehaviorTests(unittest.TestCase):
+    def _run_harness(self):
+        base = Path(tempfile.mkdtemp(prefix="peekseed-cp5-ui-"))
+        try:
+            harness = base / "cp5_behavior.js"
+            harness.write_text(NODE_CP5_HARNESS, encoding="utf-8")
+            completed = subprocess.run(
+                [shutil.which("node"), str(harness), str(UI_PATH)],
+                capture_output=True, text=True, timeout=180)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stderr or completed.stdout)
+            return {row["step"]: row for row in json.loads(completed.stdout)}
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
+
+    def test_open_review_paints_vlm_bar_without_implicit_calls(self):
+        by_step = self._run_harness()
+        opened = by_step["vlm-open"]
+        self.assertEqual(opened["vlmPosts"], 0, opened)
+        self.assertEqual(opened["planPosts"], 0, opened)
+        bar = opened["bar"]
+        for marker in ("VLM 已配置", "qwen2.5-vl-72b", "answer-main",
+                       "支持图片", "预算 $2.00", "生成/更新 VLM 报告",
+                       "与 VLM 讨论"):
+            self.assertIn(marker, bar, opened)
+        provider = opened["provider"]
+        for marker in ("VLM", "qwen2.5-vl-72b", "支持图片", "缓存命中",
+                       "VLM 建议 2", "澄清问题 1", "部分簇失败",
+                       "vlm_bad_response"):
+            self.assertIn(marker, provider, opened)
+        self.assertIn("第 0 行是否是表头？", opened["clarifications"], opened)
+        self.assertIn("是", opened["clarifications"], opened)
+
+    def test_confirmation_gate_sends_nothing_until_confirmed(self):
+        by_step = self._run_harness()
+        confirm = by_step["vlm-confirm-open"]
+        self.assertFalse(confirm["hidden"], confirm)
+        self.assertEqual(confirm["vlmPosts"], 0, confirm)
+        for marker in ("answer_link", "answer-main", "qwen2.5-vl-72b",
+                       "支持图片", "项 2 / 簇 2"):
+            self.assertIn(marker, confirm["info"], confirm)
+        self.assertIn("生成/更新全 peel VLM 报告", confirm["target"], confirm)
+        self.assertIn("crop ✓", confirm["scope"], confirm)
+        cancel = by_step["vlm-confirm-cancel"]
+        self.assertTrue(cancel["hidden"], cancel)
+        self.assertEqual(cancel["vlmPosts"], 0, cancel)
+        sent = by_step["vlm-report-sent"]
+        self.assertEqual(len(sent["posts"]), 1, sent)
+        body = sent["posts"][0]
+        self.assertEqual(body["mode"], "vlm")
+        confirmation = body["confirmation"]
+        self.assertIs(confirmation["confirmed"], True)
+        self.assertEqual(confirmation["provider"], "answer_link")
+        self.assertEqual(confirmation["link_id"], "answer-main")
+        self.assertEqual(confirmation["model"], "qwen2.5-vl-72b")
+        self.assertEqual(confirmation["scope"]["item_ids"],
+                         ["it-a", "it-b"])
+        self.assertEqual(confirmation["scope"]["cluster_ids"],
+                         ["cl-a", "cl-b"])
+        for flag in ("include_crop", "include_original_page",
+                     "include_adjacent_pages", "include_native",
+                     "include_ocr"):
+            self.assertIs(confirmation["scope"][flag], True, confirmation)
+        self.assertIn("VLM 报告已生成", sent["msg"], sent)
+        self.assertIn("VLM 后台任务", sent["vlmJob"], sent)
+        self.assertIn("已完成", sent["vlmJob"], sent)
+        # A report job never edits the plan (no /review/plan action).
+        self.assertEqual(sent["planPosts"], 0, sent)
+
+    def test_discussion_send_poll_reply_and_patch_adoption(self):
+        by_step = self._run_harness()
+        confirm = by_step["discuss-confirm"]
+        self.assertFalse(confirm["hidden"], confirm)
+        self.assertEqual(confirm["discussPosts"], 0, confirm)
+        self.assertIn("与 VLM 讨论", confirm["target"], confirm)
+        sent = by_step["discuss-sent"]
+        self.assertEqual(len(sent["posts"]), 1, sent)
+        body = sent["posts"][0]
+        self.assertEqual(body["scope"], {"cluster_id": "cl-a"})
+        self.assertEqual(body["message"], "为什么把第 0 行作为表头？")
+        self.assertEqual(body["base_plan_version"], 0)
+        self.assertNotIn("conversation_id", body)
+        self.assertIs(body["confirmation"]["confirmed"], True)
+        self.assertEqual(body["confirmation"]["scope"]["item_ids"], ["it-a"])
+        self.assertEqual(body["confirmation"]["scope"]["cluster_ids"],
+                         ["cl-a"])
+        turns = sent["turns"]
+        self.assertIn("为什么把第 0 行作为表头？", turns, sent)
+        self.assertIn("建议把第 0 行作为表头。", turns, sent)
+        self.assertIn("修改决定", turns, sent)
+        self.assertIn("返回了计划 patch", turns, sent)
+        self.assertIn("成员预览", sent["members"], sent)
+        self.assertIn("正例 1", sent["members"], sent)
+        self.assertIn("排除项 1", sent["members"], sent)
+        self.assertIn("边界例 1", sent["members"], sent)
+        self.assertIn("VLM 计划 patch 预览", sent["patch"], sent)
+        self.assertFalse(sent["adoptDisabled"], sent)
+        adopted = by_step["patch-adopted"]
+        self.assertEqual(len(adopted["posts"]), 1, adopted)
+        patch_body = adopted["posts"][0]
+        self.assertEqual(patch_body["base_plan_version"], 0)
+        self.assertEqual(patch_body["source"], "vlm")
+        self.assertEqual(patch_body["conversation_id"], "conv-1")
+        self.assertEqual(patch_body["patch"]["scope"]["kind"], "cluster")
+        self.assertIn("计划 diff", adopted["diff"], adopted)
+        self.assertIn("新增 1", adopted["diff"], adopted)
+        self.assertIn("it-a", adopted["diff"], adopted)
+        self.assertTrue(adopted["conflict"] == "", adopted)
+        # Adoption only edited the draft plan: no /review/plan action ran.
+        self.assertEqual(adopted["planPosts"], 0, adopted)
+        self.assertIn("未确认、未应用、未触发构建", adopted["msg"], adopted)
+
+    def test_patch_conflict_disables_adopt(self):
+        by_step = self._run_harness()
+        conflict = by_step["patch-conflict"]
+        self.assertEqual(len(conflict["posts"]), 2, conflict)
+        self.assertTrue(conflict["adoptDisabled"], conflict)
+        self.assertIn("采纳冲突（409）", conflict["conflict"], conflict)
+        self.assertIn("conflicts: it-a", conflict["conflict"], conflict)
+        self.assertIn("采纳按钮已禁用", conflict["conflict"], conflict)
+
+    def test_clarification_option_sends_a_message_not_an_operation(self):
+        by_step = self._run_harness()
+        clarify = by_step["clarify-answer"]
+        self.assertFalse(clarify["hidden"], clarify)
+        self.assertEqual(clarify["newPosts"], 0, clarify)
+        self.assertEqual(clarify["planPosts"], 0, clarify)
+        self.assertIn("澄清回答（讨论消息）", clarify["target"], clarify)
+        self.assertEqual(clarify["input"], "是（回答：第 0 行是否是表头？）",
+                         clarify)
+
+    def test_text_only_toggle_disables_image_scopes(self):
+        by_step = self._run_harness()
+        text_only = by_step["text-only"]
+        self.assertEqual(len(text_only["posts"]), 1, text_only)
+        scope = text_only["posts"][0]["confirmation"]["scope"]
+        self.assertIs(scope["include_crop"], False)
+        self.assertIs(scope["include_original_page"], False)
+        self.assertIs(scope["include_adjacent_pages"], False)
+        self.assertIs(scope["include_native"], True)
+        self.assertIs(scope["include_ocr"], True)
+        self.assertIn("crop ×", text_only["scope"], text_only)
+
+    def test_no_vlm_degrades_with_chinese_reason_and_rules_still_work(self):
+        by_step = self._run_harness()
+        opened = by_step["novlm-open"]
+        self.assertEqual(opened["vlmPosts"], 0, opened)
+        bar = opened["bar"]
+        self.assertIn("VLM 未配置", bar, opened)
+        self.assertIn("disabled", bar, opened)
+        self.assertIn("no enabled answer link", bar, opened)
+        self.assertIn("规则报告仍可用", bar, opened)
+        blocked = by_step["novlm-generate-blocked"]
+        self.assertTrue(blocked["hidden"], blocked)
+        self.assertEqual(blocked["vlmPosts"], 0, blocked)
+        self.assertIn("规则报告仍可用", blocked["msg"], blocked)
+        rules = by_step["novlm-rules-report"]
+        self.assertEqual(len(rules["posts"]), 1, rules)
+        self.assertEqual(rules["posts"][0], {}, rules)
+        self.assertEqual(rules["vlmPosts"], 1, rules)
+        self.assertIn("报告已生成", rules["msg"], rules)
+
+    def test_reattach_and_explicit_interrupted_retry(self):
+        by_step = self._run_harness()
+        reattach = by_step["reattach-open"]
+        self.assertEqual(reattach["vlmPosts"], 0, reattach)
+        job_panel = reattach["vlmJob"]
+        self.assertIn("VLM 后台任务", job_panel, reattach)
+        self.assertIn("report-old", job_panel, reattach)
+        self.assertIn("discuss-old", job_panel, reattach)
+        self.assertIn("已中断", job_panel, reattach)
+        self.assertIn("已完成", job_panel, reattach)
+        self.assertIn("手动重试", job_panel, reattach)
+        retry = by_step["reattach-retry"]
+        self.assertFalse(retry["hidden"], retry)
+        self.assertEqual(retry["vlmPosts"], 0, retry)
+        self.assertIn("确认生成/更新 VLM 报告？", retry["title"], retry)
+
