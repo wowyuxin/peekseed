@@ -1904,7 +1904,8 @@ def create_app():
         return request
 
     _PROPAGATE_KEYS = {"base_plan_version", "scope", "strategy", "params",
-                       "source_item_id", "exclusions", "dry_run", "operator"}
+                       "source_item_id", "exclusions", "overrides", "dry_run",
+                       "operator"}
     _PROPAGATE_SCOPE_KEYS = {"kind", "item_id", "cluster_id", "peel"}
 
     def _review_propagate_request(body):
@@ -1913,18 +1914,22 @@ def create_app():
         Body is exactly the frozen ``plan propagate`` request:
         ``{base_plan_version, scope:{kind:"item|cluster|peel", item_id?,
         cluster_id?, peel?}, strategy:{id,version}, params, source_item_id?,
-        exclusions[], dry_run, operator?}``. Unknown fields (request, scope or
-        strategy) are a 400; ``base_plan_version`` is an int >= 0; the scope has
-        exactly one selector matching ``kind``; ``strategy.id`` is a non-empty
-        string and ``strategy.version`` an int >= 1; ``params`` is an object
-        (its content is validated by peelfeed per strategy); ``source_item_id``
-        is an optional non-empty string; ``exclusions`` is a list of non-empty
-        item-id strings; ``dry_run`` is a bool (default false); ``operator`` is
-        an optional non-empty string (peelfeed defaults it to ``"user"``).
-        peekseed only checks the envelope -- member resolution, per-member
-        statuses, applicability and validators are all-or-nothing in peelfeed
-        (CP6 wire §1.2/§1.3). The request is proxied synchronously with no model
-        call and no LLM env.
+        exclusions[], overrides[], dry_run, operator?}``. Unknown fields
+        (request, scope or strategy) are a 400; ``base_plan_version`` is an
+        int >= 0; the scope has exactly one selector matching ``kind``;
+        ``strategy.id`` is a non-empty string and ``strategy.version`` an
+        int >= 1; ``params`` is an object (its content is validated by peelfeed
+        per strategy); ``source_item_id`` is an optional non-empty string;
+        ``exclusions`` is a list of non-empty item-id strings; ``overrides``
+        (CP6.1 wire §7.2/§7.5) is an optional list of non-empty item-id
+        strings, deduplicated in order; ``dry_run`` is a bool (default false);
+        ``operator`` is an optional non-empty string (peelfeed defaults it to
+        ``"user"``). peekseed only checks the envelope -- member resolution,
+        per-member statuses (including ``decided``), applicability and
+        validators are all-or-nothing in peelfeed, as are the ``overrides``
+        member-set/subset/``exclusions``-overlap checks (CP6 wire §1.2/§1.3,
+        CP6.1 §7.2). The request is proxied synchronously with no model call
+        and no LLM env.
         """
         if not isinstance(body, dict):
             raise HTTPException(
@@ -2039,6 +2044,28 @@ def create_app():
                     400, "exclusions must not contain empty ids")
             if item_id not in cleaned_exclusions:
                 cleaned_exclusions.append(item_id)
+        # CP6.1 (wire §7.2/§7.5): optional ``overrides`` = the ``decided``
+        # members the user explicitly wants to replace. Envelope/type only:
+        # membership, subset and ``exclusions`` overlap are checked
+        # all-or-nothing by peelfeed, so peekseed must not invent divergent
+        # semantics here.
+        overrides = body.get("overrides", [])
+        if overrides is None:
+            overrides = []
+        if not isinstance(overrides, list):
+            raise HTTPException(
+                400, "overrides must be a list of item ids")
+        cleaned_overrides = []
+        for raw in overrides:
+            if not isinstance(raw, str):
+                raise HTTPException(
+                    400, "overrides must contain only strings")
+            item_id = raw.strip()
+            if not item_id:
+                raise HTTPException(
+                    400, "overrides must not contain empty ids")
+            if item_id not in cleaned_overrides:
+                cleaned_overrides.append(item_id)
         dry_run = body.get("dry_run", False)
         if not isinstance(dry_run, bool):
             raise HTTPException(400, "dry_run must be a boolean")
@@ -2056,6 +2083,10 @@ def create_app():
             "exclusions": cleaned_exclusions,
             "dry_run": dry_run,
         }
+        if "overrides" in body:
+            # Pass the cleaned optional field through only when the caller sent
+            # it; peelfeed treats an absent field as ``[]`` (CP6.1 §7.2).
+            request["overrides"] = cleaned_overrides
         if source_item_id is not None:
             request["source_item_id"] = source_item_id
         if operator is not None:
@@ -2809,20 +2840,30 @@ def create_app():
                                      payload: Optional[dict] = None):
         """Proxy the synchronous CP6 cluster-level propagation (wire §2).
 
-        Body is exactly the frozen ``plan propagate`` request (CP6 wire §1.1):
+        Body is exactly the frozen ``plan propagate`` request (CP6 wire §1.1;
+        CP6.1 wire §7.2/§7.5 adds the optional ``overrides``):
         ``{base_plan_version, scope:{kind:"item|cluster|peel", …},
-        strategy:{id,version}, params, source_item_id?, exclusions[], dry_run,
-        operator?}``; the body is validated strictly here and proxied to
-        ``peelfeed plan propagate`` synchronously with **no model call and no
-        LLM env**. ``dry_run:true`` returns the member preview and writes
-        nothing; ``dry_run:false`` writes the draft plan entries (with a
-        ``kind:"propagation"`` origin) and the propagation audit record, never
-        confirming/applying/building/publishing. Status mapping follows
+        strategy:{id,version}, params, source_item_id?, exclusions[],
+        overrides[], dry_run, operator?}``; the body is validated strictly
+        here and proxied to ``peelfeed plan propagate`` synchronously with
+        **no model call and no LLM env**. ``overrides`` lists ``decided``
+        members the user explicitly wants to replace; peekseed validates the
+        envelope/type only (peelfeed enforces membership, subset and
+        ``exclusions`` overlap all-or-nothing). ``dry_run:true`` returns the
+        member preview and writes nothing; ``dry_run:false`` writes the draft
+        plan entries (with a ``kind:"propagation"`` origin) and the propagation
+        audit record, never confirming/applying/building/publishing. Members
+        with a pre-existing decision are ``decided`` and kept by default (no
+        entry write, no resolution revert, no error); overridden ``decided``
+        members are written as ``ready`` and their active R0 resolution is
+        reverted in the same review lock (CP6.1 §7.1/§7.2). The response
+        (``decided``/``existing``/``kept``/``overridden``/``counts.decided``/
+        ``overrides``) is passed through unchanged. Status mapping follows
         contract §4: 200 preview/apply; 409 ``conflict`` (base mismatch or
         locked/batch-bound members, ``error.details.conflicts``); 400
-        ``validation`` (invalid scope/strategy/params or non-excluded failing
-        members, ``error.details.reasons``); 404 not found. The response is
-        passed through unchanged; no job descriptor is created.
+        ``validation`` (invalid scope/strategy/params/overrides or non-excluded
+        failing members, ``error.details.reasons``); 404 not found. No job
+        descriptor is created.
         """
         directory = _dataset_dir(dataset_id)
         entry = _source_by_sha(directory, sha)

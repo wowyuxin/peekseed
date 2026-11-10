@@ -273,6 +273,39 @@ version/tag policy.
   entries carry a 批量 origin badge. Nothing is sent before an explicit preview
   or apply click.
 
+### Changed — CP6.1 propagation decided/overrides (M2.2 CP6.1)
+
+- **Propagation no longer silently overwrites existing decisions (K1).**
+  `POST …/review/plan/propagate` accepts the CP6.1 additive optional
+  `overrides:[item_id]` (a list of non-empty item-id strings, deduplicated in
+  order; unknown fields are still `400`; envelope/type validation only — the
+  member-set/subset/`exclusions`-overlap checks stay peelfeed's all-or-nothing
+  job and map to `400`). The cleaned field is forwarded only when the caller
+  sent it, and the response is passed through unchanged. Members with a
+  pre-existing decision are `decided` (a differing confirmed entry, an applied
+  R0 entry, or an active non-`confirm_known` R0 resolution; a derived stale
+  resolution still counts) and carry
+  `existing:{kind,status,strategy,name}`; `counts.decided` counts them. Apply
+  keeps them by default (no entry write, no resolution revert, no error; listed
+  in the audit record's `kept`), writes only the overridden `decided` members
+  as `ready` (`overridden`), and reverts every written member's active R0
+  resolution in the same review lock (including `confirm_known`). `decided` is
+  neither a conflict nor a validation error; draft entries are still replaced
+  directly.
+- **Review UI decided/override support.** `REVIEW_PROPAGATE_STATUS_LABEL` gains
+  `decided:'已有决定（默认保留）'`; `decided` rows render the `existing`
+  summary and a `将覆盖` marker when ticked. New
+  `#reviewPropagateOverrides` holds per-member override checkboxes
+  (`data-r="propagate-override"`) for decided members; checked ids are sent as
+  `overrides` in **both** the preview and apply bodies. Opening the panel and
+  every successful preview reset the exclusion and override ticks; toggling
+  repaints without sending a request, and exclusion/override are mutually
+  exclusive per item. The apply-disabled rule is unchanged (`decided` is not a
+  conflict) and the counts summary now shows `decided`. The fake peelfeed CLI
+  mirrors the CP6.1 semantics (`decided`/`existing`, kept-by-default, overridden
+  writes, active-R0 revert rows, `counts.decided`, audit `kept`/`overridden`)
+  for the API and Node stub-DOM tests.
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:

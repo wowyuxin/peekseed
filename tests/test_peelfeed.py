@@ -4132,6 +4132,359 @@ class Cp6PropagateRouteTests(unittest.TestCase):
                 self.assertEqual(len(cli.state().get("propagations") or {}),
                                  records_before)
 
+    def test_overrides_forwarded_and_decided_entry_passthrough(self):
+        """CP6.1 wire §7.2/§7.5: the route forwards ``overrides`` exactly and
+        passes the ``decided``/``existing``/``kept``/``overridden`` semantics
+        through unchanged (kept by default; overridden written as ready)."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                # A confirmed entry whose action differs from the propagated one.
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [1]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                version = confirmed.json()["plan_version"]
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "confirmed")
+                # Preview without overrides: the member is decided (kept).
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                payload = preview.json()
+                self.assertEqual(payload["members"][0]["status"], "decided")
+                self.assertEqual(payload["members"][0]["existing"], {
+                    "kind": "entry", "status": "confirmed",
+                    "strategy": {"id": "use_first_row_header", "version": 1},
+                    "name": "set_header_rows"})
+                self.assertEqual(payload["counts"]["decided"], 1)
+                self.assertEqual(payload["overrides"], [])
+                self.assertEqual(
+                    cli.state()["propagate_requests"][-1],
+                    _propagate_body(base_plan_version=version))
+                self.assertFalse(cli.state().get("propagations"))
+                # Apply without overrides keeps the confirmed entry: no write,
+                # no resolution revert, no error (wire §7.2).
+                kept = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(kept.status_code, 200, kept.text)
+                kept_payload = kept.json()
+                self.assertIs(kept_payload["changed"], False)
+                self.assertEqual(kept_payload["plan_version"], version)
+                self.assertEqual(kept_payload["diff"]["changed"], [])
+                self.assertEqual(kept_payload["counts"]["decided"], 1)
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "confirmed")
+                record = cli.state()["propagations"][
+                    kept_payload["propagation_id"]]
+                self.assertEqual(record["kept"], [self.ITEM])
+                self.assertEqual(record["overridden"], [])
+                self.assertEqual(record["overrides"], [])
+                self.assertEqual(record["selection"], [self.ITEM])
+                # Preview with overrides: the same member is now evaluated
+                # normally (ready) but still carries its ``existing`` summary;
+                # duplicates collapse and ids are stripped.
+                override_body = _propagate_body(base_plan_version=version,
+                                                overrides=["  %s  " % self.ITEM,
+                                                           self.ITEM])
+                override_preview = client.post(route, json=override_body)
+                self.assertEqual(override_preview.status_code, 200,
+                                 override_preview.text)
+                override_payload = override_preview.json()
+                self.assertEqual(override_payload["members"][0]["status"],
+                                 "ready")
+                self.assertEqual(override_payload["members"][0]["existing"],
+                                 {"kind": "entry", "status": "confirmed",
+                                  "strategy": {"id": "use_first_row_header",
+                                               "version": 1},
+                                  "name": "set_header_rows"})
+                self.assertEqual(override_payload["counts"]["decided"], 0)
+                self.assertEqual(override_payload["overrides"], [self.ITEM])
+                self.assertEqual(
+                    cli.state()["propagate_requests"][-1],
+                    dict(override_body, overrides=[self.ITEM]))
+                # Apply with the override: the entry is replaced (revision+1,
+                # propagation origin) and listed in ``overridden``.
+                applied = client.post(route, json=dict(
+                    override_body, dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["changed"], True)
+                self.assertEqual(result["plan_version"], version + 1)
+                self.assertEqual(result["overrides"], [self.ITEM])
+                changed = result["diff"]["changed"]
+                self.assertEqual(len(changed), 1)
+                self.assertEqual(changed[0]["item_id"], self.ITEM)
+                self.assertEqual(changed[0]["after"]["status"], "draft")
+                self.assertEqual(changed[0]["after"]["revision"], 2)
+                self.assertEqual(changed[0]["after"]["origin"]["kind"],
+                                 "propagation")
+                record = cli.state()["propagations"][
+                    result["propagation_id"]]
+                self.assertEqual(record["kept"], [])
+                self.assertEqual(record["overridden"], [self.ITEM])
+                self.assertEqual(record["overrides"], [self.ITEM])
+
+    def test_decided_active_resolution_kept_then_overridden_with_r0_revert(self):
+        """CP6.1 wire §7.1/§7.2: an active R0 resolution makes the member
+        ``decided`` (kept by default); an override replaces it and reverts the
+        active R0 in the same review lock."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                deferred = client.post(base + "/review/plan", json={
+                    "base_plan_version": 0, "action": "defer",
+                    "item_id": self.ITEM, "reason_code": "other",
+                    "reason": "hold for now"})
+                self.assertEqual(deferred.status_code, 200, deferred.text)
+                version = deferred.json()["plan_version"]
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["name"] for row in resolutions],
+                                 ["defer"])
+                # Preview: decided by the active defer resolution.
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "decided")
+                self.assertEqual(member["existing"], {
+                    "kind": "resolution", "status": "active",
+                    "strategy": None, "name": "defer"})
+                self.assertEqual(preview.json()["counts"]["decided"], 1)
+                self.assertEqual(cli.state()["plan"]["plan_version"], version)
+                self.assertEqual(cli.state()["plan"]["entries"], [])
+                self.assertFalse(cli.state().get("propagations"))
+                # Default apply keeps it: no entry, no revert.
+                kept = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(kept.status_code, 200, kept.text)
+                self.assertIs(kept.json()["changed"], False)
+                self.assertEqual(kept.json()["plan_version"], version)
+                self.assertEqual(cli.state()["plan"]["entries"], [])
+                self.assertEqual(len(cli.state()["resolutions"]), 1)
+                self.assertEqual(
+                    cli.state()["propagations"][
+                        kept.json()["propagation_id"]]["kept"], [self.ITEM])
+                # Override: the entry is written and the active defer is
+                # reverted with a ``revert`` resolution row (wire §7.1).
+                applied = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    overrides=[self.ITEM]))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["changed"], True)
+                self.assertEqual(result["plan_version"], version + 1)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["item_id"], self.ITEM)
+                self.assertEqual(entry["origin"]["kind"], "propagation")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+                self.assertEqual(resolutions[-1]["name"], "defer")
+                self.assertEqual(resolutions[-1]["supersedes"],
+                                 resolutions[0]["resolution_id"])
+                record = cli.state()["propagations"][
+                    result["propagation_id"]]
+                self.assertEqual(record["overridden"], [self.ITEM])
+                self.assertEqual(record["kept"], [])
+
+    def test_confirm_known_is_not_decided_but_is_reverted_when_written(self):
+        """CP6.1 wire §7.1/§7.2: an active ``confirm_known`` does not protect a
+        member (it is ``ready``, not ``decided``), and writing the entry reverts
+        it like every other active resolution name."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                cli.update(resolutions=[{
+                    "schema_version": 1,
+                    "resolution_id": "r-confirm-known-" + self.ITEM,
+                    "change": "add",
+                    "supersedes": None,
+                    "idempotency_key": "k-confirm-known",
+                    "item_id": self.ITEM,
+                    "name": "confirm_known",
+                    "reason_code": None,
+                    "reason": None,
+                    "evidence_hash": None,
+                    "source": "auto",
+                    "recorded_at": "2026-11-05T00:00:00Z",
+                }])
+                preview = client.post(route, json=_propagate_body())
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "ready")
+                self.assertNotIn("existing", member)
+                self.assertEqual(preview.json()["counts"]["decided"], 0)
+                applied = client.post(route, json=_propagate_body(
+                    dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+                self.assertEqual(resolutions[-1]["name"], "confirm_known")
+
+    def test_overrides_peelfeed_validation_passthrough(self):
+        """CP6.1 wire §7.2: member-set/subset/overlap checks belong to peelfeed
+        and are mapped to a 400 with nothing written."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                figure = "it-8b7a6c5d4e3f2a10"
+                # Not a member of the item scope.
+                outside = client.post(route, json=_propagate_body(
+                    overrides=[figure]))
+                self.assertEqual(outside.status_code, 400, outside.text)
+                self.assertIn("overrides must be a subset",
+                              outside.json()["detail"])
+                # Overlaps the exclusions list.
+                overlap = client.post(route, json=_propagate_body(
+                    exclusions=[self.ITEM], overrides=[self.ITEM]))
+                self.assertEqual(overlap.status_code, 400, overlap.text)
+                self.assertIn("overrides must not overlap exclusions",
+                              overlap.json()["detail"])
+                self.assertFalse(cli.state().get("plan"))
+                self.assertFalse(cli.state().get("propagations"))
+
+    def test_applied_r0_entry_is_decided_and_overridden(self):
+        """CP6.1 wire §7.2: an applied R0 entry makes the member ``decided``
+        (kept by default); an override replaces it and reverts its R0."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "confirm_no_header",
+                                           "version": 1},
+                              "params": {}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                version = confirmed.json()["plan_version"]
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "applied")
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "decided")
+                self.assertEqual(member["existing"], {
+                    "kind": "entry", "status": "applied",
+                    "strategy": {"id": "confirm_no_header", "version": 1},
+                    "name": "confirm_headerless"})
+                kept = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(kept.status_code, 200, kept.text)
+                self.assertIs(kept.json()["changed"], False)
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "applied")
+                self.assertEqual(len(cli.state()["resolutions"]), 1)
+                applied = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    overrides=[self.ITEM]))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["revision"], 2)
+                self.assertEqual(entry["origin"]["kind"], "propagation")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+                self.assertEqual(resolutions[-1]["name"], "confirm_headerless")
+
+    def test_confirmed_same_action_is_already_and_draft_replaced(self):
+        """CP6.1 wire §7.2: a confirmed entry with the same action is
+        ``already`` (not ``decided``, not written); a draft entry is replaced
+        directly with ``diff.changed``."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                version = confirmed.json()["plan_version"]
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "already")
+                self.assertNotIn("existing", member)
+                self.assertEqual(preview.json()["counts"]["decided"], 0)
+                repeat = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(repeat.status_code, 200, repeat.text)
+                self.assertIs(repeat.json()["changed"], False)
+                self.assertEqual(repeat.json()["diff"]["unchanged"], 1)
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "confirmed")
+                # A draft entry (not a decision) is replaced directly.
+                reselected = client.post(plan_route, json={
+                    "base_plan_version": version, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [1]}}})
+                self.assertEqual(reselected.status_code, 200,
+                                 reselected.text)
+                draft_version = reselected.json()["plan_version"]
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "draft")
+                applied = client.post(route, json=_propagate_body(
+                    base_plan_version=draft_version, dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["changed"], True)
+                self.assertEqual(len(result["diff"]["changed"]), 1)
+                self.assertEqual(result["diff"]["changed"][0]["item_id"],
+                                 self.ITEM)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["revision"], 3)
+
     def test_body_validation_never_calls_the_cli(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
@@ -4182,6 +4535,11 @@ class Cp6PropagateRouteTests(unittest.TestCase):
                     dict(good, exclusions="it-x"),
                     dict(good, exclusions=[7]),
                     dict(good, exclusions=[""]),
+                    # CP6.1: overrides is a list of non-empty item-id strings.
+                    dict(good, overrides="it-x"),
+                    dict(good, overrides={}),
+                    dict(good, overrides=[7]),
+                    dict(good, overrides=[""]),
                     dict(good, dry_run="true"),
                     dict(good, operator=""),
                 ]

@@ -1685,6 +1685,7 @@ class ReviewUiCp6Tests(unittest.TestCase):
                 'id="reviewPropagatePositives"',
                 'id="reviewPropagateBoundary"',
                 'id="reviewPropagateExclusions"',
+                'id="reviewPropagateOverrides"',
                 'id="reviewPropagateApply"', 'id="reviewPropagateDiff"',
                 'id="reviewPropagateConflict"', 'id="reviewPropagateError"'):
             self.assertIn(marker, text)
@@ -1697,13 +1698,19 @@ class ReviewUiCp6Tests(unittest.TestCase):
         for label in ("应用到相似项", "预览成员", "应用（生成 draft 条目）",
                       "当前项", "当前簇", "全 peel", "正例", "边界例",
                       "排除项", "传播 diff", "传播冲突（409）", "传播失败（400）",
-                      "批量", "逐项按自身 evidence 重建动作并独立校验"):
+                      "批量", "逐项按自身 evidence 重建动作并独立校验",
+                      "已有决定（默认保留）", "将覆盖", "覆盖已有决定"):
             self.assertIn(label, text)
         for marker in (
                 "function reviewPropagateOpen",
                 "function reviewPropagatePreview",
                 "function reviewPropagateApply",
                 "function reviewPropagateExclusionToggle",
+                "function reviewPropagateOverrideToggle",
+                "function reviewPropagateOverrideIds",
+                "function reviewPropagateOverridesHtml",
+                "function reviewPropagateExistingText",
+                "function reviewPropagateCountsHtml",
                 "function reviewPropagateApplyDisabled",
                 "function reviewPropagateConflicts",
                 "function reviewPropagateBody",
@@ -1714,8 +1721,14 @@ class ReviewUiCp6Tests(unittest.TestCase):
                 "REVIEW_PROPAGATE_STATUS_LABEL",
                 "REVIEW_PROPAGATE_CONFLICT_STATUSES",
                 "'/plan/propagate'", "dry_run:!!dryRun",
-                "operator:'user'"):
+                "operator:'user'", "overrides:reviewPropagateOverrideIds()",
+                'data-r="propagate-override"'):
             self.assertIn(marker, text)
+        # CP6.1: ``decided`` is not a conflict (the apply-disabled rule only
+        # looks at locked/in-batch members).
+        self.assertNotIn("'decided'",
+                         text[text.index("REVIEW_PROPAGATE_CONFLICT_STATUSES"):
+                              text.index("function reviewPropagateInfo")])
         # Preview is a dry run; only apply sends dry_run:false. Apply is a
         # separate explicit click and is disabled until a preview succeeded.
         preview_start = text.index("async function reviewPropagatePreview")
@@ -1723,6 +1736,8 @@ class ReviewUiCp6Tests(unittest.TestCase):
                                  preview_start)
         preview_body = text[preview_start:preview_end]
         self.assertIn("reviewPropagateBody(info,true)", preview_body)
+        self.assertIn("ctx.propagate.exclusions=[]", preview_body)
+        self.assertIn("ctx.propagate.overrides=[]", preview_body)
         apply_start = preview_end
         apply_end = text.index("function reviewPropagateExclusionToggle",
                                apply_start)
@@ -1730,6 +1745,12 @@ class ReviewUiCp6Tests(unittest.TestCase):
         self.assertIn("reviewPropagateBody(info,false)", apply_body)
         self.assertIn("reviewPropagateApplyDisabled()", apply_body)
         self.assertIn("p.previewedBase=null", apply_body)
+        # Opening the panel resets both exclusion and override ticks.
+        open_start = text.index("function reviewPropagateOpen")
+        open_end = text.index("function reviewPropagateScopeValue", open_start)
+        open_body = text[open_start:open_end]
+        self.assertIn("exclusions:[]", open_body)
+        self.assertIn("overrides:[]", open_body)
         # The apply button is disabled until a preview with the same base plan
         # version succeeded and no locked/in-batch member is left unexcluded.
         disabled_start = text.index("function reviewPropagateApplyDisabled")
@@ -1741,6 +1762,13 @@ class ReviewUiCp6Tests(unittest.TestCase):
                       disabled_body)
         self.assertIn("reviewPropagateConflicts(p.preview).length>0",
                       disabled_body)
+        # A checked override row renders the 将覆盖 marker.
+        members_start = text.index("function reviewPropagateMembersHtml")
+        members_end = text.index("function reviewPropagateListHtml",
+                                 members_start)
+        self.assertIn("将覆盖", text[members_start:members_end])
+        self.assertIn("reviewPropagateExistingText(existing)",
+                      text[members_start:members_end])
         # Propagation entries render with a 批量 origin badge.
         entry_start = text.index("function reviewEntryHtml")
         entry_end = text.index("function reviewResolutionHtml", entry_start)
@@ -1763,13 +1791,18 @@ class ReviewUiCp6Tests(unittest.TestCase):
                        'id="reviewPropagatePositives"',
                        'id="reviewPropagateBoundary"',
                        'id="reviewPropagateExclusions"',
+                       'id="reviewPropagateOverrides"',
                        'id="reviewPropagateApply"',
                        'id="reviewPropagateDiff"',
                        'id="reviewPropagateConflict"',
                        'id="reviewPropagateError"',
                        "应用到相似项", "预览成员", "应用（生成 draft 条目）",
+                       "已有决定（默认保留）", "将覆盖", "覆盖已有决定",
                        "reviewPropagateOpen", "reviewPropagatePreview",
                        "reviewPropagateApply", "reviewPropagateExclusionToggle",
+                       "reviewPropagateOverrideToggle",
+                       "reviewPropagateOverrideIds",
+                       "propagate-override",
                        "paintReviewPropagate", "'/plan/propagate'"):
             self.assertIn(marker, page)
         # Propagation never sends a provider token or LLM env.
@@ -1987,7 +2020,8 @@ const DISCUSS_RESULT = {
 };
 
 /* CP6 (Phase 5): propagation fixtures. A preview shows a ready member, a
-   locked member (must be excluded before apply) and a boundary-case member. */
+   locked member (must be excluded before apply), a boundary-case member and a
+   CP6.1 ``decided`` member (kept by default; overrideable). */
 const PROPAGATE_PREVIEW = {
   peel_id: "peel", review_schema: 2, dry_run: true, plan_version: 0,
   scope: { kind: "cluster", item_id: null, cluster_id: "cl-a", peel: null },
@@ -2000,13 +2034,33 @@ const PROPAGATE_PREVIEW = {
     { item_id: "it-c", status: "ready", reasons: [],
       action: { type: "operation", name: "set_header_rows",
         params: { rows: [0] } } },
+    { item_id: "it-d", status: "decided", reasons: [], action: null,
+      existing: { kind: "entry", status: "confirmed",
+        strategy: { id: "use_first_row_header", version: 1 },
+        name: "set_header_rows" } },
   ],
   positives: ["it-a"],
   boundary_cases: ["it-c"],
   exclusions: [],
-  counts: { members: 3, ready: 2, already: 0, failed: 0, locked: 1,
-    excluded: 0 },
+  overrides: [],
+  counts: { members: 4, ready: 2, already: 0, decided: 1, failed: 0,
+    locked: 1, excluded: 0 },
 };
+/* The same preview when it-d is explicitly overridden: peelfeed evaluates it
+   normally and writes it as ``ready`` while still carrying ``existing``. */
+const PROPAGATE_PREVIEW_OVERRIDE = Object.assign({}, PROPAGATE_PREVIEW, {
+  overrides: ["it-d"],
+  members: PROPAGATE_PREVIEW.members.map(function (member) {
+    if (member.item_id !== "it-d") return member;
+    return Object.assign({}, member, {
+      status: "ready",
+      action: { type: "operation", name: "set_header_rows",
+        params: { rows: [0] } },
+    });
+  }),
+  counts: { members: 4, ready: 3, already: 0, decided: 0, failed: 0,
+    locked: 1, excluded: 0 },
+});
 const PROPAGATE_APPLIED = {
   peel_id: "peel", review_schema: 2, dry_run: false, plan_version: 1,
   propagation_id: "prop-20261110T120000-abcd",
@@ -2014,9 +2068,9 @@ const PROPAGATE_APPLIED = {
   strategy: { id: "use_first_row_header", version: 1 },
   members: PROPAGATE_PREVIEW.members,
   positives: ["it-a"], boundary_cases: ["it-c"],
-  exclusions: ["it-b"],
-  counts: { members: 3, ready: 2, already: 0, failed: 0, locked: 1,
-    excluded: 1 },
+  exclusions: ["it-b"], overrides: [],
+  counts: { members: 4, ready: 2, already: 0, decided: 1, failed: 0,
+    locked: 1, excluded: 1 },
   diff: { added: [
       { item_id: "it-a", entry_id: "e-it-a", status: "draft",
         source: "user", origin: { kind: "propagation",
@@ -2027,6 +2081,23 @@ const PROPAGATE_APPLIED = {
     ], changed: [], removed: [], unchanged: 0 },
   changed: true,
 };
+const PROPAGATE_APPLIED_OVERRIDE = Object.assign({}, PROPAGATE_APPLIED, {
+  overrides: ["it-d"],
+  members: PROPAGATE_PREVIEW_OVERRIDE.members,
+  counts: { members: 4, ready: 3, already: 0, decided: 0, failed: 0,
+    locked: 1, excluded: 1 },
+  diff: { added: [
+      { item_id: "it-a", entry_id: "e-it-a", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+      { item_id: "it-c", entry_id: "e-it-c", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+      { item_id: "it-d", entry_id: "e-it-d", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+    ], changed: [], removed: [], unchanged: 0 },
+});
 const REVIEW_VLM_PROPAGATED = (function () {
   const payload = reviewPayload(VLM_CAPS, VLM_REPORT, 1);
   payload.items = payload.items.map(function (entry) {
@@ -2097,10 +2168,14 @@ function fetchStub(url, opts) {
           + "(parent_not_available))" }));
     }
     if (parsed.dry_run) {
-      return Promise.resolve(response(200, PROPAGATE_PREVIEW));
+      return Promise.resolve(response(200,
+        (parsed.overrides || []).indexOf("it-d") >= 0
+          ? PROPAGATE_PREVIEW_OVERRIDE : PROPAGATE_PREVIEW));
     }
     reviewPayloadCurrent = REVIEW_VLM_PROPAGATED;
-    return Promise.resolve(response(200, PROPAGATE_APPLIED));
+    return Promise.resolve(response(200,
+      (parsed.overrides || []).indexOf("it-d") >= 0
+        ? PROPAGATE_APPLIED_OVERRIDE : PROPAGATE_APPLIED));
   }
   if (method === "POST" && u.indexOf("/review/plan/patches") >= 0) {
     patchPosts.push(JSON.parse(body || "{}"));
@@ -2237,6 +2312,8 @@ const code = block
   + " reviewPropagatePreview: reviewPropagatePreview,"
   + " reviewPropagateApply: reviewPropagateApply,"
   + " reviewPropagateExclusionToggle: reviewPropagateExclusionToggle,"
+  + " reviewPropagateOverrideToggle: reviewPropagateOverrideToggle,"
+  + " reviewPropagateOverrideIds: reviewPropagateOverrideIds,"
   + " reviewPropagateApplyDisabled: reviewPropagateApplyDisabled,"
   + " reviewPropagateInfo: reviewPropagateInfo,"
   + " paintReviewPropagate: paintReviewPropagate,"
@@ -2517,6 +2594,7 @@ async function runPropagateFlow() {
     positives: htmlOf("#reviewPropagatePositives"),
     boundary: htmlOf("#reviewPropagateBoundary"),
     exclusions: htmlOf("#reviewPropagateExclusions"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
     conflict: htmlOf("#reviewPropagateConflict"),
     applyDisabled: element("#reviewPropagateApply").disabled,
     msg: htmlOf("#reviewMsg") });
@@ -2583,6 +2661,104 @@ async function runPropagateFlow() {
   return steps;
 }
 
+async function runPropagateOverrideFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  /* Opening the panel resets exclusions/overrides and sends nothing. */
+  sandbox.__review.reviewPropagateOpen();
+  await tick(20);
+  steps.push({ step: "ov-open",
+    posts: propagatePosts.length,
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  element("#reviewPropagateScope").value = "cluster";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "ov-preview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  /* Tick an exclusion and an override; toggling only repaints (no request). */
+  const exclusions = element("#reviewPropagateExclusions");
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  const overrideBox = element("#reviewPropagateOverrides");
+  overrideBox.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-override") >= 0) {
+      return [{ checked: true, value: "it-d" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateOverrideToggle();
+  await tick(40);
+  steps.push({ step: "ov-toggled",
+    posts: propagatePosts.length,
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  /* A successful preview resets exclusions and overrides; the request still
+     carries the ticks that were active when it was sent. */
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "ov-repreview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  /* Re-tick the locked exclusion and the decided override, then apply. */
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  overrideBox.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-override") >= 0) {
+      return [{ checked: true, value: "it-d" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateOverrideToggle();
+  await tick(40);
+  await sandbox.__review.reviewPropagateApply();
+  await tick(200);
+  steps.push({ step: "ov-applied",
+    posts: propagatePosts.slice(),
+    diff: htmlOf("#reviewPropagateDiff"),
+    msg: htmlOf("#reviewMsg"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  exclusions.querySelectorAll = function () { return []; };
+  overrideBox.querySelectorAll = function () { return []; };
+  /* Re-opening the panel resets the ticks again (and sends nothing). */
+  const postsBefore = propagatePosts.length;
+  sandbox.__review.reviewPropagateOpen();
+  await tick(20);
+  steps.push({ step: "ov-reopen",
+    newPosts: propagatePosts.length - postsBefore,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  return steps;
+}
+
 async function main() {
   const results = [];
   results.push(...await runVlmFlow());
@@ -2591,6 +2767,7 @@ async function main() {
   results.push(...await runReattachFlow());
   results.push(...await runSourceChoiceFlow());
   results.push(...await runPropagateFlow());
+  results.push(...await runPropagateOverrideFlow());
   console.log(JSON.stringify(results));
 }
 
@@ -2840,8 +3017,10 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertEqual(body["operator"], "user", body)
         self.assertEqual(body["base_plan_version"], 0, body)
         members = preview["members"]
-        for marker in ("it-a", "it-b", "it-c", "就绪", "已锁定",
-                       "set_header_rows"):
+        for marker in ("it-a", "it-b", "it-c", "it-d", "就绪", "已锁定",
+                       "已有决定（默认保留）", "已有条目", "状态 confirmed",
+                       "动作 set_header_rows", "策略 use_first_row_header@v1",
+                       "统计：", "已有决定 1", "set_header_rows"):
             self.assertIn(marker, members, preview)
         self.assertIn("正例", preview["positives"], preview)
         self.assertIn("it-a", preview["positives"], preview)
@@ -2849,6 +3028,11 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertIn("it-c", preview["boundary"], preview)
         self.assertIn("排除项", preview["exclusions"], preview)
         self.assertIn("propagate-exclude", preview["exclusions"], preview)
+        self.assertIn("已有决定（默认保留）", preview["exclusions"], preview)
+        # CP6.1: the decided member has an override checkbox (default kept).
+        self.assertIn("propagate-override", preview["overrides"], preview)
+        self.assertIn("it-d", preview["overrides"], preview)
+        self.assertIn("已有条目", preview["overrides"], preview)
         self.assertIn("传播冲突", preview["conflict"], preview)
         self.assertIn("it-b", preview["conflict"], preview)
         # A locked member keeps apply disabled until it is excluded.
@@ -2864,6 +3048,9 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         apply_body = applied["posts"][1]
         self.assertIs(apply_body["dry_run"], False, apply_body)
         self.assertEqual(apply_body["exclusions"], ["it-b"], apply_body)
+        # CP6.1: without an override tick the decided member is kept, so the
+        # apply body carries an empty ``overrides`` list.
+        self.assertEqual(apply_body["overrides"], [], apply_body)
         self.assertEqual(apply_body["scope"]["kind"], "cluster", apply_body)
         self.assertIn("传播 diff", applied["diff"], applied)
         self.assertIn("新增 2", applied["diff"], applied)
@@ -2885,3 +3072,66 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertIn("parent_not_available", error["error"], error)
         self.assertTrue(error["applyDisabled"], error)
 
+    def test_propagation_decided_override_toggle_and_bodies(self):
+        """CP6.1 (wire §7.2/§7.5): ``decided`` rows render the existing-decision
+        summary and a 将覆盖 marker when overridden; override ticks are sent in
+        BOTH preview and apply bodies; toggling sends nothing; opening the panel
+        and a successful preview reset the ticks."""
+        by_step = self._run_harness()
+        opened = by_step["ov-open"]
+        # Opening sends nothing and leaves no override ticks.
+        self.assertEqual(opened["posts"], 0, opened)
+        self.assertEqual(opened["overrides"], "", opened)
+        self.assertTrue(opened["applyDisabled"], opened)
+        preview = by_step["ov-preview"]
+        self.assertEqual(len(preview["posts"]), 1, preview)
+        body = preview["posts"][0]
+        self.assertIs(body["dry_run"], True, body)
+        self.assertEqual(body["overrides"], [], body)
+        self.assertEqual(body["exclusions"], [], body)
+        # The decided row renders 已有决定（默认保留） + the existing summary.
+        for marker in ("已有决定（默认保留）", "已有条目", "状态 confirmed",
+                       "动作 set_header_rows",
+                       "策略 use_first_row_header@v1", "统计：",
+                       "已有决定 1"):
+            self.assertIn(marker, preview["members"], preview)
+        self.assertNotIn("将覆盖", preview["members"], preview)
+        # The override list has the decided member's checkbox.
+        for marker in ("propagate-override", "it-d", "已有条目"):
+            self.assertIn(marker, preview["overrides"], preview)
+        # The locked member keeps apply disabled until it is excluded.
+        self.assertTrue(preview["applyDisabled"], preview)
+        toggled = by_step["ov-toggled"]
+        # Ticking exclusion/override only repaints: no request is sent.
+        self.assertEqual(toggled["posts"], 1, toggled)
+        self.assertIn("将覆盖", toggled["members"], toggled)
+        self.assertIn("checked", toggled["overrides"], toggled)
+        self.assertIn("it-d", toggled["overrides"], toggled)
+        self.assertFalse(toggled["applyDisabled"], toggled)
+        # A fresh preview carries the active ticks, then resets them on success.
+        repreview = by_step["ov-repreview"]
+        self.assertEqual(len(repreview["posts"]), 2, repreview)
+        preview_body = repreview["posts"][1]
+        self.assertIs(preview_body["dry_run"], True, preview_body)
+        self.assertEqual(preview_body["exclusions"], ["it-b"], preview_body)
+        self.assertEqual(preview_body["overrides"], ["it-d"], preview_body)
+        self.assertEqual(repreview["state"],
+                         {"exclusions": [], "overrides": []}, repreview)
+        self.assertNotIn("将覆盖", repreview["members"], repreview)
+        self.assertIn("就绪", repreview["members"], repreview)
+        self.assertTrue(repreview["applyDisabled"], repreview)
+        applied = by_step["ov-applied"]
+        self.assertEqual(len(applied["posts"]), 3, applied)
+        apply_body = applied["posts"][2]
+        self.assertIs(apply_body["dry_run"], False, apply_body)
+        self.assertEqual(apply_body["exclusions"], ["it-b"], apply_body)
+        self.assertEqual(apply_body["overrides"], ["it-d"], apply_body)
+        self.assertIn("传播 diff", applied["diff"], applied)
+        self.assertIn("新增 3", applied["diff"], applied)
+        self.assertIn("it-d", applied["diff"], applied)
+        self.assertIn("未确认、未构建、未发布", applied["msg"], applied)
+        self.assertTrue(applied["applyDisabled"], applied)
+        reopened = by_step["ov-reopen"]
+        self.assertEqual(reopened["newPosts"], 0, reopened)
+        self.assertEqual(reopened["state"],
+                         {"exclusions": [], "overrides": []}, reopened)

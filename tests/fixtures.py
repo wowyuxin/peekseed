@@ -834,7 +834,8 @@ OPERATION_STRATEGIES = {
 
 
 def resolution_record(item_id, name, entry_id=None, revision=0,
-                      reason_code=None, reason=None, evidence_hash=None):
+                      reason_code=None, reason=None, evidence_hash=None,
+                      source="user"):
     """A resolutions.jsonl row (contract §11.6), the shape ``plan defer`` uses."""
     material = "|".join([str(item_id), str(name), str(entry_id or ""),
                          str(int(revision or 0))])
@@ -851,7 +852,7 @@ def resolution_record(item_id, name, entry_id=None, revision=0,
         "reason_code": reason_code,
         "reason": reason,
         "evidence_hash": evidence_hash,
-        "source": "user",
+        "source": source,
         "recorded_at": "2026-11-05T00:00:00Z",
     }
 
@@ -867,6 +868,49 @@ def revert_resolution_record(target):
     row["idempotency_key"] = hashlib.sha256(material.encode("utf-8")).hexdigest()
     row["recorded_at"] = "2026-11-05T00:00:00Z"
     return row
+
+
+# CP6.1 (contract v1.10 §17.7 / wire §7.2): resolutions are projected to one
+# effective row per item (last active add row wins); a row is reverted by a
+# later ``revert`` row that ``supersedes`` it. The fake CLI mirrors
+# ``peelfeed/review/resolutions.py`` so ``plan propagate`` can mark ``decided``
+# members and revert their active R0 in the same write.
+RESOLUTION_EVIDENCE_BEARING = ("defer", "keep_visual_fallback",
+                               "keep_original_figure", "confirm_headerless")
+
+
+def active_resolutions(rows):
+    """The effective R0 resolution per item (mirror of ``projection``)."""
+    active = {}
+    for sequence, record in enumerate(rows or []):
+        if not isinstance(record, dict):
+            continue
+        target = record.get("supersedes")
+        if target:
+            active.pop(target, None)
+        if record.get("change") == "revert":
+            continue
+        rid = record.get("resolution_id")
+        if rid:
+            active[rid] = (sequence, record)
+    latest = {}
+    for rid, (sequence, record) in active.items():
+        item_id = str(record.get("item_id") or "")
+        current = latest.get(item_id)
+        if current is None or sequence > current[0]:
+            latest[item_id] = (sequence, record)
+    return {item_id: record for item_id, (_sequence, record) in latest.items()}
+
+
+def resolution_is_stale(record, item):
+    """Derived stale flag (contract §11.6): evidence-bearing rows only."""
+    if not isinstance(record, dict) or not isinstance(item, dict):
+        return False
+    if record.get("name") not in RESOLUTION_EVIDENCE_BEARING:
+        return False
+    recorded = record.get("evidence_hash")
+    current = (item.get("evidence") or {}).get("hash")
+    return bool(recorded and current and recorded != current)
 
 
 def report_suggestions(report_payload):
@@ -1710,6 +1754,23 @@ def main():
             params = request.get("params") if isinstance(
                 request.get("params"), dict) else {}
             exclusions = [str(item) for item in request.get("exclusions") or []]
+            # CP6.1 (wire §7.2): optional overrides of ``decided`` members.
+            overrides = []
+            raw_overrides = request.get("overrides")
+            if raw_overrides is None:
+                raw_overrides = []
+            if not isinstance(raw_overrides, list):
+                save_state(state)
+                return fail("overrides must be a list of item ids", 2,
+                            "validation")
+            for raw in raw_overrides:
+                if not isinstance(raw, str) or not raw.strip():
+                    save_state(state)
+                    return fail("overrides must contain non-empty item ids", 2,
+                                "validation")
+                item_id = raw.strip()
+                if item_id not in overrides:
+                    overrides.append(item_id)
             dry_run = bool(request.get("dry_run"))
             operator = str(request.get("operator") or "user")
             review = copy_json(state.get("review") or DEFAULT_REVIEW)
@@ -1761,15 +1822,35 @@ def main():
                                 "member set", 2, "validation")
             else:
                 source_item_id = members[0] if members else None
+            # CP6.1 (wire §7.2): overrides must be members and must not overlap
+            # exclusions; peelfeed validates all-or-nothing (400, nothing
+            # written). The fake mirrors that so peekseed's passthrough mapping
+            # is exercised without a real peelfeed.
+            outside = [item_id for item_id in overrides
+                       if item_id not in members]
+            if outside:
+                save_state(state)
+                return fail("overrides must be a subset of the resolved member "
+                            "set; not in scope: " + ", ".join(outside),
+                            2, "validation")
+            overlap = [item_id for item_id in overrides
+                       if item_id in exclusions]
+            if overlap:
+                save_state(state)
+                return fail("overrides must not overlap exclusions: "
+                            + ", ".join(overlap), 2, "validation")
             entries = [copy_json(entry) for entry in plan.get("entries") or []]
             entries_by_item = {str(entry.get("item_id")): entry
                                for entry in entries if isinstance(entry, dict)}
             not_applicable = {str(item) for item in
                               state.get("propagate_not_applicable") or []}
             failed_map = state.get("propagate_failed") or {}
+            active_by_item = active_resolutions(
+                state.get("resolutions") or [])
             resolved = []
             locked_conflicts = []
             failed_members = []
+            overridden_members = []
             for item_id in members:
                 if item_id in exclusions:
                     resolved.append({"item_id": item_id, "status": "excluded",
@@ -1787,6 +1868,56 @@ def main():
                     locked_conflicts.append(item_id)
                     continue
                 action = strategy_action(strategy_id, params)
+                failed_reasons = failed_map.get(item_id)
+                # CP6.1 §7.2: a pre-existing decision is ``decided`` unless the
+                # member is in ``overrides``. Detection happens after
+                # locked/in_batch and before not_applicable/failed_check:
+                #   * a confirmed entry whose rebuilt candidate differs or
+                #     cannot be rebuilt;
+                #   * an applied R0 entry;
+                #   * an active projected R0 resolution other than
+                #     ``confirm_known`` (a derived stale row still counts).
+                decided_existing = None
+                if existing is not None:
+                    entry_status = str(existing.get("status") or "")
+                    entry_strategy = existing.get("strategy") or {}
+                    entry_action = existing.get("action") or {}
+                    if entry_status in ("confirmed", "applied"):
+                        same = (
+                            entry_status == "confirmed"
+                            and action is not None
+                            and not failed_reasons
+                            and entry_strategy.get("id") == strategy_id
+                            and int(entry_strategy.get("version") or 0)
+                            == strategy_version
+                            and entry_action.get("params") == action.get("params"))
+                        if entry_status == "applied" or not same:
+                            decided_existing = {
+                                "kind": "entry",
+                                "status": entry_status,
+                                "strategy": {
+                                    "id": str(entry_strategy.get("id") or ""),
+                                    "version": int(
+                                        entry_strategy.get("version") or 1)},
+                                "name": str(entry_action.get("name") or ""),
+                            }
+                if decided_existing is None:
+                    active = active_by_item.get(item_id)
+                    if (active is not None
+                            and active.get("name") != "confirm_known"):
+                        decided_existing = {
+                            "kind": "resolution",
+                            "status": "stale" if resolution_is_stale(
+                                active, by_id.get(item_id) or {})
+                                else "active",
+                            "strategy": None,
+                            "name": str(active.get("name") or ""),
+                        }
+                if decided_existing is not None and item_id not in overrides:
+                    resolved.append({"item_id": item_id, "status": "decided",
+                                     "reasons": [], "action": None,
+                                     "existing": decided_existing})
+                    continue
                 if item_id in not_applicable or action is None:
                     resolved.append({"item_id": item_id,
                                      "status": "not_applicable",
@@ -1794,7 +1925,6 @@ def main():
                                      "action": None})
                     failed_members.append(item_id)
                     continue
-                failed_reasons = failed_map.get(item_id)
                 if failed_reasons:
                     resolved.append({"item_id": item_id,
                                      "status": "failed_check",
@@ -1802,6 +1932,15 @@ def main():
                                                  failed_reasons],
                                      "action": None})
                     failed_members.append(item_id)
+                    continue
+                if decided_existing is not None:
+                    # An overridden ``decided`` member is always written as
+                    # ``ready`` (even when the rebuilt action equals the old
+                    # one) so that the override is explicit (wire §7.2).
+                    resolved.append({"item_id": item_id, "status": "ready",
+                                     "reasons": [], "action": action,
+                                     "existing": decided_existing})
+                    overridden_members.append(item_id)
                     continue
                 if (existing is not None
                         and (existing.get("strategy") or {}).get("id")
@@ -1833,6 +1972,8 @@ def main():
                              if row["status"] == "ready"),
                 "already": sum(1 for row in resolved
                                if row["status"] == "already"),
+                "decided": sum(1 for row in resolved
+                               if row["status"] == "decided"),
                 "failed": sum(1 for row in resolved
                               if row["status"] in ("failed_check",
                                                    "not_applicable")),
@@ -1852,6 +1993,7 @@ def main():
                 "positives": positives,
                 "boundary_cases": boundary_cases,
                 "exclusions": exclusions,
+                "overrides": overrides,
                 "counts": counts,
             }
             if dry_run:
@@ -1872,22 +2014,30 @@ def main():
                                  "reasons": row["reasons"]}
                                 for row in resolved
                                 if row["item_id"] in failed_members]})
+            kept = [row["item_id"] for row in resolved
+                    if row["status"] == "decided"]
+            overridden = list(overridden_members)
+            # §7.2: ``selection`` stays "all non-excluded member ids" (kept
+            # members included).
             selection = [row["item_id"] for row in resolved
-                         if row["status"] in ("ready", "already")]
+                         if row["status"] != "excluded"]
             propagation_id = "prop-20261110T120000-" + hashlib.sha256(
-                json.dumps([base, scope, strategy, selection],
+                json.dumps([base, scope, strategy, selection, overrides],
                            sort_keys=True).encode()).hexdigest()[:4]
             added = []
             changed = []
             unchanged = 0
             bumped = False
             new_entries = [copy_json(entry) for entry in entries]
+            resolutions_state = state.setdefault("resolutions", [])
             for row in resolved:
                 item_id = row["item_id"]
                 if row["status"] == "already":
                     unchanged += 1
                     continue
                 if row["status"] != "ready":
+                    # ``decided`` members not in ``overrides`` are kept: no
+                    # entry written, no resolution reverted (wire §7.2).
                     continue
                 entry_id = "e-" + hashlib.sha256(
                     item_id.encode("utf-8")).hexdigest()[:16]
@@ -1932,6 +2082,14 @@ def main():
                                     "before": copy_json(current),
                                     "after": copy_json(after)})
                 bumped = True
+                # CP6.1 §7.1: writing a new entry for an item reverts that
+                # item's active R0 resolution in the same review lock (every
+                # active name, including ``confirm_known``). Kept ``decided``
+                # members never reach this branch.
+                active = active_by_item.get(item_id)
+                if active is not None:
+                    reverted = revert_resolution_record(active)
+                    resolutions_state.append(reverted)
             new_entries.sort(key=lambda entry: str(entry.get("entry_id") or ""))
             plan_version_after = int(plan.get("plan_version") or 0)
             if bumped:
@@ -1953,7 +2111,10 @@ def main():
                 "params": copy_json(params),
                 "base_plan_version": base,
                 "exclusions": exclusions,
+                "overrides": overrides,
                 "selection": selection,
+                "kept": kept,
+                "overridden": overridden,
                 "members": copy_json(resolved),
                 "positives": positives,
                 "boundary_cases": boundary_cases,
@@ -1967,6 +2128,11 @@ def main():
                 "plan_version": plan_version_after,
                 "diff": diff,
                 "changed": bool(bumped),
+                # CP6.1 §7.5 lists kept/overridden among the passed-through
+                # response fields; the authoritative audit record also carries
+                # them (§7.2). The fake is additive here (the UI ignores them).
+                "kept": kept,
+                "overridden": overridden,
             })
             save_state(state)
             return emit(response)

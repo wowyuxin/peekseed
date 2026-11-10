@@ -1237,14 +1237,22 @@ class PeelfeedClient(object):
 
         CP6 wire §1: stdin is the frozen request ``{base_plan_version,
         scope:{kind:"item|cluster|peel", …}, strategy:{id,version}, params,
-        source_item_id?, exclusions[], dry_run, operator}``; peelfeed resolves
-        the member set, rebuilds and validates every member's action from its
-        own evidence, and either returns the preview (``dry_run:true``, nothing
-        written) or writes the draft plan entries plus the propagation audit
-        record. No model call and no LLM env: the route is synchronous and the
-        request is validated by the API before this adapter is called. A base
-        mismatch or locked/batch-bound non-excluded member is ``error
-        [conflict]`` (409, ``error.details.conflicts``); a non-excluded
+        source_item_id?, exclusions[], dry_run, operator}``; CP6.1 (wire
+        §7.2/§7.5) adds the optional ``overrides:[item_id]`` list. peelfeed
+        resolves the member set, rebuilds and validates every member's action
+        from its own evidence, and either returns the preview (``dry_run:true``,
+        nothing written) or writes the draft plan entries plus the propagation
+        audit record. A member with a pre-existing decision (a differing
+        confirmed entry, an applied R0 entry, or an active non-``confirm_known``
+        resolution) is ``decided`` and kept by default; only members listed in
+        ``overrides`` are written as ``ready`` (and their active R0 resolution
+        is reverted in the same review lock, §7.1). The response carries
+        ``overrides``/``counts.decided`` and may carry ``existing`` member rows;
+        the audit record carries ``kept``/``overridden``. No model call and no
+        LLM env: the route is synchronous and the request is validated by the
+        API before this adapter is called. A base mismatch or locked/batch-bound
+        non-excluded member is ``error [conflict]`` (409,
+        ``error.details.conflicts``); a non-excluded
         ``not_applicable``/``failed_check`` member is ``error [validation]``
         (400, ``error.details.reasons``). It never confirms/applies/builds/
         publishes and never touches the corpus.

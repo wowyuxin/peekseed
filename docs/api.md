@@ -53,7 +53,7 @@ are not listed.
 | POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Create a `report` job: rules body `{item_ids?, cluster_ids?}`, VLM body `{mode:"vlm", confirmation, item_ids?, cluster_ids?}` (202) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/discussions` | Create a `discuss` job: `{conversation_id?, scope, message, base_plan_version, confirmation}` (202) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/plan/patches` | Proxy the synchronous targeted plan patch: `{base_plan_version, patch, source, conversation_id?, turn?}` (200 plan + diff; never confirms/applies) |
-| POST | `/api/datasets/{id}/sources/{sha}/review/plan/propagate` | Proxy the synchronous cluster-level propagation: frozen `plan propagate` body (preview with `dry_run:true` writes nothing; apply writes draft entries only) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/plan/propagate` | Proxy the synchronous cluster-level propagation: frozen `plan propagate` body incl. CP6.1 `overrides[]` (preview with `dry_run:true` writes nothing; apply writes draft entries only; `decided` members kept unless overridden) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/check` | Probe the OCR provider (body empty or `{}`; no `provider`) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/refresh` | Create one `type=ocr` evidence-refresh job (body exactly `{item_ids:[…]}`) |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
@@ -389,40 +389,65 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   readable error), `400` for invalid strategy/params/evidence or an unknown
   turn, `404` for an unknown conversation. This route never confirms, applies,
   builds or publishes: adopting a patch only edits the draft plan.
-- **`POST …/review/plan/propagate` — cluster-level propagation (M2.2 CP6,
-  CP6 wire §1/§2).** Body is exactly the frozen `plan propagate` request:
+- **`POST …/review/plan/propagate` — cluster-level propagation (M2.2 CP6 /
+  CP6.1, CP6 wire §1/§2, CP6.1 §7.1/§7.2/§7.5).** Body is the frozen
+  `plan propagate` request:
   `{base_plan_version, scope:{kind:"item"|"cluster"|"peel", item_id?,
   cluster_id?, peel?}, strategy:{id, version}, params, source_item_id?,
-  exclusions[], dry_run, operator?}`. The route validates the envelope strictly
-  (unknown request/scope/strategy fields, a scope without exactly one selector
-  matching `kind`, a non-object `params`, a non-string `exclusions` entry, a
-  non-bool `dry_run` or a non-string `source_item_id`/`operator` are `400`) and
-  proxies `peelfeed plan propagate` **synchronously with no model call and no
-  LLM env**; no job descriptor is created and the response is passed through
-  unchanged. `dry_run:true` returns the member preview
-  (`members`/`positives`/`boundary_cases`/`exclusions`/`counts`) and writes
-  nothing. `dry_run:false` applies the propagation: peelfeed resolves the member
-  set, rebuilds and independently validates every member's action from its own
+  exclusions[], overrides[], dry_run, operator?}`. The route validates the
+  envelope strictly (unknown request/scope/strategy fields, a scope without
+  exactly one selector matching `kind`, a non-object `params`, a non-string
+  `exclusions`/`overrides` entry, a non-bool `dry_run` or a non-string
+  `source_item_id`/`operator` are `400`; `overrides` is deduplicated and its
+  ids stripped) and proxies `peelfeed plan propagate` **synchronously with no
+  model call and no LLM env**; no job descriptor is created and the response is
+  passed through unchanged. `overrides` (CP6.1) lists `decided` members the
+  user explicitly wants to replace; peekseed checks the envelope/type only —
+  member-set/subset/`exclusions`-overlap validation is peelfeed's
+  all-or-nothing job (`400`). `dry_run:true` returns the member preview
+  (`members`/`positives`/`boundary_cases`/`exclusions`/`overrides`/`counts`)
+  and writes nothing; preview never reverts a resolution. Members with a
+  pre-existing decision are `decided` and carry
+  `existing:{kind,status,strategy,name}` (`kind:"entry"` for a differing
+  confirmed or applied R0 entry, `kind:"resolution"` for an active/stale
+  non-`confirm_known` R0 resolution); `counts.decided` counts them.
+  `dry_run:false` applies the propagation: peelfeed resolves the member set,
+  rebuilds and independently validates every member's action from its own
   evidence, then writes draft plan entries with
   `origin:{kind:"propagation", propagation_id, scope, strategy,
   base_plan_version}` plus the immutable
   `extract/review/propagations/<propagation_id>.json` audit record (scope,
-  operator, strategy version, confirmed base plan version, selection, per-member
-  results, diff, `plan_version_after`). Locked or batch-bound members that are
-  not excluded are `409 conflict` with `error.details.conflicts`; non-excluded
+  operator, strategy version, confirmed base plan version, selection,
+  `overrides`, `kept`, `overridden`, per-member results, diff,
+  `plan_version_after`). Non-excluded `decided` members are **kept** by
+  default: no entry written, no resolution reverted, no error (listed in
+  `kept`, not counted in `diff.changed`). `decided` members listed in
+  `overrides` are written as `ready` and their active R0 resolution is reverted
+  in the same review lock (`overridden`); every written member's active R0
+  resolution (including `confirm_known`) is reverted the same way (§7.1).
+  Locked or batch-bound members that are not excluded are `409 conflict` with
+  `error.details.conflicts`; non-excluded
   `not_applicable`/`failed_check` members are `400 validation` with
-  `error.details.reasons` (all-or-nothing, nothing written). A repeat no-op
-  apply returns `changed:false` without bumping `plan_version`. The route never
-  confirms, builds, publishes or touches the corpus; propagated entries are
-  normal draft entries that the existing confirm/batch/publish/clear machinery
-  handles. The Review UI exposes this as the “应用到相似项” panel
-  (`#reviewPropagate`): scope 当前项/当前簇/全 peel, read-only strategy/params,
-  explicit 预览成员 (`dry_run:true`, never writes), member status badges with
-  reasons and per-member action summaries, 正例/边界例 lists, exclusion
-  checkboxes, an apply button disabled until a preview with the same
-  `base_plan_version` succeeded and all locked/in-batch conflicts are excluded,
-  the propagation diff, the 409 conflict list, and the 400 per-member failure
-  list. Applied entries render with a 批量 origin badge.
+  `error.details.reasons` (all-or-nothing, nothing written; `decided` is
+  neither a conflict nor an error). A repeat no-op apply returns
+  `changed:false` without bumping `plan_version`. The route never confirms,
+  builds, publishes or touches the corpus; propagated entries are normal draft
+  entries that the existing confirm/batch/publish/clear machinery handles. The
+  Review UI exposes this as the “应用到相似项” panel (`#reviewPropagate`):
+  scope 当前项/当前簇/全 peel, read-only strategy/params, explicit 预览成员
+  (`dry_run:true`, never writes), member status badges with reasons,
+  per-member action summaries and `decided` existing-decision summaries
+  (已有决定（默认保留）), 正例/边界例 lists, exclusion checkboxes, a
+  `#reviewPropagateOverrides` list of per-member override checkboxes
+  (`data-r="propagate-override"`) whose checked ids are sent as `overrides` in
+  **both** the preview and apply bodies (a ticked row renders 将覆盖; an item
+  cannot be both excluded and overridden), an apply button disabled until a
+  preview with the same `base_plan_version` succeeded and all locked/in-batch
+  conflicts are excluded (the rule is unchanged; `decided` is not a conflict),
+  the counts summary (including `decided`), the propagation diff, the 409
+  conflict list, and the 400 per-member failure list. Opening the panel and
+  every successful preview reset the exclusion and override ticks. Applied
+  entries render with a 批量 origin badge.
 - `POST …/review/ocr/check` proxies `peelfeed ocr-check` (M2.1; wire §2.8) and
   returns `200` with the probe payload (`available`, `engine`, `provider`,
   `probe`, `checked_at`, `error`); `503` when OCR is unconfigured/unrunnable,

@@ -1458,10 +1458,15 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .rr-propagate-row .rr-prop-action{font:9.5px var(--mono);color:var(--faint);
   overflow-wrap:anywhere;}
 .rr-propagate-lists{display:flex;flex-direction:column;gap:3px;}
-.rr-propagate-exclusions{display:flex;flex-wrap:wrap;gap:5px 12px;font-size:10.5px;
-  color:var(--muted);}
-.rr-propagate-exclusions label{display:inline-flex;gap:5px;align-items:center;
-  cursor:pointer;}
+.rr-propagate-exclusions,.rr-propagate-overrides{display:flex;flex-wrap:wrap;
+  gap:5px 12px;font-size:10.5px;color:var(--muted);}
+.rr-propagate-exclusions label,.rr-propagate-overrides label{display:inline-flex;
+  gap:5px;align-items:center;cursor:pointer;}
+.rr-prop-existing{font:9.5px var(--mono);color:var(--faint);
+  overflow-wrap:anywhere;}
+.rr-prop-override{font:9.5px var(--mono);color:var(--warn);
+  border:1px solid rgba(251,191,36,.35);background:var(--warn-soft);
+  border-radius:6px;padding:1px 5px;}
 .rr-propagate-error{padding:7px 10px;border-radius:9px;border:1px solid
   rgba(251,113,133,.4);background:var(--bad-soft);font-size:10.5px;line-height:1.55;
   color:var(--bad);overflow-wrap:anywhere;}
@@ -1989,7 +1994,10 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
            is an explicit click that only writes draft entries. Locked/in-batch
            members must be excluded before apply is enabled; a 400 lists the
            per-member failures. Entries carry a propagation origin and render
-           with a 批量 badge. Nothing here confirms/builds/publishes. -->
+           with a 批量 badge. Nothing here confirms/builds/publishes.
+            CP6.1 (§7.2/§7.5): #reviewPropagateOverrides holds the override
+            ticks for ``decided`` rows; checked ids go in ``overrides`` on
+            preview and apply, and a ticked row shows 将覆盖. -->
       <div class="rr-discuss rr-propagate" id="reviewPropagate" hidden>
         <div class="rr-batch-h"><h4>应用到相似项</h4>
           <span class="rr-cand-meta" id="reviewPropagateAnchor"></span></div>
@@ -2010,6 +2018,7 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
           <div id="reviewPropagateBoundary" hidden></div>
         </div>
         <div class="rr-propagate-exclusions" id="reviewPropagateExclusions" hidden></div>
+        <div class="rr-propagate-overrides" id="reviewPropagateOverrides" hidden></div>
         <div class="rr-patch-diff" id="reviewPropagateDiff" hidden></div>
         <div class="rr-patch-conflict" id="reviewPropagateConflict" hidden></div>
         <div class="rr-propagate-error" id="reviewPropagateError" hidden></div>
@@ -6550,10 +6559,15 @@ function paintReviewPatchConflict(){
    base_plan_version and every locked/in-batch member is excluded. A 400 lists
    the non-excluded failing members (all-or-nothing, nothing written). Applied
    entries are draft-only with a propagation origin and render with a 批量
-   badge; nothing here confirms/builds/publishes. */
+   badge; nothing here confirms/builds/publishes.
+   CP6.1 (wire §7.2/§7.5): members with a pre-existing decision are ``decided``
+   and kept by default (never a conflict/error). The reviewer may tick an
+   override in #reviewPropagateOverrides; checked ids are sent in ``overrides``
+   on BOTH preview and apply, and a checked row renders 将覆盖. Opening the
+   panel and every successful preview reset the exclusion and override ticks. */
 const REVIEW_PROPAGATE_STATUS_LABEL={ready:'就绪',already:'已应用（不变）',
-  failed_check:'校验未通过',not_applicable:'不适用',locked:'已锁定',
-  in_batch:'批次中',excluded:'已排除'};
+  decided:'已有决定（默认保留）',failed_check:'校验未通过',not_applicable:'不适用',
+  locked:'已锁定',in_batch:'批次中',excluded:'已排除'};
 const REVIEW_PROPAGATE_CONFLICT_STATUSES=['locked','in_batch'];
 function reviewPropagateInfo(){
   const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return null;
@@ -6608,7 +6622,7 @@ function reviewPropagateOpen(){
     return;
   }
   ctx.propagate={open:true,preview:null,previewedBase:null,exclusions:[],
-    diff:null,conflict:'',error:''};
+    overrides:[],diff:null,conflict:'',error:''};
   const panel=$('#reviewPropagate'); if(panel) panel.hidden=false;
   const scope=$('#reviewPropagateScope'); if(scope) scope.value='item';
   paintReviewPropagate();
@@ -6634,6 +6648,14 @@ function reviewPropagateExcludedIds(){
   const ctx=REVIEW_CTX;
   return ((ctx&&ctx.propagate&&ctx.propagate.exclusions)||[]).slice();
 }
+/* CP6.1 (wire §7.2/§7.5): the ``decided`` members the reviewer explicitly
+   overrides. They are sent as ``overrides`` in BOTH the preview and the apply
+   body; an item cannot be both excluded and overridden (peelfeed rejects the
+   overlap with 400). */
+function reviewPropagateOverrideIds(){
+  const ctx=REVIEW_CTX;
+  return ((ctx&&ctx.propagate&&ctx.propagate.overrides)||[]).slice();
+}
 function reviewPropagateBody(info,dryRun){
   const ctx=REVIEW_CTX;
   const plan=(ctx&&ctx.data&&ctx.data.plan
@@ -6645,6 +6667,7 @@ function reviewPropagateBody(info,dryRun){
     params:info.params||{},
     source_item_id:String(info.itemId||''),
     exclusions:reviewPropagateExcludedIds(),
+    overrides:reviewPropagateOverrideIds(),
     dry_run:!!dryRun,
     operator:'user'};
 }
@@ -6657,13 +6680,51 @@ function reviewPropagateConflicts(preview){
       &&exclusions.indexOf(String(member.item_id||''))<0;
   }).map(function(member){ return String(member.item_id||''); });
 }
+/* CP6.1 (wire §7.2): a ``decided`` member carries
+   ``existing:{kind,status,strategy,name}`` — either a pre-existing plan entry
+   (confirmed/applied) or an active R0 resolution. Render it read-only next to
+   the member so the reviewer sees what a default apply would keep. */
+function reviewPropagateExistingText(existing){
+  if(!existing||typeof existing!=='object') return '';
+  const kind=String(existing.kind||'');
+  const status=String(existing.status||'');
+  const name=String(existing.name||'');
+  const strategy=(existing.strategy&&typeof existing.strategy==='object'
+    &&existing.strategy.id)
+    ?String(existing.strategy.id)+'@v'
+      +String(existing.strategy.version==null?1:existing.strategy.version):'';
+  const bits=[];
+  if(kind==='entry') bits.push('已有条目');
+  else if(kind==='resolution') bits.push('已有 R0');
+  else bits.push('已有决定');
+  if(status) bits.push('状态 '+status);
+  if(name) bits.push('动作 '+name);
+  if(strategy) bits.push('策略 '+strategy);
+  return bits.join(' · ');
+}
+function reviewPropagateCountsHtml(preview){
+  const counts=(preview&&preview.counts);
+  if(!counts||typeof counts!=='object') return '';
+  const fields=[['members','成员'],['ready','就绪'],['already','已应用（不变）'],
+    ['decided','已有决定'],['failed','失败'],['locked','已锁定'],
+    ['excluded','已排除']];
+  const bits=[];
+  fields.forEach(function(pair){
+    if(counts[pair[0]]==null) return;
+    bits.push(pair[1]+' '+reviewNum(counts[pair[0]]));
+  });
+  if(!bits.length) return '';
+  return '<div class="rr-provider-meta">统计：'+esc(bits.join(' · '))+'</div>';
+}
 function reviewPropagateMembersHtml(preview){
   const members=((preview&&preview.members)||[]).filter(function(m){
     return m&&typeof m==='object'; });
   if(!members.length) return '';
   const exclusions=reviewPropagateExcludedIds();
+  const overrides=reviewPropagateOverrideIds();
   return '<div class="rr-provider-meta">成员（'+reviewNum(members.length)
     +'）：逐项按自身 evidence 重建动作并独立校验</div>'
+    +reviewPropagateCountsHtml(preview)
     +'<div class="rr-propagate-members">'+members.map(function(member){
       const status=String(member.status||'');
       const itemId=String(member.item_id||'');
@@ -6676,9 +6737,15 @@ function reviewPropagateMembersHtml(preview){
           .join(' ')
           +(action.params?(' '+JSON.stringify(action.params)):'')
         :'—';
+      const existing=(member.existing&&typeof member.existing==='object')
+        ?member.existing:null;
+      const overridden=!!existing&&overrides.indexOf(itemId)>=0;
       return '<div class="rr-propagate-row">'
         +'<span class="rr-prop-item">'+esc(itemId)+'</span>'
         +reviewBadge(REVIEW_PROPAGATE_STATUS_LABEL[shown]||shown||'?',shown)
+        +(existing?'<span class="rr-prop-existing">'
+          +esc(reviewPropagateExistingText(existing))+'</span>':'')
+        +(overridden?'<span class="rr-prop-override">将覆盖</span>':'')
         +(reasons.length?'<span class="rr-prop-reason">'
           +esc(reasons.join('; '))+'</span>':'')
         +'<span class="rr-prop-action">动作 '+esc(actionText)+'</span>'
@@ -6706,6 +6773,28 @@ function reviewPropagateExclusionsHtml(preview){
         +' value="'+escAttr(itemId)+'"'+(checked?' checked':'')+'>'
         +esc(itemId)+' '
         +esc(REVIEW_PROPAGATE_STATUS_LABEL[status]||status||'')+'</label>';
+    }).join('')+'</div>';
+}
+function reviewPropagateOverridesHtml(preview){
+  const exclusions=reviewPropagateExcludedIds();
+  const members=((preview&&preview.members)||[]).filter(function(m){
+    return m&&typeof m==='object'
+      &&String(m.status||'')==='decided'
+      &&exclusions.indexOf(String(m.item_id||''))<0; });
+  if(!members.length) return '';
+  const overrides=reviewPropagateOverrideIds();
+  return '<div class="rr-provider-meta">覆盖已有决定（勾选后本次应用会替换该成员'
+    +'并撤销其 R0；默认保留，不勾选即不覆盖）</div>'
+    +'<div class="rr-propagate-overrides">'+members.map(function(member){
+      const itemId=String(member.item_id||'');
+      const checked=overrides.indexOf(itemId)>=0;
+      const existing=(member.existing&&typeof member.existing==='object')
+        ?member.existing:null;
+      return '<label><input type="checkbox" data-r="propagate-override"'
+        +' value="'+escAttr(itemId)+'"'+(checked?' checked':'')+'>'
+        +esc(itemId)
+        +(existing?' '+esc(reviewPropagateExistingText(existing)):'')
+        +'</label>';
     }).join('')+'</div>';
 }
 function reviewPropagateDiffHtml(diff){
@@ -6782,6 +6871,9 @@ function paintReviewPropagate(){
   const exclusions=$('#reviewPropagateExclusions');
   if(exclusions){ const html=reviewPropagateExclusionsHtml(preview);
     exclusions.hidden=!html; exclusions.innerHTML=html; }
+  const overrides=$('#reviewPropagateOverrides');
+  if(overrides){ const html=reviewPropagateOverridesHtml(preview);
+    overrides.hidden=!html; overrides.innerHTML=html; }
   const diff=$('#reviewPropagateDiff');
   if(diff){ const html=reviewPropagateDiffHtml(p.diff);
     diff.hidden=!html; diff.innerHTML=html; }
@@ -6813,7 +6905,10 @@ async function reviewPropagatePreview(){
       body:JSON.stringify(reviewPropagateBody(info,true))});
     ctx.propagate.preview=result;
     ctx.propagate.previewedBase=base;
+    /* A successful preview starts a clean member selection: exclusions and
+       override ticks are per-apply choices made after the preview (§7.5). */
     ctx.propagate.exclusions=[];
+    ctx.propagate.overrides=[];
     ctx.propagate.diff=null; ctx.propagate.conflict='';
     ctx.propagate.error='';
     reviewMsg('预览完成：'
@@ -6878,6 +6973,28 @@ function reviewPropagateExclusionToggle(){
       });
   }
   ctx.propagate.exclusions=ids;
+  /* Exclusion and override are mutually exclusive: peelfeed rejects an item
+     listed in both with 400 (wire §7.2), so ticking an exclusion drops the
+     override tick. */
+  ctx.propagate.overrides=reviewPropagateOverrideIds().filter(
+    function(itemId){ return ids.indexOf(itemId)<0; });
+  paintReviewPropagate();
+}
+function reviewPropagateOverrideToggle(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.propagate) return;
+  const box=$('#reviewPropagateOverrides');
+  const ids=[];
+  if(box&&box.querySelectorAll){
+    Array.prototype.forEach.call(
+      box.querySelectorAll('input[data-r="propagate-override"]'),
+      function(el){
+        if(el&&el.checked&&el.value) ids.push(String(el.value));
+      });
+  }
+  ctx.propagate.overrides=ids;
+  /* Ticking an override drops the exclusion for the same item (§7.2 overlap). */
+  ctx.propagate.exclusions=reviewPropagateExcludedIds().filter(
+    function(itemId){ return ids.indexOf(itemId)<0; });
   paintReviewPropagate();
 }
 function reviewVlmGenerateOpen(){
@@ -7080,7 +7197,7 @@ function reviewStatusClass(status){
   const s=String(status||'');
   if(s==='confirmed'||s==='applied'||s==='ready'||s==='auto_resolved') return 'ok';
   if(s==='needs_decision'||s==='deferred'||s==='pending_evidence'||s==='pending_report'
-     ||s==='partial'||s==='needs_ocr') return 'warn';
+     ||s==='partial'||s==='needs_ocr'||s==='decided') return 'warn';
   if(s==='failed_check'||s==='stale'||s==='unsupported') return 'bad';
   if(s==='draft'||s==='deterministic_candidate'||s==='vlm') return 'accent';
   return 'muted';
@@ -9038,10 +9155,12 @@ $('#reviewPropagateApply').onclick=function(){
   reviewRunAction(function(){ return reviewPropagateApply(); }); };
 $('#reviewPropagateExclusions').addEventListener('change',
   reviewPropagateExclusionToggle);
+$('#reviewPropagateOverrides').addEventListener('change',
+  reviewPropagateOverrideToggle);
 $('#reviewPropagateScope').addEventListener('change',function(){
   const ctx=REVIEW_CTX; if(!ctx||!ctx.propagate) return;
   ctx.propagate.preview=null; ctx.propagate.previewedBase=null;
-  ctx.propagate.exclusions=[]; ctx.propagate.diff=null;
+  ctx.propagate.exclusions=[]; ctx.propagate.overrides=[]; ctx.propagate.diff=null;
   ctx.propagate.conflict=''; ctx.propagate.error='';
   paintReviewPropagate();
 });
