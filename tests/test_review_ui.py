@@ -1597,6 +1597,51 @@ class ReviewUiCp5Tests(unittest.TestCase):
         self.assertNotIn("api_key", text[text.index("function reviewVlmBarHtml"):
                                         text.index("/* ---- workspace dialog")])
 
+    def test_served_page_ships_cp51_source_choice_and_skipped_controls(self):
+        """CP5.1 H5/H7/H2/H3: source choice, vlm_disagrees, pricing, skipped."""
+        text = _ui()
+        for marker in (
+                "function reviewItemSourceChoice",
+                "function reviewItemSourceChoiceHtml",
+                "function reviewItemSourceNoticeHtml",
+                "function reviewSelectedSources",
+                "function reviewSuggestionIdentity",
+                "function reviewItemCluster",
+                "data-r=\"accept-source\"",
+                "vlm_disagrees",
+                "采纳来源",
+                "ambiguous_suggestion",
+                "source_missing",
+                "REVIEW_SKIPPED_REASON_LABEL",
+                "reviewSkippedReasonLabel",
+                "跳过的簇/项",
+                "费用未计价",
+                "vlm_priced",
+                "vlm_max_calls_per_peel",
+                "pendingPatchTurn",
+                "body.turn=ctx.pendingPatchTurn",
+                "每 peel 调用上限"):
+            self.assertIn(marker, text)
+        # The confirm-selected request carries the sources map only when a
+        # source choice is rendered for a ticked item.
+        accept_start = text.index("}else if(kind==='accept-selected'){")
+        accept_end = text.index("}else if(kind==='clear'){", accept_start)
+        accept_body = text[accept_start:accept_end]
+        self.assertIn("reviewSelectedSources()", accept_body)
+        self.assertIn("body.sources=sources", accept_body)
+        # Adopting a discussion patch sends the assistant turn number.
+        adopt_start = text.index("async function reviewDiscussAdoptPatch")
+        adopt_end = text.index("function reviewVlmRetry", adopt_start)
+        adopt_body = text[adopt_start:adopt_end]
+        self.assertIn("body.turn=ctx.pendingPatchTurn", adopt_body)
+        # Skipped reasons are rendered in the VLM report area, not the plan.
+        provider_start = text.index("function reviewReportProviderHtml")
+        provider_end = text.index("function paintReviewReportProvider",
+                                  provider_start)
+        provider_body = text[provider_start:provider_end]
+        self.assertIn("skipped", provider_body)
+        self.assertIn("reviewSkippedReasonLabel", provider_body)
+
     def test_served_page_ships_cp5_vlm_controls(self):
         with _served_home():
             from fastapi.testclient import TestClient
@@ -1699,6 +1744,7 @@ const reportVlmPosts = [];
 const reportRulesPosts = [];
 const discussPosts = [];
 const patchPosts = [];
+const planActionBodies = [];
 let planActionPosts = 0;
 let reviewPayloadCurrent = null;
 let sourcesPayload = { sources: [] };
@@ -1738,6 +1784,8 @@ const VLM_CAPS = {
   vlm_vision: true, vlm_model: "qwen2.5-vl-72b",
   vlm_link_id: "answer-main", vlm_budget_usd: 2.0, vlm_spent_usd: 0.35,
   vlm_calls: 1, vlm_vision_checked_at: "2026-11-09T03:10:00Z",
+  /* CP5.1 H7 (wire §10.7): prices not configured -> honest "费用未计价". */
+  vlm_priced: false, vlm_max_calls_per_peel: 100,
 };
 const VLM_CAPS_OFF = Object.assign({}, VLM_CAPS, {
   vlm: false,
@@ -1758,6 +1806,13 @@ const VLM_REPORT = {
     counts: { vlm_suggestions: 2, clarifications: 1, failed_checks: 0 },
     partial_failures: [{ cluster_id: "cl-b", code: "vlm_bad_response",
       message: "cluster response was void" }],
+    /* CP5.1 H2/H3 (wire §10.3): additive skipped entries with reason codes. */
+    skipped: [
+      { cluster_id: "cl-c", item_ids: ["it-c", "it-d"],
+        reason: "ocr_not_ready" },
+      { cluster_id: "cl-d", item_ids: ["it-e"], reason: "item_cap" },
+      { cluster_id: "cl-e", item_ids: [], reason: "budget_exhausted" },
+    ],
     llm_usage: { calls: 2, tokens_input: 1200, tokens_output: 400,
       cost_usd: "0.00" },
     clusters: [],
@@ -1783,6 +1838,26 @@ const REVIEW_VLM = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
 const REVIEW_VLM_DONE = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
 const REVIEW_VLM_PLAN1 = reviewPayload(VLM_CAPS, VLM_REPORT, 1);
 const REVIEW_VLM_OFF = reviewPayload(VLM_CAPS_OFF, null, 0);
+/* CP5.1 H5 (wire §10.5): a cluster flagged ``vlm_disagrees`` whose item has a
+   rule and a VLM ready suggestion with different action identities. */
+const REVIEW_VLM_SOURCE = (function () {
+  const payload = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
+  const sourceCluster = Object.assign({}, payload.clusters[0], {
+    vlm_disagrees: true,
+    suggestions: [
+      { item_id: "it-a", strategy: { id: "use_first_row_header", version: 1 },
+        params: { rows: [0] }, evidence_refs: [], in_plan: false,
+        state: "ready", validator: { status: "ready", reasons: [] },
+        source: "rule" },
+      { item_id: "it-a", strategy: { id: "confirm_no_header", version: 1 },
+        params: {}, evidence_refs: [], in_plan: false,
+        state: "ready", validator: { status: "ready", reasons: [] },
+        source: "vlm" },
+    ],
+  });
+  payload.clusters = [sourceCluster, payload.clusters[1]];
+  return payload;
+})();
 const VLM_PATCH = {
   scope: { kind: "cluster", item_id: null, cluster_id: "cl-a" },
   members: ["it-a"], exclusions: ["it-b"], boundary_cases: ["it-b"],
@@ -1792,7 +1867,7 @@ const VLM_PATCH = {
     uncertainties: ["row 0"] }],
 };
 const DISCUSS_RESULT = {
-  schema_version: 1, intent: "modify",
+  schema_version: 1, intent: "modify", turn: 2,
   reply: "建议把第 0 行作为表头。", uncertainties: ["row 0 与数据行相似"],
   clarifications: [], patch: VLM_PATCH,
   model: "qwen2.5-vl-72b", link_id: "answer-main",
@@ -1889,7 +1964,11 @@ function fetchStub(url, opts) {
   if (method === "POST" && (u.endsWith("/review/plan")
                             || u.indexOf("/review/plan?") >= 0)) {
     planActionPosts += 1;
-    return Promise.resolve(response(200, { plan_version: 0, entries: [] }));
+    const parsedPlan = JSON.parse(body || "{}");
+    planActionBodies.push(parsedPlan);
+    return Promise.resolve(response(200, {
+      plan_version: 1, entries: [],
+      accepted: [{ item_id: (parsedPlan.item_ids || ["it-a"])[0] }] }));
   }
   if (u.indexOf("/review?") >= 0 || u.endsWith("/review")) {
     return Promise.resolve(response(200, reviewPayloadCurrent));
@@ -1956,6 +2035,9 @@ const code = block
   + " reviewDiscussAdoptPatch: reviewDiscussAdoptPatch,"
   + " reviewClarificationAnswer: reviewClarificationAnswer,"
   + " reviewVlmRetry: reviewVlmRetry,"
+  + " reviewAction: reviewAction,"
+  + " reviewSelectedSources: reviewSelectedSources,"
+  + " reviewItemSourceChoice: reviewItemSourceChoice,"
   + " generateReviewReport: generateReviewReport,"
   + " reviewLoadSource: reviewLoadSource,"
   + " paintReviewVlmJob: paintReviewVlmJob,"
@@ -1983,6 +2065,7 @@ function resetCounters() {
   reportRulesPosts.length = 0;
   discussPosts.length = 0;
   patchPosts.length = 0;
+  planActionBodies.length = 0;
   planActionPosts = 0;
   conflictMode = false;
 }
@@ -2159,12 +2242,55 @@ async function runReattachFlow() {
   return steps;
 }
 
+async function runSourceChoiceFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM_SOURCE;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  steps.push({ step: "source-open",
+    detail: htmlOf("#reviewDetail"),
+    choice: sandbox.__review.reviewItemSourceChoice(
+      { id: "it-a", cluster_id: "cl-a" }),
+    planPosts: planActionPosts });
+  /* Tick it-a and choose VLM as its adoption source, then confirm-selected.
+     The stub DOM returns the checkbox/source elements the real render emits. */
+  const detail = element("#reviewDetail");
+  detail.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("accept-pick") >= 0) {
+      return [{ checked: true, value: "it-a" }];
+    }
+    if (String(selector).indexOf("accept-source") >= 0) {
+      return [{ value: "vlm", getAttribute: function (name) {
+        return name === "data-item" ? "it-a" : null;
+      } }];
+    }
+    return [];
+  };
+  await sandbox.__review.reviewAction({
+    getAttribute: function (name) {
+      return name === "data-r" ? "accept-selected" : null;
+    },
+    closest: function () { return null; },
+    disabled: false,
+  });
+  await tick(160);
+  steps.push({ step: "source-accept",
+    posts: planActionBodies.slice(),
+    msg: htmlOf("#reviewMsg"),
+    planPosts: planActionPosts });
+  detail.querySelectorAll = function () { return []; };
+  return steps;
+}
+
 async function main() {
   const results = [];
   results.push(...await runVlmFlow());
   results.push(...await runTextOnlyFlow());
   results.push(...await runNoVlmFlow());
   results.push(...await runReattachFlow());
+  results.push(...await runSourceChoiceFlow());
   console.log(JSON.stringify(results));
 }
 
@@ -2200,12 +2326,13 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         bar = opened["bar"]
         for marker in ("VLM 已配置", "qwen2.5-vl-72b", "answer-main",
                        "支持图片", "预算 $2.00", "生成/更新 VLM 报告",
-                       "与 VLM 讨论"):
+                       "与 VLM 讨论", "费用未计价", "每 peel 调用上限 100"):
             self.assertIn(marker, bar, opened)
         provider = opened["provider"]
         for marker in ("VLM", "qwen2.5-vl-72b", "支持图片", "缓存命中",
                        "VLM 建议 2", "澄清问题 1", "部分簇失败",
-                       "vlm_bad_response"):
+                       "vlm_bad_response", "跳过的簇/项", "OCR 未就绪",
+                       "超过单项上限", "预算耗尽", "cl-c", "cl-d"):
             self.assertIn(marker, provider, opened)
         self.assertIn("第 0 行是否是表头？", opened["clarifications"], opened)
         self.assertIn("是", opened["clarifications"], opened)
@@ -2280,6 +2407,8 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertEqual(patch_body["base_plan_version"], 0)
         self.assertEqual(patch_body["source"], "vlm")
         self.assertEqual(patch_body["conversation_id"], "conv-1")
+        # CP5.1 H5: the adopted patch names the archived assistant turn.
+        self.assertEqual(patch_body["turn"], 2, patch_body)
         self.assertEqual(patch_body["patch"]["scope"]["kind"], "cluster")
         self.assertIn("计划 diff", adopted["diff"], adopted)
         self.assertIn("新增 1", adopted["diff"], adopted)
@@ -2354,4 +2483,31 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertFalse(retry["hidden"], retry)
         self.assertEqual(retry["vlmPosts"], 0, retry)
         self.assertIn("确认生成/更新 VLM 报告？", retry["title"], retry)
+
+    def test_source_choice_and_vlm_disagrees_confirm_selected(self):
+        """CP5.1 H5: ambiguous/vlm_disagrees items render a source choice and
+        the confirm-selected request carries the ``sources`` map."""
+        by_step = self._run_harness()
+        opened = by_step["source-open"]
+        self.assertEqual(opened["planPosts"], 0, opened)
+        detail = opened["detail"]
+        self.assertIn("规则建议与 VLM 建议不一致", detail, opened)
+        self.assertIn("vlm_disagrees", detail, opened)
+        self.assertIn('data-r="accept-source"', detail, opened)
+        self.assertIn("采纳来源", detail, opened)
+        self.assertIn("规则", detail, opened)
+        self.assertIn("VLM", detail, opened)
+        choice = opened["choice"]
+        self.assertTrue(choice["needsChoice"], opened)
+        self.assertTrue(choice["ambiguous"], opened)
+        self.assertTrue(choice["disagrees"], opened)
+        self.assertEqual(choice["sources"], ["rule", "vlm"], opened)
+        self.assertEqual(choice["defaultSource"], "rule", opened)
+        accepted = by_step["source-accept"]
+        self.assertEqual(len(accepted["posts"]), 1, accepted)
+        body = accepted["posts"][0]
+        self.assertEqual(body["action"], "accept", body)
+        self.assertEqual(body["item_ids"], ["it-a"], body)
+        self.assertEqual(body["sources"], {"it-a": "vlm"}, body)
+        self.assertEqual(accepted["planPosts"], 1, accepted)
 

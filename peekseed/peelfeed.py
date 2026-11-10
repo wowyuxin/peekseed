@@ -50,6 +50,7 @@ __all__ = [
     "DEFER_REASONS",
     "HANDSHAKE_TTL",
     "LLM_MODES",
+    "LLM_TUNING_ENV",
     "PeelfeedClient",
     "PeelfeedConfigError",
     "PeelfeedError",
@@ -148,6 +149,18 @@ _PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
 #: The child-only LLM provider variables (CP5 wire §1.3).
 VLM_ENV_KEYS = ("PEELFEED_LLM_BASE", "PEELFEED_LLM_MODEL",
                 "PEELFEED_LLM_TOKEN", "PEELFEED_LLM_LINK_ID")
+#: Non-secret peelfeed LLM tuning variables forwarded from peekseed's own env
+#: to **every** peelfeed child (CP5.1 H7 / wire §10.7), read-only commands
+#: included: prompt set, timeout, budget, prices, vision probe and the per-job/
+#: per-peel/per-turn caps. ``PEELFEED_LLM_PROVIDER`` is deliberately absent:
+#: the local/test command seam must never be forwarded to a production child.
+LLM_TUNING_ENV = ("PEELFEED_LLM_PROMPT_SET", "PEELFEED_LLM_TIMEOUT",
+                  "PEELFEED_LLM_BUDGET_USD", "PEELFEED_LLM_PRICE_INPUT",
+                  "PEELFEED_LLM_PRICE_OUTPUT", "PEELFEED_LLM_VISION",
+                  "PEELFEED_LLM_MAX_CALLS_PER_JOB",
+                  "PEELFEED_LLM_MAX_CALLS_PER_PEEL",
+                  "PEELFEED_LLM_MAX_IMAGES_PER_TURN",
+                  "PEELFEED_LLM_JSON_MODE")
 _LLM_ENV_PREFIX = "PEELFEED_LLM_"
 #: Peel state machine -> peekseed's per-source ``extraction.state``.
 STATE_MAP = {
@@ -877,13 +890,21 @@ class PeelfeedClient(object):
         """The child environment: allowlisted vars plus explicit LLM env only.
 
         Every ``PEELFEED_*`` variable is forwarded (the OCR config is env-only)
-        **except** ``PEELFEED_LLM_*``: those are provider credentials and are
-        only injected for a user-confirmed report/discuss child via
-        ``llm_env`` (CP5 wire §1.3). peekseed's own token/API keys never pass.
+        **except** the provider credentials: ``PEELFEED_LLM_BASE/MODEL/TOKEN/
+        LINK_ID`` are only injected for a user-confirmed report/discuss child
+        via ``llm_env`` (CP5 wire §1.3) and ``PEELFEED_LLM_PROVIDER`` is never
+        forwarded at all. The non-secret tuning variables
+        (:data:`LLM_TUNING_ENV`: prompt set, timeout, budget, prices, vision and
+        the per-job/per-peel/per-turn caps) ARE forwarded to **every** child --
+        including the read-only ``capabilities``/``status``/``review`` ones --
+        so a deployed ``PEELFEED_LLM_*`` config reaches the engine that needs it
+        (CP5.1 H7 / wire §10.7). peekseed's own token/API keys never pass.
         """
         env = {key: value for key, value in os.environ.items()
-               if key in _PASS_ENV or (key.startswith("PEELFEED_")
-                                       and not key.startswith(_LLM_ENV_PREFIX))}
+               if key in _PASS_ENV
+               or (key.startswith("PEELFEED_")
+                   and (key in LLM_TUNING_ENV
+                        or not key.startswith(_LLM_ENV_PREFIX)))}
         env["PEELFEED_SHARED_DIR"] = str(config.paths().shared_dir)
         if self.cfg.get("python") and not self.cfg.get("cli"):
             repo = self.cfg.get("repo") or ""
@@ -1081,6 +1102,11 @@ class PeelfeedClient(object):
         ``--entry <id> --base-plan-version <n>``; ``show`` is read-only. The
         response is the latest complete ReviewPlan plus ``entry``/``resolution``
         and the CP2 additive ``accepted``/``cleared``/``refresh`` objects.
+
+        CP5.1 (H5 / wire §10.5): an ``accept`` request may also carry
+        ``sources: {<item_id>: "rule"|"vlm"}``; the API validates it strictly
+        and this adapter passes it through verbatim. ``accepted[]`` entries then
+        carry ``source`` and ``origin``.
         """
         request = dict(payload or {})
         action = str(request.pop("action", "") or "").strip().lower()
@@ -1183,7 +1209,11 @@ class PeelfeedClient(object):
 
         CP5 wire §5: stdin ``{base_plan_version, patch, source:"vlm|user",
         conversation_id?}``; no model call and no LLM env (the patch was
-        produced by an earlier discuss job, or by the user). The plan never
+        produced by an earlier discuss job, or by the user). CP5.1 (H5 / wire
+        §10.5) adds ``turn`` (int ≥ 1), required with ``source:"vlm"``: peelfeed
+        compares the submitted patch with the archived assistant turn and
+        records ``source:"vlm"`` only when identical (edited → ``"user"``),
+        either way with the conversation ``origin``. The plan never
         confirms/applies anything: the response is the new plan plus the
         targeted ``diff``; a base/locked/batch conflict is ``error [conflict]``
         (409) and invalid content is ``error [validation]`` (400).

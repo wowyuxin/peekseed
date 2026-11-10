@@ -884,6 +884,36 @@ def report_suggestions(report_payload):
     return suggestions
 
 
+def suggestion_source(suggestion):
+    """The adoption source of one report suggestion (rule is the default)."""
+    suggestion = suggestion if isinstance(suggestion, dict) else {}
+    return "vlm" if str(suggestion.get("source") or "") == "vlm" else "rule"
+
+
+def suggestion_action_identity(suggestion):
+    """The wire §10.5 action identity: strategy id/version + canonical params."""
+    suggestion = suggestion if isinstance(suggestion, dict) else {}
+    strategy = suggestion.get("strategy") or {}
+    try:
+        params = json.dumps(suggestion.get("params") or {}, sort_keys=True)
+    except (TypeError, ValueError):
+        params = repr(suggestion.get("params"))
+    return (str(strategy.get("id") or ""),
+            int(strategy.get("version") or 1), params)
+
+
+def report_origin(report_payload):
+    """The plan-entry ``origin`` for a report accept (wire §10.5)."""
+    payload = report_payload if isinstance(report_payload, dict) else {}
+    inner = payload.get("report")
+    report = inner if isinstance(inner, dict) else payload
+    provider = report.get("provider") if isinstance(
+        report.get("provider"), dict) else {}
+    return {"kind": "report", "job_id": report.get("job_id"),
+            "model": provider.get("model"),
+            "prompt_version": provider.get("prompt_version")}
+
+
 def _item_evidence_hash(review, item_id):
     """The review item's current evidence hash (used for accepted entries)."""
     for item in review.get("items") or []:
@@ -1286,27 +1316,34 @@ def main():
         review_items = int(state.get("ingest_review_items") or 0)
         errors = list(state.get("ingest_errors") or [])
         delay = float(state.get("ingest_seconds") or 0)
-        peels[peel_id] = {
-            "peel_id": peel_id,
-            # CP3 flake hardening: with no simulated delay the terminal state is
-            # observable immediately (no intermediate "converting" write for a
-            # 0.05s poller to catch and persist late).
-            "state": "converting" if delay else (
-                "failed" if errors else "ready"),
-            "source": {"name": os.path.basename(source),
-                       "size": os.path.getsize(source),
-                       "sha256": sha, "pages": pages},
-            "profile": state.get("ingest_profile") or "generic",
-            "conversion_id": "" if delay else hashlib.sha256(
-                ("conv|" + sha).encode()).hexdigest(),
-            "counts": {"pages": pages, "chunks": pages},
-            "validation": {"errors": [] if delay else errors,
-                           "review_items": review_items},
-            "review_items": review_items,
-            "error": None if delay or not errors else "validation failed",
-        }
-        state["peels"] = peels
-        save_state(state)
+        # CP5.1 H9: simulate a re-ingest of an already-ready peel. The real
+        # engine keeps the previous peel summary visible until the new ingest
+        # publishes, so a status poll during the delay still reports the old
+        # ``ready`` state (the bug H9 fixes). Without this flag the fake writes
+        # an intermediate ``converting`` state immediately (CP3 flake hardening).
+        keep_previous = bool(state.get("ingest_keep_previous_state"))
+        if not (keep_previous and peel_id in peels):
+            peels[peel_id] = {
+                "peel_id": peel_id,
+                # CP3 flake hardening: with no simulated delay the terminal state
+                # is observable immediately (no intermediate "converting" write
+                # for a 0.05s poller to catch and persist late).
+                "state": "converting" if delay else (
+                    "failed" if errors else "ready"),
+                "source": {"name": os.path.basename(source),
+                           "size": os.path.getsize(source),
+                           "sha256": sha, "pages": pages},
+                "profile": state.get("ingest_profile") or "generic",
+                "conversion_id": "" if delay else hashlib.sha256(
+                    ("conv|" + sha).encode()).hexdigest(),
+                "counts": {"pages": pages, "chunks": pages},
+                "validation": {"errors": [] if delay else errors,
+                               "review_items": review_items},
+                "review_items": review_items,
+                "error": None if delay or not errors else "validation failed",
+            }
+            state["peels"] = peels
+            save_state(state)
         if delay:
             time.sleep(delay)
         conversion_id = hashlib.sha256(("conv|" + sha).encode()).hexdigest()
@@ -1411,12 +1448,44 @@ def main():
                 save_state(state)
                 return fail("source must be 'vlm' or 'user'", 2, "validation")
             conversation_id = request.get("conversation_id")
+            turn = request.get("turn")
+            conversations = state.get("conversations") or {}
             if conversation_id:
-                conversations = state.get("conversations") or {}
                 if conversation_id not in conversations:
                     save_state(state)
                     return fail("unknown conversation: "
                                 + str(conversation_id), 3, "not_found")
+            # CP5.1 H5 (wire §10.5): a VLM-sourced patch must name the archived
+            # assistant turn; the fake compares the submitted patch with that
+            # turn (identical -> source vlm, edited -> source user) and records
+            # the conversation origin either way.
+            origin = None
+            effective_source = source
+            if source == "vlm":
+                if not conversation_id:
+                    save_state(state)
+                    return fail("source 'vlm' requires conversation_id",
+                                2, "validation")
+                if (isinstance(turn, bool) or not isinstance(turn, int)
+                        or turn < 1):
+                    save_state(state)
+                    return fail("source 'vlm' requires turn (int >= 1)",
+                                2, "validation")
+                archived = next(
+                    (candidate for candidate in
+                     conversations[conversation_id].get("assistant_turns") or []
+                     if candidate.get("turn") == turn), None)
+                if archived is None or not archived.get("patch"):
+                    save_state(state)
+                    return fail("no archived assistant patch for turn "
+                                + str(turn), 2, "validation")
+                effective_source = ("vlm" if archived.get("patch") == patch
+                                    else "user")
+                origin = {"kind": "conversation",
+                          "conversation_id": conversation_id,
+                          "turn": turn,
+                          "model": archived.get("model"),
+                          "prompt_version": archived.get("prompt_version")}
             if base != plan.get("plan_version"):
                 save_state(state)
                 return fail("base_plan_version mismatch", 2, "conflict")
@@ -1565,7 +1634,8 @@ def main():
                     "dependencies": [],
                     "capability_snapshot": {"native_lines": True,
                                             "ocr": None, "vlm": None},
-                    "source": source,
+                    "source": effective_source,
+                    "origin": copy_json(origin),
                     "revision": revision,
                     "batch_id": None,
                     "notes": change.get("notes"),
@@ -1703,6 +1773,20 @@ def main():
             if not isinstance(item_ids, list) or not item_ids:
                 return fail("item_ids is required", 2, "validation")
             state.setdefault("accept_requests", []).append(copy_json(request))
+            # CP5.1 H5 (wire §10.5): optional per-item adoption sources. Keys
+            # must be requested item ids, values rule|vlm.
+            sources = request.get("sources")
+            requested = [str(raw) for raw in item_ids]
+            if sources is not None:
+                if not isinstance(sources, dict):
+                    return fail("sources must be an object", 2, "validation")
+                for raw_key, raw_value in sources.items():
+                    if str(raw_key) not in requested:
+                        return fail("sources key is not a requested item id: "
+                                    + str(raw_key), 2, "validation")
+                    if raw_value not in ("rule", "vlm"):
+                        return fail("sources value must be 'rule' or 'vlm'",
+                                    2, "validation")
             items_by_id = {item.get("id"): item
                            for item in review.get("items") or []
                            if isinstance(item, dict)}
@@ -1712,7 +1796,7 @@ def main():
                 item_id = suggestion.get("item_id")
                 status = (suggestion.get("validator") or {}).get("status")
                 if status == "ready":
-                    ready.setdefault(item_id, suggestion)
+                    ready.setdefault(item_id, []).append(suggestion)
                 elif status == "failed_check":
                     failed.setdefault(item_id, suggestion)
             reasons = []
@@ -1739,7 +1823,39 @@ def main():
                         "message": "item is stale: " + ", ".join(
                             str(code) for code in stale_reasons)})
                     continue
-                suggestion = ready.get(item_id)
+                suggestions = ready.get(item_id) or []
+                suggestion = None
+                if sources is not None and item_id in sources:
+                    wanted = sources[item_id]
+                    suggestion = next(
+                        (candidate for candidate in suggestions
+                         if suggestion_source(candidate) == wanted), None)
+                    if suggestion is None:
+                        reasons.append({
+                            "item_id": item_id, "code": "source_missing",
+                            "message": "no ready %%s suggestion for this item"
+                                       %% wanted})
+                        continue
+                elif len(suggestions) == 1:
+                    suggestion = suggestions[0]
+                elif len(suggestions) > 1:
+                    identities = {suggestion_action_identity(candidate)
+                                  for candidate in suggestions}
+                    if len(identities) == 1:
+                        # Same action identity: adopt the rule one (rule
+                        # preferred, wire §10.5).
+                        suggestion = next(
+                            (candidate for candidate in suggestions
+                             if suggestion_source(candidate) == "rule"),
+                            suggestions[0])
+                    else:
+                        reasons.append({
+                            "item_id": item_id,
+                            "code": "ambiguous_suggestion",
+                            "message": "several ready suggestions with "
+                                       "different actions; specify "
+                                       "sources[item_id]"})
+                        continue
                 if suggestion is None:
                     if item_id in failed:
                         failed_reasons = ((failed[item_id].get("validator") or {})
@@ -1763,6 +1879,7 @@ def main():
                     {"item_ids": [str(raw) for raw in item_ids],
                      "reasons": reasons})
             accepted = []
+            accept_origin = report_origin(report)
             for item_id, suggestion in resolved:
                 strategy = suggestion.get("strategy") or {}
                 strategy_id = str(strategy.get("id") or "")
@@ -1771,6 +1888,7 @@ def main():
                 if created_action is None:
                     return fail("unknown strategy: " + strategy_id,
                                 2, "validation")
+                adopted_source = suggestion_source(suggestion)
                 entry_id = "e-" + hashlib.sha256(
                     item_id.encode("utf-8")).hexdigest()[:16]
                 match = next((candidate for candidate in entries
@@ -1796,7 +1914,8 @@ def main():
                     "dependencies": [],
                     "capability_snapshot": {"native_lines": True,
                                             "ocr": None, "vlm": None},
-                    "source": suggestion.get("source") or "rule",
+                    "source": adopted_source,
+                    "origin": copy_json(accept_origin),
                     "revision": revision,
                     "batch_id": None,
                     "notes": None,
@@ -1820,6 +1939,8 @@ def main():
                     "strategy": match["strategy"],
                     "action": created_action,
                     "status": match["status"],
+                    "source": adopted_source,
+                    "origin": copy_json(accept_origin),
                     "revision": revision,
                     "replaced_existing": replaced,
                 })
@@ -2062,11 +2183,17 @@ def main():
         state.setdefault("jobs", {})[job["job_id"]] = job
         # Additive assistant-turn result summary (wire §4.3) served through the
         # peel asset route (GET …/assets/extract/review/jobs/<id>.result.json).
+        # CP5.1 H5: the assistant turn number is archived so ``plan patch`` with
+        # source:"vlm" can compare the submitted patch with it (identical -> vlm,
+        # edited -> user) and record the conversation origin.
+        conversation = conversations[conversation_id]
+        assistant_turns = conversation.setdefault("assistant_turns", [])
+        turn_number = 2 + 2 * len(assistant_turns)
         result = {
             "schema_version": 1, "job_id": job["job_id"], "peel_id": peel_id,
             "build_id": "b20261109T031000-abcdef12",
             "conversation_id": conversation_id,
-            "turn": 2, "role": "assistant", "at": "2026-11-09T03:10:00Z",
+            "turn": turn_number, "role": "assistant", "at": "2026-11-09T03:10:00Z",
             "intent": "explain", "reply": "按当前报告，该簇的规则建议是可靠的。",
             "uncertainties": [], "clarifications": [],
             "patch": None,
@@ -2082,6 +2209,14 @@ def main():
         override = state.get("discuss_result")
         if isinstance(override, dict):
             result.update(copy_json(override))
+        assistant_turns.append({
+            "turn": int(result.get("turn") or turn_number),
+            "role": "assistant",
+            "patch": copy_json(result.get("patch")),
+            "model": result.get("model"),
+            "prompt_version": result.get("prompt_version"),
+        })
+        conversation["turns"] = int(conversation.get("turns") or 0) + 1
         state.setdefault("discuss_job_results", {})[job["job_id"]] = result
         if state.get("review_after_discuss"):
             state["review"] = copy_json(state["review_after_discuss"])

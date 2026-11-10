@@ -1391,6 +1391,15 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   background:var(--accent-soft);}
 .rr-vlm-detail{font-size:10.5px;color:var(--muted);line-height:1.5;
   overflow-wrap:anywhere;}
+/* CP5.1 H5: per-item source choice / vlm_disagrees warning (wire §10.5). */
+.rr-vlm-disagree{font-size:10.5px;line-height:1.5;color:var(--warn);
+  border:1px solid rgba(251,191,36,.35);border-radius:9px;
+  background:var(--warn-soft);padding:6px 9px;margin:0 0 8px;
+  overflow-wrap:anywhere;}
+.rr-source-row{margin:0 0 8px;}
+.rr-accept-source{display:inline-flex;align-items:center;gap:6px;font-size:10.5px;
+  color:var(--muted);}
+.rr-accept-source select{min-height:26px;font-size:10.5px;padding:2px 6px;}
 .rr-vlm-job{padding:8px 11px;margin:0 0 10px;border:1px solid var(--line);
   border-radius:11px;background:var(--panel-2);min-width:0;}
 .rr-provider{display:flex;flex-direction:column;gap:4px;padding:8px 11px;
@@ -5314,10 +5323,21 @@ const REVIEW_STALE_LABEL={evidence_changed:'证据变化',parent_changed:'父表
 const REVIEW_STALE_REFRESHABLE=['evidence_changed','parent_changed'];
 /* CP2 W9: ``plan accept`` is all-or-nothing; a 400 embeds compact
    ``item_id=code`` tokens from ``detail.reasons`` (wire §2.6) which are mapped
-   to these Chinese labels. ``entry_in_batch`` is reserved for CP3. */
+   to these Chinese labels. ``entry_in_batch`` is reserved for CP3. CP5.1 H5
+   adds ``ambiguous_suggestion`` (several differing ready suggestions and no
+   per-item source) and ``source_missing`` (the requested source has no ready
+   suggestion). */
 const REVIEW_ACCEPT_REASON_LABEL={locked:'已锁定',stale:'已过期',
   no_ready_suggestion:'无就绪建议',validator_failed:'校验未通过',
-  item_missing:'条目缺失',entry_in_batch:'已在批次中'};
+  item_missing:'条目缺失',entry_in_batch:'已在批次中',
+  ambiguous_suggestion:'建议来源不明确（需按项选择规则/VLM）',
+  source_missing:'所选来源没有就绪建议'};
+/* CP5.1 H2/H3 (wire §10.3): the report additive ``skipped`` entries carry a
+   stable reason code; every Chinese label lives here. */
+const REVIEW_SKIPPED_REASON_LABEL={auto_archived:'自动归档',applied:'已应用',
+  deferred:'已暂缓',ocr_not_ready:'OCR 未就绪',informational:'仅提示',
+  item_cap:'超过单项上限',image_cap:'超过图片上限',call_cap:'超过调用上限',
+  budget_exhausted:'预算耗尽',not_analyzed:'未分析'};
 /* CP2 E2: strategies whose select call must carry real params instead of {}. */
 const REVIEW_PARAM_STRATEGIES={inherit_parent_header:'parent',
   use_header_rows:'rows'};
@@ -5861,6 +5881,14 @@ function reviewVlmBarHtml(){
   if(caps.vlm_vision===false) chips.push('<span class="rr-vlm-chip warn">text-only</span>');
   const budget=reviewVlmBudgetText(caps);
   if(budget) chips.push('<span class="rr-vlm-chip">'+esc(budget)+'</span>');
+  /* CP5.1 H7 (wire §10.7): peelfeed reports additive ``vlm_priced`` (either
+     price configured) and ``vlm_max_calls_per_peel``; with prices at 0 the
+     budget never decreases, so the bar must say so honestly. */
+  if(caps.vlm_priced===false)
+    chips.push('<span class="rr-vlm-chip warn">费用未计价</span>');
+  if(caps.vlm_max_calls_per_peel!=null)
+    chips.push('<span class="rr-vlm-chip">每 peel 调用上限 '
+      +reviewNum(caps.vlm_max_calls_per_peel)+'</span>');
   const disabled=(usable&&!busy)?'':' disabled';
   const tip=usable?'（需显式隐私确认）':('不可用：'+reason);
   return '<div class="rr-vlm-h">'+chips.join('')
@@ -5928,7 +5956,27 @@ function reviewReportProviderHtml(r){
           +reviewFailureLabel(f.code)+' — '+String(f.message||''))+'</li>';
       }).join('')+'</ul>';
   }
+  /* CP5.1 H2/H3 (wire §10.3): the report additive ``skipped`` list explains
+     which clusters/items were deliberately not sent to the provider (scope,
+     caps, OCR not ready, budget). Absent field => nothing rendered. */
+  const skipped=((info.inner&&info.inner.skipped)
+    ||(info.rep&&info.rep.skipped)||[]).filter(function(entry){
+      return entry&&typeof entry==='object'; });
+  if(skipped.length){
+    html+='<div class="rr-provider-meta">跳过的簇/项（未发送给 VLM）：</div>'
+      +'<ul class="rr-provider-fail">'+skipped.slice(0,8).map(function(entry){
+        const ids=((entry.item_ids||[])).filter(function(id){
+          return id!=null&&String(id).trim(); });
+        const text=String(entry.cluster_id||'')+' · '
+          +reviewSkippedReasonLabel(entry.reason)
+          +(ids.length?(' · '+reviewNum(ids.length)+' 项'):'');
+        return '<li>'+esc(text)+'</li>';
+      }).join('')+'</ul>';
+  }
   return html;
+}
+function reviewSkippedReasonLabel(code){
+  return REVIEW_SKIPPED_REASON_LABEL[code]||code||'已跳过';
 }
 function paintReviewReportProvider(r){
   const el=$('#reviewReportProvider'); if(!el) return;
@@ -6228,10 +6276,12 @@ async function reviewVlmStartDiscuss(payload,confirmation){
       const turn=await reviewVlmResultSummary(jobId);
       if(turn){
         ctx.discussTurns.push({role:'assistant',reply:turn.reply,
-          intent:turn.intent,at:turn.at,uncertainties:turn.uncertainties,
+          intent:turn.intent,at:turn.at,turn:Number(turn.turn||0)||0,
+          uncertainties:turn.uncertainties,
           clarifications:turn.clarifications,patch:turn.patch});
-        if(turn.patch){ ctx.pendingPatch=turn.patch; ctx.patchDiff=null;
-          ctx.patchConflict=''; }
+        if(turn.patch){ ctx.pendingPatch=turn.patch;
+          ctx.pendingPatchTurn=Number(turn.turn||0)||null;
+          ctx.patchDiff=null; ctx.patchConflict=''; }
         paintReviewDiscuss();
       }
       await refreshReview();
@@ -6317,6 +6367,7 @@ function reviewDiscussTurnHtml(turn){
   const intent=String(turn.intent||'');
   const bits=[role==='user'?'你':'VLM'];
   if(intent) bits.push(REVIEW_VLM_INTENT_LABEL[intent]||intent);
+  if(turn.turn) bits.push('第 '+Number(turn.turn)+' 回合');
   if(turn.at) bits.push(String(turn.at));
   const text=String(turn.message||turn.reply||'');
   const uncertainties=(turn.uncertainties||[]).filter(Boolean);
@@ -6537,6 +6588,10 @@ async function reviewDiscussAdoptPatch(){
   const body={base_plan_version:Number(plan.plan_version||0),
     patch:ctx.pendingPatch,source:'vlm'};
   if(ctx.discussConversationId) body.conversation_id=ctx.discussConversationId;
+  /* CP5.1 H5 (wire §10.5): a VLM-sourced patch names the assistant turn it was
+     produced by; peelfeed compares the submitted patch with that archived turn
+     (identical → source vlm, edited → source user) and records the origin. */
+  if(ctx.pendingPatchTurn) body.turn=ctx.pendingPatchTurn;
   ctx.vlmBusy=true; paintReviewDiscuss(); paintReviewVlmBar();
   reviewMsg('正在采纳计划 patch（同步校验，不确认/不应用）…');
   try{
@@ -6856,6 +6911,117 @@ function reviewSelectedItemIds(){
     function(el){ if(el.checked&&el.value) ids.push(el.value); });
   return ids;
 }
+/* --- CP5.1 H5: per-item adoption source (wire §10.5) --------------------- */
+function reviewItemCluster(item){
+  const data=REVIEW_CTX&&REVIEW_CTX.data;
+  if(!data||!item||typeof item!=='object') return null;
+  const clusters=data.clusters||[];
+  return clusters.find(function(cl){
+    return cl&&String(cl.cluster_id||'')===String(item.cluster_id||'');
+  })||null;
+}
+function reviewItemSuggestions(item){
+  const cl=reviewItemCluster(item);
+  if(!cl) return [];
+  const itemId=String((item&&item.id)||'');
+  return ((cl.suggestions||[])).filter(function(suggestion){
+    return suggestion&&typeof suggestion==='object'
+      &&String(suggestion.item_id||'')===itemId;
+  });
+}
+function reviewSuggestionIsReady(suggestion){
+  if(!suggestion||typeof suggestion!=='object') return false;
+  const state=String(suggestion.state
+    ||((suggestion.validator||{}).status)||'');
+  return state==='ready';
+}
+function reviewSuggestionSource(suggestion){
+  return String((suggestion&&suggestion.source)||'')==='vlm'?'vlm':'rule';
+}
+function reviewCanonicalValue(value){
+  if(value==null) return null;
+  if(Array.isArray(value)) return value.map(reviewCanonicalValue);
+  if(typeof value==='object'){
+    const out={};
+    Object.keys(value).sort().forEach(function(key){
+      out[key]=reviewCanonicalValue(value[key]);
+    });
+    return out;
+  }
+  return value;
+}
+/* The wire's action identity: strategy id + version + canonical params. */
+function reviewSuggestionIdentity(suggestion){
+  const strategy=(suggestion&&suggestion.strategy
+    &&typeof suggestion.strategy==='object')?suggestion.strategy:{};
+  return JSON.stringify([String(strategy.id||''),
+    Number(strategy.version||1),
+    reviewCanonicalValue((suggestion&&suggestion.params)||{})]);
+}
+/* ``{needsChoice, sources, ambiguous, disagrees}`` for one item. A source
+   choice is shown when the item has several ready suggestions with different
+   action identities (the server would answer ``ambiguous_suggestion``) or its
+   cluster is flagged ``vlm_disagrees`` (rule and VLM ready suggestions differ
+   somewhere in the cluster). Only sources that actually have a ready
+   suggestion are offered (otherwise the server answers ``source_missing``). */
+function reviewItemSourceChoice(item){
+  const cl=reviewItemCluster(item);
+  const ready=reviewItemSuggestions(item).filter(reviewSuggestionIsReady);
+  const identities={};
+  ready.forEach(function(suggestion){
+    identities[reviewSuggestionIdentity(suggestion)]=true; });
+  const sources=[];
+  ready.forEach(function(suggestion){
+    const source=reviewSuggestionSource(suggestion);
+    if(sources.indexOf(source)<0) sources.push(source); });
+  sources.sort(function(a,b){ return a==='rule'?-1:(b==='rule'?1:0); });
+  const ambiguous=Object.keys(identities).length>1;
+  const disagrees=!!(cl&&cl.vlm_disagrees===true);
+  return {cluster:cl,ready:ready,sources:sources,ambiguous:ambiguous,
+    disagrees:disagrees,needsChoice:(ambiguous||disagrees)&&sources.length>0,
+    defaultSource:sources.indexOf('rule')>=0?'rule':(sources[0]||'rule')};
+}
+function reviewSourceLabel(source){
+  return source==='vlm'?'VLM':'规则';
+}
+function reviewItemSourceChoiceHtml(item){
+  const choice=reviewItemSourceChoice(item);
+  if(!choice.needsChoice) return '';
+  const options=choice.sources.map(function(source){
+    return '<option value="'+escAttr(source)+'"'
+      +(source===choice.defaultSource?' selected':'')+'>'
+      +esc(reviewSourceLabel(source))+'</option>';
+  }).join('');
+  return '<label class="rr-field rr-accept-source" title="'
+    +escAttr('该项有多条不同的就绪建议或所在簇标 vlm_disagrees；确认前必须指定采纳来源')
+    +'"><span>采纳来源</span><select data-r="accept-source" data-item="'
+    +escAttr(item.id||'')+'">'+options+'</select></label>';
+}
+function reviewItemSourceNoticeHtml(item){
+  const choice=reviewItemSourceChoice(item);
+  if(!choice.needsChoice) return '';
+  const bits=[];
+  if(choice.ambiguous)
+    bits.push('该条目有多条动作不同的就绪建议，确认前必须指定来源（规则/VLM）。');
+  if(choice.disagrees)
+    bits.push('该簇规则建议与 VLM 建议不一致（vlm_disagrees），请按项选择来源。');
+  return '<div class="rr-vlm-disagree">'+esc(bits.join(' '))+'</div>';
+}
+/* The sources map for the confirm-selected request: only ticked items whose
+   source choice is rendered (untouched items keep the server default). */
+function reviewSelectedSources(){
+  const box=$('#reviewDetail'); if(!box) return {};
+  const ids=reviewSelectedItemIds(); if(!ids.length) return {};
+  const sources={};
+  Array.prototype.forEach.call(box.querySelectorAll(
+    'select[data-r="accept-source"]'), function(el){
+      const itemId=String((el&&el.getAttribute)?el.getAttribute('data-item'):'');
+      const value=String((el&&el.value)||'');
+      if(itemId&&ids.indexOf(itemId)>=0
+         &&(value==='rule'||value==='vlm')) sources[itemId]=value;
+    });
+  return sources;
+}
 function reviewAcceptReasonLabel(code){
   return REVIEW_ACCEPT_REASON_LABEL[code]||code||'';
 }
@@ -7139,6 +7305,8 @@ function reviewItemHtml(item){
   const batchLocked=reviewBatchEntryLocked(item&&item.entry);
   const meta=['asset '+(item.asset_id||'?'), pages?('页 p.'+pages):'',
     'code '+(item.code||'')].filter(Boolean).join(' · ');
+  const sourceChoice=reviewItemSourceChoiceHtml(item);
+  const sourceNotice=reviewItemSourceNoticeHtml(item);
   return '<article class="rr-item" data-item="'+escAttr(item.id||'')+'">'
     +'<div class="rr-item-h"><span class="rr-item-id">'+esc(item.id||'')+'</span>'
     +'<label class="rr-pick" title="勾选后可点“确认选中项”">'
@@ -7149,8 +7317,11 @@ function reviewItemHtml(item){
     +(item.stale?reviewStaleBadge(item):'')
     +(batchLocked?reviewBadge('批次中','accent'):'')
     +'</div>'
+    +sourceNotice
     +'<p class="rr-item-msg">'+esc(item.message||'')+'</p>'
     +'<div class="rr-item-meta">'+esc(meta)+'</div>'
+    +(sourceChoice?'<div class="rr-actions rr-source-row">'
+      +sourceChoice+'</div>':'')
     +reviewEvidenceHtml(item)
     +reviewOcrEvidenceHtml(item)
     +'<div class="rr-ba"><div class="rr-ba-col"><h5>当前</h5><code>'
@@ -7225,6 +7396,14 @@ function paintReviewDetail(r){
     +' data-r="accept-selected" disabled>确认选中项</button>'
     +'<span class="rr-muted">勾选条目后按报告各自的 ready 建议确认（全部或全不）</span>'
     +'</div></header>'
+    /* CP5.1 H5: a VLM report flags a cluster ``vlm_disagrees`` when its VLM
+       ready suggestion and a rule ready suggestion differ; the reviewer must
+       pick the adoption source per item before confirming. */
+    +(cl.vlm_disagrees===true
+      ?'<div class="rr-vlm-disagree">⚠ 规则建议与 VLM 建议不一致'
+        +'（vlm_disagrees=true）：确认选中项前请为每个条目选择采纳来源'
+        +'（规则/VLM）；未指定时服务器会以 ambiguous_suggestion 拒绝整次确认。</div>'
+      :'')
     +'<section class="rr-sec rr-conclusion"><h4>报告结论</h4>'
     +(conclusion?'<p>'+esc(conclusion)+'</p>'
       :'<p class="rr-muted">尚无报告结论。点“生成/更新报告”运行确定性规则，生成簇级建议。</p>')
@@ -8039,7 +8218,7 @@ async function openReview(dsId,sha){
     ocrCheckText:'',
     /* CP5: VLM state. Nothing here triggers a provider call on open. */
     vlmBusy:false,vlmConfirm:null,discussTurns:[],discussConversationId:'',
-    pendingPatch:null,patchDiff:null,patchConflict:''};
+    pendingPatch:null,patchDiff:null,patchConflict:'',pendingPatchTurn:null};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -8222,11 +8401,16 @@ async function reviewAction(btn){
     body.action=kind;
     body.entry_id=entry.entry_id;
   }else if(kind==='accept-selected'){
-    /* CP2 W9: cluster-level accept of every ticked item, all-or-nothing. */
+    /* CP2 W9: cluster-level accept of every ticked item, all-or-nothing.
+       CP5.1 H5 (wire §10.5): ticked items whose source choice is rendered send
+       ``sources:{item_id:"rule"|"vlm"}``; items without a choice keep the
+       server default (single ready suggestion / identical identities). */
     const ids=reviewSelectedItemIds();
     if(!ids.length){ reviewMsg('先勾选要确认的条目。',true); return; }
     body.action='accept';
     body.item_ids=ids;
+    const sources=reviewSelectedSources();
+    if(Object.keys(sources).length) body.sources=sources;
     errorText=reviewAcceptErrText;
   }else if(kind==='clear'){
     /* CP2 W9: clear one plan entry; locked/batch entries are rejected by the

@@ -18,8 +18,9 @@ import os
 import time
 import unittest
 
-from tests.fixtures import (DEFAULT_REPORT, DEFAULT_VLM_DISCUSS,
-                            EMBED_CHUNK, FakeModelServer, FakePeelfeedCli,
+from tests.fixtures import (DEFAULT_REPORT, DEFAULT_REVIEW,
+                            DEFAULT_VLM_DISCUSS, EMBED_CHUNK,
+                            FakeModelServer, FakePeelfeedCli,
                             REVIEW_VLM, VLM_CONFIRMATION, VLM_DISCUSS_PATCH,
                             VLM_LINK_BASE, VLM_LINK_ID, VLM_LINK_KEY,
                             VLM_LINK_KEY_ENV, VLM_MODEL, make_pdf, make_peel,
@@ -1531,8 +1532,14 @@ class PeelfeedApiTests(unittest.TestCase):
                 operation = rows["it-3f9c2a4b6d8e0f1a"]
                 self.assertEqual(set(operation), {
                     "item_id", "entry_id", "strategy", "action", "status",
-                    "revision", "replaced_existing"})
+                    "source", "origin", "revision", "replaced_existing"})
                 self.assertEqual(operation["status"], "confirmed")
+                # CP5.1 H5 (wire §10.5): accepted entries record the actual
+                # source and the report origin (job id/model/prompt version).
+                self.assertEqual(operation["source"], "rule")
+                self.assertEqual(set(operation["origin"]), {
+                    "kind", "job_id", "model", "prompt_version"})
+                self.assertEqual(operation["origin"]["kind"], "report")
                 self.assertEqual(operation["revision"], 1)
                 self.assertFalse(operation["replaced_existing"])
                 self.assertEqual(operation["action"], {
@@ -2931,9 +2938,11 @@ class Cp5VlmClientTests(unittest.TestCase):
                 self.assertEqual(cli.state()["discuss_requests"][-1],
                                  request)
                 # plan patch is synchronous, no model call, no LLM env.
+                # CP5.1 H5: source vlm needs the archived conversation+turn,
+                # so the client-shape test uses a user-sourced patch.
                 patch_request = {"base_plan_version": 0,
                                  "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
-                                 "source": "vlm"}
+                                 "source": "user"}
                 response = engine.plan_patch(peel_id, patch_request)
                 self.assertEqual(response["plan_version"], 1)
                 self.assertEqual(response["diff"]["added"][0]["item_id"],
@@ -3374,10 +3383,21 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
             with _cp5_env(root) as cli:
                 client = _client()
                 base = _extracted_review_source(client, root)
+                # CP5.1 H5: a VLM-sourced patch must name the archived assistant
+                # turn; create a discussion whose assistant turn carries the
+                # default draft patch, then adopt that exact patch.
+                cli.update(discuss_result=copy.deepcopy(DEFAULT_VLM_DISCUSS))
+                discussion = client.post(base + "/review/discussions",
+                                         json=_discuss_request())
+                self.assertEqual(discussion.status_code, 202,
+                                 discussion.text)
+                conversation_id = discussion.json()["conversation_id"]
                 cli.clear_calls()
                 body = {"base_plan_version": 0,
                         "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
-                        "source": "vlm"}
+                        "source": "vlm",
+                        "conversation_id": conversation_id,
+                        "turn": 2}
                 response = client.post(base + "/review/plan/patches",
                                        json=body)
                 self.assertEqual(response.status_code, 200, response.text)
@@ -3390,7 +3410,13 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
                 self.assertEqual(payload["diff"]["removed"], [])
                 self.assertEqual(payload["diff"]["unchanged"], 0)
                 self.assertEqual(payload["entries"][0]["status"], "draft")
+                # The archived patch was submitted unchanged -> source vlm with
+                # the conversation origin (wire §10.5).
                 self.assertEqual(payload["entries"][0]["source"], "vlm")
+                self.assertEqual(payload["entries"][0]["origin"], {
+                    "kind": "conversation",
+                    "conversation_id": conversation_id, "turn": 2,
+                    "model": VLM_MODEL, "prompt_version": "peel-reviews@1"})
                 call = next(item for item in cli.calls()
                             if item["argv"][0] == "plan")
                 self.assertEqual(call["argv"][1:5],
@@ -3417,11 +3443,11 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
                 client = _client()
                 base = _extracted_review_source(client, root)
                 route = base + "/review/plan/patches"
-                # Base mismatch -> 409 conflict.
+                # Base mismatch -> 409 conflict (source user needs no turn).
                 stale = client.post(route, json={
                     "base_plan_version": 7,
                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
-                    "source": "vlm"})
+                    "source": "user"})
                 self.assertEqual(stale.status_code, 409, stale.text)
                 self.assertIn("conflict", stale.json()["detail"])
                 # Locked entry in the patch target -> 409 with conflict ids.
@@ -3435,7 +3461,7 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
                 conflict = client.post(route, json={
                     "base_plan_version": locked_version,
                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
-                    "source": "vlm"})
+                    "source": "user"})
                 self.assertEqual(conflict.status_code, 409, conflict.text)
                 self.assertIn("conflicts:", conflict.json()["detail"])
                 self.assertIn("it-3f9c2a4b6d8e0f1a",
@@ -3458,6 +3484,25 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
                     {"base_plan_version": 0,
                      "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
                      "source": "vlm", "tier": "R2"},
+                    # CP5.1 H5 (wire §10.5): source vlm requires the archived
+                    # conversation and assistant turn number.
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm"},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1"},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1", "turn": 0},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1",
+                     "turn": True},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1",
+                     "turn": "2"},
                 ]
                 for body in bad_bodies:
                     response = client.post(route, json=body)
@@ -3466,12 +3511,13 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
                 self.assertEqual(
                     [item for item in cli.calls()
                      if item["argv"][0] == "plan"], [])
-                # Unknown conversation -> 404.
+                # Unknown conversation -> 404 (with the required turn present).
                 unknown = client.post(route, json={
                     "base_plan_version": 0,
                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
                     "source": "vlm",
-                    "conversation_id": "conv-20260101T000000-ffff"})
+                    "conversation_id": "conv-20260101T000000-ffff",
+                    "turn": 2})
                 self.assertEqual(unknown.status_code, 404, unknown.text)
                 # Invalid strategy/params -> peelfeed validation 400 (use an
                 # item that is not locked so the conflict check does not fire).
@@ -3487,8 +3533,418 @@ class Cp5PlanPatchRouteTests(unittest.TestCase):
                 }]
                 invalid = client.post(route, json={
                     "base_plan_version": locked_version, "patch": bad_patch,
-                    "source": "vlm"})
+                    "source": "user"})
                 self.assertEqual(invalid.status_code, 400, invalid.text)
+
+
+class Cp51H7EnvForwardingTests(unittest.TestCase):
+    """CP5.1 H7 (wire §10.7): tuning env reaches every child, provider does not.
+
+    peekseed forwards the non-secret ``PEELFEED_LLM_*`` tuning variables from
+    its own environment to **all** peelfeed children (read-only commands
+    included) so a deployed budget/price/timeout/vision/cap config reaches the
+    engine; ``PEELFEED_LLM_PROVIDER`` (the local/test command seam) is never
+    forwarded, and BASE/MODEL/TOKEN/LINK_ID stay child-only for report/discuss.
+    """
+
+    TUNING = {
+        "PEELFEED_LLM_PROMPT_SET": "peel-reviews@1",
+        "PEELFEED_LLM_TIMEOUT": "90",
+        "PEELFEED_LLM_BUDGET_USD": "1.50",
+        "PEELFEED_LLM_PRICE_INPUT": "0.001",
+        "PEELFEED_LLM_PRICE_OUTPUT": "0.002",
+        "PEELFEED_LLM_VISION": "1",
+        "PEELFEED_LLM_MAX_CALLS_PER_JOB": "4",
+        "PEELFEED_LLM_MAX_CALLS_PER_PEEL": "100",
+        "PEELFEED_LLM_MAX_IMAGES_PER_TURN": "6",
+        "PEELFEED_LLM_JSON_MODE": "1",
+    }
+
+    @contextlib.contextmanager
+    def _tuning_env(self):
+        saved = {key: os.environ.get(key) for key in
+                 list(self.TUNING) + ["PEELFEED_LLM_PROVIDER"]}
+        os.environ.update(self.TUNING)
+        # The seam must never reach a child: if it did, the fake CLI would
+        # execute it instead of answering from its state file.
+        os.environ["PEELFEED_LLM_PROVIDER"] = (
+            "sh -c 'echo never-forwarded; exit 2'")
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_read_only_children_get_tuning_env_but_never_provider(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli, self._tuning_env():
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                engine.capabilities()
+                engine.status_all()
+                call = cli.calls()[-1]
+                for key, value in self.TUNING.items():
+                    self.assertEqual(call["llm_env"].get(key), value, key)
+                self.assertNotIn("PEELFEED_LLM_PROVIDER", call["llm_env"])
+                self.assertNotIn("PEELFEED_LLM_TOKEN", call["llm_env"])
+                self.assertNotIn("PEELFEED_LLM_BASE", call["llm_env"])
+                self.assertNotIn("PEELFEED_LLM_MODEL", call["llm_env"])
+                # The seam is forwarded to no child and persisted nowhere.
+                self.assertNotIn("PEELFEED_LLM_PROVIDER",
+                                 json.dumps(cli.state()))
+                self.assertFalse([item for item in cli.calls()
+                                  if "never-forwarded" in item.get("argv", [])])
+
+    def test_report_and_discuss_children_get_provider_plus_tuning(self):
+        with temp_data_root() as root:
+            source = make_pdf(root / "manual.pdf")
+            with _cp5_env(root) as cli, self._tuning_env():
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                engine.review_report(
+                    peel_id, mode="vlm",
+                    confirmation=copy.deepcopy(VLM_CONFIRMATION))
+                report_call = next(item for item in cli.calls()
+                                   if item["argv"][0] == "review-report")
+                self.assertEqual(report_call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                self.assertEqual(report_call["llm_env"]["PEELFEED_LLM_MODEL"],
+                                 VLM_MODEL)
+                for key, value in self.TUNING.items():
+                    self.assertEqual(report_call["llm_env"].get(key), value,
+                                     key)
+                self.assertNotIn("PEELFEED_LLM_PROVIDER",
+                                 report_call["llm_env"])
+                engine.discuss(peel_id, _discuss_request())
+                discuss_call = next(item for item in cli.calls()
+                                    if item["argv"][0] == "discuss")
+                self.assertEqual(discuss_call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                for key, value in self.TUNING.items():
+                    self.assertEqual(discuss_call["llm_env"].get(key), value,
+                                     key)
+                self.assertNotIn("PEELFEED_LLM_PROVIDER",
+                                 discuss_call["llm_env"])
+                # No token in argv or any persisted fake state.
+                self.assertNotIn(VLM_LINK_KEY,
+                                 " ".join(report_call["argv"]))
+                self.assertNotIn(VLM_LINK_KEY, json.dumps(cli.state()))
+
+    def test_review_capabilities_preserve_priced_and_per_peel_cap(self):
+        """The overlay must keep peelfeed's additive pricing/cap fields."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                review = copy.deepcopy(REVIEW_VLM)
+                review["capabilities"].update({"vlm_priced": False,
+                                               "vlm_max_calls_per_peel": 100})
+                cli.update(review=review)
+                caps = client.get(base + "/review").json()["capabilities"]
+                self.assertIs(caps["vlm_priced"], False)
+                self.assertEqual(caps["vlm_max_calls_per_peel"], 100)
+                self.assertTrue(caps["vlm"])
+                # Absent fields stay absent (no invented default).
+                self.assertNotIn("vlm_priced",
+                                 DEFAULT_REVIEW["capabilities"])
+
+
+class Cp51H5AcceptSourceTests(unittest.TestCase):
+    """CP5.1 H5 (wire §10.5): per-item adoption source + origin/ambiguity."""
+
+    ITEM_ID = "it-3f9c2a4b6d8e0f1a"
+
+    @staticmethod
+    def _suggestion(item_id, strategy_id, source, *, version=1, params=None):
+        return {
+            "item_id": item_id,
+            "strategy": {"id": strategy_id, "version": version},
+            "params": params if params is not None else {},
+            "evidence_refs": [],
+            "validator": {"status": "ready", "reasons": []},
+            "in_plan": False,
+            "state": "ready",
+            "source": source,
+        }
+
+    def _report(self, suggestions, *, job_id=None, provider=None):
+        report = copy.deepcopy(DEFAULT_REPORT)
+        report["report"]["clusters"] = [{
+            "cluster_id": "cl-0f1e2d3c4b5a",
+            "item_ids": [self.ITEM_ID],
+            "conclusion": "规则与 VLM 建议不一致。",
+            "suggestions": suggestions,
+            "clarifications": [],
+        }]
+        if job_id is not None:
+            report["report"]["job_id"] = job_id
+        if provider is not None:
+            report["report"]["provider"] = provider
+        return report
+
+    def test_ambiguous_suggestion_needs_sources_and_records_origin(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                report = self._report(
+                    [self._suggestion(self.ITEM_ID, "use_first_row_header",
+                                      "rule"),
+                     self._suggestion(self.ITEM_ID, "confirm_no_header",
+                                      "vlm")],
+                    job_id="report-20261109T031000-abc1",
+                    provider={"kind": "vlm", "model": VLM_MODEL,
+                              "prompt_version": "peel-reviews@1"})
+                cli.update(review_report=report)
+                cli.clear_calls()
+                # Without ``sources`` the differing ready suggestions are
+                # ambiguous -> 400 all-or-nothing, no plan write.
+                ambiguous = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID]})
+                self.assertEqual(ambiguous.status_code, 400, ambiguous.text)
+                self.assertIn(self.ITEM_ID + "=ambiguous_suggestion",
+                              ambiguous.json()["detail"])
+                self.assertEqual((cli.state().get("plan") or {}).get("plan_version", 0), 0)
+                self.assertFalse((cli.state().get("plan") or {}).get("entries"))
+                # With ``sources`` the requested suggestion is adopted and the
+                # plan entry/accepted row record the actual source and origin.
+                accepted = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID],
+                    "sources": {self.ITEM_ID: "vlm"}})
+                self.assertEqual(accepted.status_code, 200, accepted.text)
+                plan = accepted.json()
+                self.assertEqual(plan["accepted"][0]["source"], "vlm")
+                self.assertEqual(plan["accepted"][0]["origin"], {
+                    "kind": "report",
+                    "job_id": "report-20261109T031000-abc1",
+                    "model": VLM_MODEL,
+                    "prompt_version": "peel-reviews@1"})
+                entry = plan["entries"][0]
+                self.assertEqual(entry["source"], "vlm")
+                self.assertEqual(entry["origin"], plan["accepted"][0]["origin"])
+                self.assertEqual(entry["strategy"]["id"], "confirm_no_header")
+                # The exact stdin request carried the sources map.
+                self.assertEqual(cli.state()["accept_requests"][-1], {
+                    "base_plan_version": 0, "item_ids": [self.ITEM_ID],
+                    "sources": {self.ITEM_ID: "vlm"}})
+                # Same-identity suggestions are not ambiguous: rule preferred.
+                cli.update(plan=None)
+                cli.update(review_report=self._report([
+                    self._suggestion(self.ITEM_ID, "use_first_row_header",
+                                     "rule"),
+                    self._suggestion(self.ITEM_ID, "use_first_row_header",
+                                     "vlm")]))
+                same = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID]})
+                self.assertEqual(same.status_code, 200, same.text)
+                self.assertEqual(same.json()["accepted"][0]["source"], "rule")
+
+    def test_source_missing_and_strict_body_validation(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                cli.clear_calls()
+                # The default report only has a rule suggestion; asking for vlm
+                # is a per-item failure ``source_missing``.
+                missing = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID],
+                    "sources": {self.ITEM_ID: "vlm"}})
+                self.assertEqual(missing.status_code, 400, missing.text)
+                self.assertIn(self.ITEM_ID + "=source_missing",
+                              missing.json()["detail"])
+                self.assertEqual((cli.state().get("plan") or {}).get("plan_version", 0), 0)
+                self.assertFalse((cli.state().get("plan") or {}).get("entries"))
+                # Strict envelope: unknown field, non-object sources, unknown
+                # key, bad value are all 400 and never reach the CLI.
+                cli.clear_calls()
+                bad_bodies = [
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID], "tier": "R2"},
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID], "sources": ["rule"]},
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID],
+                     "sources": {"it-ffffffffffffffff": "rule"}},
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID],
+                     "sources": {self.ITEM_ID: "model"}},
+                ]
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+                self.assertEqual(
+                    (cli.state().get("plan") or {}).get("plan_version", 0), 0)
+
+
+class Cp51H5PlanPatchTurnTests(unittest.TestCase):
+    """CP5.1 H5 (wire §10.5): patch turn/source determination + origin."""
+
+    def _conversation(self, client, base, cli, patch=None):
+        result = copy.deepcopy(DEFAULT_VLM_DISCUSS)
+        if patch is not None:
+            result["patch"] = copy.deepcopy(patch)
+        cli.update(discuss_result=result)
+        response = client.post(base + "/review/discussions",
+                               json=_discuss_request())
+        self.assertEqual(response.status_code, 202, response.text)
+        return response.json()["conversation_id"]
+
+    def test_identical_patch_is_vlm_and_edited_patch_is_user_with_origin(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/patches"
+                conversation_id = self._conversation(client, base, cli)
+                # The archived assistant patch, submitted unchanged -> source vlm.
+                identical = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": conversation_id, "turn": 2})
+                self.assertEqual(identical.status_code, 200, identical.text)
+                entry = identical.json()["entries"][0]
+                self.assertEqual(entry["source"], "vlm")
+                self.assertEqual(entry["origin"], {
+                    "kind": "conversation",
+                    "conversation_id": conversation_id, "turn": 2,
+                    "model": VLM_MODEL, "prompt_version": "peel-reviews@1"})
+                # A user-edited patch is recorded as source user but keeps the
+                # conversation origin (wire §10.5).
+                edited_patch = copy.deepcopy(VLM_DISCUSS_PATCH)
+                edited_patch["changes"][0]["params"] = {"rows": [1]}
+                edited = client.post(route, json={
+                    "base_plan_version": identical.json()["plan_version"],
+                    "patch": edited_patch, "source": "vlm",
+                    "conversation_id": conversation_id, "turn": 2})
+                self.assertEqual(edited.status_code, 200, edited.text)
+                entry = edited.json()["entries"][0]
+                self.assertEqual(entry["source"], "user")
+                self.assertEqual(entry["origin"]["kind"], "conversation")
+                self.assertEqual(entry["origin"]["turn"], 2)
+                self.assertEqual(entry["action"]["params"], {"rows": [1]})
+
+    def test_turn_validation_and_unknown_conversation(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/patches"
+                conversation_id = self._conversation(client, base, cli)
+                cli.clear_calls()
+                # No archived assistant patch with that number -> validation.
+                missing_turn = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": conversation_id, "turn": 8})
+                self.assertEqual(missing_turn.status_code, 400,
+                                 missing_turn.text)
+                self.assertIn("validation", missing_turn.json()["detail"])
+                # Unknown conversation -> 404.
+                unknown = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": "conv-20260101T000000-ffff",
+                    "turn": 2})
+                self.assertEqual(unknown.status_code, 404, unknown.text)
+                self.assertIn("not_found", unknown.json()["detail"])
+
+
+class Cp51H9ReingestTests(unittest.TestCase):
+    """CP5.1 H9 (wire §10.9): a re-extracting source is never marked early."""
+
+    def test_slow_reingest_of_ready_peel_stays_queued_until_worker_finishes(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                dataset, _pdf = _upload(client, root)
+                sha = _sources(client, dataset["id"])[0]["sha256"]
+                first = client.post(
+                    "/api/datasets/%s/sources/%s/extract"
+                    % (dataset["id"], sha), json={})
+                self.assertEqual(first.status_code, 200, first.text)
+                row = _wait_source(client, dataset["id"], sha)
+                self.assertEqual(row["extraction"]["state"], "extracted")
+                self.assertTrue(row["extraction"]["peel_id"])
+                # Re-ingest an already-ready peel: the fake keeps the previous
+                # ``ready`` peel visible for one second, exactly like peelfeed
+                # before it publishes the new build.
+                cli.update(ingest_seconds=1.0, ingest_keep_previous_state=True)
+                second = client.post(
+                    "/api/datasets/%s/sources/%s/extract"
+                    % (dataset["id"], sha), json={})
+                self.assertEqual(second.status_code, 200, second.text)
+                self.assertTrue(second.json()["peel"]["reused"], second.text)
+                # While the worker runs, GET …/sources must report only
+                # queued/running -- never the previous peel's ``extracted``.
+                deadline = time.time() + 0.6
+                window_states = []
+                while time.time() < deadline:
+                    state = _sources(client, dataset["id"])[0][
+                        "extraction"]["state"]
+                    window_states.append(state)
+                    self.assertNotIn(
+                        state, ("extracted", "failed"),
+                        "H9: source became terminal while the re-ingest "
+                        "worker was still running: %r" % (window_states,))
+                    time.sleep(0.05)
+                self.assertTrue(set(window_states) <= {"queued", "running"},
+                                window_states)
+                # An index build during the window must not see ``extracted``.
+                index = client.post("/api/datasets/%s/index" % dataset["id"],
+                                    json={})
+                self.assertEqual(index.status_code, 409, index.text)
+                self.assertIn("no_extracted_sources", index.json()["detail"])
+                # After the worker finishes its authoritative write the source
+                # is extracted again (the registry entry is gone).
+                row = _wait_source(client, dataset["id"], sha)
+                self.assertEqual(row["extraction"]["state"], "extracted")
+
+    def test_restart_recovery_is_unchanged_without_an_active_worker(self):
+        """No worker active: a terminal peelfeed state is still persisted."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                dataset, _pdf = _upload(client, root)
+                sha = _sources(client, dataset["id"])[0]["sha256"]
+                client.post("/api/datasets/%s/sources/%s/extract"
+                            % (dataset["id"], sha), json={})
+                row = _wait_source(client, dataset["id"], sha)
+                self.assertEqual(row["extraction"]["state"], "extracted")
+                from peekseed import app as app_module, config, ingest
+                directory = config.paths().datasets_dir / dataset["id"]
+                # Simulate a crashed worker: the dataset says running, peelfeed
+                # says ready, and no registry entry exists.
+                stale = dict(row["extraction"])
+                stale.update({"state": "running", "finished_at": None})
+                ingest.update_source(directory, sha, status="running",
+                                     extraction=stale)
+                recovered = _sources(client, dataset["id"])[0]
+                self.assertEqual(recovered["extraction"]["state"], "extracted")
+                self.assertFalse(app_module._extraction_active(directory, sha))
 
 
 class NoHttpContractTests(unittest.TestCase):

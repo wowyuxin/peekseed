@@ -202,6 +202,49 @@ version/tag policy.
   with adopt disabled. A new report never overwrites an editing draft, and no
   VLM call is implicit anywhere.
 
+### Changed — CP5.1 review fixes (M2.2 CP5.1)
+
+- **Plan accept records adoption source and origin (H5).** `POST …/review/plan`
+  accept bodies may carry `sources:{<item_id>:"rule"|"vlm"}` (strict: an unknown
+  body field, a non-object map, a key that is not a requested item id, or a
+  value other than `rule`/`vlm` is `400`). Without it, an item with several
+  ready suggestions whose action identities differ fails the all-or-nothing
+  accept with `ambiguous_suggestion`; an explicit source with no matching ready
+  suggestion fails with `source_missing`. `accepted[]` rows and plan entries
+  record `source` (`rule`/`vlm`/`user`) and `origin`
+  (`{kind:"report", job_id, model, prompt_version}` for a report accept; `null`
+  for a manual select).
+- **Plan patch records the assistant turn (H5).** `POST …/review/plan/patches`
+  accepts `turn` (int ≥ 1); `source:"vlm"` now requires both `conversation_id`
+  and `turn` (`400` otherwise). peelfeed compares the submitted patch with the
+  archived assistant turn and records `source:"vlm"` only when identical
+  (edited → `"user"`), either way with the conversation `origin`.
+- **LLM tuning env forwarding (H7).** peekseed forwards the non-secret
+  `PEELFEED_LLM_*` tuning variables (`PROMPT_SET`, `TIMEOUT`, `BUDGET_USD`,
+  `PRICE_INPUT`, `PRICE_OUTPUT`, `VISION`, `MAX_CALLS_PER_JOB`,
+  `MAX_CALLS_PER_PEEL`, `MAX_IMAGES_PER_TURN`, `JSON_MODE`) from its own
+  environment to **all** peelfeed children, including read-only
+  `capabilities`/`status`/`review` ones. `PEELFEED_LLM_PROVIDER` is never
+  forwarded; `BASE/MODEL/TOKEN/LINK_ID` stay child-only for
+  `review-report --with-vlm`/`discuss`. The review capability overlay preserves
+  peelfeed's additive `vlm_priced`/`vlm_max_calls_per_peel`; the Review UI shows
+  `费用未计价` when prices are not configured and the per-peel call cap.
+- **Re-extraction state fix (H9).** An in-process active-extraction registry
+  keyed by `(dataset dir, sha256)` is registered before the ingest worker starts
+  and cleared only after the authoritative terminal block is written. While a
+  worker is active, `GET …/sources` skips that source, so re-ingesting an
+  already-ready peel cannot report `extracted` from the previous peel while the
+  new ingest is still running; an index build during that window is still `409
+  no_extracted_sources`. Restart recovery is unchanged when no worker is active.
+- **Review UI H5/H7/H2/H3.** Items with several differing ready suggestions or a
+  cluster flagged `vlm_disagrees` render a per-item `采纳来源` choice (规则/VLM)
+  and send `sources` on 确认选中项; adopting a discussion patch sends the
+  assistant `turn`; the VLM report area renders the additive `skipped` entries
+  with Chinese reason labels (`自动归档`/`已应用`/`已暂缓`/`OCR 未就绪`/`仅提示`/
+  `超过单项上限`/`超过图片上限`/`超过调用上限`/`预算耗尽`/`未分析`) alongside the
+  existing `partial_failures`. Absent fields render nothing, so pre-CP5.1
+  payloads keep working.
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:

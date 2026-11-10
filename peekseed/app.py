@@ -160,6 +160,8 @@ def reset_state():
         _STORE = None
     with _HISTORY_LOCK:
         _HISTORY = None
+    with _ACTIVE_EXTRACTIONS_LOCK:
+        _ACTIVE_EXTRACTIONS.clear()
     config.reset_cache()
     links.reset_cache()
     localmodels.reset_cache()
@@ -520,6 +522,41 @@ TERMINAL_EXTRACTION_STATES = ("extracted", "failed", "stale",
 #: Serialises ``dataset.json`` extraction writes in this process: the worker's
 #: authoritative final block and the status pollers can race on one source.
 _EXTRACTION_WRITE_LOCK = threading.RLock()
+
+#: In-process registry of active extraction workers, keyed by
+#: ``(dataset dir, sha256)`` (CP5.1 H9 / wire §10.9). An entry is registered
+#: *before* the worker thread starts and removed only after
+#: :func:`_finish_extraction` wrote the authoritative terminal block. While it
+#: exists, :func:`_refresh_peel_states` skips that source entirely: a re-ingest
+#: of an already-ready peel must not have the previous peel's terminal state
+#: persisted as ``extracted`` while the new ingest is still running (the
+#: 2026-11-10 deploy smoke: index pinned the old build, then failed with
+#: ``NeedsReindex`` after the ingest published).
+_ACTIVE_EXTRACTIONS = {}
+_ACTIVE_EXTRACTIONS_LOCK = threading.RLock()
+
+
+def _extraction_key(directory, sha):
+    """The registry key: ``(resolved dataset dir, lowercase sha256)``."""
+    return (str(Path(directory).resolve()), str(sha or "").lower())
+
+
+def _register_extraction(directory, sha):
+    """Mark a source's extraction worker active (before the thread starts)."""
+    with _ACTIVE_EXTRACTIONS_LOCK:
+        _ACTIVE_EXTRACTIONS[_extraction_key(directory, sha)] = True
+
+
+def _clear_extraction(directory, sha):
+    """Clear the active marker (only after the authoritative terminal write)."""
+    with _ACTIVE_EXTRACTIONS_LOCK:
+        _ACTIVE_EXTRACTIONS.pop(_extraction_key(directory, sha), None)
+
+
+def _extraction_active(directory, sha):
+    """Whether a worker is currently running for this source."""
+    with _ACTIVE_EXTRACTIONS_LOCK:
+        return _extraction_key(directory, sha) in _ACTIVE_EXTRACTIONS
 
 
 def _persist_extraction(directory, sha, block, *, terminal=False):
@@ -1342,7 +1379,9 @@ def create_app():
         clear, entry_id?, entry?, item_ids?, reason_code?, reason?}``.
         ``select`` wraps the selection in ``entry``; ``defer`` carries
         ``item_id``/``reason_code``; ``accept`` is all-or-nothing over a
-        non-empty, unique ``item_ids`` list; ``clear`` names one ``entry_id``.
+        non-empty, unique ``item_ids`` list and accepts the CP5.1 additive
+        ``sources:{item_id:"rule"|"vlm"}`` map (strict body, wire §10.5);
+        ``clear`` names one ``entry_id``.
         """
         if not isinstance(body, dict):
             raise HTTPException(400, "a review plan request must be a JSON object")
@@ -1358,6 +1397,16 @@ def create_app():
             raise HTTPException(
                 400, "base_plan_version is required and must be an integer >= 0")
         if action == "accept":
+            # CP5.1 H5 (wire §10.5): the accept body is strict. Optional
+            # ``sources`` maps requested item ids to the adoption source; any
+            # other field, a non-object ``sources``, an unknown item key or a
+            # value other than "rule"/"vlm" is a 400.
+            unknown = sorted(set(body) - {"action", "base_plan_version",
+                                          "item_ids", "sources"})
+            if unknown:
+                raise HTTPException(
+                    400, "unknown plan accept field(s): %s"
+                         % ", ".join(unknown))
             item_ids = body.get("item_ids")
             if not isinstance(item_ids, list) or not item_ids:
                 raise HTTPException(
@@ -1377,7 +1426,28 @@ def create_app():
                         400, "item_ids must be unique (duplicate %s)" % item_id)
                 seen.add(item_id)
                 cleaned.append(item_id)
-            return action, {"base_plan_version": base, "item_ids": cleaned}
+            request = {"base_plan_version": base, "item_ids": cleaned}
+            sources = body.get("sources")
+            if sources is not None:
+                if not isinstance(sources, dict):
+                    raise HTTPException(
+                        400, "sources must be an object mapping requested "
+                             "item ids to 'rule' or 'vlm'")
+                cleaned_sources = {}
+                for raw_key, raw_value in sources.items():
+                    item_id = str(raw_key)
+                    if item_id not in seen:
+                        raise HTTPException(
+                            400, "sources keys must be requested item ids "
+                                 "(unknown: %s)" % item_id)
+                    if raw_value not in ("rule", "vlm"):
+                        raise HTTPException(
+                            400, "sources values must be 'rule' or 'vlm' "
+                                 "(item %s)" % item_id)
+                    cleaned_sources[item_id] = raw_value
+                if cleaned_sources:
+                    request["sources"] = cleaned_sources
+            return action, request
         if action == "clear":
             entry_id = str(body.get("entry_id") or "").strip()
             if not entry_id:
@@ -1581,8 +1651,12 @@ def create_app():
         the default answer link. peekseed therefore reports the truth here,
         preserving any peelfeed-provided probe/budget fields (``vlm_vision``,
         ``vlm_budget_usd``, ``vlm_spent_usd``, ``vlm_calls``,
-        ``vlm_vision_checked_at``). Additive ``vlm_provider`` names the resolved
-        provider (``answer_link``/``env``) for the confirmation dialog.
+        ``vlm_vision_checked_at``) and the CP5.1 additive
+        ``vlm_priced``/``vlm_max_calls_per_peel`` (wire §10.7): those come from
+        the read-only child's env, which now receives the forwarded
+        ``PEELFEED_LLM_*`` tuning variables, so peekseed must not overwrite
+        them. Additive ``vlm_provider`` names the resolved provider
+        (``answer_link``/``env``) for the confirmation dialog.
         """
         if not isinstance(payload, dict):
             return payload
@@ -1757,17 +1831,21 @@ def create_app():
         }
 
     _PLAN_PATCH_KEYS = {"base_plan_version", "patch", "source",
-                        "conversation_id"}
+                        "conversation_id", "turn"}
 
     def _review_plan_patch_request(body):
-        """Validate ``POST …/review/plan/patches`` (CP5 wire §6.3).
+        """Validate ``POST …/review/plan/patches`` (CP5 wire §6.3 / CP5.1 §10.5).
 
         Body is ``{base_plan_version, patch, source:"vlm|user",
-        conversation_id?}``; unknown fields are a 400. peekseed checks the
-        envelope only -- the patch content (scope/members/exclusions/changes)
-        is validated all-or-nothing by peelfeed (wire §5), which returns
-        ``validation`` 400 / ``conflict`` 409 / ``not_found`` 404. The route is
-        synchronous and never confirms or applies anything.
+        conversation_id?, turn?}``; unknown fields are a 400. ``turn`` (the
+        assistant turn number, int ≥ 1) is required with ``source:"vlm"`` --
+        peelfeed compares the submitted patch with that archived turn and
+        records the actual source/origin (identical → ``vlm``, edited →
+        ``user``). peekseed checks the envelope only -- the patch content
+        (scope/members/exclusions/changes) is validated all-or-nothing by
+        peelfeed (wire §5), which returns ``validation`` 400 / ``conflict`` 409
+        / ``not_found`` 404. The route is synchronous and never confirms or
+        applies anything.
         """
         if not isinstance(body, dict):
             raise HTTPException(
@@ -1797,6 +1875,20 @@ def create_app():
                 raise HTTPException(
                     400, "conversation_id must be a non-empty string")
             conversation_id = conversation_id.strip()
+        turn = body.get("turn")
+        if turn is not None:
+            if isinstance(turn, bool) or not isinstance(turn, int) or turn < 1:
+                raise HTTPException(
+                    400, "turn must be an integer >= 1 (the assistant turn "
+                         "number)")
+        if source == "vlm":
+            # CP5.1 H5 (wire §10.5): a VLM-sourced patch must name the archived
+            # conversation turn it was produced by.
+            if conversation_id is None:
+                raise HTTPException(
+                    400, "source 'vlm' requires conversation_id")
+            if turn is None:
+                raise HTTPException(400, "source 'vlm' requires turn")
         request = {
             "base_plan_version": base,
             "patch": patch,
@@ -1804,6 +1896,8 @@ def create_app():
         }
         if conversation_id is not None:
             request["conversation_id"] = conversation_id
+        if turn is not None:
+            request["turn"] = turn
         return request
 
     def _review_ocr_check_request(body):
@@ -2069,6 +2163,13 @@ def create_app():
         source state every ``PEEKSEED_PEELFEED_POLL`` seconds. The poller is
         stopped before the final block is written, so its last observation can
         never overwrite the authoritative result.
+
+        CP5.1 H9 (wire §10.9): the caller registers this worker in the
+        active-extraction registry before the thread starts; the entry is
+        removed only here, **after** :func:`_finish_extraction` persisted the
+        authoritative terminal block. Until then ``_refresh_peel_states`` skips
+        the source (the previous peel's ``ready`` state must not mark a
+        re-extracting source ``extracted`` early).
         """
         engine = peelfeed.client()
         stop = threading.Event()
@@ -2090,7 +2191,12 @@ def create_app():
         finally:
             stop.set()
             poller.join(timeout=30.0)
-        _finish_extraction(directory, sha, block, outcome)
+        try:
+            _finish_extraction(directory, sha, block, outcome)
+        finally:
+            # H9: the source may be refreshed from peelfeed again only once the
+            # authoritative terminal block is on disk.
+            _clear_extraction(directory, sha)
 
     def _refresh_peel_states(directory):
         """Poll peelfeed for non-terminal sources and persist the new state.
@@ -2101,6 +2207,14 @@ def create_app():
         persisted (restart recovery), so a source can never stay stuck at
         ``running`` after a worker crash or a lost final write; ``_persist_extraction``
         still refuses to downgrade a terminal block with a stale non-terminal one.
+
+        CP5.1 H9 (wire §10.9): a source with an active extraction worker is
+        **skipped entirely**. A re-ingest of an already-ready peel still shows
+        the *previous* peel as ``ready`` until the new ingest publishes; that
+        terminal state must not be persisted while the worker runs (otherwise
+        ``GET …/sources`` reports ``extracted`` and an index build pins the old
+        build). Restart recovery is unchanged: with no worker active an existing
+        terminal peelfeed state is still persisted.
         """
         if not peelfeed.configured():
             return
@@ -2132,6 +2246,11 @@ def create_app():
             peel_id = str(block.get("peel_id") or "")
             sha = str(entry.get("sha256") or "").lower()
             if not sha:
+                continue
+            if _extraction_active(directory, sha):
+                # H9: never read/persist peelfeed state for a source whose
+                # extraction worker is still running; the worker owns the
+                # terminal block.
                 continue
             try:
                 if peel_id:
@@ -2316,19 +2435,31 @@ def create_app():
             "finished_at": None,
             "error": None,
         })
-        ingest.update_source(directory, source_sha, status="queued",
-                             extraction=block)
-        threading.Thread(
-            target=_run_peel_command,
-            args=(directory, source_sha, block, peel_id,
-                  lambda engine: engine.ingest(
-                      str(stored.resolve()),
-                      profile=request["profile"],
-                      llm_mode=request["llm_mode"],
-                      chunk_profile=request["chunk_profile"],
-                      chunk_versions=request["chunk_versions"],
-                      force=request["force"])),
-            name="peel-extract-%s" % source_sha[:8], daemon=True).start()
+        # CP5.1 H9 (wire §10.9): register the worker *before* the queued write
+        # and the thread start so a concurrent GET …/sources / index build can
+        # never persist the previous peel's terminal state while this ingest is
+        # running. The worker clears the entry only after its authoritative
+        # terminal write.
+        _register_extraction(directory, source_sha)
+        try:
+            ingest.update_source(directory, source_sha, status="queued",
+                                 extraction=block)
+            threading.Thread(
+                target=_run_peel_command,
+                args=(directory, source_sha, block, peel_id,
+                      lambda engine: engine.ingest(
+                          str(stored.resolve()),
+                          profile=request["profile"],
+                          llm_mode=request["llm_mode"],
+                          chunk_profile=request["chunk_profile"],
+                          chunk_versions=request["chunk_versions"],
+                          force=request["force"])),
+                name="peel-extract-%s" % source_sha[:8], daemon=True).start()
+        except Exception:
+            # The queued write or the thread start failed: clear the marker so
+            # the source can be refreshed/recovered from peelfeed again.
+            _clear_extraction(directory, source_sha)
+            raise
         return {
             "source": {"sha256": entry["sha256"],
                        "name": entry.get("name") or "",
