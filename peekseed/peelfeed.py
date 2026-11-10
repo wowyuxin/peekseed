@@ -99,9 +99,10 @@ REVIEW_SCHEMA = 2
 REVIEW_GROUPS = ("cluster", "code")
 #: ``POST …/review/plan`` actions (contract §7). ``show`` is read-only;
 #: ``accept``/``clear`` are the CP2 additions (contract §11.1, wire §2.6);
-#: ``patch`` is the CP5 targeted plan patch (wire §5) and has its own route.
+#: ``patch`` is the CP5 targeted plan patch (wire §5) and ``propagate`` the CP6
+#: cluster-level propagation (CP6 wire §1); both have their own routes.
 PLAN_ACTIONS = ("show", "select", "confirm", "lock", "unlock", "defer",
-                "accept", "clear", "patch")
+                "accept", "clear", "patch", "propagate")
 #: ``plan defer`` reason codes (contract §7).
 DEFER_REASONS = ("unsupported_evidence", "grid_conflict", "not_relevant", "other")
 #: peelfeed persistent job types (contract §11.4 / CP3 wire §2.5). Only
@@ -1117,6 +1118,11 @@ class PeelfeedClient(object):
             # CP5: the targeted plan patch is synchronous and has its own
             # frozen stdin shape (wire §5); use :meth:`plan_patch`.
             raise ValueError("plan patch uses PeelfeedClient.plan_patch()")
+        if action == "propagate":
+            # CP6: cluster-level propagation is synchronous and has its own
+            # frozen stdin shape (CP6 wire §1); use :meth:`plan_propagate`.
+            raise ValueError("plan propagate uses "
+                             "PeelfeedClient.plan_propagate()")
         args = ["plan", str(peel_id), action]
         stdin_text = None
         if action in ("select", "defer", "accept"):
@@ -1222,6 +1228,31 @@ class PeelfeedClient(object):
             raise ValueError("plan patch needs a request object")
         return self._run(
             ["plan", str(peel_id), "patch", "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+        )
+
+    def plan_propagate(self, peel_id, request):
+        """``peelfeed plan propagate <peel> --input -``: synchronous propagation.
+
+        CP6 wire §1: stdin is the frozen request ``{base_plan_version,
+        scope:{kind:"item|cluster|peel", …}, strategy:{id,version}, params,
+        source_item_id?, exclusions[], dry_run, operator}``; peelfeed resolves
+        the member set, rebuilds and validates every member's action from its
+        own evidence, and either returns the preview (``dry_run:true``, nothing
+        written) or writes the draft plan entries plus the propagation audit
+        record. No model call and no LLM env: the route is synchronous and the
+        request is validated by the API before this adapter is called. A base
+        mismatch or locked/batch-bound non-excluded member is ``error
+        [conflict]`` (409, ``error.details.conflicts``); a non-excluded
+        ``not_applicable``/``failed_check`` member is ``error [validation]``
+        (400, ``error.details.reasons``). It never confirms/applies/builds/
+        publishes and never touches the corpus.
+        """
+        if not isinstance(request, dict) or not request:
+            raise ValueError("plan propagate needs a request object")
+        return self._run(
+            ["plan", str(peel_id), "propagate", "--input", "-"],
             timeout=min(SHORT_TIMEOUT, self.timeout),
             stdin_text=json.dumps(request, ensure_ascii=False),
         )

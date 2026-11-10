@@ -1386,9 +1386,12 @@ def create_app():
         if not isinstance(body, dict):
             raise HTTPException(400, "a review plan request must be a JSON object")
         action = str(body.get("action") or "").strip().lower()
-        if action not in peelfeed.PLAN_ACTIONS or action in ("show", "patch"):
+        if action not in peelfeed.PLAN_ACTIONS or action in ("show", "patch",
+                                                            "propagate"):
             # CP5: the targeted plan patch has its own frozen route
-            # (POST …/review/plan/patches); it is never an action here.
+            # (POST …/review/plan/patches); CP6: the cluster-level propagation
+            # has its own route (POST …/review/plan/propagate). Neither is an
+            # action here.
             raise HTTPException(
                 400, "action must be one of select, confirm, lock, unlock, "
                      "defer, accept, clear")
@@ -1898,6 +1901,165 @@ def create_app():
             request["conversation_id"] = conversation_id
         if turn is not None:
             request["turn"] = turn
+        return request
+
+    _PROPAGATE_KEYS = {"base_plan_version", "scope", "strategy", "params",
+                       "source_item_id", "exclusions", "dry_run", "operator"}
+    _PROPAGATE_SCOPE_KEYS = {"kind", "item_id", "cluster_id", "peel"}
+
+    def _review_propagate_request(body):
+        """Validate ``POST …/review/plan/propagate`` (CP6 wire §1.1/§2).
+
+        Body is exactly the frozen ``plan propagate`` request:
+        ``{base_plan_version, scope:{kind:"item|cluster|peel", item_id?,
+        cluster_id?, peel?}, strategy:{id,version}, params, source_item_id?,
+        exclusions[], dry_run, operator?}``. Unknown fields (request, scope or
+        strategy) are a 400; ``base_plan_version`` is an int >= 0; the scope has
+        exactly one selector matching ``kind``; ``strategy.id`` is a non-empty
+        string and ``strategy.version`` an int >= 1; ``params`` is an object
+        (its content is validated by peelfeed per strategy); ``source_item_id``
+        is an optional non-empty string; ``exclusions`` is a list of non-empty
+        item-id strings; ``dry_run`` is a bool (default false); ``operator`` is
+        an optional non-empty string (peelfeed defaults it to ``"user"``).
+        peekseed only checks the envelope -- member resolution, per-member
+        statuses, applicability and validators are all-or-nothing in peelfeed
+        (CP6 wire §1.2/§1.3). The request is proxied synchronously with no model
+        call and no LLM env.
+        """
+        if not isinstance(body, dict):
+            raise HTTPException(
+                400, "a review plan propagate request must be a JSON object")
+        unknown = sorted(set(body) - _PROPAGATE_KEYS)
+        if unknown:
+            raise HTTPException(
+                400, "unknown review plan propagate field(s): %s"
+                     % ", ".join(unknown))
+        missing = sorted({"base_plan_version", "scope", "strategy"} - set(body))
+        if missing:
+            raise HTTPException(
+                400, "a review plan propagate request is missing field(s): %s"
+                     % ", ".join(missing))
+        base = body.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            raise HTTPException(
+                400, "base_plan_version is required and must be an integer >= 0")
+        scope = body.get("scope")
+        if not isinstance(scope, dict):
+            raise HTTPException(400, "scope must be a JSON object")
+        unknown_scope = sorted(set(scope) - _PROPAGATE_SCOPE_KEYS)
+        if unknown_scope:
+            raise HTTPException(
+                400, "unknown scope field(s): %s" % ", ".join(unknown_scope))
+        kind = str(scope.get("kind") or "").strip().lower()
+        if kind not in ("item", "cluster", "peel"):
+            raise HTTPException(
+                400, "scope.kind must be 'item', 'cluster' or 'peel'")
+        cleaned_scope = {"kind": kind, "item_id": None, "cluster_id": None,
+                         "peel": None}
+        if kind == "item":
+            item_id = str(scope.get("item_id") or "").strip()
+            if not item_id:
+                raise HTTPException(400, "scope.item_id is required for kind "
+                                         "'item'")
+            if scope.get("cluster_id") is not None:
+                raise HTTPException(
+                    400, "scope must have exactly one selector "
+                         "(item_id and cluster_id are both set)")
+            if scope.get("peel") is not None:
+                raise HTTPException(
+                    400, "scope must have exactly one selector "
+                         "(item_id and peel are both set)")
+            cleaned_scope["item_id"] = item_id
+        elif kind == "cluster":
+            cluster_id = str(scope.get("cluster_id") or "").strip()
+            if not cluster_id:
+                raise HTTPException(400, "scope.cluster_id is required for "
+                                         "kind 'cluster'")
+            if scope.get("item_id") is not None:
+                raise HTTPException(
+                    400, "scope must have exactly one selector "
+                         "(cluster_id and item_id are both set)")
+            if scope.get("peel") is not None:
+                raise HTTPException(
+                    400, "scope must have exactly one selector "
+                         "(cluster_id and peel are both set)")
+            cleaned_scope["cluster_id"] = cluster_id
+        else:
+            if scope.get("peel") is not True:
+                raise HTTPException(
+                    400, "scope.peel must be true for kind 'peel'")
+            if scope.get("item_id") is not None or scope.get(
+                    "cluster_id") is not None:
+                raise HTTPException(
+                    400, "scope must have exactly one selector "
+                         "(peel and an item/cluster id are both set)")
+            cleaned_scope["peel"] = True
+        strategy = body.get("strategy")
+        if not isinstance(strategy, dict):
+            raise HTTPException(400, "strategy must be a JSON object")
+        unknown_strategy = sorted(set(strategy) - {"id", "version"})
+        if unknown_strategy:
+            raise HTTPException(
+                400, "unknown strategy field(s): %s"
+                     % ", ".join(unknown_strategy))
+        strategy_id = str(strategy.get("id") or "").strip()
+        if not strategy_id:
+            raise HTTPException(400, "strategy.id is required")
+        version = strategy.get("version")
+        if isinstance(version, bool) or not isinstance(version, int) \
+                or version < 1:
+            raise HTTPException(
+                400, "strategy.version must be an integer >= 1")
+        params = body.get("params", {})
+        if params is None:
+            params = {}
+        if not isinstance(params, dict):
+            raise HTTPException(400, "params must be a JSON object")
+        source_item_id = body.get("source_item_id")
+        if source_item_id is not None:
+            if not isinstance(source_item_id, str) \
+                    or not source_item_id.strip():
+                raise HTTPException(
+                    400, "source_item_id must be a non-empty string")
+            source_item_id = source_item_id.strip()
+        exclusions = body.get("exclusions", [])
+        if exclusions is None:
+            exclusions = []
+        if not isinstance(exclusions, list):
+            raise HTTPException(
+                400, "exclusions must be a list of item ids")
+        cleaned_exclusions = []
+        for raw in exclusions:
+            if not isinstance(raw, str):
+                raise HTTPException(
+                    400, "exclusions must contain only strings")
+            item_id = raw.strip()
+            if not item_id:
+                raise HTTPException(
+                    400, "exclusions must not contain empty ids")
+            if item_id not in cleaned_exclusions:
+                cleaned_exclusions.append(item_id)
+        dry_run = body.get("dry_run", False)
+        if not isinstance(dry_run, bool):
+            raise HTTPException(400, "dry_run must be a boolean")
+        operator = body.get("operator")
+        if operator is not None:
+            if not isinstance(operator, str) or not operator.strip():
+                raise HTTPException(
+                    400, "operator must be a non-empty string")
+            operator = operator.strip()
+        request = {
+            "base_plan_version": base,
+            "scope": cleaned_scope,
+            "strategy": {"id": strategy_id, "version": version},
+            "params": params,
+            "exclusions": cleaned_exclusions,
+            "dry_run": dry_run,
+        }
+        if source_item_id is not None:
+            request["source_item_id"] = source_item_id
+        if operator is not None:
+            request["operator"] = operator
         return request
 
     def _review_ocr_check_request(body):
@@ -2641,6 +2803,35 @@ def create_app():
         return _call_peelfeed(
             "plan patch",
             lambda: peelfeed.client().plan_patch(peel_id, request))
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/plan/propagate")
+    def source_review_plan_propagate(dataset_id: str, sha: str,
+                                     payload: Optional[dict] = None):
+        """Proxy the synchronous CP6 cluster-level propagation (wire §2).
+
+        Body is exactly the frozen ``plan propagate`` request (CP6 wire §1.1):
+        ``{base_plan_version, scope:{kind:"item|cluster|peel", …},
+        strategy:{id,version}, params, source_item_id?, exclusions[], dry_run,
+        operator?}``; the body is validated strictly here and proxied to
+        ``peelfeed plan propagate`` synchronously with **no model call and no
+        LLM env**. ``dry_run:true`` returns the member preview and writes
+        nothing; ``dry_run:false`` writes the draft plan entries (with a
+        ``kind:"propagation"`` origin) and the propagation audit record, never
+        confirming/applying/building/publishing. Status mapping follows
+        contract §4: 200 preview/apply; 409 ``conflict`` (base mismatch or
+        locked/batch-bound members, ``error.details.conflicts``); 400
+        ``validation`` (invalid scope/strategy/params or non-excluded failing
+        members, ``error.details.reasons``); 404 not found. The response is
+        passed through unchanged; no job descriptor is created.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        request = _review_propagate_request(payload or {})
+        return _call_peelfeed(
+            "plan propagate",
+            lambda: peelfeed.client().plan_propagate(peel_id, request))
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/ocr/check")
     def source_review_ocr_check(dataset_id: str, sha: str,

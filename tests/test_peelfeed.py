@@ -3947,6 +3947,264 @@ class Cp51H9ReingestTests(unittest.TestCase):
                 self.assertFalse(app_module._extraction_active(directory, sha))
 
 
+def _propagate_body(**overrides):
+    """A frozen CP6 wire §1.1 ``plan propagate`` request (preview by default)."""
+    body = {
+        "base_plan_version": 0,
+        "scope": {"kind": "item", "item_id": "it-3f9c2a4b6d8e0f1a",
+                  "cluster_id": None, "peel": None},
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "params": {"rows": [0]},
+        "source_item_id": "it-3f9c2a4b6d8e0f1a",
+        "exclusions": [],
+        "dry_run": True,
+        "operator": "user",
+    }
+    body.update(overrides)
+    return body
+
+
+class Cp6PropagateRouteTests(unittest.TestCase):
+    """CP6 wire §1/§2: synchronous cluster-level propagation proxy."""
+
+    ITEM = "it-3f9c2a4b6d8e0f1a"
+
+    def test_client_plan_propagate_argv_stdin_and_no_llm_env(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            source = make_pdf(root / "manual.pdf")
+            with peelfeed_env(CLI=str(cli.path)):
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                body = _propagate_body()
+                result = engine.plan_propagate(peel_id, body)
+                self.assertIs(result["dry_run"], True)
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "plan")
+                self.assertEqual(call["argv"][1:5],
+                                 [peel_id, "propagate", "--input", "-"])
+                self.assertIn("--root", call["argv"])
+                self.assertIn("--json", call["argv"])
+                # No model call and no LLM env for a propagation child.
+                self.assertEqual(call["llm_env"], {})
+                self.assertEqual(cli.state()["propagate_requests"][-1], body)
+                self.assertFalse(cli.state().get("propagations"))
+
+    def test_preview_and_apply_round_trip(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                peel_id = "peel-" + base.split("/")[5][:8]
+                cli.clear_calls()
+                body = _propagate_body()
+                preview = client.post(route, json=body)
+                self.assertEqual(preview.status_code, 200, preview.text)
+                payload = preview.json()
+                self.assertIs(payload["dry_run"], True)
+                # The preview response omits apply-only fields and writes
+                # nothing (wire §1.5).
+                for key in ("propagation_id", "diff", "changed"):
+                    self.assertNotIn(key, payload)
+                self.assertEqual(payload["plan_version"], 0)
+                self.assertEqual([member["item_id"]
+                                  for member in payload["members"]],
+                                 [self.ITEM])
+                self.assertEqual(payload["members"][0]["status"], "ready")
+                self.assertEqual(payload["counts"]["members"], 1)
+                self.assertNotIn("plan", cli.state())
+                self.assertFalse(cli.state().get("propagations"))
+                # Exact frozen request reached the fake CLI; no LLM env.
+                self.assertEqual(cli.state()["propagate_requests"][-1], body)
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "plan")
+                self.assertEqual(call["argv"][1:5],
+                                 [peel_id, "propagate", "--input", "-"])
+                self.assertEqual(call["llm_env"], {})
+                # Apply: draft entry + propagation origin + audit record.
+                applied = client.post(route,
+                                      json=_propagate_body(dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["dry_run"], False)
+                self.assertTrue(result["propagation_id"].startswith("prop-"))
+                self.assertEqual(result["plan_version"], 1)
+                self.assertIs(result["changed"], True)
+                self.assertEqual(result["diff"]["added"][0]["item_id"],
+                                 self.ITEM)
+                plan = cli.state()["plan"]
+                entry = plan["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["source"], "user")
+                self.assertEqual(entry["origin"]["kind"], "propagation")
+                self.assertEqual(entry["origin"]["propagation_id"],
+                                 result["propagation_id"])
+                record = cli.state()["propagations"][
+                    result["propagation_id"]]
+                self.assertEqual(record["operator"], "user")
+                self.assertEqual(record["selection"], [self.ITEM])
+                self.assertEqual(record["base_plan_version"], 0)
+                self.assertEqual(record["plan_version_after"], 1)
+                # A repeat apply is a no-op: changed false, no version bump,
+                # no duplicate entry, audit record still written (wire §1.3).
+                repeat = client.post(route, json=_propagate_body(
+                    base_plan_version=1, dry_run=False))
+                self.assertEqual(repeat.status_code, 200, repeat.text)
+                self.assertIs(repeat.json()["changed"], False)
+                self.assertEqual(repeat.json()["plan_version"], 1)
+                self.assertEqual(repeat.json()["diff"]["unchanged"], 1)
+                self.assertEqual(len(cli.state()["plan"]["entries"]), 1)
+                self.assertEqual(len(cli.state()["propagations"]), 2)
+
+    def test_locked_conflict_and_validation_passthrough(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                # Lock the item through the existing plan machinery.
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                locked = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "lock", "entry_id": entry_id})
+                self.assertEqual(locked.status_code, 200, locked.text)
+                version = locked.json()["plan_version"]
+                # Preview shows the locked member and writes nothing.
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertEqual(preview.json()["members"][0]["status"],
+                                 "locked")
+                self.assertFalse(cli.state().get("propagations"))
+                # Apply without excluding it -> 409 conflict (conflict ids in
+                # the readable error), plan untouched.
+                conflict = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(conflict.status_code, 409, conflict.text)
+                self.assertIn("conflicts:", conflict.json()["detail"])
+                self.assertIn(self.ITEM, conflict.json()["detail"])
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                # Explicitly excluding it allows the (no-op) apply.
+                excluded = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    exclusions=[self.ITEM]))
+                self.assertEqual(excluded.status_code, 200, excluded.text)
+                self.assertIs(excluded.json()["changed"], False)
+                self.assertEqual(excluded.json()["plan_version"], version)
+                self.assertEqual(excluded.json()["counts"]["excluded"], 1)
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                records_before = len(cli.state().get("propagations") or {})
+                # Base mismatch -> 409 conflict.
+                stale = client.post(route, json=_propagate_body(
+                    base_plan_version=99))
+                self.assertEqual(stale.status_code, 409, stale.text)
+                self.assertIn("conflict", stale.json()["detail"])
+                # A non-excluded failing member -> 400 validation with the
+                # per-member reasons, nothing written.
+                cli.update(propagate_failed={
+                    "it-8b7a6c5d4e3f2a10": ["parent_not_available"]})
+                failed = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    scope={"kind": "item",
+                           "item_id": "it-8b7a6c5d4e3f2a10",
+                           "cluster_id": None, "peel": None},
+                    source_item_id="it-8b7a6c5d4e3f2a10",
+                    strategy={"id": "use_first_row_header", "version": 1},
+                    params={"rows": [0]}))
+                self.assertEqual(failed.status_code, 400, failed.text)
+                self.assertIn("validation", failed.json()["detail"])
+                self.assertIn("it-8b7a6c5d4e3f2a10",
+                              failed.json()["detail"])
+                self.assertEqual(len(cli.state().get("propagations") or {}),
+                                 records_before)
+
+    def test_body_validation_never_calls_the_cli(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                good = _propagate_body()
+                bad_bodies = [
+                    # Unknown request/scope/strategy fields.
+                    dict(good, extra=True),
+                    dict(good, scope={"kind": "item",
+                                      "item_id": self.ITEM,
+                                      "cluster_id": None, "peel": None,
+                                      "unknown": 1}),
+                    dict(good, strategy={"id": "use_first_row_header",
+                                         "version": 1, "unknown": 1}),
+                    # Missing required fields / bad base.
+                    {"scope": good["scope"], "strategy": good["strategy"]},
+                    {"base_plan_version": 0, "strategy": good["strategy"]},
+                    {"base_plan_version": 0, "scope": good["scope"]},
+                    dict(good, base_plan_version=True),
+                    dict(good, base_plan_version=-1),
+                    dict(good, base_plan_version="0"),
+                    # Scope shape / selector rules.
+                    dict(good, scope=[]),
+                    dict(good, scope={"kind": "document",
+                                      "item_id": None, "cluster_id": None,
+                                      "peel": None}),
+                    dict(good, scope={"kind": "item", "item_id": None,
+                                      "cluster_id": None, "peel": None}),
+                    dict(good, scope={"kind": "item", "item_id": self.ITEM,
+                                      "cluster_id": "cl-0f1e2d3c4b5a",
+                                      "peel": None}),
+                    dict(good, scope={"kind": "cluster", "item_id": None,
+                                      "cluster_id": None, "peel": None}),
+                    dict(good, scope={"kind": "peel", "item_id": None,
+                                      "cluster_id": None, "peel": False}),
+                    # Strategy / params / optional fields.
+                    dict(good, strategy={}),
+                    dict(good, strategy={"id": "use_first_row_header",
+                                         "version": 0}),
+                    dict(good, strategy={"id": "use_first_row_header",
+                                         "version": True}),
+                    dict(good, params=[]),
+                    dict(good, source_item_id=7),
+                    dict(good, source_item_id="  "),
+                    dict(good, exclusions="it-x"),
+                    dict(good, exclusions=[7]),
+                    dict(good, exclusions=[""]),
+                    dict(good, dry_run="true"),
+                    dict(good, operator=""),
+                ]
+                cli.clear_calls()
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+                # The generic plan route still rejects the propagate action.
+                wrong_action = client.post(base + "/review/plan", json={
+                    "base_plan_version": 0, "action": "propagate"})
+                self.assertEqual(wrong_action.status_code, 400,
+                                 wrong_action.text)
+                self.assertIn("action must be one of",
+                              wrong_action.json()["detail"])
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+
+
 class NoHttpContractTests(unittest.TestCase):
     def test_the_adapter_has_no_http_or_token_code_path(self):
         """The seam stays CLI-only. CP5 (wire §1.3) may pass a link's

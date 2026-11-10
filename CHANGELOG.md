@@ -245,6 +245,34 @@ version/tag policy.
   existing `partial_failures`. Absent fields render nothing, so pre-CP5.1
   payloads keep working.
 
+### Added — cluster-level plan propagation (M2.2 CP6)
+
+- **Propagation route.** `POST …/review/plan/propagate` proxies the synchronous
+  `peelfeed plan propagate` command (CP6 wire §1/§2) with no model call and no
+  LLM env. The body is the frozen request `{base_plan_version,
+  scope:{kind:"item"|"cluster"|"peel", …}, strategy:{id,version}, params,
+  source_item_id?, exclusions[], dry_run, operator?}` and is validated strictly
+  (unknown request/scope/strategy fields, a scope without exactly one selector,
+  a non-object `params`, a non-list `exclusions`, a non-bool `dry_run` and
+  non-string `source_item_id`/`operator` are `400`). `dry_run:true` returns the
+  member preview and writes nothing; `dry_run:false` writes draft plan entries
+  with `origin:{kind:"propagation", propagation_id, scope, strategy,
+  base_plan_version}` plus the immutable propagation audit record. Locked or
+  batch-bound members that are not excluded are `409 conflict`
+  (`error.details.conflicts`); non-excluded failing members are `400 validation`
+  (`error.details.reasons`, all-or-nothing, nothing written); a repeat no-op
+  apply returns `changed:false` without bumping the plan version. The route
+  never confirms/builds/publishes and never touches the corpus.
+- **Review UI “应用到相似项” panel.** Scope selector (当前项/当前簇/全 peel),
+  read-only strategy/version/params, explicit 预览成员 (`dry_run:true`), member
+  list with status badges/reasons/per-member action summaries, 正例/边界例
+  lists, exclusion checkboxes, and an 应用 button that stays disabled until a
+  preview with the same `base_plan_version` succeeded and every locked/in-batch
+  conflict is excluded. The 409 conflict list and 400 per-member failures are
+  rendered inline; after apply the plan/report view refreshes and the new draft
+  entries carry a 批量 origin badge. Nothing is sent before an explicit preview
+  or apply click.
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:

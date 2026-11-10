@@ -1673,6 +1673,109 @@ class ReviewUiCp5Tests(unittest.TestCase):
         self.assertNotIn("PEELFEED_LLM_BASE", page)
 
 
+class ReviewUiCp6Tests(unittest.TestCase):
+    """CP6 (M2.2 Phase 5) wire §3: the 应用到相似项 propagation panel."""
+
+    def test_review_modal_ships_the_propagation_panel_hooks(self):
+        text = _ui()
+        for marker in (
+                'id="reviewPropagate"', 'id="reviewPropagateOpen"',
+                'id="reviewPropagateScope"', 'id="reviewPropagateStrategy"',
+                'id="reviewPropagatePreview"', 'id="reviewPropagateMembers"',
+                'id="reviewPropagatePositives"',
+                'id="reviewPropagateBoundary"',
+                'id="reviewPropagateExclusions"',
+                'id="reviewPropagateApply"', 'id="reviewPropagateDiff"',
+                'id="reviewPropagateConflict"', 'id="reviewPropagateError"'):
+            self.assertIn(marker, text)
+        # The panel lives inside the review modal, before the rollback confirm.
+        modal = text.index('id="reviewModal"')
+        panel = text.index('id="reviewPropagate"')
+        rollback = text.index('id="reviewRollbackConfirm"')
+        self.assertLess(modal, panel)
+        self.assertLess(panel, rollback)
+        for label in ("应用到相似项", "预览成员", "应用（生成 draft 条目）",
+                      "当前项", "当前簇", "全 peel", "正例", "边界例",
+                      "排除项", "传播 diff", "传播冲突（409）", "传播失败（400）",
+                      "批量", "逐项按自身 evidence 重建动作并独立校验"):
+            self.assertIn(label, text)
+        for marker in (
+                "function reviewPropagateOpen",
+                "function reviewPropagatePreview",
+                "function reviewPropagateApply",
+                "function reviewPropagateExclusionToggle",
+                "function reviewPropagateApplyDisabled",
+                "function reviewPropagateConflicts",
+                "function reviewPropagateBody",
+                "function reviewPropagateMembersHtml",
+                "function reviewPropagateExclusionsHtml",
+                "function reviewPropagateDiffHtml",
+                "function paintReviewPropagate",
+                "REVIEW_PROPAGATE_STATUS_LABEL",
+                "REVIEW_PROPAGATE_CONFLICT_STATUSES",
+                "'/plan/propagate'", "dry_run:!!dryRun",
+                "operator:'user'"):
+            self.assertIn(marker, text)
+        # Preview is a dry run; only apply sends dry_run:false. Apply is a
+        # separate explicit click and is disabled until a preview succeeded.
+        preview_start = text.index("async function reviewPropagatePreview")
+        preview_end = text.index("async function reviewPropagateApply",
+                                 preview_start)
+        preview_body = text[preview_start:preview_end]
+        self.assertIn("reviewPropagateBody(info,true)", preview_body)
+        apply_start = preview_end
+        apply_end = text.index("function reviewPropagateExclusionToggle",
+                               apply_start)
+        apply_body = text[apply_start:apply_end]
+        self.assertIn("reviewPropagateBody(info,false)", apply_body)
+        self.assertIn("reviewPropagateApplyDisabled()", apply_body)
+        self.assertIn("p.previewedBase=null", apply_body)
+        # The apply button is disabled until a preview with the same base plan
+        # version succeeded and no locked/in-batch member is left unexcluded.
+        disabled_start = text.index("function reviewPropagateApplyDisabled")
+        disabled_end = text.index("function paintReviewPropagate",
+                                  disabled_start)
+        disabled_body = text[disabled_start:disabled_end]
+        self.assertIn("previewedBase==null", disabled_body)
+        self.assertIn("Number(plan.plan_version||0)!==Number(p.previewedBase)",
+                      disabled_body)
+        self.assertIn("reviewPropagateConflicts(p.preview).length>0",
+                      disabled_body)
+        # Propagation entries render with a 批量 origin badge.
+        entry_start = text.index("function reviewEntryHtml")
+        entry_end = text.index("function reviewResolutionHtml", entry_start)
+        self.assertIn("origin.kind==='propagation'", text[entry_start:entry_end])
+        self.assertIn("批量", text[entry_start:entry_end])
+
+    def test_served_page_ships_cp6_propagation_controls(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+
+            response = TestClient(app_module.create_app()).get("/")
+            self.assertEqual(response.status_code, 200, response.text)
+            page = response.text
+        for marker in ('id="reviewPropagate"', 'id="reviewPropagateOpen"',
+                       'id="reviewPropagateScope"',
+                       'id="reviewPropagateStrategy"',
+                       'id="reviewPropagatePreview"',
+                       'id="reviewPropagateMembers"',
+                       'id="reviewPropagatePositives"',
+                       'id="reviewPropagateBoundary"',
+                       'id="reviewPropagateExclusions"',
+                       'id="reviewPropagateApply"',
+                       'id="reviewPropagateDiff"',
+                       'id="reviewPropagateConflict"',
+                       'id="reviewPropagateError"',
+                       "应用到相似项", "预览成员", "应用（生成 draft 条目）",
+                       "reviewPropagateOpen", "reviewPropagatePreview",
+                       "reviewPropagateApply", "reviewPropagateExclusionToggle",
+                       "paintReviewPropagate", "'/plan/propagate'"):
+            self.assertIn(marker, page)
+        # Propagation never sends a provider token or LLM env.
+        self.assertNotIn("PEELFEED_LLM_TOKEN", page)
+
+
 # ---------------------------------------------------------------------------
 # CP5 Node stub-DOM behaviour harness: runs the real review JS block against
 # canned fetch responses (no browser, no network) and proves:
@@ -1745,7 +1848,9 @@ const reportRulesPosts = [];
 const discussPosts = [];
 const patchPosts = [];
 const planActionBodies = [];
+const propagatePosts = [];
 let planActionPosts = 0;
+let propagateMode = "ok";
 let reviewPayloadCurrent = null;
 let sourcesPayload = { sources: [] };
 let conflictMode = false;
@@ -1757,8 +1862,12 @@ function item(id, clusterId) {
     cluster_id: clusterId, message: "m", triage: "deterministic_candidate",
     status: "needs_decision",
     evidence: { hash: "h", crops: [], native_line_ids: [], ocr_evidence: [] },
-    current: {}, candidates: [], strategies: [], entry: null, resolution: null,
-    stale: false };
+    current: {}, candidates: [{ strategy: { id: "use_first_row_header",
+      version: 1 }, action: { type: "operation", name: "set_header_rows",
+      params: { rows: [0] } }, source: "rule",
+      validator: { status: "ready", reasons: [] },
+      evidence_refs: ["asset:table-" + id] }],
+    strategies: [], entry: null, resolution: null, stale: false };
 }
 function cluster(cid, ids) {
   return { cluster_id: cid, code: "table_header_absent", title: "t",
@@ -1877,6 +1986,72 @@ const DISCUSS_RESULT = {
   evidence_hashes: {}, base_plan_version: 0,
 };
 
+/* CP6 (Phase 5): propagation fixtures. A preview shows a ready member, a
+   locked member (must be excluded before apply) and a boundary-case member. */
+const PROPAGATE_PREVIEW = {
+  peel_id: "peel", review_schema: 2, dry_run: true, plan_version: 0,
+  scope: { kind: "cluster", item_id: null, cluster_id: "cl-a", peel: null },
+  strategy: { id: "use_first_row_header", version: 1 },
+  members: [
+    { item_id: "it-a", status: "ready", reasons: [],
+      action: { type: "operation", name: "set_header_rows",
+        params: { rows: [0] } } },
+    { item_id: "it-b", status: "locked", reasons: [], action: null },
+    { item_id: "it-c", status: "ready", reasons: [],
+      action: { type: "operation", name: "set_header_rows",
+        params: { rows: [0] } } },
+  ],
+  positives: ["it-a"],
+  boundary_cases: ["it-c"],
+  exclusions: [],
+  counts: { members: 3, ready: 2, already: 0, failed: 0, locked: 1,
+    excluded: 0 },
+};
+const PROPAGATE_APPLIED = {
+  peel_id: "peel", review_schema: 2, dry_run: false, plan_version: 1,
+  propagation_id: "prop-20261110T120000-abcd",
+  scope: { kind: "cluster", item_id: null, cluster_id: "cl-a", peel: null },
+  strategy: { id: "use_first_row_header", version: 1 },
+  members: PROPAGATE_PREVIEW.members,
+  positives: ["it-a"], boundary_cases: ["it-c"],
+  exclusions: ["it-b"],
+  counts: { members: 3, ready: 2, already: 0, failed: 0, locked: 1,
+    excluded: 1 },
+  diff: { added: [
+      { item_id: "it-a", entry_id: "e-it-a", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+      { item_id: "it-c", entry_id: "e-it-c", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+    ], changed: [], removed: [], unchanged: 0 },
+  changed: true,
+};
+const REVIEW_VLM_PROPAGATED = (function () {
+  const payload = reviewPayload(VLM_CAPS, VLM_REPORT, 1);
+  payload.items = payload.items.map(function (entry) {
+    if (entry.id !== "it-a") return entry;
+    return Object.assign({}, entry, {
+      entry: { entry_id: "e-it-a", item_id: "it-a", status: "draft",
+        stale: false, stale_reasons: [], locked: false,
+        strategy: { id: "use_first_row_header", version: 1 },
+        action: { type: "operation", name: "set_header_rows",
+          params: { rows: [0] } },
+        evidence: { hash: "h", refs: [] }, dependencies: [],
+        capability_snapshot: { native_lines: true, ocr: null, vlm: null },
+        source: "user",
+        origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd",
+          scope: { kind: "cluster", item_id: null, cluster_id: "cl-a",
+            peel: null },
+          strategy: { id: "use_first_row_header", version: 1 },
+          base_plan_version: 0 },
+        revision: 1, batch_id: null, notes: null },
+    });
+  });
+  return payload;
+})();
+
 function sourceRow(jobs) {
   return { name: "manual.pdf", sha256: sha, status: "extracted",
     extraction: { state: "extracted", peel_id: "peel",
@@ -1906,6 +2081,26 @@ function fetchStub(url, opts) {
   /* Asset URLs contain "/review/jobs/" too, so match assets first. */
   if (u.indexOf("/assets/") >= 0) {
     return Promise.resolve(response(200, DISCUSS_RESULT));
+  }
+  if (method === "POST" && u.indexOf("/review/plan/propagate") >= 0) {
+    const parsed = JSON.parse(body || "{}");
+    propagatePosts.push(parsed);
+    if (propagateMode === "conflict") {
+      return Promise.resolve(response(409, {
+        detail: "peelfeed plan propagate failed: error [conflict] propagate "
+          + "touches locked/batch-bound members (conflicts: it-b)" }));
+    }
+    if (propagateMode === "validation") {
+      return Promise.resolve(response(400, {
+        detail: "peelfeed plan propagate failed: error [validation] propagate "
+          + "has non-excluded failing members (it-b=failed_check "
+          + "(parent_not_available))" }));
+    }
+    if (parsed.dry_run) {
+      return Promise.resolve(response(200, PROPAGATE_PREVIEW));
+    }
+    reviewPayloadCurrent = REVIEW_VLM_PROPAGATED;
+    return Promise.resolve(response(200, PROPAGATE_APPLIED));
   }
   if (method === "POST" && u.indexOf("/review/plan/patches") >= 0) {
     patchPosts.push(JSON.parse(body || "{}"));
@@ -2038,6 +2233,13 @@ const code = block
   + " reviewAction: reviewAction,"
   + " reviewSelectedSources: reviewSelectedSources,"
   + " reviewItemSourceChoice: reviewItemSourceChoice,"
+  + " reviewPropagateOpen: reviewPropagateOpen,"
+  + " reviewPropagatePreview: reviewPropagatePreview,"
+  + " reviewPropagateApply: reviewPropagateApply,"
+  + " reviewPropagateExclusionToggle: reviewPropagateExclusionToggle,"
+  + " reviewPropagateApplyDisabled: reviewPropagateApplyDisabled,"
+  + " reviewPropagateInfo: reviewPropagateInfo,"
+  + " paintReviewPropagate: paintReviewPropagate,"
   + " generateReviewReport: generateReviewReport,"
   + " reviewLoadSource: reviewLoadSource,"
   + " paintReviewVlmJob: paintReviewVlmJob,"
@@ -2066,6 +2268,8 @@ function resetCounters() {
   discussPosts.length = 0;
   patchPosts.length = 0;
   planActionBodies.length = 0;
+  propagatePosts.length = 0;
+  propagateMode = "ok";
   planActionPosts = 0;
   conflictMode = false;
 }
@@ -2284,6 +2488,101 @@ async function runSourceChoiceFlow() {
   return steps;
 }
 
+async function runPropagateFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  /* Opening the 应用到相似项 panel is local UI state: nothing is sent and
+     apply stays disabled until an explicit preview succeeded. */
+  sandbox.__review.reviewPropagateOpen();
+  await tick(20);
+  steps.push({ step: "prop-open",
+    hidden: element("#reviewPropagate").hidden,
+    strategy: element("#reviewPropagateStrategy").textContent,
+    scope: element("#reviewPropagateScope").value,
+    posts: propagatePosts.length,
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    detail: htmlOf("#reviewDetail") });
+  /* Preview sends dry_run:true and renders members/positives/boundary/
+     exclusions; the locked member keeps apply disabled. */
+  element("#reviewPropagateScope").value = "cluster";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "prop-preview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    positives: htmlOf("#reviewPropagatePositives"),
+    boundary: htmlOf("#reviewPropagateBoundary"),
+    exclusions: htmlOf("#reviewPropagateExclusions"),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    msg: htmlOf("#reviewMsg") });
+  /* Exclude the locked member: the conflict clears and apply becomes enabled. */
+  const exclusions = element("#reviewPropagateExclusions");
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  await tick(40);
+  steps.push({ step: "prop-excluded",
+    exclusions: htmlOf("#reviewPropagateExclusions"),
+    members: htmlOf("#reviewPropagateMembers"),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    posts: propagatePosts.length });
+  /* Explicit apply: dry_run:false with the exclusions; diff + 批量 entry. */
+  await sandbox.__review.reviewPropagateApply();
+  await tick(200);
+  steps.push({ step: "prop-applied",
+    posts: propagatePosts.slice(),
+    diff: htmlOf("#reviewPropagateDiff"),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    detail: htmlOf("#reviewDetail"),
+    msg: htmlOf("#reviewMsg"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  exclusions.querySelectorAll = function () { return []; };
+  /* A 409 on apply shows the conflict list and keeps apply disabled. */
+  sandbox.__review.reviewPropagateOpen();
+  element("#reviewPropagateScope").value = "cluster";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(120);
+  /* Exclude the locked member so the apply click is sent; the server then
+     answers 409 (e.g. a race after the preview) and the conflict list renders. */
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  await tick(40);
+  propagateMode = "conflict";
+  await sandbox.__review.reviewPropagateApply();
+  await tick(160);
+  steps.push({ step: "prop-conflict",
+    posts: propagatePosts.slice(),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    msg: htmlOf("#reviewMsg") });
+  exclusions.querySelectorAll = function () { return []; };
+  /* A 400 preview renders the per-member error and keeps apply disabled. */
+  propagateMode = "validation";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(120);
+  steps.push({ step: "prop-error",
+    error: htmlOf("#reviewPropagateError"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    msg: htmlOf("#reviewMsg") });
+  propagateMode = "ok";
+  return steps;
+}
+
 async function main() {
   const results = [];
   results.push(...await runVlmFlow());
@@ -2291,6 +2590,7 @@ async function main() {
   results.push(...await runNoVlmFlow());
   results.push(...await runReattachFlow());
   results.push(...await runSourceChoiceFlow());
+  results.push(...await runPropagateFlow());
   console.log(JSON.stringify(results));
 }
 
@@ -2510,4 +2810,78 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertEqual(body["item_ids"], ["it-a"], body)
         self.assertEqual(body["sources"], {"it-a": "vlm"}, body)
         self.assertEqual(accepted["planPosts"], 1, accepted)
+
+    def test_propagation_panel_preview_exclude_apply_conflict_error(self):
+        """CP6 wire §3: 应用到相似项 — preview is a dry run, apply is an
+        explicit click enabled only after a preview with the same base plan
+        version and all locked members excluded; diff/error render, 批量 badge."""
+        by_step = self._run_harness()
+        opened = by_step["prop-open"]
+        self.assertFalse(opened["hidden"], opened)
+        # Opening the panel sends nothing; apply is disabled without a preview.
+        self.assertEqual(opened["posts"], 0, opened)
+        self.assertEqual(opened["scope"], "item", opened)
+        self.assertIn("use_first_row_header", opened["strategy"], opened)
+        self.assertIn("参数", opened["strategy"], opened)
+        self.assertTrue(opened["applyDisabled"], opened)
+        self.assertIn('id="reviewPropagateOpen"', opened["detail"], opened)
+        preview = by_step["prop-preview"]
+        self.assertEqual(len(preview["posts"]), 1, preview)
+        body = preview["posts"][0]
+        self.assertIs(body["dry_run"], True, body)
+        self.assertEqual(body["scope"], {
+            "kind": "cluster", "item_id": None, "cluster_id": "cl-a",
+            "peel": None}, body)
+        self.assertEqual(body["strategy"],
+                         {"id": "use_first_row_header", "version": 1}, body)
+        self.assertEqual(body["params"], {"rows": [0]}, body)
+        self.assertEqual(body["source_item_id"], "it-a", body)
+        self.assertEqual(body["exclusions"], [], body)
+        self.assertEqual(body["operator"], "user", body)
+        self.assertEqual(body["base_plan_version"], 0, body)
+        members = preview["members"]
+        for marker in ("it-a", "it-b", "it-c", "就绪", "已锁定",
+                       "set_header_rows"):
+            self.assertIn(marker, members, preview)
+        self.assertIn("正例", preview["positives"], preview)
+        self.assertIn("it-a", preview["positives"], preview)
+        self.assertIn("边界例", preview["boundary"], preview)
+        self.assertIn("it-c", preview["boundary"], preview)
+        self.assertIn("排除项", preview["exclusions"], preview)
+        self.assertIn("propagate-exclude", preview["exclusions"], preview)
+        self.assertIn("传播冲突", preview["conflict"], preview)
+        self.assertIn("it-b", preview["conflict"], preview)
+        # A locked member keeps apply disabled until it is excluded.
+        self.assertTrue(preview["applyDisabled"], preview)
+        excluded = by_step["prop-excluded"]
+        # Ticking an exclusion sends nothing; it only re-evaluates the button.
+        self.assertEqual(excluded["posts"], 1, excluded)
+        self.assertIn("已排除", excluded["members"], excluded)
+        self.assertEqual(excluded["conflict"], "", excluded)
+        self.assertFalse(excluded["applyDisabled"], excluded)
+        applied = by_step["prop-applied"]
+        self.assertEqual(len(applied["posts"]), 2, applied)
+        apply_body = applied["posts"][1]
+        self.assertIs(apply_body["dry_run"], False, apply_body)
+        self.assertEqual(apply_body["exclusions"], ["it-b"], apply_body)
+        self.assertEqual(apply_body["scope"]["kind"], "cluster", apply_body)
+        self.assertIn("传播 diff", applied["diff"], applied)
+        self.assertIn("新增 2", applied["diff"], applied)
+        self.assertIn("it-a", applied["diff"], applied)
+        # The refreshed plan entry renders a 批量 propagation origin badge on
+        # its draft entry (the UI labels draft as 已选策略).
+        self.assertIn("批量", applied["detail"], applied)
+        self.assertIn("已选策略", applied["detail"], applied)
+        self.assertIn("未确认、未构建、未发布", applied["msg"], applied)
+        # A fresh preview is required after the plan version changed.
+        self.assertTrue(applied["applyDisabled"], applied)
+        conflict = by_step["prop-conflict"]
+        self.assertIn("传播冲突", conflict["conflict"], conflict)
+        self.assertIn("conflicts: it-b", conflict["conflict"], conflict)
+        self.assertTrue(conflict["applyDisabled"], conflict)
+        error = by_step["prop-error"]
+        self.assertIn("传播失败", error["error"], error)
+        self.assertIn("validation", error["error"], error)
+        self.assertIn("parent_not_available", error["error"], error)
+        self.assertTrue(error["applyDisabled"], error)
 

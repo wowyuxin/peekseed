@@ -1446,6 +1446,25 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
 .rr-patch-conflict{padding:7px 10px;border-radius:9px;border:1px solid
   rgba(251,113,133,.4);background:var(--bad-soft);font-size:10.5px;line-height:1.55;
   color:var(--bad);overflow-wrap:anywhere;}
+/* CP6 (M2.2 Phase 5): cluster-level propagation panel. Preview is a dry-run;
+   apply is an explicit click and locked/in-batch members must be excluded. */
+.rr-propagate-members{display:flex;flex-direction:column;gap:4px;font-size:10.5px;
+  line-height:1.5;color:var(--muted);min-width:0;}
+.rr-propagate-row{display:flex;flex-wrap:wrap;gap:4px 9px;align-items:baseline;
+  padding:4px 7px;border:1px solid var(--line-soft);border-radius:8px;
+  background:var(--panel);min-width:0;}
+.rr-propagate-row .rr-prop-item{font:9.5px var(--mono);color:var(--text);}
+.rr-propagate-row .rr-prop-reason{color:var(--warn);}
+.rr-propagate-row .rr-prop-action{font:9.5px var(--mono);color:var(--faint);
+  overflow-wrap:anywhere;}
+.rr-propagate-lists{display:flex;flex-direction:column;gap:3px;}
+.rr-propagate-exclusions{display:flex;flex-wrap:wrap;gap:5px 12px;font-size:10.5px;
+  color:var(--muted);}
+.rr-propagate-exclusions label{display:inline-flex;gap:5px;align-items:center;
+  cursor:pointer;}
+.rr-propagate-error{padding:7px 10px;border-radius:9px;border:1px solid
+  rgba(251,113,133,.4);background:var(--bad-soft);font-size:10.5px;line-height:1.55;
+  color:var(--bad);overflow-wrap:anywhere;}
 .rr-vlm-provider{margin:0 0 8px;padding:0;list-style:none;display:flex;
   flex-direction:column;gap:3px;font:10px var(--mono);color:var(--muted);
   overflow-wrap:anywhere;}
@@ -1963,6 +1982,40 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
         <div class="rr-batch-row">
           <button type="button" id="reviewDiscussAdoptPatch" disabled>采纳该计划 patch（不确认/不应用）</button>
           <span class="rr-cand-meta">采纳只编辑 draft 计划；确认条目与发布仍需你单独操作。</span>
+        </div>
+      </div>
+      <!-- CP6 (M2.2 Phase 5): cluster-level propagation ("应用到相似项").
+           Preview calls the route with dry_run:true and writes nothing; apply
+           is an explicit click that only writes draft entries. Locked/in-batch
+           members must be excluded before apply is enabled; a 400 lists the
+           per-member failures. Entries carry a propagation origin and render
+           with a 批量 badge. Nothing here confirms/builds/publishes. -->
+      <div class="rr-discuss rr-propagate" id="reviewPropagate" hidden>
+        <div class="rr-batch-h"><h4>应用到相似项</h4>
+          <span class="rr-cand-meta" id="reviewPropagateAnchor"></span></div>
+        <div class="rr-discuss-controls">
+          <label class="rr-field"><span>范围</span>
+            <select id="reviewPropagateScope">
+              <option value="item">当前项</option>
+              <option value="cluster">当前簇</option>
+              <option value="peel">全 peel</option>
+            </select></label>
+          <span class="rr-field"><span>策略</span>
+            <span class="rr-cand-meta" id="reviewPropagateStrategy">—</span></span>
+          <button type="button" id="reviewPropagatePreview">预览成员</button>
+        </div>
+        <div class="rr-propagate-members" id="reviewPropagateMembers" hidden></div>
+        <div class="rr-propagate-lists">
+          <div id="reviewPropagatePositives" hidden></div>
+          <div id="reviewPropagateBoundary" hidden></div>
+        </div>
+        <div class="rr-propagate-exclusions" id="reviewPropagateExclusions" hidden></div>
+        <div class="rr-patch-diff" id="reviewPropagateDiff" hidden></div>
+        <div class="rr-patch-conflict" id="reviewPropagateConflict" hidden></div>
+        <div class="rr-propagate-error" id="reviewPropagateError" hidden></div>
+        <div class="rr-batch-row">
+          <button type="button" id="reviewPropagateApply" disabled>应用（生成 draft 条目）</button>
+          <span class="rr-cand-meta">预览不写计划；应用只生成 draft 条目，不确认/不构建/不发布。</span>
         </div>
       </div>
     </div>
@@ -6491,6 +6544,342 @@ function paintReviewPatchConflict(){
   el.innerHTML='<b>采纳冲突（409）</b>：'+esc(String(text))
     +'。采纳按钮已禁用；请先解锁/处理冲突条目，或重新讨论生成 patch。';
 }
+/* ---- CP6 (M2.2 Phase 5): cluster-level propagation ("应用到相似项") --------
+   The preview call sends dry_run:true and writes nothing. Apply is a separate
+   explicit click; it is enabled only after a preview succeeded with the same
+   base_plan_version and every locked/in-batch member is excluded. A 400 lists
+   the non-excluded failing members (all-or-nothing, nothing written). Applied
+   entries are draft-only with a propagation origin and render with a 批量
+   badge; nothing here confirms/builds/publishes. */
+const REVIEW_PROPAGATE_STATUS_LABEL={ready:'就绪',already:'已应用（不变）',
+  failed_check:'校验未通过',not_applicable:'不适用',locked:'已锁定',
+  in_batch:'批次中',excluded:'已排除'};
+const REVIEW_PROPAGATE_CONFLICT_STATUSES=['locked','in_batch'];
+function reviewPropagateInfo(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return null;
+  const item=reviewDiscussAnchorItem();
+  if(!item||!item.id) return null;
+  const entry=item.entry||null;
+  let strategy=null; let params={};
+  if(entry&&entry.strategy&&entry.strategy.id){
+    strategy={id:String(entry.strategy.id),
+      version:Number(entry.strategy.version||1)};
+    params=(entry.action&&entry.action.params
+      &&typeof entry.action.params==='object')?entry.action.params:{};
+  }else{
+    const candidate=((item.candidates||[])).find(function(c){
+      return c&&c.strategy&&c.strategy.id; });
+    if(candidate){
+      strategy={id:String(candidate.strategy.id),
+        version:Number(candidate.strategy.version||1)};
+      params=(candidate.action&&candidate.action.params
+        &&typeof candidate.action.params==='object')?candidate.action.params:{};
+    }else{
+      const suggestion=reviewItemSuggestions(item).filter(
+        reviewSuggestionIsReady)[0];
+      if(suggestion&&suggestion.strategy&&suggestion.strategy.id){
+        strategy={id:String(suggestion.strategy.id),
+          version:Number(suggestion.strategy.version||1)};
+        params=(suggestion.params&&typeof suggestion.params==='object')
+          ?suggestion.params:{};
+      }
+    }
+  }
+  if(!strategy) return null;
+  return {item:item,itemId:String(item.id||''),
+    clusterId:String(item.cluster_id||''),
+    strategy:strategy,params:params||{}};
+}
+function reviewPropagateOpenHtml(){
+  const info=reviewPropagateInfo();
+  const disabled=info?'':' disabled';
+  const title=info
+    ?'用当前项的策略与参数约束，为相似项逐项重建动作（先预览，后显式应用）'
+    :'先为当前项选择策略或让报告给出候选，才能应用到相似项';
+  return '<button type="button" class="secondary" id="reviewPropagateOpen"'
+    +' data-r="propagate-open"'+disabled+' title="'+escAttr(title)+'">'
+    +'应用到相似项</button>';
+}
+function reviewPropagateOpen(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return;
+  const info=reviewPropagateInfo();
+  if(!info){
+    reviewMsg('先为当前项选择策略或让报告给出候选，再应用到相似项。',true);
+    return;
+  }
+  ctx.propagate={open:true,preview:null,previewedBase:null,exclusions:[],
+    diff:null,conflict:'',error:''};
+  const panel=$('#reviewPropagate'); if(panel) panel.hidden=false;
+  const scope=$('#reviewPropagateScope'); if(scope) scope.value='item';
+  paintReviewPropagate();
+  reviewMsg('已打开“应用到相似项”：先点“预览成员”（dry_run，不写计划）。');
+}
+function reviewPropagateScopeValue(){
+  const el=$('#reviewPropagateScope');
+  return el?String(el.value||'item'):'item';
+}
+function reviewPropagateScopePayload(info){
+  const scope=reviewPropagateScopeValue();
+  const ctx=REVIEW_CTX;
+  if(scope==='peel')
+    return {kind:'peel',item_id:null,cluster_id:null,peel:true};
+  if(scope==='cluster')
+    return {kind:'cluster',item_id:null,
+      cluster_id:String(info.clusterId||((ctx&&ctx.selected)||'')),
+      peel:null};
+  return {kind:'item',item_id:String(info.itemId||''),
+    cluster_id:null,peel:null};
+}
+function reviewPropagateExcludedIds(){
+  const ctx=REVIEW_CTX;
+  return ((ctx&&ctx.propagate&&ctx.propagate.exclusions)||[]).slice();
+}
+function reviewPropagateBody(info,dryRun){
+  const ctx=REVIEW_CTX;
+  const plan=(ctx&&ctx.data&&ctx.data.plan
+    &&typeof ctx.data.plan==='object')?ctx.data.plan:{};
+  return {base_plan_version:Number(plan.plan_version||0),
+    scope:reviewPropagateScopePayload(info),
+    strategy:{id:String(info.strategy.id),
+      version:Number(info.strategy.version||1)},
+    params:info.params||{},
+    source_item_id:String(info.itemId||''),
+    exclusions:reviewPropagateExcludedIds(),
+    dry_run:!!dryRun,
+    operator:'user'};
+}
+function reviewPropagateConflicts(preview){
+  const exclusions=reviewPropagateExcludedIds();
+  return ((preview&&preview.members)||[]).filter(function(member){
+    return member&&typeof member==='object'
+      &&REVIEW_PROPAGATE_CONFLICT_STATUSES.indexOf(
+        String(member.status||''))>=0
+      &&exclusions.indexOf(String(member.item_id||''))<0;
+  }).map(function(member){ return String(member.item_id||''); });
+}
+function reviewPropagateMembersHtml(preview){
+  const members=((preview&&preview.members)||[]).filter(function(m){
+    return m&&typeof m==='object'; });
+  if(!members.length) return '';
+  const exclusions=reviewPropagateExcludedIds();
+  return '<div class="rr-provider-meta">成员（'+reviewNum(members.length)
+    +'）：逐项按自身 evidence 重建动作并独立校验</div>'
+    +'<div class="rr-propagate-members">'+members.map(function(member){
+      const status=String(member.status||'');
+      const itemId=String(member.item_id||'');
+      const shown=exclusions.indexOf(itemId)>=0?'excluded':status;
+      const reasons=((member.reasons||[])).filter(Boolean);
+      const action=(member.action&&typeof member.action==='object')
+        ?member.action:null;
+      const actionText=action
+        ?[String(action.type||''),String(action.name||'')].filter(Boolean)
+          .join(' ')
+          +(action.params?(' '+JSON.stringify(action.params)):'')
+        :'—';
+      return '<div class="rr-propagate-row">'
+        +'<span class="rr-prop-item">'+esc(itemId)+'</span>'
+        +reviewBadge(REVIEW_PROPAGATE_STATUS_LABEL[shown]||shown||'?',shown)
+        +(reasons.length?'<span class="rr-prop-reason">'
+          +esc(reasons.join('; '))+'</span>':'')
+        +'<span class="rr-prop-action">动作 '+esc(actionText)+'</span>'
+        +'</div>';
+    }).join('')+'</div>';
+}
+function reviewPropagateListHtml(title,ids,empty){
+  const list=((ids||[])).filter(Boolean);
+  return '<div class="rr-provider-meta">'+esc(title)+'（'
+    +reviewNum(list.length)+'）：'
+    +(list.length?esc(list.join(', ')):esc(empty||'无'))+'</div>';
+}
+function reviewPropagateExclusionsHtml(preview){
+  const members=((preview&&preview.members)||[]).filter(function(m){
+    return m&&typeof m==='object'; });
+  if(!members.length) return '';
+  const exclusions=reviewPropagateExcludedIds();
+  return '<div class="rr-provider-meta">排除项（勾选后不参与应用；'
+    +'锁定/批次中成员必须先排除）</div>'
+    +'<div class="rr-propagate-exclusions">'+members.map(function(member){
+      const itemId=String(member.item_id||'');
+      const status=String(member.status||'');
+      const checked=exclusions.indexOf(itemId)>=0;
+      return '<label><input type="checkbox" data-r="propagate-exclude"'
+        +' value="'+escAttr(itemId)+'"'+(checked?' checked':'')+'>'
+        +esc(itemId)+' '
+        +esc(REVIEW_PROPAGATE_STATUS_LABEL[status]||status||'')+'</label>';
+    }).join('')+'</div>';
+}
+function reviewPropagateDiffHtml(diff){
+  if(!diff||typeof diff!=='object') return '';
+  const added=((diff.added||[])).filter(Boolean);
+  const changed=((diff.changed||[])).filter(function(c){
+    return c&&typeof c==='object'; });
+  const removed=((diff.removed||[])).filter(Boolean);
+  let html='<div><b>传播 diff</b>（draft 计划；未确认/未构建/未发布）</div>';
+  html+='<div>新增 '+reviewNum(added.length)+'：'
+    +esc(added.slice(0,12).map(function(entry){
+      return String(entry.item_id||''); }).join(', ')||'—')+'</div>';
+  if(changed.length){
+    html+='<div>变更 '+reviewNum(changed.length)+'：'
+      +esc(changed.slice(0,12).map(function(change){
+        return String(change.item_id||''); }).join(', '))+'</div>';
+  }
+  if(removed.length) html+='<div>移除 '+reviewNum(removed.length)+'</div>';
+  html+='<div>未变化 '+reviewNum(diff.unchanged||0)+'</div>';
+  return html;
+}
+function reviewPropagateConflictHtml(conflicts){
+  const text=(typeof conflicts==='string')?conflicts
+    :((conflicts&&conflicts.length)?conflicts.join(', '):'');
+  if(!text) return '';
+  return '<b>传播冲突（409）</b>：'+esc(text)
+    +'。锁定/批次中的成员必须先排除，再重新预览并应用。';
+}
+function reviewPropagateErrorHtml(text){
+  if(!text) return '';
+  return '<b>传播失败（400）</b>：'+esc(String(text));
+}
+function reviewPropagateApplyDisabled(){
+  const ctx=REVIEW_CTX; const p=ctx&&ctx.propagate;
+  if(!p||!p.preview||p.previewedBase==null) return true;
+  /* A 409 conflict (even a raced one) keeps apply disabled until the reviewer
+     excludes the listed members and previews again. */
+  if(p.conflict) return true;
+  if(ctx.busy||ctx.vlmBusy) return true;
+  const plan=(ctx.data&&ctx.data.plan&&typeof ctx.data.plan==='object')
+    ?ctx.data.plan:{};
+  if(Number(plan.plan_version||0)!==Number(p.previewedBase)) return true;
+  return reviewPropagateConflicts(p.preview).length>0;
+}
+function paintReviewPropagate(){
+  const ctx=REVIEW_CTX; if(!ctx) return;
+  const p=ctx.propagate||{};
+  const panel=$('#reviewPropagate');
+  if(panel) panel.hidden=!p.open;
+  if(!p.open) return;
+  const info=reviewPropagateInfo();
+  const anchor=$('#reviewPropagateAnchor');
+  if(anchor) anchor.textContent=info
+    ?('锚定 '+info.itemId+(info.clusterId?' · 簇 '+info.clusterId:'')
+      +(reviewPropagateScopeValue()==='peel'?' · 全 peel':'')):'';
+  const strategy=$('#reviewPropagateStrategy');
+  if(strategy) strategy.textContent=info
+    ?(info.strategy.id+' @v'+info.strategy.version+' · 参数 '
+      +JSON.stringify(info.params||{})):'—';
+  const preview=p.preview;
+  const members=$('#reviewPropagateMembers');
+  if(members){ const html=reviewPropagateMembersHtml(preview);
+    members.hidden=!html; members.innerHTML=html; }
+  const positives=$('#reviewPropagatePositives');
+  if(positives){ const html=preview
+      ?reviewPropagateListHtml('正例（与代表项 cluster_key 相同）',
+        preview.positives,'无'):'';
+    positives.hidden=!html; positives.innerHTML=html; }
+  const boundary=$('#reviewPropagateBoundary');
+  if(boundary){ const html=preview
+      ?reviewPropagateListHtml('边界例（cluster_key 不同，仅展示）',
+        preview.boundary_cases,'无'):'';
+    boundary.hidden=!html; boundary.innerHTML=html; }
+  const exclusions=$('#reviewPropagateExclusions');
+  if(exclusions){ const html=reviewPropagateExclusionsHtml(preview);
+    exclusions.hidden=!html; exclusions.innerHTML=html; }
+  const diff=$('#reviewPropagateDiff');
+  if(diff){ const html=reviewPropagateDiffHtml(p.diff);
+    diff.hidden=!html; diff.innerHTML=html; }
+  const conflict=$('#reviewPropagateConflict');
+  if(conflict){ const conflicts=preview?reviewPropagateConflicts(preview):[];
+    const html=reviewPropagateConflictHtml(p.conflict||conflicts);
+    conflict.hidden=!html; conflict.innerHTML=html; }
+  const error=$('#reviewPropagateError');
+  if(error){ const html=reviewPropagateErrorHtml(p.error);
+    error.hidden=!html; error.innerHTML=html; }
+  const apply=$('#reviewPropagateApply');
+  if(apply) apply.disabled=reviewPropagateApplyDisabled();
+}
+async function reviewPropagatePreview(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data||ctx.busy) return;
+  const info=reviewPropagateInfo();
+  if(!info){
+    reviewMsg('先为当前项选择策略或让报告给出候选。',true); return;
+  }
+  ctx.propagate=ctx.propagate||{};
+  ctx.propagate.open=true;
+  const base=Number(((ctx.data.plan||{}).plan_version)||0);
+  ctx.busy=true; paintReviewPropagate();
+  reviewMsg('正在预览传播成员（dry_run，不写计划）…');
+  try{
+    const result=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/plan/propagate',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(reviewPropagateBody(info,true))});
+    ctx.propagate.preview=result;
+    ctx.propagate.previewedBase=base;
+    ctx.propagate.exclusions=[];
+    ctx.propagate.diff=null; ctx.propagate.conflict='';
+    ctx.propagate.error='';
+    reviewMsg('预览完成：'
+      +reviewNum(((result&&result.members)||[]).length)
+      +' 个成员；预览未写任何计划。',false);
+  }catch(e){
+    ctx.propagate.preview=null; ctx.propagate.previewedBase=null;
+    ctx.propagate.conflict=''; ctx.propagate.error=reviewErrText(e);
+    reviewMsg('传播预览失败：'+reviewErrText(e),true);
+  }finally{
+    ctx.busy=false; paintReviewPropagate(); paintReviewDetail(ctx.data);
+  }
+}
+async function reviewPropagateApply(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.data||ctx.busy) return;
+  const p=ctx.propagate;
+  if(!p||!p.preview||p.previewedBase==null) return;
+  if(reviewPropagateApplyDisabled()){
+    reviewMsg('请先预览成员；锁定/批次中成员必须先排除。',true); return;
+  }
+  const info=reviewPropagateInfo();
+  if(!info){ reviewMsg('当前项没有可传播的策略。',true); return; }
+  ctx.busy=true; paintReviewPropagate();
+  reviewMsg('正在应用传播（写入 draft 条目，不确认/不构建/不发布）…');
+  try{
+    const result=await reviewFetchJSON(reviewBase(ctx.dataset,ctx.sha)
+      +'/plan/propagate',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(reviewPropagateBody(info,false))});
+    p.diff=(result&&result.diff)||null;
+    p.preview=result;
+    p.previewedBase=null;   // a plan version change needs a fresh preview
+    p.conflict=''; p.error='';
+    const version=Number((result&&result.plan_version)||0);
+    await refreshReview('传播已应用（draft 条目，计划 v'+version+'）。');
+    reviewMsg('已写入 '
+      +reviewNum(((result&&result.diff&&result.diff.added)||[]).length)
+      +' 个 draft 条目（计划 v'+version+'）；未确认、未构建、未发布。',false);
+  }catch(e){
+    if(e&&e.status===409){
+      p.conflict=String((e&&e.message)||'冲突');
+      p.diff=null;
+      reviewMsg('传播冲突：'+reviewErrText(e)
+        +'；请排除冲突成员后重新预览。',true);
+    }else{
+      p.error=reviewErrText(e);
+      reviewMsg('传播失败：'+reviewErrText(e),true);
+    }
+  }finally{
+    ctx.busy=false; paintReviewPropagate(); paintReviewDetail(ctx.data);
+  }
+}
+function reviewPropagateExclusionToggle(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.propagate) return;
+  const box=$('#reviewPropagateExclusions');
+  const ids=[];
+  if(box&&box.querySelectorAll){
+    Array.prototype.forEach.call(
+      box.querySelectorAll('input[data-r="propagate-exclude"]'),
+      function(el){
+        if(el&&el.checked&&el.value) ids.push(String(el.value));
+      });
+  }
+  ctx.propagate.exclusions=ids;
+  paintReviewPropagate();
+}
 function reviewVlmGenerateOpen(){
   const ctx=REVIEW_CTX; if(!ctx||!ctx.data) return;
   const caps=reviewVlmCapabilities();
@@ -7214,9 +7603,19 @@ function reviewEntryHtml(item){
     '策略 '+reviewStrategyName(item,entry.strategy)];
   if(entry.locked) bits.push('已锁定');
   if(entry.stale) bits.push('已过期：'+reviewStaleText(entry));
-  const attrs=(entry.stale&&codes.length)?' title="'+escAttr(codes.join(', '))+'"':'';
+  /* CP6: propagation entries carry a ``kind:"propagation"`` origin; the badge
+     makes a 批量-generated draft visible next to hand-selected entries. */
+  const origin=(entry.origin&&typeof entry.origin==='object')?entry.origin:null;
+  const originBadge=(origin&&origin.kind==='propagation')
+    ?' <span class="rr-badge accent" title="'+escAttr('批量传播 origin：'
+      +String(origin.propagation_id||'')
+      +' · base v'+String(origin.base_plan_version==null?'?'
+        :origin.base_plan_version))+'">批量</span>'
+    :'';
+  const attrs=(entry.stale&&codes.length)
+    ?' title="'+escAttr(codes.join(', '))+'"':'';
   let html='<div class="rr-entry'+(entry.stale?' is-stale':'')+'"'+attrs+'>'
-    +esc(bits.join(' · '))+'</div>';
+    +esc(bits.join(' · '))+originBadge+'</div>';
   if(entry.stale){
     html+=reviewStaleRefreshable(entry)
       ?'<div class="rr-entry-hint">可点“确认”重新确认：会刷新该条目的证据与父表快照。</div>'
@@ -7394,6 +7793,7 @@ function paintReviewDetail(r){
     +'<div class="rr-det-meta">'+esc(detailMeta)+'</div>'
     +'<div class="rr-det-actions"><button type="button" class="secondary"'
     +' data-r="accept-selected" disabled>确认选中项</button>'
+    +reviewPropagateOpenHtml()
     +'<span class="rr-muted">勾选条目后按报告各自的 ready 建议确认（全部或全不）</span>'
     +'</div></header>'
     /* CP5.1 H5: a VLM report flags a cluster ``vlm_disagrees`` when its VLM
@@ -7419,6 +7819,9 @@ function paintReviewDetail(r){
     +'构建并发布候选才会按 R2 完整重建（CXL 约 2 分钟，发布后需要 reindex）。'
     +'锁定与暂缓是 R0 审阅记录，不改变 corpus，也不触发重建。</p>';
   reviewSyncAcceptButton();
+  /* CP6: the propagation panel is anchored to the selected item/cluster; its
+     open button above is enabled only when the item has a known strategy. */
+  paintReviewPropagate();
 }
 function refreshReviewChip(){
   if(DATASETS.length) paintDatasetDialog();
@@ -8191,6 +8594,7 @@ function paintReview(r){
   paintReviewConflict();
   paintReviewClusters(r);
   paintReviewDetail(r);
+  paintReviewPropagate();
   /* The OCR refresh row reads the checkbox selection from #reviewDetail, so
      the batch section is painted after the detail. */
   paintReviewBatch();
@@ -8218,7 +8622,9 @@ async function openReview(dsId,sha){
     ocrCheckText:'',
     /* CP5: VLM state. Nothing here triggers a provider call on open. */
     vlmBusy:false,vlmConfirm:null,discussTurns:[],discussConversationId:'',
-    pendingPatch:null,patchDiff:null,patchConflict:'',pendingPatchTurn:null};
+    pendingPatch:null,patchDiff:null,patchConflict:'',pendingPatchTurn:null,
+    /* CP6: propagation state. Opening the review never previews/applies. */
+    propagate:null};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -8246,6 +8652,8 @@ async function openReview(dsId,sha){
   if(clar){ clar.hidden=true; clar.innerHTML=''; }
   const discuss=$('#reviewDiscuss');
   if(discuss) discuss.hidden=true;
+  const propagate=$('#reviewPropagate');
+  if(propagate) propagate.hidden=true;
   const conflict=$('#reviewConflict');
   if(conflict){ conflict.hidden=true; conflict.innerHTML=''; }
   try{
@@ -8376,6 +8784,9 @@ async function reviewAction(btn){
   if(!ctx||!ctx.data) return;
   const kind=btn&&btn.getAttribute('data-r');
   if(!kind) return;
+  /* CP6: opening the 应用到相似项 panel is local UI state only; the preview and
+     apply requests are separate explicit clicks inside the panel. */
+  if(kind==='propagate-open'){ reviewPropagateOpen(); return; }
   const card=btn.closest('.rr-item');
   const itemId=card?card.getAttribute('data-item'):'';
   const item=itemId?ctx.itemsById[itemId]:null;
@@ -8616,6 +9027,23 @@ $('#reviewDiscussAdoptPatch').onclick=function(){
   reviewRunAction(function(){ return reviewDiscussAdoptPatch(); }); };
 $('#reviewDiscussInput').addEventListener('keydown',function(ev){
   if(ev&&ev.key==='Enter'){ ev.preventDefault(); reviewDiscussSendOpen(); }
+});
+/* CP6: the propagation panel. Opening and preview never write; apply is the
+   only click that writes draft entries and stays disabled until a successful
+   preview with the same base_plan_version has every locked/in-batch member
+   excluded. A scope change invalidates the preview (apply stays disabled). */
+$('#reviewPropagatePreview').onclick=function(){
+  reviewRunAction(function(){ return reviewPropagatePreview(); }); };
+$('#reviewPropagateApply').onclick=function(){
+  reviewRunAction(function(){ return reviewPropagateApply(); }); };
+$('#reviewPropagateExclusions').addEventListener('change',
+  reviewPropagateExclusionToggle);
+$('#reviewPropagateScope').addEventListener('change',function(){
+  const ctx=REVIEW_CTX; if(!ctx||!ctx.propagate) return;
+  ctx.propagate.preview=null; ctx.propagate.previewedBase=null;
+  ctx.propagate.exclusions=[]; ctx.propagate.diff=null;
+  ctx.propagate.conflict=''; ctx.propagate.error='';
+  paintReviewPropagate();
 });
 /* CP5: the privacy-confirmation dialog. Only #reviewVlmConfirmGo sends a
    request; cancel/backdrop/close hide it and send nothing. The text-only toggle

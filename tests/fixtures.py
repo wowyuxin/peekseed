@@ -1666,6 +1666,310 @@ def main():
             }
             save_state(state)
             return emit(response)
+        if action == "propagate":
+            # CP6 wire §1: synchronous cluster-level propagation. Preview
+            # (dry_run) returns members/positives/boundary/exclusions and writes
+            # nothing; apply writes draft entries + the propagation audit
+            # record, or fails conflict/validation all-or-nothing.
+            if option(rest, "--input") is None:
+                save_state(state)
+                return fail("--input is required for plan propagate", 2,
+                            "validation")
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                save_state(state)
+                return fail("plan propagate input must be a JSON object", 2,
+                            "validation")
+            state.setdefault("propagate_requests", []).append(
+                copy_json(request))
+            error = state.get("propagate_error")
+            if error:
+                save_state(state)
+                return fail(error.get("message") or "plan propagate failed",
+                            int(error.get("exit") or 2),
+                            error.get("code") or "validation",
+                            error.get("detail"))
+            base = request.get("base_plan_version")
+            if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+                save_state(state)
+                return fail("base_plan_version must be an integer >= 0", 2,
+                            "validation")
+            if base != plan.get("plan_version"):
+                save_state(state)
+                return fail("base_plan_version mismatch", 2, "conflict")
+            scope = request.get("scope")
+            if not isinstance(scope, dict):
+                save_state(state)
+                return fail("scope is required", 2, "validation")
+            strategy = request.get("strategy")
+            if not isinstance(strategy, dict):
+                save_state(state)
+                return fail("strategy is required", 2, "validation")
+            strategy_id = str(strategy.get("id") or "")
+            strategy_version = int(strategy.get("version") or 1)
+            params = request.get("params") if isinstance(
+                request.get("params"), dict) else {}
+            exclusions = [str(item) for item in request.get("exclusions") or []]
+            dry_run = bool(request.get("dry_run"))
+            operator = str(request.get("operator") or "user")
+            review = copy_json(state.get("review") or DEFAULT_REVIEW)
+            items = [item for item in review.get("items") or []
+                     if isinstance(item, dict) and item.get("id")]
+            by_id = {str(item.get("id")): item for item in items}
+            cluster_key = {}
+            for cluster in review.get("clusters") or []:
+                if isinstance(cluster, dict):
+                    cluster_key[str(cluster.get("cluster_id") or "")] = \
+                        cluster.get("cluster_key")
+            kind = str(scope.get("kind") or "")
+            if kind == "item":
+                item_id = str(scope.get("item_id") or "")
+                if item_id not in by_id:
+                    save_state(state)
+                    return fail("scope item is not in this peel", 2,
+                                "validation")
+                members = [item_id]
+            elif kind == "cluster":
+                cluster_id = str(scope.get("cluster_id") or "")
+                members = [str(item.get("id")) for item in items
+                           if str(item.get("cluster_id") or "") == cluster_id]
+                if not members:
+                    save_state(state)
+                    return fail("scope cluster is not in this peel", 2,
+                                "validation")
+            elif kind == "peel":
+                members = [str(item.get("id")) for item in items]
+            else:
+                save_state(state)
+                return fail("scope.kind must be item, cluster or peel", 2,
+                            "validation")
+
+            def member_priority(item_id):
+                item = by_id.get(item_id) or {}
+                status = str(item.get("status") or "")
+                human = 0 if status in ("needs_decision", "pending_evidence",
+                                        "pending_report", "failed_check") else 1
+                return (human, item_id)
+
+            members = sorted(members, key=member_priority)
+            source_item_id = request.get("source_item_id")
+            if source_item_id is not None:
+                source_item_id = str(source_item_id)
+                if source_item_id not in members:
+                    save_state(state)
+                    return fail("source_item_id is not in the resolved "
+                                "member set", 2, "validation")
+            else:
+                source_item_id = members[0] if members else None
+            entries = [copy_json(entry) for entry in plan.get("entries") or []]
+            entries_by_item = {str(entry.get("item_id")): entry
+                               for entry in entries if isinstance(entry, dict)}
+            not_applicable = {str(item) for item in
+                              state.get("propagate_not_applicable") or []}
+            failed_map = state.get("propagate_failed") or {}
+            resolved = []
+            locked_conflicts = []
+            failed_members = []
+            for item_id in members:
+                if item_id in exclusions:
+                    resolved.append({"item_id": item_id, "status": "excluded",
+                                     "reasons": [], "action": None})
+                    continue
+                existing = entries_by_item.get(item_id)
+                if existing is not None and existing.get("locked"):
+                    resolved.append({"item_id": item_id, "status": "locked",
+                                     "reasons": [], "action": None})
+                    locked_conflicts.append(item_id)
+                    continue
+                if existing is not None and existing.get("batch_id"):
+                    resolved.append({"item_id": item_id, "status": "in_batch",
+                                     "reasons": [], "action": None})
+                    locked_conflicts.append(item_id)
+                    continue
+                action = strategy_action(strategy_id, params)
+                if item_id in not_applicable or action is None:
+                    resolved.append({"item_id": item_id,
+                                     "status": "not_applicable",
+                                     "reasons": ["strategy_not_applicable"],
+                                     "action": None})
+                    failed_members.append(item_id)
+                    continue
+                failed_reasons = failed_map.get(item_id)
+                if failed_reasons:
+                    resolved.append({"item_id": item_id,
+                                     "status": "failed_check",
+                                     "reasons": [str(reason) for reason in
+                                                 failed_reasons],
+                                     "action": None})
+                    failed_members.append(item_id)
+                    continue
+                if (existing is not None
+                        and (existing.get("strategy") or {}).get("id")
+                        == strategy_id
+                        and (existing.get("action") or {}).get("params")
+                        == action.get("params")):
+                    resolved.append({"item_id": item_id, "status": "already",
+                                     "reasons": [], "action": action})
+                    continue
+                resolved.append({"item_id": item_id, "status": "ready",
+                                 "reasons": [], "action": action})
+            representative = by_id.get(source_item_id) or {}
+            rep_key = cluster_key.get(
+                str(representative.get("cluster_id") or ""))
+            positives = []
+            boundary_cases = []
+            for row in resolved:
+                if row["status"] != "ready":
+                    continue
+                item = by_id.get(row["item_id"]) or {}
+                key = cluster_key.get(str(item.get("cluster_id") or ""))
+                if key == rep_key:
+                    positives.append(row["item_id"])
+                else:
+                    boundary_cases.append(row["item_id"])
+            counts = {
+                "members": len(resolved),
+                "ready": sum(1 for row in resolved
+                             if row["status"] == "ready"),
+                "already": sum(1 for row in resolved
+                               if row["status"] == "already"),
+                "failed": sum(1 for row in resolved
+                              if row["status"] in ("failed_check",
+                                                   "not_applicable")),
+                "locked": sum(1 for row in resolved
+                              if row["status"] == "locked"),
+                "excluded": sum(1 for row in resolved
+                                if row["status"] == "excluded"),
+            }
+            response = {
+                "peel_id": peel_id,
+                "review_schema": 2,
+                "dry_run": dry_run,
+                "plan_version": int(plan.get("plan_version") or 0),
+                "scope": copy_json(scope),
+                "strategy": copy_json(strategy),
+                "members": resolved,
+                "positives": positives,
+                "boundary_cases": boundary_cases,
+                "exclusions": exclusions,
+                "counts": counts,
+            }
+            if dry_run:
+                save_state(state)
+                return emit(response)
+            if locked_conflicts:
+                save_state(state)
+                return fail("propagate touches locked/batch-bound members", 2,
+                            "conflict",
+                            {"conflicts": sorted(locked_conflicts)})
+            if failed_members:
+                save_state(state)
+                return fail("propagate has non-excluded failing members", 2,
+                            "validation",
+                            {"reasons": [
+                                {"item_id": row["item_id"],
+                                 "code": row["status"],
+                                 "reasons": row["reasons"]}
+                                for row in resolved
+                                if row["item_id"] in failed_members]})
+            selection = [row["item_id"] for row in resolved
+                         if row["status"] in ("ready", "already")]
+            propagation_id = "prop-20261110T120000-" + hashlib.sha256(
+                json.dumps([base, scope, strategy, selection],
+                           sort_keys=True).encode()).hexdigest()[:4]
+            added = []
+            changed = []
+            unchanged = 0
+            bumped = False
+            new_entries = [copy_json(entry) for entry in entries]
+            for row in resolved:
+                item_id = row["item_id"]
+                if row["status"] == "already":
+                    unchanged += 1
+                    continue
+                if row["status"] != "ready":
+                    continue
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                current = next((entry for entry in new_entries
+                                if entry.get("entry_id") == entry_id), None)
+                revision = 1
+                if current is not None:
+                    revision = int(current.get("revision") or 0) + 1
+                    new_entries = [entry for entry in new_entries
+                                   if entry.get("entry_id") != entry_id]
+                after = {
+                    "entry_id": entry_id,
+                    "item_id": item_id,
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": strategy_version},
+                    "action": copy_json(row["action"]),
+                    "evidence": {"hash": (by_id[item_id].get("evidence")
+                                          or {}).get("hash"), "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": "user",
+                    "origin": {"kind": "propagation",
+                               "propagation_id": propagation_id,
+                               "scope": copy_json(scope),
+                               "strategy": {"id": strategy_id,
+                                            "version": strategy_version},
+                               "base_plan_version": base},
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": None,
+                }
+                new_entries.append(after)
+                if current is None:
+                    added.append(copy_json(after))
+                else:
+                    changed.append({"item_id": item_id,
+                                    "before": copy_json(current),
+                                    "after": copy_json(after)})
+                bumped = True
+            new_entries.sort(key=lambda entry: str(entry.get("entry_id") or ""))
+            plan_version_after = int(plan.get("plan_version") or 0)
+            if bumped:
+                plan_version_after += 1
+                plan["plan_version"] = plan_version_after
+                plan["updated_at"] = "2026-11-10T12:00:00Z"
+            plan["entries"] = new_entries
+            state["plan"] = plan
+            diff = {"added": added, "changed": changed, "removed": [],
+                    "unchanged": unchanged}
+            record = {
+                "schema_version": 1,
+                "propagation_id": propagation_id,
+                "peel_id": peel_id,
+                "created_at": "2026-11-10T12:00:00Z",
+                "operator": operator,
+                "scope": copy_json(scope),
+                "strategy": copy_json(strategy),
+                "params": copy_json(params),
+                "base_plan_version": base,
+                "exclusions": exclusions,
+                "selection": selection,
+                "members": copy_json(resolved),
+                "positives": positives,
+                "boundary_cases": boundary_cases,
+                "changed": bool(bumped),
+                "plan_version_after": plan_version_after,
+                "diff": diff,
+            }
+            state.setdefault("propagations", {})[propagation_id] = record
+            response.update({
+                "propagation_id": propagation_id,
+                "plan_version": plan_version_after,
+                "diff": diff,
+                "changed": bool(bumped),
+            })
+            save_state(state)
+            return emit(response)
         if action not in ("select", "confirm", "lock", "unlock", "defer",
                           "accept", "clear"):
             return fail("unknown plan action: " + str(action), 2, "validation")
