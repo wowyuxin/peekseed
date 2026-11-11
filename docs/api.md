@@ -445,9 +445,14 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   preview with the same `base_plan_version` succeeded and all locked/in-batch
   conflicts are excluded (the rule is unchanged; `decided` is not a conflict),
   the counts summary (including `decided`), the propagation diff, the 409
-  conflict list, and the 400 per-member failure list. Opening the panel and
-  every successful preview reset the exclusion and override ticks. Applied
-  entries render with a 批量 origin badge.
+  conflict list, and the 400 per-member failure list. Opening the panel starts
+  with both tick lists empty; a successful preview instead adopts the
+  response-echoed `exclusions`/`overrides` as the current ticks (CP6.2 L1, wire
+  §8.1), so the apply body carries the same lists the preview was computed with
+  unless the reviewer changes a tick and previews again. The override list also
+  includes a `ready` member carrying `existing` (a member overridden in that
+  preview), so the override can be unticked. Applied entries render with a 批量
+  origin badge.
 - `POST …/review/ocr/check` proxies `peelfeed ocr-check` (M2.1; wire §2.8) and
   returns `200` with the probe payload (`available`, `engine`, `provider`,
   `probe`, `checked_at`, `error`); `503` when OCR is unconfigured/unrunnable,

@@ -360,6 +360,16 @@ version/tag policy.
 
 ### Fixed
 
+- **CP6.2 L1 propagation preview/apply tick consistency.** A successful
+  “应用到相似项” preview now adopts the response-echoed
+  `exclusions`/`overrides` as the current ticks instead of clearing them, so
+  应用 sends exactly the lists the preview was computed with: a member shown
+  已排除 is not written, and a kept `decided` member is written only when it is
+  explicitly overridden and previewed again. `#reviewPropagateOverrides` now
+  lists every member carrying `existing` — including a `ready` member
+  overridden in the preview — so its override can be unticked back to
+  `decided` (kept). Opening the panel still starts with empty ticks (wire
+  §8.1; supersedes the CP6.1 reset behaviour).
 - **CP1.1 review-contract sync.** An R0 plan entry (selecting
   `confirm_no_header`, `keep_visual_fallback` or `keep_original_figure`) is now
   `applied` once confirmed (the R0 resolution is written immediately, no corpus

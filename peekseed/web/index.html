@@ -6563,8 +6563,15 @@ function paintReviewPatchConflict(){
    CP6.1 (wire §7.2/§7.5): members with a pre-existing decision are ``decided``
    and kept by default (never a conflict/error). The reviewer may tick an
    override in #reviewPropagateOverrides; checked ids are sent in ``overrides``
-   on BOTH preview and apply, and a checked row renders 将覆盖. Opening the
-   panel and every successful preview reset the exclusion and override ticks. */
+   on BOTH preview and apply, and a checked row renders 将覆盖.
+   CP6.2 L1 (wire §8.1): opening the panel starts with both tick lists empty,
+   while a successful preview adopts the response-echoed ``exclusions`` /
+   ``overrides`` as the current ticks (it never clears them), so the apply body
+   carries the same lists the preview was computed with unless the reviewer
+   changes a tick and previews again. #reviewPropagateOverrides lists every
+   member carrying ``existing`` (``decided`` members and ``ready`` members
+   overridden in that preview) that is not excluded, so an override can be
+   unticked. */
 const REVIEW_PROPAGATE_STATUS_LABEL={ready:'就绪',already:'已应用（不变）',
   decided:'已有决定（默认保留）',failed_check:'校验未通过',not_applicable:'不适用',
   locked:'已锁定',in_batch:'批次中',excluded:'已排除'};
@@ -6648,10 +6655,11 @@ function reviewPropagateExcludedIds(){
   const ctx=REVIEW_CTX;
   return ((ctx&&ctx.propagate&&ctx.propagate.exclusions)||[]).slice();
 }
-/* CP6.1 (wire §7.2/§7.5): the ``decided`` members the reviewer explicitly
-   overrides. They are sent as ``overrides`` in BOTH the preview and the apply
-   body; an item cannot be both excluded and overridden (peelfeed rejects the
-   overlap with 400). */
+/* CP6.1 (wire §7.2/§7.5): the members the reviewer explicitly overrides. They
+   are sent as ``overrides`` in BOTH the preview and the apply body; an item
+   cannot be both excluded and overridden (peelfeed rejects the overlap with
+   400). CP6.2 L1 (§8.1): after an overridden preview the list also contains a
+   ``ready`` member that carries ``existing``, so that override can be unticked. */
 function reviewPropagateOverrideIds(){
   const ctx=REVIEW_CTX;
   return ((ctx&&ctx.propagate&&ctx.propagate.overrides)||[]).slice();
@@ -6777,9 +6785,13 @@ function reviewPropagateExclusionsHtml(preview){
 }
 function reviewPropagateOverridesHtml(preview){
   const exclusions=reviewPropagateExcludedIds();
+  /* CP6.2 L1 (wire §8.1): list every member carrying ``existing`` and not
+     excluded — both ``decided`` members and ``ready`` members that were
+     overridden in this preview — so an override can be unticked; checked ids
+     come from ctx.propagate.overrides and a checked row renders 将覆盖. */
   const members=((preview&&preview.members)||[]).filter(function(m){
     return m&&typeof m==='object'
-      &&String(m.status||'')==='decided'
+      &&m.existing&&typeof m.existing==='object'
       &&exclusions.indexOf(String(m.item_id||''))<0; });
   if(!members.length) return '';
   const overrides=reviewPropagateOverrideIds();
@@ -6905,10 +6917,16 @@ async function reviewPropagatePreview(){
       body:JSON.stringify(reviewPropagateBody(info,true))});
     ctx.propagate.preview=result;
     ctx.propagate.previewedBase=base;
-    /* A successful preview starts a clean member selection: exclusions and
-       override ticks are per-apply choices made after the preview (§7.5). */
-    ctx.propagate.exclusions=[];
-    ctx.propagate.overrides=[];
+    /* CP6.2 L1 (wire §8.1): adopt the response-echoed ticks as the current
+       selection. The rendered members/statuses/counts were computed with
+       exactly these lists, so apply must send them back unchanged: a member
+       shown 已排除 is not written, and a kept ``decided`` member is written
+       only when it is explicitly overridden and previewed again. Opening the
+       panel still starts with both lists empty. */
+    ctx.propagate.exclusions=((result&&result.exclusions)||[]).map(
+      function(itemId){ return String(itemId); }).filter(Boolean);
+    ctx.propagate.overrides=((result&&result.overrides)||[]).map(
+      function(itemId){ return String(itemId); }).filter(Boolean);
     ctx.propagate.diff=null; ctx.propagate.conflict='';
     ctx.propagate.error='';
     reviewMsg('预览完成：'

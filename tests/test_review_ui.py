@@ -1736,8 +1736,13 @@ class ReviewUiCp6Tests(unittest.TestCase):
                                  preview_start)
         preview_body = text[preview_start:preview_end]
         self.assertIn("reviewPropagateBody(info,true)", preview_body)
-        self.assertIn("ctx.propagate.exclusions=[]", preview_body)
-        self.assertIn("ctx.propagate.overrides=[]", preview_body)
+        # CP6.2 L1 (wire §8.1): a successful preview adopts the response-echoed
+        # ``exclusions``/``overrides`` as the current ticks; it must NOT clear
+        # them (the old CP6.1 reset is what made preview and apply disagree).
+        self.assertIn("result.exclusions", preview_body)
+        self.assertIn("result.overrides", preview_body)
+        self.assertNotIn("ctx.propagate.exclusions=[]", preview_body)
+        self.assertNotIn("ctx.propagate.overrides=[]", preview_body)
         apply_start = preview_end
         apply_end = text.index("function reviewPropagateExclusionToggle",
                                apply_start)
@@ -1769,6 +1774,16 @@ class ReviewUiCp6Tests(unittest.TestCase):
         self.assertIn("将覆盖", text[members_start:members_end])
         self.assertIn("reviewPropagateExistingText(existing)",
                       text[members_start:members_end])
+        # CP6.2 L1: the override list includes every member carrying
+        # ``existing`` (``decided`` and an overridden ``ready`` member) that is
+        # not excluded, so an override can be unticked.
+        overrides_start = text.index("function reviewPropagateOverridesHtml")
+        overrides_end = text.index("function reviewPropagateDiffHtml",
+                                   overrides_start)
+        overrides_body = text[overrides_start:overrides_end]
+        self.assertIn("m.existing", overrides_body)
+        self.assertIn("typeof m.existing==='object'", overrides_body)
+        self.assertNotIn("String(m.status||'')==='decided'", overrides_body)
         # Propagation entries render with a 批量 origin badge.
         entry_start = text.index("function reviewEntryHtml")
         entry_end = text.index("function reviewResolutionHtml", entry_start)
@@ -2047,13 +2062,17 @@ const PROPAGATE_PREVIEW = {
     locked: 1, excluded: 0 },
 };
 /* The same preview when it-d is explicitly overridden: peelfeed evaluates it
-   normally and writes it as ``ready`` while still carrying ``existing``. */
+   normally and writes it as ``ready`` while still carrying ``existing`` (CP6.2
+   L1, wire §8.1: the override checkbox must stay listable/untickable). */
 const PROPAGATE_PREVIEW_OVERRIDE = Object.assign({}, PROPAGATE_PREVIEW, {
   overrides: ["it-d"],
   members: PROPAGATE_PREVIEW.members.map(function (member) {
     if (member.item_id !== "it-d") return member;
     return Object.assign({}, member, {
       status: "ready",
+      existing: { kind: "entry", status: "confirmed",
+        strategy: { id: "use_first_row_header", version: 1 },
+        name: "set_header_rows" },
       action: { type: "operation", name: "set_header_rows",
         params: { rows: [0] } },
     });
@@ -2144,6 +2163,41 @@ function jobRecord(type, id, status, resultRef) {
             message: "the job process is no longer running" }
         : null) };
 }
+/* CP6.2 L1 (wire §8.1): the fake peelfeed CLI echoes the request's
+   ``exclusions``/``overrides`` and resolves excluded members with status
+   ``excluded``; the stub preview must mirror that so the UI's echo-adoption
+   (preview keeps its ticks instead of clearing them) is exercised. */
+function propagateCounts(members) {
+  function count(status) {
+    return members.filter(function (member) {
+      return String(member.status || "") === status; }).length;
+  }
+  return {
+    members: members.length,
+    ready: count("ready"),
+    already: count("already"),
+    decided: count("decided"),
+    failed: count("failed_check") + count("not_applicable"),
+    locked: count("locked"),
+    excluded: count("excluded"),
+  };
+}
+function propagatePreviewResponse(parsed) {
+  const base = (parsed.overrides || []).indexOf("it-d") >= 0
+    ? PROPAGATE_PREVIEW_OVERRIDE : PROPAGATE_PREVIEW;
+  const exclusions = (parsed.exclusions || []).map(String);
+  const overrides = (parsed.overrides || []).map(String);
+  const members = base.members.map(function (member) {
+    if (exclusions.indexOf(String(member.item_id || "")) < 0) return member;
+    return Object.assign({}, member, { status: "excluded", action: null });
+  });
+  return Object.assign({}, base, {
+    exclusions: exclusions,
+    overrides: overrides,
+    members: members,
+    counts: propagateCounts(members),
+  });
+}
 function fetchStub(url, opts) {
   const method = String((opts || {}).method || "GET").toUpperCase();
   const body = String((opts || {}).body || "");
@@ -2168,9 +2222,7 @@ function fetchStub(url, opts) {
           + "(parent_not_available))" }));
     }
     if (parsed.dry_run) {
-      return Promise.resolve(response(200,
-        (parsed.overrides || []).indexOf("it-d") >= 0
-          ? PROPAGATE_PREVIEW_OVERRIDE : PROPAGATE_PREVIEW));
+      return Promise.resolve(response(200, propagatePreviewResponse(parsed)));
     }
     reviewPayloadCurrent = REVIEW_VLM_PROPAGATED;
     return Promise.resolve(response(200,
@@ -2706,8 +2758,9 @@ async function runPropagateOverrideFlow() {
     members: htmlOf("#reviewPropagateMembers"),
     overrides: htmlOf("#reviewPropagateOverrides"),
     applyDisabled: element("#reviewPropagateApply").disabled });
-  /* A successful preview resets exclusions and overrides; the request still
-     carries the ticks that were active when it was sent. */
+  /* CP6.2 L1 (wire §8.1): a successful preview adopts the response-echoed
+     ticks instead of clearing them; the request still carries the ticks that
+     were active when it was sent. */
   await sandbox.__review.reviewPropagatePreview();
   await tick(160);
   steps.push({ step: "ov-repreview",
@@ -2720,25 +2773,45 @@ async function runPropagateOverrideFlow() {
       return { exclusions: (ctx.propagate.exclusions || []).slice(),
         overrides: (ctx.propagate.overrides || []).slice() };
     })() });
-  /* Re-tick the locked exclusion and the decided override, then apply. */
-  exclusions.querySelectorAll = function (selector) {
-    if (String(selector).indexOf("propagate-exclude") >= 0) {
-      return [{ checked: true, value: "it-b" }];
-    }
-    return [];
-  };
-  sandbox.__review.reviewPropagateExclusionToggle();
-  overrideBox.querySelectorAll = function (selector) {
-    if (String(selector).indexOf("propagate-override") >= 0) {
-      return [{ checked: true, value: "it-d" }];
-    }
-    return [];
-  };
-  sandbox.__review.reviewPropagateOverrideToggle();
-  await tick(40);
+  /* Apply WITHOUT re-ticking: the body must carry the adopted lists, so the
+     member shown 已排除 is not written. */
   await sandbox.__review.reviewPropagateApply();
   await tick(200);
   steps.push({ step: "ov-applied",
+    posts: propagatePosts.slice(),
+    diff: htmlOf("#reviewPropagateDiff"),
+    msg: htmlOf("#reviewMsg"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  /* Untick the overridden ready+existing member: the toggle sends nothing and
+     the member returns to ``decided`` (kept) after a fresh preview. */
+  overrideBox.querySelectorAll = function () { return []; };
+  sandbox.__review.reviewPropagateOverrideToggle();
+  await tick(40);
+  steps.push({ step: "ov-unticked",
+    posts: propagatePosts.length,
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "ov-untick-preview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  await sandbox.__review.reviewPropagateApply();
+  await tick(200);
+  steps.push({ step: "ov-untick-applied",
     posts: propagatePosts.slice(),
     diff: htmlOf("#reviewPropagateDiff"),
     msg: htmlOf("#reviewMsg"),
@@ -3073,10 +3146,13 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertTrue(error["applyDisabled"], error)
 
     def test_propagation_decided_override_toggle_and_bodies(self):
-        """CP6.1 (wire §7.2/§7.5): ``decided`` rows render the existing-decision
-        summary and a 将覆盖 marker when overridden; override ticks are sent in
-        BOTH preview and apply bodies; toggling sends nothing; opening the panel
-        and a successful preview reset the ticks."""
+        """CP6.1 + CP6.2 L1 (wire §7.2/§7.5/§8.1): ``decided`` rows render the
+        existing-decision summary and a 将覆盖 marker when overridden; override
+        ticks are sent in BOTH preview and apply bodies; toggling sends nothing;
+        opening the panel starts with empty ticks, while a successful preview
+        adopts the response-echoed ticks (no reset). An overridden ``ready``
+        member keeps its override checkbox so it can be unticked back to
+        ``decided`` (kept, not written)."""
         by_step = self._run_harness()
         opened = by_step["ov-open"]
         # Opening sends nothing and leaves no override ticks.
@@ -3108,7 +3184,8 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertIn("checked", toggled["overrides"], toggled)
         self.assertIn("it-d", toggled["overrides"], toggled)
         self.assertFalse(toggled["applyDisabled"], toggled)
-        # A fresh preview carries the active ticks, then resets them on success.
+        # CP6.2 L1: the preview echoes the active ticks and the UI adopts them
+        # as the current selection instead of resetting to [].
         repreview = by_step["ov-repreview"]
         self.assertEqual(len(repreview["posts"]), 2, repreview)
         preview_body = repreview["posts"][1]
@@ -3116,10 +3193,20 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertEqual(preview_body["exclusions"], ["it-b"], preview_body)
         self.assertEqual(preview_body["overrides"], ["it-d"], preview_body)
         self.assertEqual(repreview["state"],
-                         {"exclusions": [], "overrides": []}, repreview)
-        self.assertNotIn("将覆盖", repreview["members"], repreview)
+                         {"exclusions": ["it-b"], "overrides": ["it-d"]},
+                         repreview)
+        # it-d is now ``ready`` but still carries ``existing``, so its override
+        # checkbox stays listed and checked; the checked row renders 将覆盖.
+        self.assertIn("将覆盖", repreview["members"], repreview)
         self.assertIn("就绪", repreview["members"], repreview)
-        self.assertTrue(repreview["applyDisabled"], repreview)
+        self.assertIn("已有条目", repreview["members"], repreview)
+        self.assertIn("已排除 1", repreview["members"], repreview)
+        self.assertIn("propagate-override", repreview["overrides"], repreview)
+        self.assertIn("it-d", repreview["overrides"], repreview)
+        self.assertIn("checked", repreview["overrides"], repreview)
+        self.assertFalse(repreview["applyDisabled"], repreview)
+        # Apply without re-ticking: the body carries the same lists the preview
+        # was computed with, so the member shown 已排除 is not written.
         applied = by_step["ov-applied"]
         self.assertEqual(len(applied["posts"]), 3, applied)
         apply_body = applied["posts"][2]
@@ -3129,8 +3216,54 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertIn("传播 diff", applied["diff"], applied)
         self.assertIn("新增 3", applied["diff"], applied)
         self.assertIn("it-d", applied["diff"], applied)
+        self.assertNotIn("it-b", applied["diff"], applied)
         self.assertIn("未确认、未构建、未发布", applied["msg"], applied)
         self.assertTrue(applied["applyDisabled"], applied)
+        # Untick the overridden ready+existing member: the toggle sends nothing
+        # and a fresh preview returns it to ``decided`` (kept).
+        unticked = by_step["ov-unticked"]
+        self.assertEqual(unticked["posts"], 3, unticked)
+        self.assertEqual(unticked["state"],
+                         {"exclusions": ["it-b"], "overrides": []}, unticked)
+        self.assertNotIn("将覆盖", unticked["members"], unticked)
+        self.assertIn("propagate-override", unticked["overrides"], unticked)
+        self.assertIn("it-d", unticked["overrides"], unticked)
+        self.assertNotIn("checked", unticked["overrides"], unticked)
+        self.assertTrue(unticked["applyDisabled"], unticked)
+        untick_preview = by_step["ov-untick-preview"]
+        self.assertEqual(len(untick_preview["posts"]), 4, untick_preview)
+        untick_preview_body = untick_preview["posts"][3]
+        self.assertIs(untick_preview_body["dry_run"], True,
+                      untick_preview_body)
+        self.assertEqual(untick_preview_body["exclusions"], ["it-b"],
+                         untick_preview_body)
+        self.assertEqual(untick_preview_body["overrides"], [],
+                         untick_preview_body)
+        self.assertEqual(untick_preview["state"],
+                         {"exclusions": ["it-b"], "overrides": []},
+                         untick_preview)
+        self.assertIn("已有决定（默认保留）", untick_preview["members"],
+                      untick_preview)
+        self.assertNotIn("将覆盖", untick_preview["members"], untick_preview)
+        self.assertIn("propagate-override", untick_preview["overrides"],
+                      untick_preview)
+        self.assertIn("it-d", untick_preview["overrides"], untick_preview)
+        self.assertNotIn("checked", untick_preview["overrides"],
+                         untick_preview)
+        self.assertFalse(untick_preview["applyDisabled"], untick_preview)
+        # Apply after the untick sends ``overrides:[]`` and does not write it-d.
+        untick_applied = by_step["ov-untick-applied"]
+        self.assertEqual(len(untick_applied["posts"]), 5, untick_applied)
+        untick_apply_body = untick_applied["posts"][4]
+        self.assertIs(untick_apply_body["dry_run"], False, untick_apply_body)
+        self.assertEqual(untick_apply_body["exclusions"], ["it-b"],
+                         untick_apply_body)
+        self.assertEqual(untick_apply_body["overrides"], [], untick_apply_body)
+        self.assertIn("传播 diff", untick_applied["diff"], untick_applied)
+        self.assertIn("新增 2", untick_applied["diff"], untick_applied)
+        self.assertNotIn("it-d", untick_applied["diff"], untick_applied)
+        self.assertNotIn("it-b", untick_applied["diff"], untick_applied)
+        self.assertTrue(untick_applied["applyDisabled"], untick_applied)
         reopened = by_step["ov-reopen"]
         self.assertEqual(reopened["newPosts"], 0, reopened)
         self.assertEqual(reopened["state"],
