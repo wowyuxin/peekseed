@@ -36,6 +36,25 @@ version/tag policy.
   `corrections_conflict` becomes a valid extraction state. Run `peekseed migrate`
   (dry-run by default) or `peekseed migrate --apply`.
 
+### Added — PDF.js page viewer (fast citation deep links)
+
+- **Citations open a vendored PDF.js viewer instead of downloading the whole
+  PDF first.** `pdf_url` now points at
+  `/pdfjs/web/viewer.html?file=%2Fpdf%2F<dataset>%2F<file>#page=N` (the viewer is
+  served from `peekseed/web/pdfjs/`, Apache-2.0, mounted at `/pdfjs/`; no
+  JavaScript build step). The viewer is configured for **range-only loading**
+  (`disableAutoFetch`/`disableStream` in `viewer.mjs`, documented in
+  `web/pdfjs/LOCAL-PATCHES.md`), so it paints the cited page from the byte ranges
+  it needs and renders neighbouring pages as they scroll into view; `GET /pdf`
+  now answers `Range` requests (`206`, `Accept-Ranges: bytes`). Measured on the
+  12 MB CXL spec: `#page=700` paints in ~0.3 s from ~0.26 MB instead of waiting
+  for all 12 MB. A stripped install without the assets falls back to the
+  browser's native viewer on the same `/pdf` URL.
+- Packaging: the viewer ships in both the wheel and the sdist (`pyproject.toml`
+  package-data + `MANIFEST.in`); CI asserts the wheel contains the viewer and
+  worker. Tests: `tests/test_pdf_viewer.py` (static assets, URL shape, fallback,
+  Range) and the packaging contract.
+
 ### Added — review build/publish (M2 CP3)
 
 - New review routes: `POST …/review/reports` (202 job), `POST …/review/batches`

@@ -101,6 +101,14 @@ jobs:
               assert any(n.endswith("peekseed/web/index.html") for n in names), (
                   "peekseed/web/index.html is missing from the wheel"
               )
+              assert any(n.endswith("peekseed/web/pdfjs/web/viewer.html")
+                         for n in names), (
+                  "the vendored PDF.js viewer is missing from the wheel"
+              )
+              assert any(n.endswith("peekseed/web/pdfjs/build/pdf.worker.mjs")
+                         for n in names), (
+                  "the PDF.js worker is missing from the wheel"
+              )
               metadata = [n for n in names
                           if n.endswith(".dist-info/entry_points.txt")]
               assert metadata, "wheel metadata has no entry_points.txt"
@@ -115,6 +123,7 @@ jobs:
               names = archive.getnames()
           required = [
               "peekseed/web/index.html",
+              "peekseed/web/pdfjs/web/viewer.html",
               "docs/api.md",
               "docs/install.md",
               "docs/deploy.md",

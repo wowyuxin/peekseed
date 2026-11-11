@@ -211,8 +211,10 @@ is sent.
 - Uploads: 50 MB per file, 50 files, 200 MB total; streamed to disk with the
   limits enforced while reading, not after. Filenames are sanitized before any
   directory is created (zip-slip safe). Uploads stay available with peelfeed down.
-- `/pdf/<dataset>/<file>` is served **inline** so `#page=N` opens the browser's
-  native viewer; only the stored copies in the shared `sources/` pool are served,
+- `/pdf/<dataset>/<file>` is served **inline** (with Range support); citations
+  deep-link into the vendored PDF.js viewer (`/pdfjs/web/viewer.html?file=…
+  #page=N`), which paints the cited page from byte ranges instead of downloading
+  the whole PDF. Only the stored copies in the shared `sources/` pool are served,
   with traversal and symlink escapes rejected.
 - One unreadable source does not hide the rest; one corrupt index does not hide
   the healthy ones.

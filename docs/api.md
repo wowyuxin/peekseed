@@ -63,7 +63,8 @@ are not listed.
 | GET | `/api/jobs/{id}` | One job record |
 | DELETE | `/api/jobs/{id}` | Request cancellation between batches |
 | POST | `/api/jobs/{id}/resume` | Resume an interrupted/cancelled/failed build |
-| GET | `/pdf/{dataset}/{filename}` | Serve the stored PDF inline from the shared sources pool |
+| GET | `/pdf/{dataset}/{filename}` | Serve the stored PDF inline (Range-capable) from the shared sources pool |
+| GET | `/pdfjs/{path}` | Vendored PDF.js viewer static assets (the viewer deep-links to `/pdf/...#page=N`) |
 | GET | `/api/links` | Model links (masked) |
 | POST | `/api/links` | Create a link |
 | PUT | `/api/links/{id}` | Update a link |
@@ -184,10 +185,22 @@ pool when no other dataset references them. Returns
 ### `GET /pdf/{dataset}/{filename}`
 
 Serves the stored PDF **inline** (`Content-Disposition: inline`,
-`application/pdf`) from the shared sources pool so the browser's own viewer opens
-it and `#page=N` jumps to a chunk's page. The name is basename-checked and the
-resolved file must stay inside `$PEEKSEED_SHARED_DIR/sources`; traversal and
-symlink escapes are `400`.
+`application/pdf`) from the shared sources pool, with **HTTP Range** support
+(`206 Partial Content`, `Accept-Ranges: bytes`). The name is basename-checked and
+the resolved file must stay inside `$PEEKSEED_SHARED_DIR/sources`; traversal and
+symlink escapes are `400`. Reads are not gated by the token.
+
+### `GET /pdfjs/{path}`
+
+Serves the vendored PDF.js viewer (Apache-2.0; `peekseed/web/pdfjs/`) as static
+files. Citation links point at
+`/pdfjs/web/viewer.html?file=%2Fpdf%2F<dataset>%2F<file>#page=N`; the viewer is
+configured for **range-only loading** (`disableAutoFetch`/`disableStream`), so it
+paints the cited page from the byte ranges it needs instead of downloading the
+whole PDF, and neighbours render as they scroll into view. There is no
+JavaScript build step and the assets ship with the package. If the assets are
+absent (a stripped install), citations fall back to the browser's native viewer
+on the same `/pdf` URL.
 
 ## peelfeed (extraction engine, CLI only)
 
@@ -517,7 +530,7 @@ Returns:
               "space": "…", "label": "…", "section": "…", "chapter": "…",
               "numbering": "…", "page_start": 12, "page_end": 13,
               "source": "CXL_spec.pdf",
-              "pdf_url": "/pdf/cxl/CXL_spec.pdf#page=12",
+              "pdf_url": "/pdfjs/web/viewer.html?file=%2Fpdf%2Fcxl%2FCXL_spec.pdf#page=12",
               "snippet": "…"}],
  "history_id": "…"}
 ```

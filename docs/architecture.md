@@ -151,6 +151,8 @@ row/dimension validation, is reported as `needs_reindex`, never served.
 - Uploads stream to disk with per-file, file-count and total-size limits enforced
   while reading; filenames are sanitized before any directory is created, and
   the bytes are stored once in the shared `sources/<sha256>/` pool.
-- `/pdf` serves only from the shared `sources/` pool, inline, with traversal and
-  symlink escapes rejected.
+- `/pdf` serves only from the shared `sources/` pool, inline, with HTTP Range
+  support and traversal/symlink escapes rejected; `/pdfjs/` serves only the
+  vendored PDF.js static assets. Citation links deep-link into the viewer with
+  `#page=N`, which fetches only the byte ranges the page needs.
 - The server never executes shell scripts or starts model processes.

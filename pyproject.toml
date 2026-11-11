@@ -58,9 +58,17 @@ package-dir = {"" = "."}
 include = ["peekseed*"]
 
 [tool.setuptools.package-data]
-# The single-file web UI sits beside the Python package and must ship in both
-# the wheel and the sdist; tests/test_packaging.py and CI assert this.
-peekseed = ["web/*"]
+# The single-file web UI and the vendored PDF.js viewer (Apache-2.0) sit beside
+# the Python package and must ship in both the wheel and the sdist;
+# tests/test_packaging.py and CI assert this.
+peekseed = [
+  "web/*",
+  "web/pdfjs/*",
+  "web/pdfjs/build/*",
+  "web/pdfjs/web/*",
+  "web/pdfjs/web/*/*",
+  "web/pdfjs/web/*/*/*",
+]
 
 [tool.ruff]
 line-length = 88

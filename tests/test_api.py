@@ -168,7 +168,8 @@ class ApiTests(unittest.TestCase):
             body = response.json()
             self.assertTrue(body["results"])
             first = body["results"][0]
-            self.assertTrue(first["pdf_url"].startswith("/pdf/%s/" % dataset["id"]))
+            self.assertIn("/pdfjs/web/viewer.html?file=", first["pdf_url"])
+            self.assertIn("#page=", first["pdf_url"])
             self.assertEqual(first["rank"], 1)
             # the stream variant reports the same result
             stream = client.post("/api/search/stream", json={

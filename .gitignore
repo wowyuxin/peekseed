@@ -13,6 +13,11 @@ workspace/
 *.log
 *.pid
 
+# Vendored PDF.js viewer: its prebuilt generic build/ directory is a shipped
+# asset, not a local Python build artifact.
+!peekseed/web/pdfjs/build/
+!peekseed/web/pdfjs/build/**
+
 # OS / editor
 .DS_Store
 

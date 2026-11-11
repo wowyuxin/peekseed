@@ -253,8 +253,12 @@ when no index exists for the active space.
   embedding compatibility are the configured endpoints' responsibility.
 - **Index rebuilds are required** when the embedding link's id or model
   changes; there is no cross-space search.
-- **PDF viewer is the browser's**, not a vendored PDF.js; page citations open
-  the stored file served by the local API.
+- **PDF viewer:** page citations open a vendored PDF.js viewer at `/pdfjs/`
+  with `#page=N`. It fetches only the byte ranges the cited page needs (the
+  `/pdf` route answers Range requests), so a large PDF paints the target page
+  quickly instead of downloading the whole file; neighbours render as they
+  scroll into view. No JavaScript build step: the viewer ships as static
+  assets with the package.
 - **Not tested on Windows**: the test suite and helper script assume a POSIX
   environment.
 

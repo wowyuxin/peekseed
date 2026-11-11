@@ -107,12 +107,14 @@ created only after every file passed validation. Each file is then stored once a
 ## `/pdf` is inline and read-only
 
 `GET /pdf/<dataset>/<file>` serves the dataset's stored source from the shared
-`sources/<sha256>/` pool inline (`Content-Disposition: inline`) so a browser
-opens its PDF viewer and `#page=N` jumps to the chunk's page. Names containing
-path separators, `..`, absolute paths, encoded traversal or NUL are rejected;
-the resolved path must stay inside `$PEEKSEED_SHARED_DIR/sources`
-(`Path.relative_to` on resolved paths), so a symlink that escapes the pool is
-never served. Reads are not gated by the token.
+`sources/<sha256>/` pool inline (`Content-Disposition: inline`, Range-capable) so
+a browser can open it; citation links deep-link into the vendored PDF.js viewer
+(`/pdfjs/web/viewer.html?file=…#page=N`), which is static, read-only and fetches
+only the byte ranges the page needs. Names containing path separators,
+`..`, absolute paths, encoded traversal or NUL are rejected; the resolved path
+must stay inside `$PEEKSEED_SHARED_DIR/sources` (`Path.relative_to` on resolved
+paths), so a symlink that escapes the pool is never served. `/pdf` and `/pdfjs/`
+reads are not gated by the token.
 
 ## File modes
 

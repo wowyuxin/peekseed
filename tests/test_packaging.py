@@ -85,9 +85,34 @@ class PackagingTests(unittest.TestCase):
                 "%s must not be a peekseed dependency" % removed,
             )
 
-    def test_package_data_ships_the_web_ui(self):
+    def test_package_data_ships_the_web_ui_and_pdfjs_viewer(self):
         package_data = self.pyproject["tool"]["setuptools"]["package-data"]
         self.assertIn("web/*", package_data["peekseed"])
+        for pattern in ("web/pdfjs/*", "web/pdfjs/build/*",
+                        "web/pdfjs/web/*", "web/pdfjs/web/*/*",
+                        "web/pdfjs/web/*/*/*"):
+            self.assertIn(pattern, package_data["peekseed"])
+
+    def test_vendored_pdfjs_viewer_ships_with_range_only_patches(self):
+        viewer = ROOT / "peekseed" / "web" / "pdfjs"
+        for rel in ("LICENSE", "LOCAL-PATCHES.md",
+                    "build/pdf.mjs", "build/pdf.worker.mjs",
+                    "build/pdf.sandbox.mjs",
+                    "web/viewer.html", "web/viewer.mjs", "web/viewer.css",
+                    "web/locale/locale.json",
+                    "web/locale/en-US/viewer.ftl",
+                    "web/locale/zh-CN/viewer.ftl",
+                    "web/cmaps/Adobe-Japan1-UCS2.bcmap",
+                    "web/standard_fonts/FoxitSerif.pfb",
+                    "web/wasm/openjpeg.wasm",
+                    "web/images/altText_add.svg"):
+            self.assertTrue((viewer / rel).is_file(), rel)
+        viewer_js = (viewer / "web" / "viewer.mjs").read_text(encoding="utf-8")
+        self.assertIn("disableAutoFetch", viewer_js)
+        self.assertIn("disableStream", viewer_js)
+        notices = (ROOT / "THIRD-PARTY-NOTICES.md").read_text(encoding="utf-8")
+        self.assertIn("PDF.js", notices)
+        self.assertIn("Apache-2.0", notices)
 
     def test_editable_layout_supports_same_named_checkout(self):
         # An explicit common package root makes setuptools use a plain .pth,

@@ -36,6 +36,7 @@ import httpx
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (__version__, answer as answer_mod, config, contracts, ingest,
@@ -287,12 +288,29 @@ def _quote_segment(value):
     return quote(str(value or ""), safe="")
 
 
+#: Vendored PDF.js viewer (Apache-2.0, see web/pdfjs/LOCAL-PATCHES.md) mounted
+#: at /pdfjs by create_app(). It is the previous fast page viewer: with
+#: disableAutoFetch/disableStream it requests only the byte ranges the cited
+#: page needs, so a 12 MB PDF paints its target page from ~0.3 MB instead of
+#: downloading the whole file first (GET /pdf supports Range requests).
+PDFJS_DIR = Path(__file__).resolve().parent / "web" / "pdfjs"
+PDFJS_VIEWER = "/pdfjs/web/viewer.html"
+
+
+def _pdfjs_available():
+    return (PDFJS_DIR / "web" / "viewer.html").is_file()
+
+
 def _pdf_url(dataset, meta):
     """The page link for one chunk, or "" when it has no source/page.
 
-    The original PDF is served from the API and opened by the browser's native
-    viewer; a chunk without a page (a text-only format, for example) gets no
-    link rather than a dead one.
+    The original PDF is served by the API (``/pdf/...``, Range-capable). When
+    the vendored PDF.js viewer is available the link deep-links into it with
+    ``#page=N``; the viewer paints the cited page from byte ranges instead of
+    waiting for the whole PDF, and neighbours render as they scroll into view.
+    Without the viewer (e.g. a stripped install) the link falls back to the
+    browser's native viewer on the same ``/pdf`` URL. A chunk without a page
+    (a text-only format, for example) gets no link rather than a dead one.
     """
     source = (meta or {}).get("source") or ""
     try:
@@ -301,8 +319,12 @@ def _pdf_url(dataset, meta):
         page = 0
     if not source or page < 1:
         return ""
-    return "/pdf/%s/%s#page=%d" % (_quote_segment(dataset),
-                                   _quote_segment(source), page)
+    pdf_path = "/pdf/%s/%s" % (_quote_segment(dataset),
+                               _quote_segment(source))
+    if _pdfjs_available():
+        return "%s?file=%s#page=%d" % (PDFJS_VIEWER,
+                                       quote(pdf_path, safe=""), page)
+    return pdf_path + "#page=%d" % page
 
 
 def _result_label(meta):
@@ -1217,6 +1239,14 @@ def create_app():
         yield
 
     app = FastAPI(title="peekseed", version=__version__, lifespan=lifespan)
+
+    # The vendored PDF.js viewer is static files, mounted before the routes.
+    # Citations deep-link to /pdfjs/web/viewer.html?file=/pdf/<dataset>/<file>
+    # #page=N; the viewer fetches only the ranges the page needs (see
+    # _pdf_url and web/pdfjs/LOCAL-PATCHES.md).
+    if _pdfjs_available():
+        app.mount("/pdfjs", StaticFiles(directory=str(PDFJS_DIR), html=True),
+                  name="pdfjs")
 
     @app.middleware("http")
     async def cache_policy(request: Request, call_next):
