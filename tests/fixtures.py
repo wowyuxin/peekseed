@@ -834,7 +834,8 @@ OPERATION_STRATEGIES = {
 
 
 def resolution_record(item_id, name, entry_id=None, revision=0,
-                      reason_code=None, reason=None, evidence_hash=None):
+                      reason_code=None, reason=None, evidence_hash=None,
+                      source="user"):
     """A resolutions.jsonl row (contract §11.6), the shape ``plan defer`` uses."""
     material = "|".join([str(item_id), str(name), str(entry_id or ""),
                          str(int(revision or 0))])
@@ -851,7 +852,7 @@ def resolution_record(item_id, name, entry_id=None, revision=0,
         "reason_code": reason_code,
         "reason": reason,
         "evidence_hash": evidence_hash,
-        "source": "user",
+        "source": source,
         "recorded_at": "2026-11-05T00:00:00Z",
     }
 
@@ -869,6 +870,49 @@ def revert_resolution_record(target):
     return row
 
 
+# CP6.1 (contract v1.10 §17.7 / wire §7.2): resolutions are projected to one
+# effective row per item (last active add row wins); a row is reverted by a
+# later ``revert`` row that ``supersedes`` it. The fake CLI mirrors
+# ``peelfeed/review/resolutions.py`` so ``plan propagate`` can mark ``decided``
+# members and revert their active R0 in the same write.
+RESOLUTION_EVIDENCE_BEARING = ("defer", "keep_visual_fallback",
+                               "keep_original_figure", "confirm_headerless")
+
+
+def active_resolutions(rows):
+    """The effective R0 resolution per item (mirror of ``projection``)."""
+    active = {}
+    for sequence, record in enumerate(rows or []):
+        if not isinstance(record, dict):
+            continue
+        target = record.get("supersedes")
+        if target:
+            active.pop(target, None)
+        if record.get("change") == "revert":
+            continue
+        rid = record.get("resolution_id")
+        if rid:
+            active[rid] = (sequence, record)
+    latest = {}
+    for rid, (sequence, record) in active.items():
+        item_id = str(record.get("item_id") or "")
+        current = latest.get(item_id)
+        if current is None or sequence > current[0]:
+            latest[item_id] = (sequence, record)
+    return {item_id: record for item_id, (_sequence, record) in latest.items()}
+
+
+def resolution_is_stale(record, item):
+    """Derived stale flag (contract §11.6): evidence-bearing rows only."""
+    if not isinstance(record, dict) or not isinstance(item, dict):
+        return False
+    if record.get("name") not in RESOLUTION_EVIDENCE_BEARING:
+        return False
+    recorded = record.get("evidence_hash")
+    current = (item.get("evidence") or {}).get("hash")
+    return bool(recorded and current and recorded != current)
+
+
 def report_suggestions(report_payload):
     """Flatten a review-report payload into its per-item suggestions."""
     payload = report_payload if isinstance(report_payload, dict) else {}
@@ -882,6 +926,36 @@ def report_suggestions(report_payload):
             if isinstance(suggestion, dict):
                 suggestions.append(suggestion)
     return suggestions
+
+
+def suggestion_source(suggestion):
+    """The adoption source of one report suggestion (rule is the default)."""
+    suggestion = suggestion if isinstance(suggestion, dict) else {}
+    return "vlm" if str(suggestion.get("source") or "") == "vlm" else "rule"
+
+
+def suggestion_action_identity(suggestion):
+    """The wire §10.5 action identity: strategy id/version + canonical params."""
+    suggestion = suggestion if isinstance(suggestion, dict) else {}
+    strategy = suggestion.get("strategy") or {}
+    try:
+        params = json.dumps(suggestion.get("params") or {}, sort_keys=True)
+    except (TypeError, ValueError):
+        params = repr(suggestion.get("params"))
+    return (str(strategy.get("id") or ""),
+            int(strategy.get("version") or 1), params)
+
+
+def report_origin(report_payload):
+    """The plan-entry ``origin`` for a report accept (wire §10.5)."""
+    payload = report_payload if isinstance(report_payload, dict) else {}
+    inner = payload.get("report")
+    report = inner if isinstance(inner, dict) else payload
+    provider = report.get("provider") if isinstance(
+        report.get("provider"), dict) else {}
+    return {"kind": "report", "job_id": report.get("job_id"),
+            "model": provider.get("model"),
+            "prompt_version": provider.get("prompt_version")}
 
 
 def _item_evidence_hash(review, item_id):
@@ -1219,6 +1293,11 @@ def main():
             # is env-only), so the fake records them for the seam tests.
             "ocr_env": {key: value for key, value in sorted(os.environ.items())
                         if key.startswith("PEELFEED_OCR_")},
+            # CP5: the VLM provider env is child-only (report/discuss). The fake
+            # records it so tests can prove the token reaches exactly those
+            # children and never a rules report/plan/job call.
+            "llm_env": {key: value for key, value in sorted(os.environ.items())
+                        if key.startswith("PEELFEED_LLM_")},
         }) + "\n")
     if not argv:
         return fail("missing command")
@@ -1281,27 +1360,34 @@ def main():
         review_items = int(state.get("ingest_review_items") or 0)
         errors = list(state.get("ingest_errors") or [])
         delay = float(state.get("ingest_seconds") or 0)
-        peels[peel_id] = {
-            "peel_id": peel_id,
-            # CP3 flake hardening: with no simulated delay the terminal state is
-            # observable immediately (no intermediate "converting" write for a
-            # 0.05s poller to catch and persist late).
-            "state": "converting" if delay else (
-                "failed" if errors else "ready"),
-            "source": {"name": os.path.basename(source),
-                       "size": os.path.getsize(source),
-                       "sha256": sha, "pages": pages},
-            "profile": state.get("ingest_profile") or "generic",
-            "conversion_id": "" if delay else hashlib.sha256(
-                ("conv|" + sha).encode()).hexdigest(),
-            "counts": {"pages": pages, "chunks": pages},
-            "validation": {"errors": [] if delay else errors,
-                           "review_items": review_items},
-            "review_items": review_items,
-            "error": None if delay or not errors else "validation failed",
-        }
-        state["peels"] = peels
-        save_state(state)
+        # CP5.1 H9: simulate a re-ingest of an already-ready peel. The real
+        # engine keeps the previous peel summary visible until the new ingest
+        # publishes, so a status poll during the delay still reports the old
+        # ``ready`` state (the bug H9 fixes). Without this flag the fake writes
+        # an intermediate ``converting`` state immediately (CP3 flake hardening).
+        keep_previous = bool(state.get("ingest_keep_previous_state"))
+        if not (keep_previous and peel_id in peels):
+            peels[peel_id] = {
+                "peel_id": peel_id,
+                # CP3 flake hardening: with no simulated delay the terminal state
+                # is observable immediately (no intermediate "converting" write
+                # for a 0.05s poller to catch and persist late).
+                "state": "converting" if delay else (
+                    "failed" if errors else "ready"),
+                "source": {"name": os.path.basename(source),
+                           "size": os.path.getsize(source),
+                           "sha256": sha, "pages": pages},
+                "profile": state.get("ingest_profile") or "generic",
+                "conversion_id": "" if delay else hashlib.sha256(
+                    ("conv|" + sha).encode()).hexdigest(),
+                "counts": {"pages": pages, "chunks": pages},
+                "validation": {"errors": [] if delay else errors,
+                               "review_items": review_items},
+                "review_items": review_items,
+                "error": None if delay or not errors else "validation failed",
+            }
+            state["peels"] = peels
+            save_state(state)
         if delay:
             time.sleep(delay)
         conversion_id = hashlib.sha256(("conv|" + sha).encode()).hexdigest()
@@ -1377,6 +1463,679 @@ def main():
         action = values[1] if len(values) > 1 else "show"
         if action == "show":
             return emit(plan)
+        if action == "patch":
+            # CP5 wire §5: synchronous targeted plan patch (no model call).
+            # stdin {base_plan_version, patch, source:"vlm|user",
+            # conversation_id?}; returns the new plan + targeted diff.
+            if option(rest, "--input") is None:
+                save_state(state)
+                return fail("--input is required for plan patch", 2,
+                            "validation")
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                save_state(state)
+                return fail("plan patch input must be a JSON object", 2,
+                            "validation")
+            state.setdefault("plan_patch_requests", []).append(
+                copy_json(request))
+            base = request.get("base_plan_version")
+            if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+                save_state(state)
+                return fail("base_plan_version must be an integer >= 0", 2,
+                            "validation")
+            patch = request.get("patch")
+            if not isinstance(patch, dict):
+                save_state(state)
+                return fail("patch must be a JSON object", 2, "validation")
+            source = request.get("source")
+            if source not in ("vlm", "user"):
+                save_state(state)
+                return fail("source must be 'vlm' or 'user'", 2, "validation")
+            conversation_id = request.get("conversation_id")
+            turn = request.get("turn")
+            conversations = state.get("conversations") or {}
+            if conversation_id:
+                if conversation_id not in conversations:
+                    save_state(state)
+                    return fail("unknown conversation: "
+                                + str(conversation_id), 3, "not_found")
+            # CP5.1 H5 (wire §10.5): a VLM-sourced patch must name the archived
+            # assistant turn; the fake compares the submitted patch with that
+            # turn (identical -> source vlm, edited -> source user) and records
+            # the conversation origin either way.
+            origin = None
+            effective_source = source
+            if source == "vlm":
+                if not conversation_id:
+                    save_state(state)
+                    return fail("source 'vlm' requires conversation_id",
+                                2, "validation")
+                if (isinstance(turn, bool) or not isinstance(turn, int)
+                        or turn < 1):
+                    save_state(state)
+                    return fail("source 'vlm' requires turn (int >= 1)",
+                                2, "validation")
+                archived = next(
+                    (candidate for candidate in
+                     conversations[conversation_id].get("assistant_turns") or []
+                     if candidate.get("turn") == turn), None)
+                if archived is None or not archived.get("patch"):
+                    save_state(state)
+                    return fail("no archived assistant patch for turn "
+                                + str(turn), 2, "validation")
+                effective_source = ("vlm" if archived.get("patch") == patch
+                                    else "user")
+                origin = {"kind": "conversation",
+                          "conversation_id": conversation_id,
+                          "turn": turn,
+                          "model": archived.get("model"),
+                          "prompt_version": archived.get("prompt_version")}
+            if base != plan.get("plan_version"):
+                save_state(state)
+                return fail("base_plan_version mismatch", 2, "conflict")
+            error = state.get("plan_patch_error")
+            if error:
+                save_state(state)
+                return fail(error.get("message") or "plan patch rejected",
+                            int(error.get("exit") or 2),
+                            error.get("code") or "validation",
+                            error.get("detail"))
+            review = copy_json(state.get("review") or DEFAULT_REVIEW)
+            item_cluster = {}
+            all_item_ids = []
+            for item in review.get("items") or []:
+                if not isinstance(item, dict):
+                    continue
+                item_id = str(item.get("id") or "")
+                if not item_id:
+                    continue
+                all_item_ids.append(item_id)
+                item_cluster[item_id] = str(item.get("cluster_id") or "")
+            scope = patch.get("scope") if isinstance(
+                patch.get("scope"), dict) else {}
+            kind = str(scope.get("kind") or "")
+            if kind == "item":
+                members = [str(scope.get("item_id") or "")]
+            elif kind == "cluster":
+                cluster_id = str(scope.get("cluster_id") or "")
+                members = [item_id for item_id in all_item_ids
+                           if item_cluster.get(item_id) == cluster_id]
+            elif kind == "peel":
+                members = list(all_item_ids)
+            else:
+                save_state(state)
+                return fail("patch.scope.kind must be item, cluster or peel",
+                            2, "validation")
+            members = [item_id for item_id in members if item_id]
+            exclusions = [str(item_id) for item_id in
+                          (patch.get("exclusions") or [])]
+            target = sorted(set(members) - set(exclusions))
+            declared = patch.get("members")
+            if declared is not None and sorted(
+                    str(item_id) for item_id in declared) != target:
+                save_state(state)
+                return fail("patch.members must equal the resolved target set",
+                            2, "validation")
+            changes = patch.get("changes")
+            if not isinstance(changes, list):
+                save_state(state)
+                return fail("patch.changes must be a list", 2, "validation")
+            by_item = {}
+            for change in changes:
+                if not isinstance(change, dict):
+                    save_state(state)
+                    return fail("patch change must be an object", 2,
+                                "validation")
+                item_id = str(change.get("item_id") or "")
+                if not item_id or item_id not in target:
+                    save_state(state)
+                    return fail("patch change item is not in the target set: "
+                                + str(item_id), 2, "validation")
+                if item_id in by_item:
+                    save_state(state)
+                    return fail("duplicate patch change for " + item_id, 2,
+                                "validation")
+                op = change.get("op")
+                if op not in ("select", "remove"):
+                    save_state(state)
+                    return fail("unknown patch op: " + str(op), 2,
+                                "validation")
+                by_item[item_id] = change
+            missing = [item_id for item_id in target
+                       if item_id not in by_item]
+            if missing:
+                save_state(state)
+                return fail("patch is missing a change for " + missing[0], 2,
+                            "validation")
+            existing = {entry.get("entry_id"): entry
+                        for entry in plan.get("entries") or []
+                        if isinstance(entry, dict)}
+            entries = [copy_json(entry) for entry in
+                       (plan.get("entries") or [])]
+            conflicts = []
+            for item_id, change in by_item.items():
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                current = next((entry for entry in entries
+                                if entry.get("entry_id") == entry_id), None)
+                if current is not None and (current.get("locked")
+                                            or current.get("batch_id")):
+                    conflicts.append(item_id)
+            if conflicts:
+                save_state(state)
+                return fail("patch touches locked/batch-bound entries", 2,
+                            "conflict", {"conflicts": sorted(conflicts)})
+            added = []
+            changed = []
+            removed = []
+            unchanged = 0
+            bumped = False
+            for item_id, change in by_item.items():
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                current = next((entry for entry in entries
+                                if entry.get("entry_id") == entry_id), None)
+                if change.get("op") == "remove":
+                    if current is None:
+                        unchanged += 1
+                        continue
+                    entries = [entry for entry in entries
+                               if entry.get("entry_id") != entry_id]
+                    removed.append(copy_json(current))
+                    bumped = True
+                    continue
+                strategy = change.get("strategy") or {}
+                strategy_id = str(strategy.get("id") or "")
+                action_entry = strategy_action(
+                    strategy_id, change.get("params") or {})
+                if action_entry is None:
+                    save_state(state)
+                    return fail("unknown strategy: " + strategy_id, 2,
+                                "validation")
+                params = dict(change.get("params") or {})
+                if (current is not None
+                        and current.get("strategy", {}).get("id") == strategy_id
+                        and (current.get("action") or {}).get("params")
+                        == params):
+                    # No-op select: keep the entry and do not bump the version.
+                    unchanged += 1
+                    continue
+                revision = 1
+                if current is not None:
+                    revision = int(current.get("revision") or 0) + 1
+                after = {
+                    "entry_id": entry_id,
+                    "item_id": item_id,
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": int(strategy.get("version") or 1)},
+                    "action": action_entry,
+                    "evidence": {"hash": "9c1f2e3d4b5a69788796a5b4c3d2e1f0",
+                                 "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": effective_source,
+                    "origin": copy_json(origin),
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": change.get("notes"),
+                }
+                entries = [entry for entry in entries
+                           if entry.get("entry_id") != entry_id]
+                entries.append(after)
+                if current is None:
+                    added.append(copy_json(after))
+                else:
+                    changed.append({"item_id": item_id,
+                                    "before": copy_json(current),
+                                    "after": copy_json(after)})
+                bumped = True
+            entries.sort(key=lambda entry: str(entry.get("entry_id") or ""))
+            if bumped:
+                plan["plan_version"] = int(plan.get("plan_version") or 0) + 1
+                plan["updated_at"] = "2026-11-09T03:10:00Z"
+            plan["entries"] = entries
+            state["plan"] = plan
+            response = {
+                "peel_id": peel_id,
+                "review_schema": 2,
+                "plan_version": int(plan.get("plan_version") or 0),
+                "entries": entries,
+                "diff": {"added": added, "changed": changed,
+                         "removed": removed, "unchanged": unchanged},
+            }
+            save_state(state)
+            return emit(response)
+        if action == "propagate":
+            # CP6 wire §1: synchronous cluster-level propagation. Preview
+            # (dry_run) returns members/positives/boundary/exclusions and writes
+            # nothing; apply writes draft entries + the propagation audit
+            # record, or fails conflict/validation all-or-nothing.
+            if option(rest, "--input") is None:
+                save_state(state)
+                return fail("--input is required for plan propagate", 2,
+                            "validation")
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                save_state(state)
+                return fail("plan propagate input must be a JSON object", 2,
+                            "validation")
+            state.setdefault("propagate_requests", []).append(
+                copy_json(request))
+            error = state.get("propagate_error")
+            if error:
+                save_state(state)
+                return fail(error.get("message") or "plan propagate failed",
+                            int(error.get("exit") or 2),
+                            error.get("code") or "validation",
+                            error.get("detail"))
+            base = request.get("base_plan_version")
+            if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+                save_state(state)
+                return fail("base_plan_version must be an integer >= 0", 2,
+                            "validation")
+            if base != plan.get("plan_version"):
+                save_state(state)
+                return fail("base_plan_version mismatch", 2, "conflict")
+            scope = request.get("scope")
+            if not isinstance(scope, dict):
+                save_state(state)
+                return fail("scope is required", 2, "validation")
+            strategy = request.get("strategy")
+            if not isinstance(strategy, dict):
+                save_state(state)
+                return fail("strategy is required", 2, "validation")
+            strategy_id = str(strategy.get("id") or "")
+            strategy_version = int(strategy.get("version") or 1)
+            params = request.get("params") if isinstance(
+                request.get("params"), dict) else {}
+            exclusions = [str(item) for item in request.get("exclusions") or []]
+            # CP6.1 (wire §7.2): optional overrides of ``decided`` members.
+            overrides = []
+            raw_overrides = request.get("overrides")
+            if raw_overrides is None:
+                raw_overrides = []
+            if not isinstance(raw_overrides, list):
+                save_state(state)
+                return fail("overrides must be a list of item ids", 2,
+                            "validation")
+            for raw in raw_overrides:
+                if not isinstance(raw, str) or not raw.strip():
+                    save_state(state)
+                    return fail("overrides must contain non-empty item ids", 2,
+                                "validation")
+                item_id = raw.strip()
+                if item_id not in overrides:
+                    overrides.append(item_id)
+            dry_run = bool(request.get("dry_run"))
+            operator = str(request.get("operator") or "user")
+            review = copy_json(state.get("review") or DEFAULT_REVIEW)
+            items = [item for item in review.get("items") or []
+                     if isinstance(item, dict) and item.get("id")]
+            by_id = {str(item.get("id")): item for item in items}
+            cluster_key = {}
+            for cluster in review.get("clusters") or []:
+                if isinstance(cluster, dict):
+                    cluster_key[str(cluster.get("cluster_id") or "")] = \
+                        cluster.get("cluster_key")
+            kind = str(scope.get("kind") or "")
+            if kind == "item":
+                item_id = str(scope.get("item_id") or "")
+                if item_id not in by_id:
+                    save_state(state)
+                    return fail("scope item is not in this peel", 2,
+                                "validation")
+                members = [item_id]
+            elif kind == "cluster":
+                cluster_id = str(scope.get("cluster_id") or "")
+                members = [str(item.get("id")) for item in items
+                           if str(item.get("cluster_id") or "") == cluster_id]
+                if not members:
+                    save_state(state)
+                    return fail("scope cluster is not in this peel", 2,
+                                "validation")
+            elif kind == "peel":
+                members = [str(item.get("id")) for item in items]
+            else:
+                save_state(state)
+                return fail("scope.kind must be item, cluster or peel", 2,
+                            "validation")
+
+            def member_priority(item_id):
+                item = by_id.get(item_id) or {}
+                status = str(item.get("status") or "")
+                human = 0 if status in ("needs_decision", "pending_evidence",
+                                        "pending_report", "failed_check") else 1
+                return (human, item_id)
+
+            members = sorted(members, key=member_priority)
+            source_item_id = request.get("source_item_id")
+            if source_item_id is not None:
+                source_item_id = str(source_item_id)
+                if source_item_id not in members:
+                    save_state(state)
+                    return fail("source_item_id is not in the resolved "
+                                "member set", 2, "validation")
+            else:
+                source_item_id = members[0] if members else None
+            # CP6.1 (wire §7.2): overrides must be members and must not overlap
+            # exclusions; peelfeed validates all-or-nothing (400, nothing
+            # written). The fake mirrors that so peekseed's passthrough mapping
+            # is exercised without a real peelfeed.
+            outside = [item_id for item_id in overrides
+                       if item_id not in members]
+            if outside:
+                save_state(state)
+                return fail("overrides must be a subset of the resolved member "
+                            "set; not in scope: " + ", ".join(outside),
+                            2, "validation")
+            overlap = [item_id for item_id in overrides
+                       if item_id in exclusions]
+            if overlap:
+                save_state(state)
+                return fail("overrides must not overlap exclusions: "
+                            + ", ".join(overlap), 2, "validation")
+            entries = [copy_json(entry) for entry in plan.get("entries") or []]
+            entries_by_item = {str(entry.get("item_id")): entry
+                               for entry in entries if isinstance(entry, dict)}
+            not_applicable = {str(item) for item in
+                              state.get("propagate_not_applicable") or []}
+            failed_map = state.get("propagate_failed") or {}
+            active_by_item = active_resolutions(
+                state.get("resolutions") or [])
+            resolved = []
+            locked_conflicts = []
+            failed_members = []
+            overridden_members = []
+            for item_id in members:
+                if item_id in exclusions:
+                    resolved.append({"item_id": item_id, "status": "excluded",
+                                     "reasons": [], "action": None})
+                    continue
+                existing = entries_by_item.get(item_id)
+                if existing is not None and existing.get("locked"):
+                    resolved.append({"item_id": item_id, "status": "locked",
+                                     "reasons": [], "action": None})
+                    locked_conflicts.append(item_id)
+                    continue
+                if existing is not None and existing.get("batch_id"):
+                    resolved.append({"item_id": item_id, "status": "in_batch",
+                                     "reasons": [], "action": None})
+                    locked_conflicts.append(item_id)
+                    continue
+                action = strategy_action(strategy_id, params)
+                failed_reasons = failed_map.get(item_id)
+                # CP6.1 §7.2: a pre-existing decision is ``decided`` unless the
+                # member is in ``overrides``. Detection happens after
+                # locked/in_batch and before not_applicable/failed_check:
+                #   * a confirmed entry whose rebuilt candidate differs or
+                #     cannot be rebuilt;
+                #   * an applied R0 entry;
+                #   * an active projected R0 resolution other than
+                #     ``confirm_known`` (a derived stale row still counts).
+                decided_existing = None
+                if existing is not None:
+                    entry_status = str(existing.get("status") or "")
+                    entry_strategy = existing.get("strategy") or {}
+                    entry_action = existing.get("action") or {}
+                    if entry_status in ("confirmed", "applied"):
+                        same = (
+                            entry_status == "confirmed"
+                            and action is not None
+                            and not failed_reasons
+                            and entry_strategy.get("id") == strategy_id
+                            and int(entry_strategy.get("version") or 0)
+                            == strategy_version
+                            and entry_action.get("params") == action.get("params"))
+                        if entry_status == "applied" or not same:
+                            decided_existing = {
+                                "kind": "entry",
+                                "status": entry_status,
+                                "strategy": {
+                                    "id": str(entry_strategy.get("id") or ""),
+                                    "version": int(
+                                        entry_strategy.get("version") or 1)},
+                                "name": str(entry_action.get("name") or ""),
+                            }
+                if decided_existing is None:
+                    active = active_by_item.get(item_id)
+                    if (active is not None
+                            and active.get("name") != "confirm_known"):
+                        decided_existing = {
+                            "kind": "resolution",
+                            "status": "stale" if resolution_is_stale(
+                                active, by_id.get(item_id) or {})
+                                else "active",
+                            "strategy": None,
+                            "name": str(active.get("name") or ""),
+                        }
+                if decided_existing is not None and item_id not in overrides:
+                    resolved.append({"item_id": item_id, "status": "decided",
+                                     "reasons": [], "action": None,
+                                     "existing": decided_existing})
+                    continue
+                if item_id in not_applicable or action is None:
+                    resolved.append({"item_id": item_id,
+                                     "status": "not_applicable",
+                                     "reasons": ["strategy_not_applicable"],
+                                     "action": None})
+                    failed_members.append(item_id)
+                    continue
+                if failed_reasons:
+                    resolved.append({"item_id": item_id,
+                                     "status": "failed_check",
+                                     "reasons": [str(reason) for reason in
+                                                 failed_reasons],
+                                     "action": None})
+                    failed_members.append(item_id)
+                    continue
+                if decided_existing is not None:
+                    # An overridden ``decided`` member is always written as
+                    # ``ready`` (even when the rebuilt action equals the old
+                    # one) so that the override is explicit (wire §7.2).
+                    resolved.append({"item_id": item_id, "status": "ready",
+                                     "reasons": [], "action": action,
+                                     "existing": decided_existing})
+                    overridden_members.append(item_id)
+                    continue
+                if (existing is not None
+                        and (existing.get("strategy") or {}).get("id")
+                        == strategy_id
+                        and (existing.get("action") or {}).get("params")
+                        == action.get("params")):
+                    resolved.append({"item_id": item_id, "status": "already",
+                                     "reasons": [], "action": action})
+                    continue
+                resolved.append({"item_id": item_id, "status": "ready",
+                                 "reasons": [], "action": action})
+            representative = by_id.get(source_item_id) or {}
+            rep_key = cluster_key.get(
+                str(representative.get("cluster_id") or ""))
+            positives = []
+            boundary_cases = []
+            for row in resolved:
+                if row["status"] != "ready":
+                    continue
+                item = by_id.get(row["item_id"]) or {}
+                key = cluster_key.get(str(item.get("cluster_id") or ""))
+                if key == rep_key:
+                    positives.append(row["item_id"])
+                else:
+                    boundary_cases.append(row["item_id"])
+            counts = {
+                "members": len(resolved),
+                "ready": sum(1 for row in resolved
+                             if row["status"] == "ready"),
+                "already": sum(1 for row in resolved
+                               if row["status"] == "already"),
+                "decided": sum(1 for row in resolved
+                               if row["status"] == "decided"),
+                "failed": sum(1 for row in resolved
+                              if row["status"] in ("failed_check",
+                                                   "not_applicable")),
+                "locked": sum(1 for row in resolved
+                              if row["status"] == "locked"),
+                "excluded": sum(1 for row in resolved
+                                if row["status"] == "excluded"),
+            }
+            response = {
+                "peel_id": peel_id,
+                "review_schema": 2,
+                "dry_run": dry_run,
+                "plan_version": int(plan.get("plan_version") or 0),
+                "scope": copy_json(scope),
+                "strategy": copy_json(strategy),
+                "members": resolved,
+                "positives": positives,
+                "boundary_cases": boundary_cases,
+                "exclusions": exclusions,
+                "overrides": overrides,
+                "counts": counts,
+            }
+            if dry_run:
+                save_state(state)
+                return emit(response)
+            if locked_conflicts:
+                save_state(state)
+                return fail("propagate touches locked/batch-bound members", 2,
+                            "conflict",
+                            {"conflicts": sorted(locked_conflicts)})
+            if failed_members:
+                save_state(state)
+                return fail("propagate has non-excluded failing members", 2,
+                            "validation",
+                            {"reasons": [
+                                {"item_id": row["item_id"],
+                                 "code": row["status"],
+                                 "reasons": row["reasons"]}
+                                for row in resolved
+                                if row["item_id"] in failed_members]})
+            kept = [row["item_id"] for row in resolved
+                    if row["status"] == "decided"]
+            overridden = list(overridden_members)
+            # §7.2: ``selection`` stays "all non-excluded member ids" (kept
+            # members included).
+            selection = [row["item_id"] for row in resolved
+                         if row["status"] != "excluded"]
+            propagation_id = "prop-20261110T120000-" + hashlib.sha256(
+                json.dumps([base, scope, strategy, selection, overrides],
+                           sort_keys=True).encode()).hexdigest()[:4]
+            added = []
+            changed = []
+            unchanged = 0
+            bumped = False
+            new_entries = [copy_json(entry) for entry in entries]
+            resolutions_state = state.setdefault("resolutions", [])
+            for row in resolved:
+                item_id = row["item_id"]
+                if row["status"] == "already":
+                    unchanged += 1
+                    continue
+                if row["status"] != "ready":
+                    # ``decided`` members not in ``overrides`` are kept: no
+                    # entry written, no resolution reverted (wire §7.2).
+                    continue
+                entry_id = "e-" + hashlib.sha256(
+                    item_id.encode("utf-8")).hexdigest()[:16]
+                current = next((entry for entry in new_entries
+                                if entry.get("entry_id") == entry_id), None)
+                revision = 1
+                if current is not None:
+                    revision = int(current.get("revision") or 0) + 1
+                    new_entries = [entry for entry in new_entries
+                                   if entry.get("entry_id") != entry_id]
+                after = {
+                    "entry_id": entry_id,
+                    "item_id": item_id,
+                    "status": "draft",
+                    "stale": False,
+                    "stale_reasons": [],
+                    "locked": False,
+                    "strategy": {"id": strategy_id,
+                                 "version": strategy_version},
+                    "action": copy_json(row["action"]),
+                    "evidence": {"hash": (by_id[item_id].get("evidence")
+                                          or {}).get("hash"), "refs": []},
+                    "dependencies": [],
+                    "capability_snapshot": {"native_lines": True,
+                                            "ocr": None, "vlm": None},
+                    "source": "user",
+                    "origin": {"kind": "propagation",
+                               "propagation_id": propagation_id,
+                               "scope": copy_json(scope),
+                               "strategy": {"id": strategy_id,
+                                            "version": strategy_version},
+                               "base_plan_version": base},
+                    "revision": revision,
+                    "batch_id": None,
+                    "notes": None,
+                }
+                new_entries.append(after)
+                if current is None:
+                    added.append(copy_json(after))
+                else:
+                    changed.append({"item_id": item_id,
+                                    "before": copy_json(current),
+                                    "after": copy_json(after)})
+                bumped = True
+                # CP6.1 §7.1: writing a new entry for an item reverts that
+                # item's active R0 resolution in the same review lock (every
+                # active name, including ``confirm_known``). Kept ``decided``
+                # members never reach this branch.
+                active = active_by_item.get(item_id)
+                if active is not None:
+                    reverted = revert_resolution_record(active)
+                    resolutions_state.append(reverted)
+            new_entries.sort(key=lambda entry: str(entry.get("entry_id") or ""))
+            plan_version_after = int(plan.get("plan_version") or 0)
+            if bumped:
+                plan_version_after += 1
+                plan["plan_version"] = plan_version_after
+                plan["updated_at"] = "2026-11-10T12:00:00Z"
+            plan["entries"] = new_entries
+            state["plan"] = plan
+            diff = {"added": added, "changed": changed, "removed": [],
+                    "unchanged": unchanged}
+            record = {
+                "schema_version": 1,
+                "propagation_id": propagation_id,
+                "peel_id": peel_id,
+                "created_at": "2026-11-10T12:00:00Z",
+                "operator": operator,
+                "scope": copy_json(scope),
+                "strategy": copy_json(strategy),
+                "params": copy_json(params),
+                "base_plan_version": base,
+                "exclusions": exclusions,
+                "overrides": overrides,
+                "selection": selection,
+                "kept": kept,
+                "overridden": overridden,
+                "members": copy_json(resolved),
+                "positives": positives,
+                "boundary_cases": boundary_cases,
+                "changed": bool(bumped),
+                "plan_version_after": plan_version_after,
+                "diff": diff,
+            }
+            state.setdefault("propagations", {})[propagation_id] = record
+            response.update({
+                "propagation_id": propagation_id,
+                "plan_version": plan_version_after,
+                "diff": diff,
+                "changed": bool(bumped),
+                # CP6.1 §7.5 lists kept/overridden among the passed-through
+                # response fields; the authoritative audit record also carries
+                # them (§7.2). The fake is additive here (the UI ignores them).
+                "kept": kept,
+                "overridden": overridden,
+            })
+            save_state(state)
+            return emit(response)
         if action not in ("select", "confirm", "lock", "unlock", "defer",
                           "accept", "clear"):
             return fail("unknown plan action: " + str(action), 2, "validation")
@@ -1484,6 +2243,20 @@ def main():
             if not isinstance(item_ids, list) or not item_ids:
                 return fail("item_ids is required", 2, "validation")
             state.setdefault("accept_requests", []).append(copy_json(request))
+            # CP5.1 H5 (wire §10.5): optional per-item adoption sources. Keys
+            # must be requested item ids, values rule|vlm.
+            sources = request.get("sources")
+            requested = [str(raw) for raw in item_ids]
+            if sources is not None:
+                if not isinstance(sources, dict):
+                    return fail("sources must be an object", 2, "validation")
+                for raw_key, raw_value in sources.items():
+                    if str(raw_key) not in requested:
+                        return fail("sources key is not a requested item id: "
+                                    + str(raw_key), 2, "validation")
+                    if raw_value not in ("rule", "vlm"):
+                        return fail("sources value must be 'rule' or 'vlm'",
+                                    2, "validation")
             items_by_id = {item.get("id"): item
                            for item in review.get("items") or []
                            if isinstance(item, dict)}
@@ -1493,7 +2266,7 @@ def main():
                 item_id = suggestion.get("item_id")
                 status = (suggestion.get("validator") or {}).get("status")
                 if status == "ready":
-                    ready.setdefault(item_id, suggestion)
+                    ready.setdefault(item_id, []).append(suggestion)
                 elif status == "failed_check":
                     failed.setdefault(item_id, suggestion)
             reasons = []
@@ -1520,7 +2293,39 @@ def main():
                         "message": "item is stale: " + ", ".join(
                             str(code) for code in stale_reasons)})
                     continue
-                suggestion = ready.get(item_id)
+                suggestions = ready.get(item_id) or []
+                suggestion = None
+                if sources is not None and item_id in sources:
+                    wanted = sources[item_id]
+                    suggestion = next(
+                        (candidate for candidate in suggestions
+                         if suggestion_source(candidate) == wanted), None)
+                    if suggestion is None:
+                        reasons.append({
+                            "item_id": item_id, "code": "source_missing",
+                            "message": "no ready %%s suggestion for this item"
+                                       %% wanted})
+                        continue
+                elif len(suggestions) == 1:
+                    suggestion = suggestions[0]
+                elif len(suggestions) > 1:
+                    identities = {suggestion_action_identity(candidate)
+                                  for candidate in suggestions}
+                    if len(identities) == 1:
+                        # Same action identity: adopt the rule one (rule
+                        # preferred, wire §10.5).
+                        suggestion = next(
+                            (candidate for candidate in suggestions
+                             if suggestion_source(candidate) == "rule"),
+                            suggestions[0])
+                    else:
+                        reasons.append({
+                            "item_id": item_id,
+                            "code": "ambiguous_suggestion",
+                            "message": "several ready suggestions with "
+                                       "different actions; specify "
+                                       "sources[item_id]"})
+                        continue
                 if suggestion is None:
                     if item_id in failed:
                         failed_reasons = ((failed[item_id].get("validator") or {})
@@ -1544,6 +2349,7 @@ def main():
                     {"item_ids": [str(raw) for raw in item_ids],
                      "reasons": reasons})
             accepted = []
+            accept_origin = report_origin(report)
             for item_id, suggestion in resolved:
                 strategy = suggestion.get("strategy") or {}
                 strategy_id = str(strategy.get("id") or "")
@@ -1552,6 +2358,7 @@ def main():
                 if created_action is None:
                     return fail("unknown strategy: " + strategy_id,
                                 2, "validation")
+                adopted_source = suggestion_source(suggestion)
                 entry_id = "e-" + hashlib.sha256(
                     item_id.encode("utf-8")).hexdigest()[:16]
                 match = next((candidate for candidate in entries
@@ -1577,7 +2384,8 @@ def main():
                     "dependencies": [],
                     "capability_snapshot": {"native_lines": True,
                                             "ocr": None, "vlm": None},
-                    "source": suggestion.get("source") or "rule",
+                    "source": adopted_source,
+                    "origin": copy_json(accept_origin),
                     "revision": revision,
                     "batch_id": None,
                     "notes": None,
@@ -1601,6 +2409,8 @@ def main():
                     "strategy": match["strategy"],
                     "action": created_action,
                     "status": match["status"],
+                    "source": adopted_source,
+                    "origin": copy_json(accept_origin),
                     "revision": revision,
                     "replaced_existing": replaced,
                 })
@@ -1717,12 +2527,46 @@ def main():
         peel_id = first_positional(rest)
         if peel_id not in peels:
             return fail("no such peel", 3, "not_found")
-        if "--with-vlm" in rest:
-            return fail("VLM reports are not available in CP3", 2, "validation")
+        with_vlm = "--with-vlm" in rest
         request = {}
         if option(rest, "--input") is not None:
             request = read_stdin_json() or {}
-            state.setdefault("review_report_requests", []).append(request)
+            if with_vlm:
+                state.setdefault("review_vlm_requests", []).append(
+                    copy_json(request))
+            else:
+                state.setdefault("review_report_requests", []).append(request)
+        if with_vlm:
+            # CP5 wire §2.1: ``--with-vlm`` requires the frozen VLM request
+            # {mode:"vlm", confirmation:{…}}; the real peelfeed re-checks the
+            # confirmation against its env and the resolved scope.
+            if not isinstance(request, dict) or request.get("mode") != "vlm":
+                save_state(state)
+                return fail("--with-vlm needs {mode:'vlm', confirmation:{…}}",
+                            2, "validation")
+            confirmation = request.get("confirmation")
+            if (not isinstance(confirmation, dict)
+                    or confirmation.get("confirmed") is not True):
+                save_state(state)
+                return fail("privacy confirmation is required",
+                            2, "privacy_confirmation_required")
+            error = state.get("review_vlm_error")
+            if error:
+                save_state(state)
+                return fail(error.get("message") or "VLM report failed",
+                            int(error.get("exit") or 2),
+                            error.get("code") or "vlm_unavailable",
+                            error.get("detail"))
+            job = new_job("report", result_ref="report.json",
+                          nonce=len(state.get("jobs") or {}))
+            state.setdefault("jobs", {})[job["job_id"]] = job
+            # The real job replaces report.json with the VLM report; tests can
+            # install the post-job review payload to assert the UI render.
+            if state.get("review_after_vlm_report"):
+                state["review"] = copy_json(state["review_after_vlm_report"])
+            save_state(state)
+            return emit({"job_id": job["job_id"], "status": "queued",
+                         "result_ref": None})
         # CP3: a persistent ``report`` job; the fake job is terminal immediately
         # (the poller never waits for a fake process) and the report payload is
         # still available in ``state["review_report"]`` for assertions.
@@ -1732,6 +2576,123 @@ def main():
         save_state(state)
         return emit({"job_id": job["job_id"], "status": "queued",
                      "result_ref": None})
+
+    if command == "discuss":
+        # CP5 wire §2.1/§4: one persistent ``discuss`` job; stdin is the frozen
+        # {conversation_id?, scope, message, base_plan_version, confirmation}.
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for discuss", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            save_state(state)
+            return fail("discuss input must be a JSON object", 2, "validation")
+        state.setdefault("discuss_requests", []).append(copy_json(request))
+        confirmation = request.get("confirmation")
+        if (not isinstance(confirmation, dict)
+                or confirmation.get("confirmed") is not True):
+            save_state(state)
+            return fail("privacy confirmation is required",
+                        2, "privacy_confirmation_required")
+        scope = request.get("scope")
+        if not isinstance(scope, dict):
+            save_state(state)
+            return fail("scope is required", 2, "validation")
+        selectors = 0
+        for key in ("item_id", "cluster_id"):
+            if scope.get(key) is not None:
+                selectors += 1
+        if scope.get("peel") is not None:
+            if scope.get("peel") is not True:
+                save_state(state)
+                return fail("scope.peel must be true", 2, "validation")
+            selectors += 1
+        if selectors != 1:
+            save_state(state)
+            return fail("scope needs exactly one selector", 2, "validation")
+        message = request.get("message")
+        if not isinstance(message, str) or not message.strip():
+            save_state(state)
+            return fail("message must be non-empty", 2, "validation")
+        if len(message.strip()) > 4000:
+            save_state(state)
+            return fail("message is longer than 4000 characters", 2,
+                        "validation")
+        base = request.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int) or base < 0:
+            save_state(state)
+            return fail("base_plan_version must be an integer >= 0", 2,
+                        "validation")
+        error = state.get("discuss_error")
+        if error:
+            save_state(state)
+            return fail(error.get("message") or "discussion failed",
+                        int(error.get("exit") or 2),
+                        error.get("code") or "vlm_unavailable",
+                        error.get("detail"))
+        conversations = state.setdefault("conversations", {})
+        conversation_id = request.get("conversation_id")
+        if conversation_id:
+            if conversation_id not in conversations:
+                save_state(state)
+                return fail("unknown conversation: " + str(conversation_id),
+                            3, "not_found")
+        else:
+            conversation_id = "conv-20261109T031000-" + hashlib.sha256(
+                ("conv|" + peel_id + "|" + str(len(conversations))).encode()
+            ).hexdigest()[:4]
+            conversations[conversation_id] = {
+                "schema_version": 1, "type": "conversation",
+                "conversation_id": conversation_id, "peel_id": peel_id,
+                "scope": copy_json(scope), "base_plan_version": base}
+        job = new_job("discuss",
+                      result_ref="conversations/" + conversation_id + ".jsonl",
+                      nonce=len(state.get("jobs") or {}))
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        # Additive assistant-turn result summary (wire §4.3) served through the
+        # peel asset route (GET …/assets/extract/review/jobs/<id>.result.json).
+        # CP5.1 H5: the assistant turn number is archived so ``plan patch`` with
+        # source:"vlm" can compare the submitted patch with it (identical -> vlm,
+        # edited -> user) and record the conversation origin.
+        conversation = conversations[conversation_id]
+        assistant_turns = conversation.setdefault("assistant_turns", [])
+        turn_number = 2 + 2 * len(assistant_turns)
+        result = {
+            "schema_version": 1, "job_id": job["job_id"], "peel_id": peel_id,
+            "build_id": "b20261109T031000-abcdef12",
+            "conversation_id": conversation_id,
+            "turn": turn_number, "role": "assistant", "at": "2026-11-09T03:10:00Z",
+            "intent": "explain", "reply": "按当前报告，该簇的规则建议是可靠的。",
+            "uncertainties": [], "clarifications": [],
+            "patch": None,
+            "model": os.environ.get("PEELFEED_LLM_MODEL") or "fake-model",
+            "link_id": os.environ.get("PEELFEED_LLM_LINK_ID") or "env",
+            "prompt_version": "peel-reviews@1", "vision": False,
+            "cached": False,
+            "usage": {"input_tokens": 10, "output_tokens": 20,
+                      "cost_usd": "0.00"},
+            "evidence_hashes": {}, "base_plan_version": base,
+            "diff": None,
+        }
+        override = state.get("discuss_result")
+        if isinstance(override, dict):
+            result.update(copy_json(override))
+        assistant_turns.append({
+            "turn": int(result.get("turn") or turn_number),
+            "role": "assistant",
+            "patch": copy_json(result.get("patch")),
+            "model": result.get("model"),
+            "prompt_version": result.get("prompt_version"),
+        })
+        conversation["turns"] = int(conversation.get("turns") or 0) + 1
+        state.setdefault("discuss_job_results", {})[job["job_id"]] = result
+        if state.get("review_after_discuss"):
+            state["review"] = copy_json(state["review_after_discuss"])
+        save_state(state)
+        return emit({"job_id": job["job_id"],
+                     "conversation_id": conversation_id, "status": "queued"})
 
     if command == "ocr-check":
         # M2.1 wire §2.8: short provider probe; optional peel id persists the
@@ -2630,6 +3591,136 @@ REVIEW_OCR_UNAVAILABLE = review_ocr_payload(
 
 
 
+
+
+# --- M2.2 CP5: VLM report/discussion fixtures (wire §2.3/§3.5/§4.2/§7) -----
+# The answer link peekseed resolves for report/discuss children (wire §1.3).
+VLM_LINK_ID = "answer-main"
+VLM_MODEL = "qwen2.5-vl-72b"
+VLM_LINK_BASE = "http://127.0.0.1:11434/v1"
+VLM_LINK_KEY_ENV = "PEEKSEED_ANSWER_API_KEY"
+VLM_LINK_KEY = "sk-test-vlm-secret"
+
+# The frozen privacy confirmation (wire §1.2); scope sets are the resolved
+# target item/cluster ids, sorted unique.
+VLM_CONFIRMATION = {
+    "confirmed": True,
+    "provider": "answer_link",
+    "link_id": VLM_LINK_ID,
+    "model": VLM_MODEL,
+    "scope": {
+        "item_ids": ["it-3f9c2a4b6d8e0f1a"],
+        "cluster_ids": ["cl-0f1e2d3c4b5a"],
+        "include_crop": True,
+        "include_original_page": True,
+        "include_adjacent_pages": True,
+        "include_native": True,
+        "include_ocr": True,
+    },
+}
+
+# ``review.capabilities`` additive VLM fields (wire §2.3).
+REVIEW_CAPABILITIES_VLM = {
+    "review_schema": 2, "native_lines": True,
+    "ocr": True, "ocr_configured": True, "ocr_detail": None,
+    "ocr_engine": "rapidocr@1.4.4", "ocr_min_confidence": 0.6,
+    "ocr_status": {"available": True, "checked_at": "2026-11-09T03:10:00Z",
+                   "error": None},
+    "vlm": True, "vlm_detail": None, "vlm_vision": True,
+    "vlm_model": VLM_MODEL, "vlm_link_id": VLM_LINK_ID,
+    "vlm_budget_usd": 2.0, "vlm_spent_usd": 0.0, "vlm_calls": 0,
+    "vlm_vision_checked_at": "2026-11-09T03:10:00Z",
+}
+
+# The additive report object fields (wire §3.5) merged over DEFAULT_REPORT's
+# report object: a VLM report with one partial failure and clarifications.
+DEFAULT_VLM_REPORT = copy_json(DEFAULT_REPORT["report"])
+DEFAULT_VLM_REPORT.update({
+    "status": "partial",
+    "provider": {"kind": "vlm", "model": VLM_MODEL,
+                 "prompt_version": "peel-reviews@1",
+                 "link_id": VLM_LINK_ID, "vision": True, "cached": False,
+                 "text_only": False},
+    "counts": {"suggestions": 2, "auto_archived": 0, "unsupported": 0,
+               "needs_decision": 0, "vlm_suggestions": 2,
+               "clarifications": 1, "failed_checks": 0},
+    "partial_failures": [{"cluster_id": "cl-1a2b3c4d5e6f",
+                          "code": "vlm_bad_response",
+                          "message": "cluster response was void"}],
+    "llm_usage": {"calls": 2, "tokens_input": 1200, "tokens_output": 400,
+                  "cost_usd": "0.00"},
+})
+DEFAULT_VLM_REPORT["clusters"][0]["clarifications"] = [{
+    "question": "第 0 行是否是表头？",
+    "options": ["是，第 0 行", "是，前两行", "不是表头"],
+    "item_id": "it-3f9c2a4b6d8e0f1a",
+}]
+
+# A discuss job's assistant-turn patch (wire §4.2): draft only, never applied.
+VLM_DISCUSS_PATCH = {
+    "scope": {"kind": "cluster", "item_id": None,
+              "cluster_id": "cl-0f1e2d3c4b5a"},
+    "members": ["it-3f9c2a4b6d8e0f1a"],
+    "exclusions": [],
+    "boundary_cases": ["it-8b7a6c5d4e3f2a10"],
+    "changes": [{
+        "op": "select",
+        "item_id": "it-3f9c2a4b6d8e0f1a",
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "params": {"rows": [0]},
+        "evidence_refs": ["asset:table-3-19"],
+        "uncertainties": ["row 0 是否为表头"],
+    }],
+}
+
+# A discuss job's result summary (wire §4.3); the fake CLI merges overrides.
+DEFAULT_VLM_DISCUSS = {
+    "schema_version": 1,
+    "intent": "modify",
+    "reply": "按你的说明，建议把第 0 行作为表头，并保留其他条目不变。",
+    "uncertainties": ["row 0 与数据行相似"],
+    "clarifications": [],
+    "patch": VLM_DISCUSS_PATCH,
+    "model": VLM_MODEL,
+    "link_id": VLM_LINK_ID,
+    "prompt_version": "peel-reviews@1",
+    "vision": True,
+    "cached": False,
+    "usage": {"input_tokens": 900, "output_tokens": 200,
+              "cost_usd": "0.00"},
+    "evidence_hashes": {"it-3f9c2a4b6d8e0f1a": "h"},
+    "base_plan_version": 0,
+    "diff": None,
+}
+
+
+def review_vlm_payload(*, capabilities=None, report=None, items=None,
+                       clusters=None):
+    """A schema-2 review payload with the CP5 additive VLM keys."""
+    review = copy_json(DEFAULT_REVIEW)
+    review["capabilities"] = copy_json(
+        capabilities or REVIEW_CAPABILITIES_VLM)
+    if report is not None:
+        review["report"] = copy_json(report)
+    else:
+        review["report"] = {
+            "status": "ready", "generated_at": "2026-11-09T03:10:00Z",
+            "stale": False,
+            "provider": copy_json(DEFAULT_VLM_REPORT["provider"]),
+            "report": copy_json(DEFAULT_VLM_REPORT),
+        }
+    if items is not None:
+        review["items"] = copy_json(items)
+    if clusters is not None:
+        review["clusters"] = copy_json(clusters)
+    return review
+
+
+REVIEW_VLM = review_vlm_payload()
+REVIEW_VLM_NO_PROVIDER = review_vlm_payload(capabilities=dict(
+    REVIEW_CAPABILITIES_VLM, vlm=False,
+    vlm_detail="VLM 未配置：添加一个启用的 answer link 并设置其 api_key_env",
+    vlm_model=None, vlm_link_id=None, vlm_vision=None))
 
 
 class FakePeelfeedCli:

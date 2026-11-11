@@ -159,6 +159,172 @@ version/tag policy.
   behaviour harness (auto-create once, interrupted manual retry, check 503,
   evidence/low-confidence rendering).
 
+### Added — VLM report, discussion and plan patches (M2.2 CP5)
+
+- **VLM report route.** `POST …/review/reports` now accepts
+  `{mode:"vlm", confirmation, item_ids?, cluster_ids?}` in addition to the
+  unchanged rules body. The frozen privacy confirmation
+  (`{confirmed:true, provider:"answer_link"|"env", link_id, model,
+  scope:{item_ids, cluster_ids, include_crop, include_original_page,
+  include_adjacent_pages, include_native, include_ocr}}`) is validated
+  field-by-field (unknown/missing fields and `confirmed != true` are `400`) and
+  re-resolved against the actual provider: `provider`/`link_id`/`model`
+  mismatch is `400 privacy_confirmation_required`; no usable provider is
+  `503 vlm_unavailable` — in both cases no job is created and no provider call
+  happens. Returns `202 {job_id, status:"queued"}` with a `type:"report"`
+  descriptor in `extraction.review_jobs`.
+- **Discussion route.** `POST …/review/discussions` creates one persistent
+  `discuss` job from `{conversation_id?, scope:{item_id?|cluster_id?|peel:true},
+  message, base_plan_version, confirmation}` (exactly one scope selector,
+  message 1..4000 chars, base int ≥ 0, the same privacy confirmation gate) and
+  returns `202 {job_id, conversation_id, status:"queued"}`. The descriptor is
+  stored with the additive `conversation_id` (dataset schema stays 4); the job
+  returns explanations and a **draft** patch only and never confirms/applies a
+  plan change.
+- **Targeted plan patch route.** `POST …/review/plan/patches` proxies the
+  synchronous `plan patch` command (`{base_plan_version, patch,
+  source:"vlm"|"user", conversation_id?}`) and returns `200` with the new plan
+  and targeted diff (`added`/`changed`/`removed`/`unchanged`); `409` for a base
+  mismatch or locked/batch-bound entries (conflicting item ids surfaced),
+  `400` validation, `404` unknown conversation. It never confirms, applies,
+  builds or publishes.
+- **Answer-link / env provider seam.** Only the user-confirmed
+  `review-report --with-vlm` and `discuss` children receive
+  `PEELFEED_LLM_BASE/MODEL/TOKEN/LINK_ID` in their environment; every other
+  peelfeed child gets the LLM env stripped, and the token is never in argv,
+  stdin, `dataset.json`, a job descriptor, a log line or an error message.
+  peekseed's own `PEELFEED_LLM_BASE/MODEL/TOKEN` env wins over the default
+  answer link (first enabled answer link, same as the Q&A page); missing
+  link/key is `503 vlm_unavailable`. Because peelfeed's read-only
+  `capabilities` child never sees that env, `GET …/review` and
+  `GET …/review/items/{id}` overlay the resolved truth on `capabilities`
+  (`vlm`, `vlm_detail`, `vlm_provider`, `vlm_model`, `vlm_link_id`, preserving
+  peelfeed's `vlm_vision`/budget fields).
+- **Review UI.** A `#reviewVlmBar` shows the provider (answer link/env),
+  model/link, vision, budget and text-only state plus `生成/更新 VLM 报告` and
+  `与 VLM 讨论`; both are disabled with a Chinese reason when
+  `capabilities.vlm` is false while the rules-only report stays usable. Every
+  provider call is gated by the explicit `#reviewVlmConfirm` dialog (provider/
+  link/model, resolved item/cluster counts, five evidence-scope checkboxes and
+  a text-only toggle); nothing is sent without `confirmed:true` (cancel sends
+  no request). `#reviewVlmJob` polls report/discuss jobs, re-attaches persisted
+  descriptors after a reload, and shows interrupted jobs with an explicit
+  manual retry only (never auto-rerun). `#reviewReportProvider` renders the
+  report provider kind/model/vision/cached/text-only, partial failures,
+  clarification counts and usage; VLM suggestions carry a 规则/VLM source
+  badge. `#reviewClarifications` option buttons send a discussion message
+  (never an operation). `#reviewDiscuss` is anchored to the current
+  item/cluster (or whole peel), renders turns/intent, the draft patch,
+  `#reviewDiscussMembers` (positive/boundary/exclusion preview, preview only)
+  and adopts through the synchronous plan/patches route; `#reviewPatchDiff`
+  shows the server diff and `#reviewPatchConflict` shows a 409 conflict list
+  with adopt disabled. A new report never overwrites an editing draft, and no
+  VLM call is implicit anywhere.
+
+### Changed — CP5.1 review fixes (M2.2 CP5.1)
+
+- **Plan accept records adoption source and origin (H5).** `POST …/review/plan`
+  accept bodies may carry `sources:{<item_id>:"rule"|"vlm"}` (strict: an unknown
+  body field, a non-object map, a key that is not a requested item id, or a
+  value other than `rule`/`vlm` is `400`). Without it, an item with several
+  ready suggestions whose action identities differ fails the all-or-nothing
+  accept with `ambiguous_suggestion`; an explicit source with no matching ready
+  suggestion fails with `source_missing`. `accepted[]` rows and plan entries
+  record `source` (`rule`/`vlm`/`user`) and `origin`
+  (`{kind:"report", job_id, model, prompt_version}` for a report accept; `null`
+  for a manual select).
+- **Plan patch records the assistant turn (H5).** `POST …/review/plan/patches`
+  accepts `turn` (int ≥ 1); `source:"vlm"` now requires both `conversation_id`
+  and `turn` (`400` otherwise). peelfeed compares the submitted patch with the
+  archived assistant turn and records `source:"vlm"` only when identical
+  (edited → `"user"`), either way with the conversation `origin`.
+- **LLM tuning env forwarding (H7).** peekseed forwards the non-secret
+  `PEELFEED_LLM_*` tuning variables (`PROMPT_SET`, `TIMEOUT`, `BUDGET_USD`,
+  `PRICE_INPUT`, `PRICE_OUTPUT`, `VISION`, `MAX_CALLS_PER_JOB`,
+  `MAX_CALLS_PER_PEEL`, `MAX_IMAGES_PER_TURN`, `JSON_MODE`) from its own
+  environment to **all** peelfeed children, including read-only
+  `capabilities`/`status`/`review` ones. `PEELFEED_LLM_PROVIDER` is never
+  forwarded; `BASE/MODEL/TOKEN/LINK_ID` stay child-only for
+  `review-report --with-vlm`/`discuss`. The review capability overlay preserves
+  peelfeed's additive `vlm_priced`/`vlm_max_calls_per_peel`; the Review UI shows
+  `费用未计价` when prices are not configured and the per-peel call cap.
+- **Re-extraction state fix (H9).** An in-process active-extraction registry
+  keyed by `(dataset dir, sha256)` is registered before the ingest worker starts
+  and cleared only after the authoritative terminal block is written. While a
+  worker is active, `GET …/sources` skips that source, so re-ingesting an
+  already-ready peel cannot report `extracted` from the previous peel while the
+  new ingest is still running; an index build during that window is still `409
+  no_extracted_sources`. Restart recovery is unchanged when no worker is active.
+- **Review UI H5/H7/H2/H3.** Items with several differing ready suggestions or a
+  cluster flagged `vlm_disagrees` render a per-item `采纳来源` choice (规则/VLM)
+  and send `sources` on 确认选中项; adopting a discussion patch sends the
+  assistant `turn`; the VLM report area renders the additive `skipped` entries
+  with Chinese reason labels (`自动归档`/`已应用`/`已暂缓`/`OCR 未就绪`/`仅提示`/
+  `超过单项上限`/`超过图片上限`/`超过调用上限`/`预算耗尽`/`未分析`) alongside the
+  existing `partial_failures`. Absent fields render nothing, so pre-CP5.1
+  payloads keep working.
+
+### Added — cluster-level plan propagation (M2.2 CP6)
+
+- **Propagation route.** `POST …/review/plan/propagate` proxies the synchronous
+  `peelfeed plan propagate` command (CP6 wire §1/§2) with no model call and no
+  LLM env. The body is the frozen request `{base_plan_version,
+  scope:{kind:"item"|"cluster"|"peel", …}, strategy:{id,version}, params,
+  source_item_id?, exclusions[], dry_run, operator?}` and is validated strictly
+  (unknown request/scope/strategy fields, a scope without exactly one selector,
+  a non-object `params`, a non-list `exclusions`, a non-bool `dry_run` and
+  non-string `source_item_id`/`operator` are `400`). `dry_run:true` returns the
+  member preview and writes nothing; `dry_run:false` writes draft plan entries
+  with `origin:{kind:"propagation", propagation_id, scope, strategy,
+  base_plan_version}` plus the immutable propagation audit record. Locked or
+  batch-bound members that are not excluded are `409 conflict`
+  (`error.details.conflicts`); non-excluded failing members are `400 validation`
+  (`error.details.reasons`, all-or-nothing, nothing written); a repeat no-op
+  apply returns `changed:false` without bumping the plan version. The route
+  never confirms/builds/publishes and never touches the corpus.
+- **Review UI “应用到相似项” panel.** Scope selector (当前项/当前簇/全 peel),
+  read-only strategy/version/params, explicit 预览成员 (`dry_run:true`), member
+  list with status badges/reasons/per-member action summaries, 正例/边界例
+  lists, exclusion checkboxes, and an 应用 button that stays disabled until a
+  preview with the same `base_plan_version` succeeded and every locked/in-batch
+  conflict is excluded. The 409 conflict list and 400 per-member failures are
+  rendered inline; after apply the plan/report view refreshes and the new draft
+  entries carry a 批量 origin badge. Nothing is sent before an explicit preview
+  or apply click.
+
+### Changed — CP6.1 propagation decided/overrides (M2.2 CP6.1)
+
+- **Propagation no longer silently overwrites existing decisions (K1).**
+  `POST …/review/plan/propagate` accepts the CP6.1 additive optional
+  `overrides:[item_id]` (a list of non-empty item-id strings, deduplicated in
+  order; unknown fields are still `400`; envelope/type validation only — the
+  member-set/subset/`exclusions`-overlap checks stay peelfeed's all-or-nothing
+  job and map to `400`). The cleaned field is forwarded only when the caller
+  sent it, and the response is passed through unchanged. Members with a
+  pre-existing decision are `decided` (a differing confirmed entry, an applied
+  R0 entry, or an active non-`confirm_known` R0 resolution; a derived stale
+  resolution still counts) and carry
+  `existing:{kind,status,strategy,name}`; `counts.decided` counts them. Apply
+  keeps them by default (no entry write, no resolution revert, no error; listed
+  in the audit record's `kept`), writes only the overridden `decided` members
+  as `ready` (`overridden`), and reverts every written member's active R0
+  resolution in the same review lock (including `confirm_known`). `decided` is
+  neither a conflict nor a validation error; draft entries are still replaced
+  directly.
+- **Review UI decided/override support.** `REVIEW_PROPAGATE_STATUS_LABEL` gains
+  `decided:'已有决定（默认保留）'`; `decided` rows render the `existing`
+  summary and a `将覆盖` marker when ticked. New
+  `#reviewPropagateOverrides` holds per-member override checkboxes
+  (`data-r="propagate-override"`) for decided members; checked ids are sent as
+  `overrides` in **both** the preview and apply bodies. Opening the panel and
+  every successful preview reset the exclusion and override ticks; toggling
+  repaints without sending a request, and exclusion/override are mutually
+  exclusive per item. The apply-disabled rule is unchanged (`decided` is not a
+  conflict) and the counts summary now shows `decided`. The fake peelfeed CLI
+  mirrors the CP6.1 semantics (`decided`/`existing`, kept-by-default, overridden
+  writes, active-R0 revert rows, `counts.decided`, audit `kept`/`overridden`)
+  for the API and Node stub-DOM tests.
+
 ### Added
 
 - **Structured review API (M2 CP1)**, proxied from the peelfeed CLI:
@@ -213,6 +379,16 @@ version/tag policy.
 
 ### Fixed
 
+- **CP6.2 L1 propagation preview/apply tick consistency.** A successful
+  “应用到相似项” preview now adopts the response-echoed
+  `exclusions`/`overrides` as the current ticks instead of clearing them, so
+  应用 sends exactly the lists the preview was computed with: a member shown
+  已排除 is not written, and a kept `decided` member is written only when it is
+  explicitly overridden and previewed again. `#reviewPropagateOverrides` now
+  lists every member carrying `existing` — including a `ready` member
+  overridden in the preview — so its override can be unticked back to
+  `decided` (kept). Opening the panel still starts with empty ticks (wire
+  §8.1; supersedes the CP6.1 reset behaviour).
 - **CP1.1 review-contract sync.** An R0 plan entry (selecting
   `confirm_no_header`, `keep_visual_fallback` or `keep_original_figure`) is now
   `applied` once confirmed (the R0 resolution is written immediately, no corpus

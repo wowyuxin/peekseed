@@ -40,7 +40,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, contracts
+from . import config, contracts, links
 
 __all__ = [
     "DEFAULT_CHUNK_PROFILE",
@@ -50,6 +50,7 @@ __all__ = [
     "DEFER_REASONS",
     "HANDSHAKE_TTL",
     "LLM_MODES",
+    "LLM_TUNING_ENV",
     "PeelfeedClient",
     "PeelfeedConfigError",
     "PeelfeedError",
@@ -61,6 +62,7 @@ __all__ = [
     "REVIEW_SCHEMA",
     "SHORT_TIMEOUT",
     "STATE_MAP",
+    "VLM_ENV_KEYS",
     "client",
     "config_path",
     "configured",
@@ -75,6 +77,8 @@ __all__ = [
     "reset_cache",
     "seeded",
     "status",
+    "vlm_child_env",
+    "vlm_provider",
 ]
 
 VERSION = 1
@@ -94,9 +98,11 @@ REVIEW_SCHEMA = 2
 #: ``GET …/review?group=`` values (contract §2): merged clusters or by code.
 REVIEW_GROUPS = ("cluster", "code")
 #: ``POST …/review/plan`` actions (contract §7). ``show`` is read-only;
-#: ``accept``/``clear`` are the CP2 additions (contract §11.1, wire §2.6).
+#: ``accept``/``clear`` are the CP2 additions (contract §11.1, wire §2.6);
+#: ``patch`` is the CP5 targeted plan patch (wire §5) and ``propagate`` the CP6
+#: cluster-level propagation (CP6 wire §1); both have their own routes.
 PLAN_ACTIONS = ("show", "select", "confirm", "lock", "unlock", "defer",
-                "accept", "clear")
+                "accept", "clear", "patch", "propagate")
 #: ``plan defer`` reason codes (contract §7).
 DEFER_REASONS = ("unsupported_evidence", "grid_conflict", "not_relevant", "other")
 #: peelfeed persistent job types (contract §11.4 / CP3 wire §2.5). Only
@@ -127,13 +133,36 @@ _ERROR_STATUS = {
     "ocr_unavailable": 503,
     "not_ready": 409,
     "ocr_config_invalid": 400,
+    # CP5 (M2.2) VLM: the provider is unconfigured/unresolvable -> 503 (no job
+    # is created); a privacy-confirmation mismatch is 400 (contract §4).
+    "vlm_unavailable": 503,
 }
 #: ``error [<code>] <message>`` -- peelfeed's stderr first line for an error.
 _ERROR_LINE = re.compile(r"^\s*error\s*\[([A-Za-z0-9_.-]+)\]\s*(.*)$")
-#: Only these variables (plus every PEELFEED_*) reach the peelfeed subprocess;
-#: peekseed's token and API keys never do.
+#: Only these variables (plus every PEELFEED_* except the LLM ones) reach the
+#: peelfeed subprocess; peekseed's token and API keys never do. The
+#: ``PEELFEED_LLM_*`` provider variables are deliberately excluded from the
+#: inherited environment: only a user-confirmed ``review-report --with-vlm`` /
+#: ``discuss`` child gets them, resolved from the default answer link (CP5 wire
+#: §1.3 -- token only in that child's env, never argv/dataset/job/log/error).
 _PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
              "TMPDIR")
+#: The child-only LLM provider variables (CP5 wire §1.3).
+VLM_ENV_KEYS = ("PEELFEED_LLM_BASE", "PEELFEED_LLM_MODEL",
+                "PEELFEED_LLM_TOKEN", "PEELFEED_LLM_LINK_ID")
+#: Non-secret peelfeed LLM tuning variables forwarded from peekseed's own env
+#: to **every** peelfeed child (CP5.1 H7 / wire §10.7), read-only commands
+#: included: prompt set, timeout, budget, prices, vision probe and the per-job/
+#: per-peel/per-turn caps. ``PEELFEED_LLM_PROVIDER`` is deliberately absent:
+#: the local/test command seam must never be forwarded to a production child.
+LLM_TUNING_ENV = ("PEELFEED_LLM_PROMPT_SET", "PEELFEED_LLM_TIMEOUT",
+                  "PEELFEED_LLM_BUDGET_USD", "PEELFEED_LLM_PRICE_INPUT",
+                  "PEELFEED_LLM_PRICE_OUTPUT", "PEELFEED_LLM_VISION",
+                  "PEELFEED_LLM_MAX_CALLS_PER_JOB",
+                  "PEELFEED_LLM_MAX_CALLS_PER_PEEL",
+                  "PEELFEED_LLM_MAX_IMAGES_PER_TURN",
+                  "PEELFEED_LLM_JSON_MODE")
+_LLM_ENV_PREFIX = "PEELFEED_LLM_"
 #: Peel state machine -> peekseed's per-source ``extraction.state``.
 STATE_MAP = {
     "queued": "queued",
@@ -441,6 +470,129 @@ def client(cfg=None, *, timeout=None):
         cfg, timeout=timeout if timeout is not None else cfg["timeout"])
 
 
+# --- VLM provider resolution (CP5 wire §1.2/§1.3) --------------------------
+# Resolution order (design §3.2, Phase 4): peekseed's own ``PEELFEED_LLM_*``
+# env wins; otherwise the default answer link (the first enabled one, same as
+# the Q&A page). The token is read here and injected only into a user-confirmed
+# report/discuss child; :func:`vlm_provider` returns the public descriptor the
+# API overlays on the review payload and the UI shows in the confirmation
+# dialog -- never the token.
+
+_VLM_ENV_KEYS = ("PEELFEED_LLM_BASE", "PEELFEED_LLM_MODEL",
+                 "PEELFEED_LLM_TOKEN")
+
+
+def _clean_token(value):
+    """A provider token, or "" when absent/malformed (never echoed in errors)."""
+    text = str(value or "").strip()
+    if any(ch.isspace() or ord(ch) < 32 for ch in text):
+        return ""
+    return text
+
+
+def _env_vlm_provider():
+    """The provider from peekseed's own ``PEELFEED_LLM_*`` env, or None.
+
+    ``BASE``/``MODEL``/``TOKEN`` must all be set; ``LINK_ID`` defaults to
+    ``"env"`` (the audit/cache identity when no answer link is involved).
+    """
+    base = str(os.environ.get("PEELFEED_LLM_BASE") or "").strip()
+    model = str(os.environ.get("PEELFEED_LLM_MODEL") or "").strip()
+    token = _clean_token(os.environ.get("PEELFEED_LLM_TOKEN"))
+    if not (base and model and token):
+        return None
+    link_id = str(os.environ.get("PEELFEED_LLM_LINK_ID") or "").strip() or "env"
+    return {"provider": "env", "link_id": link_id, "model": model,
+            "base_url": base, "_token": token}
+
+
+def _answer_link_vlm_provider():
+    """``(provider_dict_or_None, reason)`` from the default answer link."""
+    try:
+        link = links.default_answer_link()
+    except links.LinkConfigError as exc:
+        return None, "the model links config is unreadable: %s" % exc
+    if link is None:
+        return None, (
+            "no enabled answer link: add one in Settings and set its "
+            "api_key_env in the deploy env, or set "
+            "PEELFEED_LLM_BASE/MODEL/TOKEN")
+    base = str(link.get("base_url") or "").strip()
+    model = str(link.get("model") or "").strip()
+    if not base or not model:
+        return None, ("answer link '%s' needs base_url and model"
+                      % link.get("id"))
+    key = links.api_key(link)
+    if not key:
+        return None, ("the API key env for answer link '%s' is not set"
+                      % link.get("id"))
+    return {"provider": "answer_link", "link_id": str(link.get("id") or ""),
+            "model": model, "base_url": base, "_token": key}, None
+
+
+def _resolved_vlm_provider():
+    """``(provider_dict_with_token_or_None, reason)``: env first, then link."""
+    env = _env_vlm_provider()
+    if env is not None:
+        return env, None
+    return _answer_link_vlm_provider()
+
+
+def vlm_provider():
+    """The public VLM provider descriptor (never the token).
+
+    ``{provider: "env"|"answer_link", link_id, model, base_url, available,
+    reason}``. Used by the API to overlay ``capabilities.vlm*`` on the review
+    payload: peelfeed's ``capabilities`` child never receives the provider env
+    (only report/discuss children do), so peekseed reports the truth itself.
+    """
+    provider, reason = _resolved_vlm_provider()
+    if provider is None:
+        return {"provider": "answer_link", "link_id": None, "model": None,
+                "base_url": None, "available": False, "reason": reason}
+    return {"provider": provider["provider"],
+            "link_id": provider["link_id"],
+            "model": provider["model"],
+            "base_url": provider["base_url"],
+            "available": True, "reason": None}
+
+
+def vlm_child_env(provider=None):
+    """The child-only provider env for one confirmed report/discuss call.
+
+    Only ``review-report --with-vlm`` and ``discuss`` children receive these
+    four variables; every other peelfeed child gets the LLM env stripped (see
+    :meth:`PeelfeedClient._environment`). The token lives only in this dict and
+    is never put in argv, stdin, a dataset/job descriptor, a log line or an
+    error message (wire §1.3). ``provider`` may be the public descriptor from
+    :func:`vlm_provider`; the token is then re-resolved from the same source.
+    """
+    if provider is None:
+        provider, reason = _resolved_vlm_provider()
+        if provider is None:
+            raise PeelfeedError(
+                503, "error [vlm_unavailable] %s" % reason) from None
+    token = str(provider.get("_token") or "")
+    if not token:
+        if provider.get("provider") == "env":
+            env = _env_vlm_provider()
+            token = env["_token"] if env is not None else ""
+        else:
+            link = links.get(str(provider.get("link_id") or ""))
+            token = links.api_key(link) if link is not None else ""
+    if not token:
+        raise PeelfeedError(
+            503,
+            "error [vlm_unavailable] the VLM provider token is not set",
+        )
+    return {
+        "PEELFEED_LLM_BASE": str(provider.get("base_url") or "").strip(),
+        "PEELFEED_LLM_MODEL": str(provider.get("model") or "").strip(),
+        "PEELFEED_LLM_TOKEN": token,
+        "PEELFEED_LLM_LINK_ID": str(provider.get("link_id") or "env"),
+    }
+
+
 # --- handshake -------------------------------------------------------------
 
 
@@ -735,18 +887,36 @@ class PeelfeedClient(object):
             argv.append("--json")
         return argv
 
-    def _environment(self):
+    def _environment(self, llm_env=None):
+        """The child environment: allowlisted vars plus explicit LLM env only.
+
+        Every ``PEELFEED_*`` variable is forwarded (the OCR config is env-only)
+        **except** the provider credentials: ``PEELFEED_LLM_BASE/MODEL/TOKEN/
+        LINK_ID`` are only injected for a user-confirmed report/discuss child
+        via ``llm_env`` (CP5 wire §1.3) and ``PEELFEED_LLM_PROVIDER`` is never
+        forwarded at all. The non-secret tuning variables
+        (:data:`LLM_TUNING_ENV`: prompt set, timeout, budget, prices, vision and
+        the per-job/per-peel/per-turn caps) ARE forwarded to **every** child --
+        including the read-only ``capabilities``/``status``/``review`` ones --
+        so a deployed ``PEELFEED_LLM_*`` config reaches the engine that needs it
+        (CP5.1 H7 / wire §10.7). peekseed's own token/API keys never pass.
+        """
         env = {key: value for key, value in os.environ.items()
-               if key in _PASS_ENV or key.startswith("PEELFEED_")}
+               if key in _PASS_ENV
+               or (key.startswith("PEELFEED_")
+                   and (key in LLM_TUNING_ENV
+                        or not key.startswith(_LLM_ENV_PREFIX)))}
         env["PEELFEED_SHARED_DIR"] = str(config.paths().shared_dir)
         if self.cfg.get("python") and not self.cfg.get("cli"):
             repo = self.cfg.get("repo") or ""
             if repo:
                 env["PYTHONPATH"] = repo
+        if llm_env:
+            env.update({str(key): str(value) for key, value in llm_env.items()})
         return env
 
     def _run(self, args, *, timeout=None, root=True, json_flag=True,
-             stdin_text=None):
+             stdin_text=None, llm_env=None):
         argv = self._argv(args, root=root, json_flag=json_flag)
         try:
             completed = subprocess.run(
@@ -756,7 +926,7 @@ class PeelfeedClient(object):
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout or self.timeout,
-                env=self._environment(),
+                env=self._environment(llm_env=llm_env),
                 input=stdin_text,
             )
         except subprocess.TimeoutExpired:
@@ -847,6 +1017,14 @@ class PeelfeedClient(object):
             # Accept is all-or-nothing: keep every per-item reason readable for
             # the UI instead of truncating the list to three entries.
             return code, reason[:1000]
+        # CP5 wire §5: a targeted plan patch rejected by locked/batch-bound
+        # entries lists the conflicting item ids in error.details.conflicts;
+        # keep them in the readable reason so the UI can show the conflict list.
+        conflicts = detail.get("conflicts") if isinstance(detail, dict) else None
+        if isinstance(conflicts, list) and conflicts:
+            reason = "%s (conflicts: %s)" % (
+                reason, ", ".join(str(item) for item in conflicts))
+            return code, reason[:1000]
         return code, reason[:300]
 
     def _error_detail(self, completed):
@@ -925,12 +1103,26 @@ class PeelfeedClient(object):
         ``--entry <id> --base-plan-version <n>``; ``show`` is read-only. The
         response is the latest complete ReviewPlan plus ``entry``/``resolution``
         and the CP2 additive ``accepted``/``cleared``/``refresh`` objects.
+
+        CP5.1 (H5 / wire §10.5): an ``accept`` request may also carry
+        ``sources: {<item_id>: "rule"|"vlm"}``; the API validates it strictly
+        and this adapter passes it through verbatim. ``accepted[]`` entries then
+        carry ``source`` and ``origin``.
         """
         request = dict(payload or {})
         action = str(request.pop("action", "") or "").strip().lower()
         if action not in PLAN_ACTIONS:
             raise ValueError("plan action must be one of %s"
                              % ", ".join(PLAN_ACTIONS))
+        if action == "patch":
+            # CP5: the targeted plan patch is synchronous and has its own
+            # frozen stdin shape (wire §5); use :meth:`plan_patch`.
+            raise ValueError("plan patch uses PeelfeedClient.plan_patch()")
+        if action == "propagate":
+            # CP6: cluster-level propagation is synchronous and has its own
+            # frozen stdin shape (CP6 wire §1); use :meth:`plan_propagate`.
+            raise ValueError("plan propagate uses "
+                             "PeelfeedClient.plan_propagate()")
         args = ["plan", str(peel_id), action]
         stdin_text = None
         if action in ("select", "defer", "accept"):
@@ -948,27 +1140,130 @@ class PeelfeedClient(object):
         return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout),
                          stdin_text=stdin_text)
 
-    def review_report(self, peel_id, item_ids=None, cluster_ids=None):
-        """``peelfeed review-report <peel_id> [--input -]`` (contract §5).
+    def review_report(self, peel_id, item_ids=None, cluster_ids=None, *,
+                      mode="rules", confirmation=None, timeout=None):
+        """``peelfeed review-report <peel_id> [--input -] [--with-vlm]``.
 
-        CP3 (wire §2.6): the command creates a persistent ``report`` job and
-        returns ``{"job_id", "status": "queued", "result_ref": null}``; the job
-        writes ``extract/review/report.json`` when it finishes (poll ``job
+        CP3 (wire §2.6): the rules command creates a persistent ``report`` job
+        and returns ``{"job_id", "status": "queued", "result_ref": null}``; the
+        job writes ``extract/review/report.json`` when it finishes (poll ``job
         show``). The optional request filters items/clusters are passed through
         as the job payload (rules-only CP3 reports are full-peel).
+
+        CP5 (wire §1.3/§2.1): ``mode="vlm"`` sends ``--with-vlm`` and the frozen
+        stdin ``{"mode":"vlm","confirmation":{…},"item_ids":[…],
+        "cluster_ids":[…]``; the provider is resolved from the default answer
+        link and injected **only into this child's env** (never argv/stdin).
+        A missing link/key raises 503 ``vlm_unavailable`` before the CLI runs
+        (no job is created); the route validates/compares the confirmation
+        before calling this.
         """
+        mode = str(mode or "rules").strip().lower()
+        if mode not in ("rules", "vlm"):
+            raise ValueError("review-report mode must be 'rules' or 'vlm'")
         args = ["review-report", str(peel_id)]
         request = {}
+        llm_env = None
         if item_ids:
             request["item_ids"] = [str(item) for item in item_ids]
         if cluster_ids:
             request["cluster_ids"] = [str(cluster) for cluster in cluster_ids]
-        stdin_text = None
-        if request:
+        if mode == "vlm":
+            if not isinstance(confirmation, dict) or not confirmation:
+                raise ValueError("a VLM report needs a confirmation object")
+            llm_env = vlm_child_env()
+            args.append("--with-vlm")
+            request = {"mode": "vlm", "confirmation": confirmation}
+            if item_ids:
+                request["item_ids"] = [str(item) for item in item_ids]
+            if cluster_ids:
+                request["cluster_ids"] = [str(cluster) for cluster in cluster_ids]
             args.extend(["--input", "-"])
             stdin_text = json.dumps(request, ensure_ascii=False)
-        return self._run(args, timeout=min(SHORT_TIMEOUT, self.timeout),
-                         stdin_text=stdin_text)
+        else:
+            stdin_text = None
+            if request:
+                args.extend(["--input", "-"])
+                stdin_text = json.dumps(request, ensure_ascii=False)
+        return self._run(args, timeout=timeout or min(SHORT_TIMEOUT,
+                                                     self.timeout),
+                         stdin_text=stdin_text, llm_env=llm_env)
+
+    def discuss(self, peel_id, request):
+        """``peelfeed discuss <peel> --input -``: one persistent discussion job.
+
+        CP5 wire §2.1/§4: stdin is the frozen request
+        ``{conversation_id?, scope:{…}, message, base_plan_version,
+        confirmation:{…}}``; the job appends a conversation turn and returns
+        ``{"job_id","conversation_id","status":"queued"}``. The provider is
+        resolved from the default answer link and injected only into this
+        child's env (wire §1.3); a missing link/key is 503 ``vlm_unavailable``
+        before the CLI runs. ``request`` is already validated by the route.
+        """
+        if not isinstance(request, dict) or not request:
+            raise ValueError("discuss needs a request object")
+        llm_env = vlm_child_env()
+        return self._run(
+            ["discuss", str(peel_id), "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+            llm_env=llm_env,
+        )
+
+    def plan_patch(self, peel_id, request):
+        """``peelfeed plan patch <peel> --input -``: synchronous targeted patch.
+
+        CP5 wire §5: stdin ``{base_plan_version, patch, source:"vlm|user",
+        conversation_id?}``; no model call and no LLM env (the patch was
+        produced by an earlier discuss job, or by the user). CP5.1 (H5 / wire
+        §10.5) adds ``turn`` (int ≥ 1), required with ``source:"vlm"``: peelfeed
+        compares the submitted patch with the archived assistant turn and
+        records ``source:"vlm"`` only when identical (edited → ``"user"``),
+        either way with the conversation ``origin``. The plan never
+        confirms/applies anything: the response is the new plan plus the
+        targeted ``diff``; a base/locked/batch conflict is ``error [conflict]``
+        (409) and invalid content is ``error [validation]`` (400).
+        """
+        if not isinstance(request, dict) or not request:
+            raise ValueError("plan patch needs a request object")
+        return self._run(
+            ["plan", str(peel_id), "patch", "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+        )
+
+    def plan_propagate(self, peel_id, request):
+        """``peelfeed plan propagate <peel> --input -``: synchronous propagation.
+
+        CP6 wire §1: stdin is the frozen request ``{base_plan_version,
+        scope:{kind:"item|cluster|peel", …}, strategy:{id,version}, params,
+        source_item_id?, exclusions[], dry_run, operator}``; CP6.1 (wire
+        §7.2/§7.5) adds the optional ``overrides:[item_id]`` list. peelfeed
+        resolves the member set, rebuilds and validates every member's action
+        from its own evidence, and either returns the preview (``dry_run:true``,
+        nothing written) or writes the draft plan entries plus the propagation
+        audit record. A member with a pre-existing decision (a differing
+        confirmed entry, an applied R0 entry, or an active non-``confirm_known``
+        resolution) is ``decided`` and kept by default; only members listed in
+        ``overrides`` are written as ``ready`` (and their active R0 resolution
+        is reverted in the same review lock, §7.1). The response carries
+        ``overrides``/``counts.decided`` and may carry ``existing`` member rows;
+        the audit record carries ``kept``/``overridden``. No model call and no
+        LLM env: the route is synchronous and the request is validated by the
+        API before this adapter is called. A base mismatch or locked/batch-bound
+        non-excluded member is ``error [conflict]`` (409,
+        ``error.details.conflicts``); a non-excluded
+        ``not_applicable``/``failed_check`` member is ``error [validation]``
+        (400, ``error.details.reasons``). It never confirms/applies/builds/
+        publishes and never touches the corpus.
+        """
+        if not isinstance(request, dict) or not request:
+            raise ValueError("plan propagate needs a request object")
+        return self._run(
+            ["plan", str(peel_id), "propagate", "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+        )
 
     # --- on-demand OCR (M2.1 CP4; contract §4 additions, wire §2.8) ---
     # CP4.1 G1: this client NEVER sends a caller-supplied ``provider`` object.

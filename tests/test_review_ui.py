@@ -1475,3 +1475,1796 @@ class ReviewUiOcrBehaviorTests(unittest.TestCase):
         self.assertIn("0.55", evidence["low"], evidence)
         self.assertIn("OCR 未识别到文字", evidence["empty"], evidence)
         self.assertEqual(evidence["uncoveredIds"], ["it-fig"], evidence)
+
+
+# ---------------------------------------------------------------------------
+# CP5 (M2.2) served-HTML assertions: the VLM bar, the explicit privacy
+# confirmation dialog, the VLM job panel, the report provider summary, the
+# clarifications and the discussion/patch panel all ship with the frozen stable
+# ids and Chinese labels (wire-contract §7).
+# ---------------------------------------------------------------------------
+
+class ReviewUiCp5Tests(unittest.TestCase):
+    def test_review_modal_ships_the_cp5_vlm_containers(self):
+        text = _ui()
+        for marker in (
+                'id="reviewVlmBar"', 'id="reviewVlmJob"',
+                'id="reviewReportProvider"', 'id="reviewClarifications"',
+                'id="reviewDiscuss"', 'id="reviewVlmConfirm"',
+                'id="reviewVlmConfirmGo"', 'id="reviewVlmConfirmCancel"',
+                'id="reviewVlmConfirmCancelBtn"',
+                'id="reviewVlmScopeCrop"', 'id="reviewVlmScopeOriginalPage"',
+                'id="reviewVlmScopeAdjacentPages"', 'id="reviewVlmScopeNative"',
+                'id="reviewVlmScopeOcr"', 'id="reviewVlmTextOnly"',
+                'id="reviewDiscussScope"', 'id="reviewDiscussInput"',
+                'id="reviewDiscussSend"', 'id="reviewDiscussTurns"',
+                'id="reviewDiscussPatch"', 'id="reviewDiscussAdoptPatch"',
+                'id="reviewDiscussMembers"', 'id="reviewPatchDiff"',
+                'id="reviewPatchConflict"'):
+            self.assertIn(marker, text)
+        # The generated bar buttons carry the frozen stable ids.
+        self.assertIn('id="reviewVlmGenerate"', text)
+        self.assertIn('id="reviewVlmDiscuss"', text)
+        # Dialog lives inside the review modal, before the workspace modal.
+        modal = text.index('id="reviewModal"')
+        confirm = text.index('id="reviewVlmConfirm"')
+        workspace = text.index('id="workspaceModal"')
+        self.assertLess(modal, confirm)
+        self.assertLess(confirm, workspace)
+
+    def test_vlm_actions_are_gated_and_never_implicit(self):
+        text = _ui()
+        for marker in (
+                "function reviewVlmBarHtml", "function paintReviewVlmBar",
+                "function reviewVlmGenerateOpen", "function reviewVlmConfirmOpen",
+                "function reviewVlmConfirmClose", "function reviewVlmConfirmed",
+                "function reviewVlmStartReport", "function reviewVlmStartDiscuss",
+                "function reviewVlmPollJob", "function reviewVlmRetry",
+                "function reviewVlmResultSummary", "function reviewVlmJobs",
+                "function paintReviewVlmJob", "function paintReviewReportProvider",
+                "function paintReviewClarifications", "function reviewDiscussOpen",
+                "function reviewDiscussSendOpen", "function reviewDiscussAdoptPatch",
+                "function reviewClarificationAnswer", "function paintReviewPatchDiff",
+                "function paintReviewPatchConflict", "function reviewVlmProviderLabel",
+                "REVIEW_VLM_INTENT_LABEL", "REVIEW_VLM_JOB_TYPES"):
+            self.assertIn(marker, text)
+        # Painting the bar/provider/clarifications never issues a request.
+        bar_start = text.index("function reviewVlmBarHtml")
+        bar_end = text.index("function reviewReportProviderInfo")
+        bar_body = text[bar_start:bar_end]
+        for forbidden in ("reviewFetchJSON", "/reports", "/discussions",
+                          "fetch("):
+            self.assertNotIn(forbidden, bar_body)
+        provider_start = text.index("function reviewReportProviderHtml")
+        provider_end = text.index("function paintReviewClarifications")
+        self.assertNotIn("reviewFetchJSON",
+                         text[provider_start:provider_end])
+        # Explicit confirmation gate: the only confirmed:true is built in
+        # reviewVlmConfirmed, and both start functions are called from there.
+        confirmed_start = text.index("function reviewVlmConfirmed")
+        confirmed_end = text.index("async function reviewVlmStartReport")
+        confirmed_body = text[confirmed_start:confirmed_end]
+        self.assertIn("confirmed:true", confirmed_body)
+        self.assertIn("reviewVlmStartReport(payload,confirmation)",
+                      confirmed_body)
+        self.assertIn("reviewVlmStartDiscuss(payload,confirmation)",
+                      confirmed_body)
+        # Every provider call uses the frozen routes.
+        self.assertIn("+'/reports'", text)
+        self.assertIn("+'/discussions'", text)
+        self.assertIn("+'/plan/patches'", text)
+        # Patch adoption is synchronous and never a /review/plan action.
+        adopt_start = text.index("async function reviewDiscussAdoptPatch")
+        adopt_end = text.index("function reviewVlmRetry")
+        adopt_body = text[adopt_start:adopt_end]
+        self.assertNotIn("reviewVlmPollJob", adopt_body)
+        self.assertNotIn("+'/plan'", adopt_body)
+        self.assertIn("source:'vlm'", adopt_body)
+        self.assertIn("patchConflict", adopt_body)
+        self.assertIn("采纳按钮已禁用", text)
+        # A clarification option sends a discussion message, never an
+        # operation: it only opens the confirmation dialog.
+        clar_start = text.index("function reviewClarificationAnswer")
+        clar_end = text.index("async function reviewDiscussAdoptPatch")
+        clar_body = text[clar_start:clar_end]
+        self.assertIn("reviewVlmConfirmOpen('clarify'", clar_body)
+        self.assertNotIn("+'/plan'", clar_body)
+        self.assertNotIn("+'/batches'", clar_body)
+        # Interrupted report/discuss jobs only retry on an explicit action.
+        self.assertIn('data-r="vlm-retry"', text)
+        self.assertIn("任务中断，可手动重试", text)
+        self.assertIn("不会自动重跑", text)
+        self.assertIn("function reviewVlmRetry", text)
+        # No-VLM degradation stays fully usable and shows a Chinese reason.
+        self.assertIn("VLM 未配置", text)
+        self.assertIn("规则报告仍可用", text)
+        self.assertIn("reviewVlmUsable", text)
+        # Report provider / source badge / partial failures.
+        self.assertIn("reviewSuggestionSourceBadge", text)
+        self.assertIn("VLM 建议", text)
+        self.assertIn("部分簇失败", text)
+        self.assertIn("partial_failures", text)
+        self.assertIn("text-only", text)
+        self.assertIn("vlm_provider", text)
+        self.assertIn("VLM 后台任务", text)
+        # Discussion scope selector labels (current item / current cluster /
+        # whole peel) and the member/boundary/exclusion preview.
+        for label in ("当前项", "当前簇", "全 peel", "成员预览", "正例",
+                      "边界例", "排除项"):
+            self.assertIn(label, text)
+        # Nothing in the UI sends a provider override or a token.
+        self.assertNotIn("PEELFEED_LLM_TOKEN", text)
+        self.assertNotIn("api_key", text[text.index("function reviewVlmBarHtml"):
+                                        text.index("/* ---- workspace dialog")])
+
+    def test_served_page_ships_cp51_source_choice_and_skipped_controls(self):
+        """CP5.1 H5/H7/H2/H3: source choice, vlm_disagrees, pricing, skipped."""
+        text = _ui()
+        for marker in (
+                "function reviewItemSourceChoice",
+                "function reviewItemSourceChoiceHtml",
+                "function reviewItemSourceNoticeHtml",
+                "function reviewSelectedSources",
+                "function reviewSuggestionIdentity",
+                "function reviewItemCluster",
+                "data-r=\"accept-source\"",
+                "vlm_disagrees",
+                "采纳来源",
+                "ambiguous_suggestion",
+                "source_missing",
+                "REVIEW_SKIPPED_REASON_LABEL",
+                "reviewSkippedReasonLabel",
+                "跳过的簇/项",
+                "费用未计价",
+                "vlm_priced",
+                "vlm_max_calls_per_peel",
+                "pendingPatchTurn",
+                "body.turn=ctx.pendingPatchTurn",
+                "每 peel 调用上限"):
+            self.assertIn(marker, text)
+        # The confirm-selected request carries the sources map only when a
+        # source choice is rendered for a ticked item.
+        accept_start = text.index("}else if(kind==='accept-selected'){")
+        accept_end = text.index("}else if(kind==='clear'){", accept_start)
+        accept_body = text[accept_start:accept_end]
+        self.assertIn("reviewSelectedSources()", accept_body)
+        self.assertIn("body.sources=sources", accept_body)
+        # Adopting a discussion patch sends the assistant turn number.
+        adopt_start = text.index("async function reviewDiscussAdoptPatch")
+        adopt_end = text.index("function reviewVlmRetry", adopt_start)
+        adopt_body = text[adopt_start:adopt_end]
+        self.assertIn("body.turn=ctx.pendingPatchTurn", adopt_body)
+        # Skipped reasons are rendered in the VLM report area, not the plan.
+        provider_start = text.index("function reviewReportProviderHtml")
+        provider_end = text.index("function paintReviewReportProvider",
+                                  provider_start)
+        provider_body = text[provider_start:provider_end]
+        self.assertIn("skipped", provider_body)
+        self.assertIn("reviewSkippedReasonLabel", provider_body)
+
+    def test_served_page_ships_cp5_vlm_controls(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+
+            response = TestClient(app_module.create_app()).get("/")
+            self.assertEqual(response.status_code, 200, response.text)
+            page = response.text
+        for marker in ('id="reviewVlmBar"', 'id="reviewVlmJob"',
+                       'id="reviewVlmConfirm"', 'id="reviewVlmConfirmGo"',
+                       'id="reviewReportProvider"', 'id="reviewClarifications"',
+                       'id="reviewDiscuss"', 'id="reviewPatchDiff"',
+                       'id="reviewPatchConflict"',
+                       "生成/更新 VLM 报告", "与 VLM 讨论",
+                       "确认发送审阅证据给 VLM？", "确认并发送",
+                       "仅文本（不发送图片）", "VLM 后台任务",
+                       "任务中断，可手动重试", "不会自动重跑",
+                       "VLM 未配置", "规则报告仍可用",
+                       "reviewVlmGenerateOpen", "reviewVlmConfirmed",
+                       "reviewDiscussSendOpen", "reviewDiscussAdoptPatch",
+                       "reviewClarificationAnswer", "paintReviewVlmBar",
+                       "paintReviewReportProvider", "paintReviewClarifications",
+                       "paintReviewVlmJob", "paintReviewDiscuss",
+                       "'/reports'", "'/discussions'", "'/plan/patches'"):
+            self.assertIn(marker, page)
+        # CP5: the confirmation dialog is the only path to a provider call; the
+        # UI never carries the child-only token.
+        self.assertNotIn("PEELFEED_LLM_TOKEN", page)
+        self.assertNotIn("PEELFEED_LLM_BASE", page)
+
+
+class ReviewUiCp6Tests(unittest.TestCase):
+    """CP6 (M2.2 Phase 5) wire §3: the 应用到相似项 propagation panel."""
+
+    def test_review_modal_ships_the_propagation_panel_hooks(self):
+        text = _ui()
+        for marker in (
+                'id="reviewPropagate"', 'id="reviewPropagateOpen"',
+                'id="reviewPropagateScope"', 'id="reviewPropagateStrategy"',
+                'id="reviewPropagatePreview"', 'id="reviewPropagateMembers"',
+                'id="reviewPropagatePositives"',
+                'id="reviewPropagateBoundary"',
+                'id="reviewPropagateExclusions"',
+                'id="reviewPropagateOverrides"',
+                'id="reviewPropagateApply"', 'id="reviewPropagateDiff"',
+                'id="reviewPropagateConflict"', 'id="reviewPropagateError"'):
+            self.assertIn(marker, text)
+        # The panel lives inside the review modal, before the rollback confirm.
+        modal = text.index('id="reviewModal"')
+        panel = text.index('id="reviewPropagate"')
+        rollback = text.index('id="reviewRollbackConfirm"')
+        self.assertLess(modal, panel)
+        self.assertLess(panel, rollback)
+        for label in ("应用到相似项", "预览成员", "应用（生成 draft 条目）",
+                      "当前项", "当前簇", "全 peel", "正例", "边界例",
+                      "排除项", "传播 diff", "传播冲突（409）", "传播失败（400）",
+                      "批量", "逐项按自身 evidence 重建动作并独立校验",
+                      "已有决定（默认保留）", "将覆盖", "覆盖已有决定"):
+            self.assertIn(label, text)
+        for marker in (
+                "function reviewPropagateOpen",
+                "function reviewPropagatePreview",
+                "function reviewPropagateApply",
+                "function reviewPropagateExclusionToggle",
+                "function reviewPropagateOverrideToggle",
+                "function reviewPropagateOverrideIds",
+                "function reviewPropagateOverridesHtml",
+                "function reviewPropagateExistingText",
+                "function reviewPropagateCountsHtml",
+                "function reviewPropagateApplyDisabled",
+                "function reviewPropagateConflicts",
+                "function reviewPropagateBody",
+                "function reviewPropagateMembersHtml",
+                "function reviewPropagateExclusionsHtml",
+                "function reviewPropagateDiffHtml",
+                "function paintReviewPropagate",
+                "REVIEW_PROPAGATE_STATUS_LABEL",
+                "REVIEW_PROPAGATE_CONFLICT_STATUSES",
+                "'/plan/propagate'", "dry_run:!!dryRun",
+                "operator:'user'", "overrides:reviewPropagateOverrideIds()",
+                'data-r="propagate-override"'):
+            self.assertIn(marker, text)
+        # CP6.1: ``decided`` is not a conflict (the apply-disabled rule only
+        # looks at locked/in-batch members).
+        self.assertNotIn("'decided'",
+                         text[text.index("REVIEW_PROPAGATE_CONFLICT_STATUSES"):
+                              text.index("function reviewPropagateInfo")])
+        # Preview is a dry run; only apply sends dry_run:false. Apply is a
+        # separate explicit click and is disabled until a preview succeeded.
+        preview_start = text.index("async function reviewPropagatePreview")
+        preview_end = text.index("async function reviewPropagateApply",
+                                 preview_start)
+        preview_body = text[preview_start:preview_end]
+        self.assertIn("reviewPropagateBody(info,true)", preview_body)
+        # CP6.2 L1 (wire §8.1): a successful preview adopts the response-echoed
+        # ``exclusions``/``overrides`` as the current ticks; it must NOT clear
+        # them (the old CP6.1 reset is what made preview and apply disagree).
+        self.assertIn("result.exclusions", preview_body)
+        self.assertIn("result.overrides", preview_body)
+        self.assertNotIn("ctx.propagate.exclusions=[]", preview_body)
+        self.assertNotIn("ctx.propagate.overrides=[]", preview_body)
+        apply_start = preview_end
+        apply_end = text.index("function reviewPropagateExclusionToggle",
+                               apply_start)
+        apply_body = text[apply_start:apply_end]
+        self.assertIn("reviewPropagateBody(info,false)", apply_body)
+        self.assertIn("reviewPropagateApplyDisabled()", apply_body)
+        self.assertIn("p.previewedBase=null", apply_body)
+        # Opening the panel resets both exclusion and override ticks.
+        open_start = text.index("function reviewPropagateOpen")
+        open_end = text.index("function reviewPropagateScopeValue", open_start)
+        open_body = text[open_start:open_end]
+        self.assertIn("exclusions:[]", open_body)
+        self.assertIn("overrides:[]", open_body)
+        # The apply button is disabled until a preview with the same base plan
+        # version succeeded and no locked/in-batch member is left unexcluded.
+        disabled_start = text.index("function reviewPropagateApplyDisabled")
+        disabled_end = text.index("function paintReviewPropagate",
+                                  disabled_start)
+        disabled_body = text[disabled_start:disabled_end]
+        self.assertIn("previewedBase==null", disabled_body)
+        self.assertIn("Number(plan.plan_version||0)!==Number(p.previewedBase)",
+                      disabled_body)
+        self.assertIn("reviewPropagateConflicts(p.preview).length>0",
+                      disabled_body)
+        # A checked override row renders the 将覆盖 marker.
+        members_start = text.index("function reviewPropagateMembersHtml")
+        members_end = text.index("function reviewPropagateListHtml",
+                                 members_start)
+        self.assertIn("将覆盖", text[members_start:members_end])
+        self.assertIn("reviewPropagateExistingText(existing)",
+                      text[members_start:members_end])
+        # CP6.2 L1: the override list includes every member carrying
+        # ``existing`` (``decided`` and an overridden ``ready`` member) that is
+        # not excluded, so an override can be unticked.
+        overrides_start = text.index("function reviewPropagateOverridesHtml")
+        overrides_end = text.index("function reviewPropagateDiffHtml",
+                                   overrides_start)
+        overrides_body = text[overrides_start:overrides_end]
+        self.assertIn("m.existing", overrides_body)
+        self.assertIn("typeof m.existing==='object'", overrides_body)
+        self.assertNotIn("String(m.status||'')==='decided'", overrides_body)
+        # Propagation entries render with a 批量 origin badge.
+        entry_start = text.index("function reviewEntryHtml")
+        entry_end = text.index("function reviewResolutionHtml", entry_start)
+        self.assertIn("origin.kind==='propagation'", text[entry_start:entry_end])
+        self.assertIn("批量", text[entry_start:entry_end])
+
+    def test_served_page_ships_cp6_propagation_controls(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+
+            response = TestClient(app_module.create_app()).get("/")
+            self.assertEqual(response.status_code, 200, response.text)
+            page = response.text
+        for marker in ('id="reviewPropagate"', 'id="reviewPropagateOpen"',
+                       'id="reviewPropagateScope"',
+                       'id="reviewPropagateStrategy"',
+                       'id="reviewPropagatePreview"',
+                       'id="reviewPropagateMembers"',
+                       'id="reviewPropagatePositives"',
+                       'id="reviewPropagateBoundary"',
+                       'id="reviewPropagateExclusions"',
+                       'id="reviewPropagateOverrides"',
+                       'id="reviewPropagateApply"',
+                       'id="reviewPropagateDiff"',
+                       'id="reviewPropagateConflict"',
+                       'id="reviewPropagateError"',
+                       "应用到相似项", "预览成员", "应用（生成 draft 条目）",
+                       "已有决定（默认保留）", "将覆盖", "覆盖已有决定",
+                       "reviewPropagateOpen", "reviewPropagatePreview",
+                       "reviewPropagateApply", "reviewPropagateExclusionToggle",
+                       "reviewPropagateOverrideToggle",
+                       "reviewPropagateOverrideIds",
+                       "propagate-override",
+                       "paintReviewPropagate", "'/plan/propagate'"):
+            self.assertIn(marker, page)
+        # Propagation never sends a provider token or LLM env.
+        self.assertNotIn("PEELFEED_LLM_TOKEN", page)
+
+
+# ---------------------------------------------------------------------------
+# CP5 Node stub-DOM behaviour harness: runs the real review JS block against
+# canned fetch responses (no browser, no network) and proves:
+#   * opening the review paints the VLM bar from capabilities.vlm/vlm_provider
+#     without any implicit provider call;
+#   * the confirmation dialog is a hard gate: cancel sends nothing, only the
+#     explicit Go click builds confirmed:true and POSTs the frozen bodies;
+#   * a VLM report job polls to done, refreshes the report and renders the
+#     provider summary (kind/model/vision/cached/text-only/partial failures);
+#   * a discussion send polls to done, reads the result summary through the
+#     asset route, renders turns + the draft patch and adopts it through the
+#     synchronous plan/patches route (never a /review/plan action);
+#   * a 409 patch conflict shows the conflict list and disables adopt;
+#   * a clarification option opens the discussion confirmation (never a plan
+#     operation);
+#   * capabilities.vlm=false disables both actions with a Chinese reason while
+#     the rules report still works;
+#   * persisted report/discuss descriptors re-attach after a reload, an
+#     interrupted job shows an explicit retry, and nothing auto-reruns.
+# ---------------------------------------------------------------------------
+
+NODE_CP5_HARNESS = r"""
+/*
+ * Drive the real review JS block with a stub DOM + canned fetch. No browser, no
+ * network: every request is recorded and answered from the scenario tables.
+ */
+const fs = require("fs");
+const vm = require("vm");
+
+const html = fs.readFileSync(process.argv[2], "utf8");
+const start = html.indexOf("/* ---- review report dialog", 150000);
+const end = html.indexOf("/* ---- workspace dialog", start);
+if (start < 0 || end < 0) throw new Error("review block markers not found");
+const block = html.slice(start, end);
+
+const elements = new Map();
+function element(key) {
+  if (elements.has(key)) return elements.get(key);
+  const listeners = {};
+  const value = {
+    id: key, innerHTML: "", textContent: "", hidden: true, disabled: false,
+    value: "", files: [], checked: false, listeners, onclick: null,
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    addEventListener(type, fn) {
+      (listeners[type] = listeners[type] || []).push(fn);
+    },
+    appendChild() {}, focus() {}, blur() {}, closest() { return null; },
+    remove() {}, querySelector() { return element(key + ":child"); },
+    querySelectorAll() { return []; }, getAttribute() { return null; },
+    setAttribute() {}, style: {}, dataset: {}, scrollIntoView() {},
+    isConnected: true,
+  };
+  elements.set(key, value);
+  return value;
+}
+const document = {
+  querySelector(selector) { return element(selector); },
+  querySelectorAll() { return []; },
+  addEventListener() {}, getElementById(id) { return element("#" + id); },
+  createElement() { return element("created"); },
+  createTextNode() { return {}; },
+  body: { style: {}, classList: { toggle() {} }, appendChild() {} },
+  documentElement: { style: {}, classList: { toggle() {} } },
+  head: { appendChild() {} },
+};
+
+const calls = [];
+const reportVlmPosts = [];
+const reportRulesPosts = [];
+const discussPosts = [];
+const patchPosts = [];
+const planActionBodies = [];
+const propagatePosts = [];
+let planActionPosts = 0;
+let propagateMode = "ok";
+let reviewPayloadCurrent = null;
+let sourcesPayload = { sources: [] };
+let conflictMode = false;
+const sha = "a".repeat(64);
+
+function item(id, clusterId) {
+  return { id: id, code: "table_header_absent", kind: "table",
+    severity: "warning", blocking: false, asset_id: "table-" + id, pages: [1],
+    cluster_id: clusterId, message: "m", triage: "deterministic_candidate",
+    status: "needs_decision",
+    evidence: { hash: "h", crops: [], native_line_ids: [], ocr_evidence: [] },
+    current: {}, candidates: [{ strategy: { id: "use_first_row_header",
+      version: 1 }, action: { type: "operation", name: "set_header_rows",
+      params: { rows: [0] } }, source: "rule",
+      validator: { status: "ready", reasons: [] },
+      evidence_refs: ["asset:table-" + id] }],
+    strategies: [], entry: null, resolution: null, stale: false };
+}
+function cluster(cid, ids) {
+  return { cluster_id: cid, code: "table_header_absent", title: "t",
+    kind: "table", item_count: ids.length, human_pending: ids.length,
+    representative_item_id: ids[0], states: { needs_decision: ids.length },
+    conclusion: "c",
+    suggestions: [{ item_id: ids[0],
+      strategy: { id: "use_first_row_header", version: 1 }, params: {},
+      evidence_refs: [], validator: { status: "ready", reasons: [] },
+      in_plan: false, state: "ready", source: "vlm" }],
+    clarifications: [{ question: "第 0 行是否是表头？",
+      options: ["是", "否"], item_id: ids[0] }],
+    strategies: [], item_ids: ids };
+}
+const ITEMS = [item("it-a", "cl-a"), item("it-b", "cl-b")];
+const CLUSTERS = [cluster("cl-a", ["it-a"]), cluster("cl-b", ["it-b"])];
+
+const VLM_CAPS = {
+  review_schema: 2, native_lines: true,
+  ocr: false, ocr_configured: false, ocr_detail: null,
+  ocr_status: { available: false, checked_at: null, error: null },
+  vlm: true, vlm_detail: null, vlm_provider: "answer_link",
+  vlm_vision: true, vlm_model: "qwen2.5-vl-72b",
+  vlm_link_id: "answer-main", vlm_budget_usd: 2.0, vlm_spent_usd: 0.35,
+  vlm_calls: 1, vlm_vision_checked_at: "2026-11-09T03:10:00Z",
+  /* CP5.1 H7 (wire §10.7): prices not configured -> honest "费用未计价". */
+  vlm_priced: false, vlm_max_calls_per_peel: 100,
+};
+const VLM_CAPS_OFF = Object.assign({}, VLM_CAPS, {
+  vlm: false,
+  vlm_detail: "VLM 不可用：no enabled answer link",
+  vlm_model: null, vlm_link_id: null, vlm_vision: null,
+});
+const VLM_REPORT = {
+  status: "partial", generated_at: "2026-11-09T03:10:00Z", stale: false,
+  provider: { kind: "vlm", model: "qwen2.5-vl-72b",
+    prompt_version: "peel-reviews@1", link_id: "answer-main",
+    vision: true, cached: true, text_only: false },
+  report: {
+    schema_version: 1, status: "partial", stale: false,
+    generated_at: "2026-11-09T03:10:00Z",
+    provider: { kind: "vlm", model: "qwen2.5-vl-72b",
+      prompt_version: "peel-reviews@1", link_id: "answer-main",
+      vision: true, cached: true, text_only: false },
+    counts: { vlm_suggestions: 2, clarifications: 1, failed_checks: 0 },
+    partial_failures: [{ cluster_id: "cl-b", code: "vlm_bad_response",
+      message: "cluster response was void" }],
+    /* CP5.1 H2/H3 (wire §10.3): additive skipped entries with reason codes. */
+    skipped: [
+      { cluster_id: "cl-c", item_ids: ["it-c", "it-d"],
+        reason: "ocr_not_ready" },
+      { cluster_id: "cl-d", item_ids: ["it-e"], reason: "item_cap" },
+      { cluster_id: "cl-e", item_ids: [], reason: "budget_exhausted" },
+    ],
+    llm_usage: { calls: 2, tokens_input: 1200, tokens_output: 400,
+      cost_usd: "0.00" },
+    clusters: [],
+  },
+};
+function reviewPayload(caps, report, planVersion) {
+  return {
+    peel_id: "peel", review_schema: 2,
+    generated_at: "2026-11-09T03:10:00Z", profile: "generic",
+    capabilities: caps, report: report || null, ocr: null,
+    counts: { raw_items: 2, items: 2, clusters: 2, human_pending: 2,
+      human_pending_clusters: 2, pending_evidence: 0, auto_resolved: 0,
+      needs_decision: 2, draft: 0, confirmed: 0, applied: 0, deferred: 0,
+      failed_check: 0, stale: 0, unsupported_items: 0 },
+    triage_counts: { deterministic_candidate: 2, needs_decision: 0,
+      needs_ocr: 0, informational: 0, unsupported: 0 },
+    plan: { plan_version: planVersion || 0, entries: 0, draft: 0,
+      confirmed: 0, locked: 0, stale: 0 },
+    clusters: CLUSTERS, items: ITEMS,
+  };
+}
+const REVIEW_VLM = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
+const REVIEW_VLM_DONE = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
+const REVIEW_VLM_PLAN1 = reviewPayload(VLM_CAPS, VLM_REPORT, 1);
+const REVIEW_VLM_OFF = reviewPayload(VLM_CAPS_OFF, null, 0);
+/* CP5.1 H5 (wire §10.5): a cluster flagged ``vlm_disagrees`` whose item has a
+   rule and a VLM ready suggestion with different action identities. */
+const REVIEW_VLM_SOURCE = (function () {
+  const payload = reviewPayload(VLM_CAPS, VLM_REPORT, 0);
+  const sourceCluster = Object.assign({}, payload.clusters[0], {
+    vlm_disagrees: true,
+    suggestions: [
+      { item_id: "it-a", strategy: { id: "use_first_row_header", version: 1 },
+        params: { rows: [0] }, evidence_refs: [], in_plan: false,
+        state: "ready", validator: { status: "ready", reasons: [] },
+        source: "rule" },
+      { item_id: "it-a", strategy: { id: "confirm_no_header", version: 1 },
+        params: {}, evidence_refs: [], in_plan: false,
+        state: "ready", validator: { status: "ready", reasons: [] },
+        source: "vlm" },
+    ],
+  });
+  payload.clusters = [sourceCluster, payload.clusters[1]];
+  return payload;
+})();
+const VLM_PATCH = {
+  scope: { kind: "cluster", item_id: null, cluster_id: "cl-a" },
+  members: ["it-a"], exclusions: ["it-b"], boundary_cases: ["it-b"],
+  changes: [{ op: "select", item_id: "it-a",
+    strategy: { id: "use_first_row_header", version: 1 },
+    params: { rows: [0] }, evidence_refs: ["asset:table-it-a"],
+    uncertainties: ["row 0"] }],
+};
+const DISCUSS_RESULT = {
+  schema_version: 1, intent: "modify", turn: 2,
+  reply: "建议把第 0 行作为表头。", uncertainties: ["row 0 与数据行相似"],
+  clarifications: [], patch: VLM_PATCH,
+  model: "qwen2.5-vl-72b", link_id: "answer-main",
+  prompt_version: "peel-reviews@1", vision: true, cached: false,
+  at: "2026-11-09T03:10:02Z",
+  usage: { input_tokens: 900, output_tokens: 200, cost_usd: "0.00" },
+  evidence_hashes: {}, base_plan_version: 0,
+};
+
+/* CP6 (Phase 5): propagation fixtures. A preview shows a ready member, a
+   locked member (must be excluded before apply), a boundary-case member and a
+   CP6.1 ``decided`` member (kept by default; overrideable). */
+const PROPAGATE_PREVIEW = {
+  peel_id: "peel", review_schema: 2, dry_run: true, plan_version: 0,
+  scope: { kind: "cluster", item_id: null, cluster_id: "cl-a", peel: null },
+  strategy: { id: "use_first_row_header", version: 1 },
+  members: [
+    { item_id: "it-a", status: "ready", reasons: [],
+      action: { type: "operation", name: "set_header_rows",
+        params: { rows: [0] } } },
+    { item_id: "it-b", status: "locked", reasons: [], action: null },
+    { item_id: "it-c", status: "ready", reasons: [],
+      action: { type: "operation", name: "set_header_rows",
+        params: { rows: [0] } } },
+    { item_id: "it-d", status: "decided", reasons: [], action: null,
+      existing: { kind: "entry", status: "confirmed",
+        strategy: { id: "use_first_row_header", version: 1 },
+        name: "set_header_rows" } },
+  ],
+  positives: ["it-a"],
+  boundary_cases: ["it-c"],
+  exclusions: [],
+  overrides: [],
+  counts: { members: 4, ready: 2, already: 0, decided: 1, failed: 0,
+    locked: 1, excluded: 0 },
+};
+/* The same preview when it-d is explicitly overridden: peelfeed evaluates it
+   normally and writes it as ``ready`` while still carrying ``existing`` (CP6.2
+   L1, wire §8.1: the override checkbox must stay listable/untickable). */
+const PROPAGATE_PREVIEW_OVERRIDE = Object.assign({}, PROPAGATE_PREVIEW, {
+  overrides: ["it-d"],
+  members: PROPAGATE_PREVIEW.members.map(function (member) {
+    if (member.item_id !== "it-d") return member;
+    return Object.assign({}, member, {
+      status: "ready",
+      existing: { kind: "entry", status: "confirmed",
+        strategy: { id: "use_first_row_header", version: 1 },
+        name: "set_header_rows" },
+      action: { type: "operation", name: "set_header_rows",
+        params: { rows: [0] } },
+    });
+  }),
+  counts: { members: 4, ready: 3, already: 0, decided: 0, failed: 0,
+    locked: 1, excluded: 0 },
+});
+const PROPAGATE_APPLIED = {
+  peel_id: "peel", review_schema: 2, dry_run: false, plan_version: 1,
+  propagation_id: "prop-20261110T120000-abcd",
+  scope: { kind: "cluster", item_id: null, cluster_id: "cl-a", peel: null },
+  strategy: { id: "use_first_row_header", version: 1 },
+  members: PROPAGATE_PREVIEW.members,
+  positives: ["it-a"], boundary_cases: ["it-c"],
+  exclusions: ["it-b"], overrides: [],
+  counts: { members: 4, ready: 2, already: 0, decided: 1, failed: 0,
+    locked: 1, excluded: 1 },
+  diff: { added: [
+      { item_id: "it-a", entry_id: "e-it-a", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+      { item_id: "it-c", entry_id: "e-it-c", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+    ], changed: [], removed: [], unchanged: 0 },
+  changed: true,
+};
+const PROPAGATE_APPLIED_OVERRIDE = Object.assign({}, PROPAGATE_APPLIED, {
+  overrides: ["it-d"],
+  members: PROPAGATE_PREVIEW_OVERRIDE.members,
+  counts: { members: 4, ready: 3, already: 0, decided: 0, failed: 0,
+    locked: 1, excluded: 1 },
+  diff: { added: [
+      { item_id: "it-a", entry_id: "e-it-a", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+      { item_id: "it-c", entry_id: "e-it-c", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+      { item_id: "it-d", entry_id: "e-it-d", status: "draft",
+        source: "user", origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd" } },
+    ], changed: [], removed: [], unchanged: 0 },
+});
+const REVIEW_VLM_PROPAGATED = (function () {
+  const payload = reviewPayload(VLM_CAPS, VLM_REPORT, 1);
+  payload.items = payload.items.map(function (entry) {
+    if (entry.id !== "it-a") return entry;
+    return Object.assign({}, entry, {
+      entry: { entry_id: "e-it-a", item_id: "it-a", status: "draft",
+        stale: false, stale_reasons: [], locked: false,
+        strategy: { id: "use_first_row_header", version: 1 },
+        action: { type: "operation", name: "set_header_rows",
+          params: { rows: [0] } },
+        evidence: { hash: "h", refs: [] }, dependencies: [],
+        capability_snapshot: { native_lines: true, ocr: null, vlm: null },
+        source: "user",
+        origin: { kind: "propagation",
+          propagation_id: "prop-20261110T120000-abcd",
+          scope: { kind: "cluster", item_id: null, cluster_id: "cl-a",
+            peel: null },
+          strategy: { id: "use_first_row_header", version: 1 },
+          base_plan_version: 0 },
+        revision: 1, batch_id: null, notes: null },
+    });
+  });
+  return payload;
+})();
+
+function sourceRow(jobs) {
+  return { name: "manual.pdf", sha256: sha, status: "extracted",
+    extraction: { state: "extracted", peel_id: "peel",
+      conversion_id: "c", review_jobs: jobs || {} } };
+}
+function response(status, payload) {
+  return { ok: status >= 200 && status < 300, status: status,
+           json: async function () { return payload; },
+           text: async function () { return JSON.stringify(payload); } };
+}
+function jobRecord(type, id, status, resultRef) {
+  return { job_id: id, type: type, status: status,
+    progress: { stage: "done", done: 1, total: 1 },
+    result_ref: resultRef || null,
+    error: status === "failed"
+      ? { code: "vlm_bad_response", message: "void" }
+      : (status === "interrupted"
+        ? { code: "interrupted",
+            message: "the job process is no longer running" }
+        : null) };
+}
+/* CP6.2 L1 (wire §8.1): the fake peelfeed CLI echoes the request's
+   ``exclusions``/``overrides`` and resolves excluded members with status
+   ``excluded``; the stub preview must mirror that so the UI's echo-adoption
+   (preview keeps its ticks instead of clearing them) is exercised. */
+function propagateCounts(members) {
+  function count(status) {
+    return members.filter(function (member) {
+      return String(member.status || "") === status; }).length;
+  }
+  return {
+    members: members.length,
+    ready: count("ready"),
+    already: count("already"),
+    decided: count("decided"),
+    failed: count("failed_check") + count("not_applicable"),
+    locked: count("locked"),
+    excluded: count("excluded"),
+  };
+}
+function propagatePreviewResponse(parsed) {
+  const base = (parsed.overrides || []).indexOf("it-d") >= 0
+    ? PROPAGATE_PREVIEW_OVERRIDE : PROPAGATE_PREVIEW;
+  const exclusions = (parsed.exclusions || []).map(String);
+  const overrides = (parsed.overrides || []).map(String);
+  const members = base.members.map(function (member) {
+    if (exclusions.indexOf(String(member.item_id || "")) < 0) return member;
+    return Object.assign({}, member, { status: "excluded", action: null });
+  });
+  return Object.assign({}, base, {
+    exclusions: exclusions,
+    overrides: overrides,
+    members: members,
+    counts: propagateCounts(members),
+  });
+}
+function fetchStub(url, opts) {
+  const method = String((opts || {}).method || "GET").toUpperCase();
+  const body = String((opts || {}).body || "");
+  calls.push({ url: String(url), method: method, body: body });
+  const u = String(url);
+  /* Asset URLs contain "/review/jobs/" too, so match assets first. */
+  if (u.indexOf("/assets/") >= 0) {
+    return Promise.resolve(response(200, DISCUSS_RESULT));
+  }
+  if (method === "POST" && u.indexOf("/review/plan/propagate") >= 0) {
+    const parsed = JSON.parse(body || "{}");
+    propagatePosts.push(parsed);
+    if (propagateMode === "conflict") {
+      return Promise.resolve(response(409, {
+        detail: "peelfeed plan propagate failed: error [conflict] propagate "
+          + "touches locked/batch-bound members (conflicts: it-b)" }));
+    }
+    if (propagateMode === "validation") {
+      return Promise.resolve(response(400, {
+        detail: "peelfeed plan propagate failed: error [validation] propagate "
+          + "has non-excluded failing members (it-b=failed_check "
+          + "(parent_not_available))" }));
+    }
+    if (parsed.dry_run) {
+      return Promise.resolve(response(200, propagatePreviewResponse(parsed)));
+    }
+    reviewPayloadCurrent = REVIEW_VLM_PROPAGATED;
+    return Promise.resolve(response(200,
+      (parsed.overrides || []).indexOf("it-d") >= 0
+        ? PROPAGATE_APPLIED_OVERRIDE : PROPAGATE_APPLIED));
+  }
+  if (method === "POST" && u.indexOf("/review/plan/patches") >= 0) {
+    patchPosts.push(JSON.parse(body || "{}"));
+    if (conflictMode) {
+      return Promise.resolve(response(409, {
+        detail: "peelfeed plan patch failed: error [conflict] patch touches "
+          + "locked/batch-bound entries (conflicts: it-a)" }));
+    }
+    reviewPayloadCurrent = REVIEW_VLM_PLAN1;
+    return Promise.resolve(response(200, {
+      peel_id: "peel", review_schema: 2, plan_version: 1, entries: [],
+      diff: { added: [{ item_id: "it-a" }], changed: [],
+              removed: [], unchanged: 0 } }));
+  }
+  if (method === "POST" && u.indexOf("/review/reports") >= 0) {
+    const parsed = JSON.parse(body || "{}");
+    if (parsed.mode === "vlm") {
+      reportVlmPosts.push(parsed);
+      return Promise.resolve(response(202,
+        { job_id: "report-vlm-1", status: "queued" }));
+    }
+    reportRulesPosts.push(parsed);
+    return Promise.resolve(response(202,
+      { job_id: "report-rules-1", status: "queued" }));
+  }
+  if (method === "POST" && u.indexOf("/review/discussions") >= 0) {
+    discussPosts.push(JSON.parse(body || "{}"));
+    return Promise.resolve(response(202, { job_id: "discuss-1",
+      conversation_id: "conv-1", status: "queued" }));
+  }
+  if (u.indexOf("/review/jobs/") >= 0) {
+    if (u.indexOf("report-vlm-1") >= 0) {
+      reviewPayloadCurrent = REVIEW_VLM_DONE;
+      return Promise.resolve(response(200,
+        jobRecord("report", "report-vlm-1", "done", "report.json")));
+    }
+    if (u.indexOf("report-rules-1") >= 0) {
+      reviewPayloadCurrent = REVIEW_VLM;
+      return Promise.resolve(response(200,
+        jobRecord("report", "report-rules-1", "done", "report.json")));
+    }
+    if (u.indexOf("discuss-1") >= 0) {
+      return Promise.resolve(response(200, jobRecord("discuss", "discuss-1",
+        "done", "conversations/conv-1.jsonl")));
+    }
+    if (u.indexOf("report-old") >= 0) {
+      return Promise.resolve(response(200,
+        jobRecord("report", "report-old", "interrupted")));
+    }
+    if (u.indexOf("discuss-old") >= 0) {
+      return Promise.resolve(response(200, jobRecord("discuss", "discuss-old",
+        "done", "conversations/conv-old.jsonl")));
+    }
+    return Promise.resolve(response(404, { detail: "unknown job" }));
+  }
+  if (method === "POST" && (u.endsWith("/review/plan")
+                            || u.indexOf("/review/plan?") >= 0)) {
+    planActionPosts += 1;
+    const parsedPlan = JSON.parse(body || "{}");
+    planActionBodies.push(parsedPlan);
+    return Promise.resolve(response(200, {
+      plan_version: 1, entries: [],
+      accepted: [{ item_id: (parsedPlan.item_ids || ["it-a"])[0] }] }));
+  }
+  if (u.indexOf("/review?") >= 0 || u.endsWith("/review")) {
+    return Promise.resolve(response(200, reviewPayloadCurrent));
+  }
+  if (u.indexOf("/sources") >= 0) {
+    return Promise.resolve(response(200, sourcesPayload));
+  }
+  return Promise.reject(new Error("unexpected fetch " + method + " " + u));
+}
+
+const PF_STATUS = {
+  handshake: { available: true, version: "0.1.0", review_schema: 2,
+    ocr: { configured: false } },
+  config: { configured: true },
+};
+function esc(value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function escAttr(value) { return esc(value); }
+function toast() {}
+function fmtBytes(value) { return String(value) + " B"; }
+function fmtTime(value) { return String(value || ""); }
+function $(selector) { return element(selector); }
+function getJSON(path) {
+  return fetchStub(path).then(function (r) {
+    if (!r.ok) throw new Error(path + " returned HTTP " + r.status);
+    return r.json();
+  });
+}
+function callJSON() { throw new Error("callJSON not used in the harness"); }
+async function loadDatasets() { return []; }
+
+const sandbox = {
+  document, window: {}, DATASETS: [], DATASET_SOURCES: {},
+  REVIEW_COUNTS: {}, REVIEW_CTX: null, PF_STATUS: PF_STATUS,
+  $, esc, escAttr, callJSON, getJSON, toast, fmtBytes, fmtTime,
+  loadDatasets, console, setTimeout, clearTimeout, setInterval, clearInterval,
+  Promise, Number, String, JSON, Math, Date, Error, RegExp, Array, Object,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat, isNaN,
+  fetch: fetchStub,
+  location: { hash: "", origin: "http://127.0.0.1:0", href: "" },
+  history: { replaceState() {}, pushState() {} },
+  localStorage: { getItem() { return ""; }, setItem() {}, removeItem() {} },
+  sessionStorage: { getItem() { return ""; }, setItem() {}, removeItem() {} },
+  navigator: { clipboard: { writeText() { return Promise.resolve(); } } },
+  requestAnimationFrame(fn) { return setTimeout(fn, 0); },
+  matchMedia() { return { matches: false, addEventListener() {} }; },
+  alert() {}, confirm() { return true; }, prompt() { return ""; },
+  innerWidth: 1400, innerHeight: 900,
+  addEventListener() {}, removeEventListener() {},
+};
+sandbox.globalThis = sandbox;
+
+const code = block
+  + "\n;globalThis.__review = {"
+  + " openReview: openReview,"
+  + " reviewVlmGenerateOpen: reviewVlmGenerateOpen,"
+  + " reviewVlmConfirmClose: reviewVlmConfirmClose,"
+  + " reviewVlmConfirmed: reviewVlmConfirmed,"
+  + " reviewDiscussOpen: reviewDiscussOpen,"
+  + " reviewDiscussSendOpen: reviewDiscussSendOpen,"
+  + " reviewDiscussAdoptPatch: reviewDiscussAdoptPatch,"
+  + " reviewClarificationAnswer: reviewClarificationAnswer,"
+  + " reviewVlmRetry: reviewVlmRetry,"
+  + " reviewAction: reviewAction,"
+  + " reviewSelectedSources: reviewSelectedSources,"
+  + " reviewItemSourceChoice: reviewItemSourceChoice,"
+  + " reviewPropagateOpen: reviewPropagateOpen,"
+  + " reviewPropagatePreview: reviewPropagatePreview,"
+  + " reviewPropagateApply: reviewPropagateApply,"
+  + " reviewPropagateExclusionToggle: reviewPropagateExclusionToggle,"
+  + " reviewPropagateOverrideToggle: reviewPropagateOverrideToggle,"
+  + " reviewPropagateOverrideIds: reviewPropagateOverrideIds,"
+  + " reviewPropagateApplyDisabled: reviewPropagateApplyDisabled,"
+  + " reviewPropagateInfo: reviewPropagateInfo,"
+  + " paintReviewPropagate: paintReviewPropagate,"
+  + " generateReviewReport: generateReviewReport,"
+  + " reviewLoadSource: reviewLoadSource,"
+  + " paintReviewVlmJob: paintReviewVlmJob,"
+  + " paintReviewVlmConfirmScope: paintReviewVlmConfirmScope,"
+  + " getContext: function(){ return REVIEW_CTX; },"
+  + " setData: function(data){ REVIEW_CTX={dataset:'docs',sha:'" + sha
+  + "',data:data}; },"
+  + " element: function(key){ return element(key); },"
+  + " calls: function(){ return calls; } };";
+const context = vm.createContext(sandbox);
+vm.runInContext(code, context, { filename: "index.html#review-block" });
+
+function tick(ms) { return new Promise((resolve) => setTimeout(resolve, ms || 80)); }
+function htmlOf(selector) { return element(selector).innerHTML; }
+function vlmPosts() {
+  return calls.filter(function (call) {
+    return call.method === "POST" && (call.url.indexOf("/review/reports") >= 0
+      || call.url.indexOf("/review/discussions") >= 0
+      || call.url.indexOf("/review/plan/patches") >= 0);
+  });
+}
+function resetCounters() {
+  calls.length = 0;
+  reportVlmPosts.length = 0;
+  reportRulesPosts.length = 0;
+  discussPosts.length = 0;
+  patchPosts.length = 0;
+  planActionBodies.length = 0;
+  propagatePosts.length = 0;
+  propagateMode = "ok";
+  planActionPosts = 0;
+  conflictMode = false;
+}
+function button(attrs) {
+  return { getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(attrs, name)
+      ? attrs[name] : null;
+  } };
+}
+
+async function runVlmFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  steps.push({ step: "vlm-open",
+    bar: htmlOf("#reviewVlmBar"),
+    provider: htmlOf("#reviewReportProvider"),
+    clarifications: htmlOf("#reviewClarifications"),
+    vlmPosts: vlmPosts().length,
+    planPosts: planActionPosts });
+  /* Opening the confirmation dialog must not send anything. */
+  sandbox.__review.reviewVlmGenerateOpen();
+  await tick(20);
+  steps.push({ step: "vlm-confirm-open",
+    hidden: element("#reviewVlmConfirm").hidden,
+    info: htmlOf("#reviewVlmConfirmInfo"),
+    target: element("#reviewVlmConfirmTarget").textContent,
+    scope: element("#reviewVlmConfirmScope").textContent,
+    vlmPosts: vlmPosts().length });
+  sandbox.__review.reviewVlmConfirmClose();
+  await tick(20);
+  steps.push({ step: "vlm-confirm-cancel",
+    hidden: element("#reviewVlmConfirm").hidden,
+    vlmPosts: vlmPosts().length });
+  /* Explicit Go: report body + confirmation gate. */
+  sandbox.__review.reviewVlmGenerateOpen();
+  sandbox.__review.reviewVlmConfirmed();
+  await tick(160);
+  steps.push({ step: "vlm-report-sent",
+    posts: reportVlmPosts.slice(),
+    bar: htmlOf("#reviewVlmBar"),
+    provider: htmlOf("#reviewReportProvider"),
+    vlmJob: htmlOf("#reviewVlmJob"),
+    msg: htmlOf("#reviewMsg"),
+    vlmPosts: vlmPosts().length,
+    planPosts: planActionPosts });
+  /* Discussion: open panel, scope cluster, send via confirmation. */
+  sandbox.__review.reviewDiscussOpen();
+  element("#reviewDiscussScope").value = "cluster";
+  element("#reviewDiscussInput").value = "为什么把第 0 行作为表头？";
+  sandbox.__review.reviewDiscussSendOpen();
+  await tick(20);
+  steps.push({ step: "discuss-confirm",
+    hidden: element("#reviewVlmConfirm").hidden,
+    info: htmlOf("#reviewVlmConfirmInfo"),
+    target: element("#reviewVlmConfirmTarget").textContent,
+    discussPosts: discussPosts.length });
+  sandbox.__review.reviewVlmConfirmed();
+  await tick(200);
+  steps.push({ step: "discuss-sent",
+    posts: discussPosts.slice(),
+    turns: htmlOf("#reviewDiscussTurns"),
+    patch: htmlOf("#reviewDiscussPatch"),
+    members: htmlOf("#reviewDiscussMembers"),
+    adoptDisabled: element("#reviewDiscussAdoptPatch").disabled,
+    msg: htmlOf("#reviewMsg"),
+    planPosts: planActionPosts });
+  /* Adopt the draft patch through the synchronous plan/patches route. */
+  await sandbox.__review.reviewDiscussAdoptPatch();
+  await tick(120);
+  steps.push({ step: "patch-adopted",
+    posts: patchPosts.slice(),
+    diff: htmlOf("#reviewPatchDiff"),
+    conflict: htmlOf("#reviewPatchConflict"),
+    adoptDisabled: element("#reviewDiscussAdoptPatch").disabled,
+    msg: htmlOf("#reviewMsg"),
+    planPosts: planActionPosts });
+  /* A 409 conflict disables adopt and shows the conflict list. */
+  conflictMode = true;
+  await sandbox.__review.reviewDiscussAdoptPatch();
+  await tick(120);
+  steps.push({ step: "patch-conflict",
+    posts: patchPosts.slice(),
+    conflict: htmlOf("#reviewPatchConflict"),
+    adoptDisabled: element("#reviewDiscussAdoptPatch").disabled,
+    msg: htmlOf("#reviewMsg") });
+  /* A clarification option opens the discussion confirmation; no operation. */
+  const postsBefore = vlmPosts().length;
+  sandbox.__review.reviewClarificationAnswer(button({
+    "data-option": "是", "data-question": "第 0 行是否是表头？",
+    "data-item": "it-a", "data-cluster": "cl-a" }));
+  await tick(20);
+  steps.push({ step: "clarify-answer",
+    hidden: element("#reviewVlmConfirm").hidden,
+    target: element("#reviewVlmConfirmTarget").textContent,
+    input: element("#reviewDiscussInput").value,
+    newPosts: vlmPosts().length - postsBefore,
+    planPosts: planActionPosts });
+  sandbox.__review.reviewVlmConfirmClose();
+  return steps;
+}
+
+async function runTextOnlyFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  sandbox.__review.reviewVlmGenerateOpen();
+  element("#reviewVlmTextOnly").checked = true;
+  sandbox.__review.paintReviewVlmConfirmScope();
+  sandbox.__review.reviewVlmConfirmed();
+  await tick(160);
+  return [{ step: "text-only",
+    posts: reportVlmPosts.slice(),
+    scope: element("#reviewVlmConfirmScope").textContent,
+    msg: htmlOf("#reviewMsg") }];
+}
+
+async function runNoVlmFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM_OFF;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  steps.push({ step: "novlm-open",
+    bar: htmlOf("#reviewVlmBar"),
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  sandbox.__review.reviewVlmGenerateOpen();
+  await tick(20);
+  steps.push({ step: "novlm-generate-blocked",
+    hidden: element("#reviewVlmConfirm").hidden,
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  await sandbox.__review.generateReviewReport();
+  await tick(160);
+  steps.push({ step: "novlm-rules-report",
+    posts: reportRulesPosts.slice(),
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  return steps;
+}
+
+async function runReattachFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({
+    "report-old": { type: "report", created_at: "2026-11-09T03:00:00Z",
+      batch_id: null, conversation_id: null },
+    "discuss-old": { type: "discuss", created_at: "2026-11-09T03:05:00Z",
+      batch_id: null, conversation_id: "conv-old" },
+  })] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick(120);
+  steps.push({ step: "reattach-open",
+    vlmJob: htmlOf("#reviewVlmJob"),
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  sandbox.__review.reviewVlmRetry(button({ "data-type": "report",
+    "data-job": "report-old" }));
+  await tick(20);
+  steps.push({ step: "reattach-retry",
+    hidden: element("#reviewVlmConfirm").hidden,
+    title: element("#reviewVlmConfirmTitle").textContent,
+    vlmPosts: vlmPosts().length,
+    msg: htmlOf("#reviewMsg") });
+  sandbox.__review.reviewVlmConfirmClose();
+  return steps;
+}
+
+async function runSourceChoiceFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM_SOURCE;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  steps.push({ step: "source-open",
+    detail: htmlOf("#reviewDetail"),
+    choice: sandbox.__review.reviewItemSourceChoice(
+      { id: "it-a", cluster_id: "cl-a" }),
+    planPosts: planActionPosts });
+  /* Tick it-a and choose VLM as its adoption source, then confirm-selected.
+     The stub DOM returns the checkbox/source elements the real render emits. */
+  const detail = element("#reviewDetail");
+  detail.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("accept-pick") >= 0) {
+      return [{ checked: true, value: "it-a" }];
+    }
+    if (String(selector).indexOf("accept-source") >= 0) {
+      return [{ value: "vlm", getAttribute: function (name) {
+        return name === "data-item" ? "it-a" : null;
+      } }];
+    }
+    return [];
+  };
+  await sandbox.__review.reviewAction({
+    getAttribute: function (name) {
+      return name === "data-r" ? "accept-selected" : null;
+    },
+    closest: function () { return null; },
+    disabled: false,
+  });
+  await tick(160);
+  steps.push({ step: "source-accept",
+    posts: planActionBodies.slice(),
+    msg: htmlOf("#reviewMsg"),
+    planPosts: planActionPosts });
+  detail.querySelectorAll = function () { return []; };
+  return steps;
+}
+
+async function runPropagateFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  /* Opening the 应用到相似项 panel is local UI state: nothing is sent and
+     apply stays disabled until an explicit preview succeeded. */
+  sandbox.__review.reviewPropagateOpen();
+  await tick(20);
+  steps.push({ step: "prop-open",
+    hidden: element("#reviewPropagate").hidden,
+    strategy: element("#reviewPropagateStrategy").textContent,
+    scope: element("#reviewPropagateScope").value,
+    posts: propagatePosts.length,
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    detail: htmlOf("#reviewDetail") });
+  /* Preview sends dry_run:true and renders members/positives/boundary/
+     exclusions; the locked member keeps apply disabled. */
+  element("#reviewPropagateScope").value = "cluster";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "prop-preview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    positives: htmlOf("#reviewPropagatePositives"),
+    boundary: htmlOf("#reviewPropagateBoundary"),
+    exclusions: htmlOf("#reviewPropagateExclusions"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    msg: htmlOf("#reviewMsg") });
+  /* Exclude the locked member: the conflict clears and apply becomes enabled. */
+  const exclusions = element("#reviewPropagateExclusions");
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  await tick(40);
+  steps.push({ step: "prop-excluded",
+    exclusions: htmlOf("#reviewPropagateExclusions"),
+    members: htmlOf("#reviewPropagateMembers"),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    posts: propagatePosts.length });
+  /* Explicit apply: dry_run:false with the exclusions; diff + 批量 entry. */
+  await sandbox.__review.reviewPropagateApply();
+  await tick(200);
+  steps.push({ step: "prop-applied",
+    posts: propagatePosts.slice(),
+    diff: htmlOf("#reviewPropagateDiff"),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    detail: htmlOf("#reviewDetail"),
+    msg: htmlOf("#reviewMsg"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  exclusions.querySelectorAll = function () { return []; };
+  /* A 409 on apply shows the conflict list and keeps apply disabled. */
+  sandbox.__review.reviewPropagateOpen();
+  element("#reviewPropagateScope").value = "cluster";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(120);
+  /* Exclude the locked member so the apply click is sent; the server then
+     answers 409 (e.g. a race after the preview) and the conflict list renders. */
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  await tick(40);
+  propagateMode = "conflict";
+  await sandbox.__review.reviewPropagateApply();
+  await tick(160);
+  steps.push({ step: "prop-conflict",
+    posts: propagatePosts.slice(),
+    conflict: htmlOf("#reviewPropagateConflict"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    msg: htmlOf("#reviewMsg") });
+  exclusions.querySelectorAll = function () { return []; };
+  /* A 400 preview renders the per-member error and keeps apply disabled. */
+  propagateMode = "validation";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(120);
+  steps.push({ step: "prop-error",
+    error: htmlOf("#reviewPropagateError"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    msg: htmlOf("#reviewMsg") });
+  propagateMode = "ok";
+  return steps;
+}
+
+async function runPropagateOverrideFlow() {
+  resetCounters();
+  reviewPayloadCurrent = REVIEW_VLM;
+  sourcesPayload = { sources: [sourceRow({})] };
+  const steps = [];
+  await sandbox.__review.openReview("docs", sha);
+  await tick();
+  /* Opening the panel resets exclusions/overrides and sends nothing. */
+  sandbox.__review.reviewPropagateOpen();
+  await tick(20);
+  steps.push({ step: "ov-open",
+    posts: propagatePosts.length,
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  element("#reviewPropagateScope").value = "cluster";
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "ov-preview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  /* Tick an exclusion and an override; toggling only repaints (no request). */
+  const exclusions = element("#reviewPropagateExclusions");
+  exclusions.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-exclude") >= 0) {
+      return [{ checked: true, value: "it-b" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateExclusionToggle();
+  const overrideBox = element("#reviewPropagateOverrides");
+  overrideBox.querySelectorAll = function (selector) {
+    if (String(selector).indexOf("propagate-override") >= 0) {
+      return [{ checked: true, value: "it-d" }];
+    }
+    return [];
+  };
+  sandbox.__review.reviewPropagateOverrideToggle();
+  await tick(40);
+  steps.push({ step: "ov-toggled",
+    posts: propagatePosts.length,
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  /* CP6.2 L1 (wire §8.1): a successful preview adopts the response-echoed
+     ticks instead of clearing them; the request still carries the ticks that
+     were active when it was sent. */
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "ov-repreview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  /* Apply WITHOUT re-ticking: the body must carry the adopted lists, so the
+     member shown 已排除 is not written. */
+  await sandbox.__review.reviewPropagateApply();
+  await tick(200);
+  steps.push({ step: "ov-applied",
+    posts: propagatePosts.slice(),
+    diff: htmlOf("#reviewPropagateDiff"),
+    msg: htmlOf("#reviewMsg"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  /* Untick the overridden ready+existing member: the toggle sends nothing and
+     the member returns to ``decided`` (kept) after a fresh preview. */
+  overrideBox.querySelectorAll = function () { return []; };
+  sandbox.__review.reviewPropagateOverrideToggle();
+  await tick(40);
+  steps.push({ step: "ov-unticked",
+    posts: propagatePosts.length,
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  await sandbox.__review.reviewPropagatePreview();
+  await tick(160);
+  steps.push({ step: "ov-untick-preview",
+    posts: propagatePosts.slice(),
+    members: htmlOf("#reviewPropagateMembers"),
+    overrides: htmlOf("#reviewPropagateOverrides"),
+    applyDisabled: element("#reviewPropagateApply").disabled,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  await sandbox.__review.reviewPropagateApply();
+  await tick(200);
+  steps.push({ step: "ov-untick-applied",
+    posts: propagatePosts.slice(),
+    diff: htmlOf("#reviewPropagateDiff"),
+    msg: htmlOf("#reviewMsg"),
+    applyDisabled: element("#reviewPropagateApply").disabled });
+  exclusions.querySelectorAll = function () { return []; };
+  overrideBox.querySelectorAll = function () { return []; };
+  /* Re-opening the panel resets the ticks again (and sends nothing). */
+  const postsBefore = propagatePosts.length;
+  sandbox.__review.reviewPropagateOpen();
+  await tick(20);
+  steps.push({ step: "ov-reopen",
+    newPosts: propagatePosts.length - postsBefore,
+    state: (function () {
+      const ctx = sandbox.__review.getContext();
+      return { exclusions: (ctx.propagate.exclusions || []).slice(),
+        overrides: (ctx.propagate.overrides || []).slice() };
+    })() });
+  return steps;
+}
+
+async function main() {
+  const results = [];
+  results.push(...await runVlmFlow());
+  results.push(...await runTextOnlyFlow());
+  results.push(...await runNoVlmFlow());
+  results.push(...await runReattachFlow());
+  results.push(...await runSourceChoiceFlow());
+  results.push(...await runPropagateFlow());
+  results.push(...await runPropagateOverrideFlow());
+  console.log(JSON.stringify(results));
+}
+
+main().catch(function (error) {
+  console.error((error && error.stack) || error);
+  process.exit(1);
+});
+"""
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed for the CP5 DOM behaviour harness")
+class ReviewUiCp5BehaviorTests(unittest.TestCase):
+    def _run_harness(self):
+        base = Path(tempfile.mkdtemp(prefix="peekseed-cp5-ui-"))
+        try:
+            harness = base / "cp5_behavior.js"
+            harness.write_text(NODE_CP5_HARNESS, encoding="utf-8")
+            completed = subprocess.run(
+                [shutil.which("node"), str(harness), str(UI_PATH)],
+                capture_output=True, text=True, timeout=180)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stderr or completed.stdout)
+            return {row["step"]: row for row in json.loads(completed.stdout)}
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
+
+    def test_open_review_paints_vlm_bar_without_implicit_calls(self):
+        by_step = self._run_harness()
+        opened = by_step["vlm-open"]
+        self.assertEqual(opened["vlmPosts"], 0, opened)
+        self.assertEqual(opened["planPosts"], 0, opened)
+        bar = opened["bar"]
+        for marker in ("VLM 已配置", "qwen2.5-vl-72b", "answer-main",
+                       "支持图片", "预算 $2.00", "生成/更新 VLM 报告",
+                       "与 VLM 讨论", "费用未计价", "每 peel 调用上限 100"):
+            self.assertIn(marker, bar, opened)
+        provider = opened["provider"]
+        for marker in ("VLM", "qwen2.5-vl-72b", "支持图片", "缓存命中",
+                       "VLM 建议 2", "澄清问题 1", "部分簇失败",
+                       "vlm_bad_response", "跳过的簇/项", "OCR 未就绪",
+                       "超过单项上限", "预算耗尽", "cl-c", "cl-d"):
+            self.assertIn(marker, provider, opened)
+        self.assertIn("第 0 行是否是表头？", opened["clarifications"], opened)
+        self.assertIn("是", opened["clarifications"], opened)
+
+    def test_confirmation_gate_sends_nothing_until_confirmed(self):
+        by_step = self._run_harness()
+        confirm = by_step["vlm-confirm-open"]
+        self.assertFalse(confirm["hidden"], confirm)
+        self.assertEqual(confirm["vlmPosts"], 0, confirm)
+        for marker in ("answer_link", "answer-main", "qwen2.5-vl-72b",
+                       "支持图片", "项 2 / 簇 2"):
+            self.assertIn(marker, confirm["info"], confirm)
+        self.assertIn("生成/更新全 peel VLM 报告", confirm["target"], confirm)
+        self.assertIn("crop ✓", confirm["scope"], confirm)
+        cancel = by_step["vlm-confirm-cancel"]
+        self.assertTrue(cancel["hidden"], cancel)
+        self.assertEqual(cancel["vlmPosts"], 0, cancel)
+        sent = by_step["vlm-report-sent"]
+        self.assertEqual(len(sent["posts"]), 1, sent)
+        body = sent["posts"][0]
+        self.assertEqual(body["mode"], "vlm")
+        confirmation = body["confirmation"]
+        self.assertIs(confirmation["confirmed"], True)
+        self.assertEqual(confirmation["provider"], "answer_link")
+        self.assertEqual(confirmation["link_id"], "answer-main")
+        self.assertEqual(confirmation["model"], "qwen2.5-vl-72b")
+        self.assertEqual(confirmation["scope"]["item_ids"],
+                         ["it-a", "it-b"])
+        self.assertEqual(confirmation["scope"]["cluster_ids"],
+                         ["cl-a", "cl-b"])
+        for flag in ("include_crop", "include_original_page",
+                     "include_adjacent_pages", "include_native",
+                     "include_ocr"):
+            self.assertIs(confirmation["scope"][flag], True, confirmation)
+        self.assertIn("VLM 报告已生成", sent["msg"], sent)
+        self.assertIn("VLM 后台任务", sent["vlmJob"], sent)
+        self.assertIn("已完成", sent["vlmJob"], sent)
+        # A report job never edits the plan (no /review/plan action).
+        self.assertEqual(sent["planPosts"], 0, sent)
+
+    def test_discussion_send_poll_reply_and_patch_adoption(self):
+        by_step = self._run_harness()
+        confirm = by_step["discuss-confirm"]
+        self.assertFalse(confirm["hidden"], confirm)
+        self.assertEqual(confirm["discussPosts"], 0, confirm)
+        self.assertIn("与 VLM 讨论", confirm["target"], confirm)
+        sent = by_step["discuss-sent"]
+        self.assertEqual(len(sent["posts"]), 1, sent)
+        body = sent["posts"][0]
+        self.assertEqual(body["scope"], {"cluster_id": "cl-a"})
+        self.assertEqual(body["message"], "为什么把第 0 行作为表头？")
+        self.assertEqual(body["base_plan_version"], 0)
+        self.assertNotIn("conversation_id", body)
+        self.assertIs(body["confirmation"]["confirmed"], True)
+        self.assertEqual(body["confirmation"]["scope"]["item_ids"], ["it-a"])
+        self.assertEqual(body["confirmation"]["scope"]["cluster_ids"],
+                         ["cl-a"])
+        turns = sent["turns"]
+        self.assertIn("为什么把第 0 行作为表头？", turns, sent)
+        self.assertIn("建议把第 0 行作为表头。", turns, sent)
+        self.assertIn("修改决定", turns, sent)
+        self.assertIn("返回了计划 patch", turns, sent)
+        self.assertIn("成员预览", sent["members"], sent)
+        self.assertIn("正例 1", sent["members"], sent)
+        self.assertIn("排除项 1", sent["members"], sent)
+        self.assertIn("边界例 1", sent["members"], sent)
+        self.assertIn("VLM 计划 patch 预览", sent["patch"], sent)
+        self.assertFalse(sent["adoptDisabled"], sent)
+        adopted = by_step["patch-adopted"]
+        self.assertEqual(len(adopted["posts"]), 1, adopted)
+        patch_body = adopted["posts"][0]
+        self.assertEqual(patch_body["base_plan_version"], 0)
+        self.assertEqual(patch_body["source"], "vlm")
+        self.assertEqual(patch_body["conversation_id"], "conv-1")
+        # CP5.1 H5: the adopted patch names the archived assistant turn.
+        self.assertEqual(patch_body["turn"], 2, patch_body)
+        self.assertEqual(patch_body["patch"]["scope"]["kind"], "cluster")
+        self.assertIn("计划 diff", adopted["diff"], adopted)
+        self.assertIn("新增 1", adopted["diff"], adopted)
+        self.assertIn("it-a", adopted["diff"], adopted)
+        self.assertTrue(adopted["conflict"] == "", adopted)
+        # Adoption only edited the draft plan: no /review/plan action ran.
+        self.assertEqual(adopted["planPosts"], 0, adopted)
+        self.assertIn("未确认、未应用、未触发构建", adopted["msg"], adopted)
+
+    def test_patch_conflict_disables_adopt(self):
+        by_step = self._run_harness()
+        conflict = by_step["patch-conflict"]
+        self.assertEqual(len(conflict["posts"]), 2, conflict)
+        self.assertTrue(conflict["adoptDisabled"], conflict)
+        self.assertIn("采纳冲突（409）", conflict["conflict"], conflict)
+        self.assertIn("conflicts: it-a", conflict["conflict"], conflict)
+        self.assertIn("采纳按钮已禁用", conflict["conflict"], conflict)
+
+    def test_clarification_option_sends_a_message_not_an_operation(self):
+        by_step = self._run_harness()
+        clarify = by_step["clarify-answer"]
+        self.assertFalse(clarify["hidden"], clarify)
+        self.assertEqual(clarify["newPosts"], 0, clarify)
+        self.assertEqual(clarify["planPosts"], 0, clarify)
+        self.assertIn("澄清回答（讨论消息）", clarify["target"], clarify)
+        self.assertEqual(clarify["input"], "是（回答：第 0 行是否是表头？）",
+                         clarify)
+
+    def test_text_only_toggle_disables_image_scopes(self):
+        by_step = self._run_harness()
+        text_only = by_step["text-only"]
+        self.assertEqual(len(text_only["posts"]), 1, text_only)
+        scope = text_only["posts"][0]["confirmation"]["scope"]
+        self.assertIs(scope["include_crop"], False)
+        self.assertIs(scope["include_original_page"], False)
+        self.assertIs(scope["include_adjacent_pages"], False)
+        self.assertIs(scope["include_native"], True)
+        self.assertIs(scope["include_ocr"], True)
+        self.assertIn("crop ×", text_only["scope"], text_only)
+
+    def test_no_vlm_degrades_with_chinese_reason_and_rules_still_work(self):
+        by_step = self._run_harness()
+        opened = by_step["novlm-open"]
+        self.assertEqual(opened["vlmPosts"], 0, opened)
+        bar = opened["bar"]
+        self.assertIn("VLM 未配置", bar, opened)
+        self.assertIn("disabled", bar, opened)
+        self.assertIn("no enabled answer link", bar, opened)
+        self.assertIn("规则报告仍可用", bar, opened)
+        blocked = by_step["novlm-generate-blocked"]
+        self.assertTrue(blocked["hidden"], blocked)
+        self.assertEqual(blocked["vlmPosts"], 0, blocked)
+        self.assertIn("规则报告仍可用", blocked["msg"], blocked)
+        rules = by_step["novlm-rules-report"]
+        self.assertEqual(len(rules["posts"]), 1, rules)
+        self.assertEqual(rules["posts"][0], {}, rules)
+        self.assertEqual(rules["vlmPosts"], 1, rules)
+        self.assertIn("报告已生成", rules["msg"], rules)
+
+    def test_reattach_and_explicit_interrupted_retry(self):
+        by_step = self._run_harness()
+        reattach = by_step["reattach-open"]
+        self.assertEqual(reattach["vlmPosts"], 0, reattach)
+        job_panel = reattach["vlmJob"]
+        self.assertIn("VLM 后台任务", job_panel, reattach)
+        self.assertIn("report-old", job_panel, reattach)
+        self.assertIn("discuss-old", job_panel, reattach)
+        self.assertIn("已中断", job_panel, reattach)
+        self.assertIn("已完成", job_panel, reattach)
+        self.assertIn("手动重试", job_panel, reattach)
+        retry = by_step["reattach-retry"]
+        self.assertFalse(retry["hidden"], retry)
+        self.assertEqual(retry["vlmPosts"], 0, retry)
+        self.assertIn("确认生成/更新 VLM 报告？", retry["title"], retry)
+
+    def test_source_choice_and_vlm_disagrees_confirm_selected(self):
+        """CP5.1 H5: ambiguous/vlm_disagrees items render a source choice and
+        the confirm-selected request carries the ``sources`` map."""
+        by_step = self._run_harness()
+        opened = by_step["source-open"]
+        self.assertEqual(opened["planPosts"], 0, opened)
+        detail = opened["detail"]
+        self.assertIn("规则建议与 VLM 建议不一致", detail, opened)
+        self.assertIn("vlm_disagrees", detail, opened)
+        self.assertIn('data-r="accept-source"', detail, opened)
+        self.assertIn("采纳来源", detail, opened)
+        self.assertIn("规则", detail, opened)
+        self.assertIn("VLM", detail, opened)
+        choice = opened["choice"]
+        self.assertTrue(choice["needsChoice"], opened)
+        self.assertTrue(choice["ambiguous"], opened)
+        self.assertTrue(choice["disagrees"], opened)
+        self.assertEqual(choice["sources"], ["rule", "vlm"], opened)
+        self.assertEqual(choice["defaultSource"], "rule", opened)
+        accepted = by_step["source-accept"]
+        self.assertEqual(len(accepted["posts"]), 1, accepted)
+        body = accepted["posts"][0]
+        self.assertEqual(body["action"], "accept", body)
+        self.assertEqual(body["item_ids"], ["it-a"], body)
+        self.assertEqual(body["sources"], {"it-a": "vlm"}, body)
+        self.assertEqual(accepted["planPosts"], 1, accepted)
+
+    def test_propagation_panel_preview_exclude_apply_conflict_error(self):
+        """CP6 wire §3: 应用到相似项 — preview is a dry run, apply is an
+        explicit click enabled only after a preview with the same base plan
+        version and all locked members excluded; diff/error render, 批量 badge."""
+        by_step = self._run_harness()
+        opened = by_step["prop-open"]
+        self.assertFalse(opened["hidden"], opened)
+        # Opening the panel sends nothing; apply is disabled without a preview.
+        self.assertEqual(opened["posts"], 0, opened)
+        self.assertEqual(opened["scope"], "item", opened)
+        self.assertIn("use_first_row_header", opened["strategy"], opened)
+        self.assertIn("参数", opened["strategy"], opened)
+        self.assertTrue(opened["applyDisabled"], opened)
+        self.assertIn('id="reviewPropagateOpen"', opened["detail"], opened)
+        preview = by_step["prop-preview"]
+        self.assertEqual(len(preview["posts"]), 1, preview)
+        body = preview["posts"][0]
+        self.assertIs(body["dry_run"], True, body)
+        self.assertEqual(body["scope"], {
+            "kind": "cluster", "item_id": None, "cluster_id": "cl-a",
+            "peel": None}, body)
+        self.assertEqual(body["strategy"],
+                         {"id": "use_first_row_header", "version": 1}, body)
+        self.assertEqual(body["params"], {"rows": [0]}, body)
+        self.assertEqual(body["source_item_id"], "it-a", body)
+        self.assertEqual(body["exclusions"], [], body)
+        self.assertEqual(body["operator"], "user", body)
+        self.assertEqual(body["base_plan_version"], 0, body)
+        members = preview["members"]
+        for marker in ("it-a", "it-b", "it-c", "it-d", "就绪", "已锁定",
+                       "已有决定（默认保留）", "已有条目", "状态 confirmed",
+                       "动作 set_header_rows", "策略 use_first_row_header@v1",
+                       "统计：", "已有决定 1", "set_header_rows"):
+            self.assertIn(marker, members, preview)
+        self.assertIn("正例", preview["positives"], preview)
+        self.assertIn("it-a", preview["positives"], preview)
+        self.assertIn("边界例", preview["boundary"], preview)
+        self.assertIn("it-c", preview["boundary"], preview)
+        self.assertIn("排除项", preview["exclusions"], preview)
+        self.assertIn("propagate-exclude", preview["exclusions"], preview)
+        self.assertIn("已有决定（默认保留）", preview["exclusions"], preview)
+        # CP6.1: the decided member has an override checkbox (default kept).
+        self.assertIn("propagate-override", preview["overrides"], preview)
+        self.assertIn("it-d", preview["overrides"], preview)
+        self.assertIn("已有条目", preview["overrides"], preview)
+        self.assertIn("传播冲突", preview["conflict"], preview)
+        self.assertIn("it-b", preview["conflict"], preview)
+        # A locked member keeps apply disabled until it is excluded.
+        self.assertTrue(preview["applyDisabled"], preview)
+        excluded = by_step["prop-excluded"]
+        # Ticking an exclusion sends nothing; it only re-evaluates the button.
+        self.assertEqual(excluded["posts"], 1, excluded)
+        self.assertIn("已排除", excluded["members"], excluded)
+        self.assertEqual(excluded["conflict"], "", excluded)
+        self.assertFalse(excluded["applyDisabled"], excluded)
+        applied = by_step["prop-applied"]
+        self.assertEqual(len(applied["posts"]), 2, applied)
+        apply_body = applied["posts"][1]
+        self.assertIs(apply_body["dry_run"], False, apply_body)
+        self.assertEqual(apply_body["exclusions"], ["it-b"], apply_body)
+        # CP6.1: without an override tick the decided member is kept, so the
+        # apply body carries an empty ``overrides`` list.
+        self.assertEqual(apply_body["overrides"], [], apply_body)
+        self.assertEqual(apply_body["scope"]["kind"], "cluster", apply_body)
+        self.assertIn("传播 diff", applied["diff"], applied)
+        self.assertIn("新增 2", applied["diff"], applied)
+        self.assertIn("it-a", applied["diff"], applied)
+        # The refreshed plan entry renders a 批量 propagation origin badge on
+        # its draft entry (the UI labels draft as 已选策略).
+        self.assertIn("批量", applied["detail"], applied)
+        self.assertIn("已选策略", applied["detail"], applied)
+        self.assertIn("未确认、未构建、未发布", applied["msg"], applied)
+        # A fresh preview is required after the plan version changed.
+        self.assertTrue(applied["applyDisabled"], applied)
+        conflict = by_step["prop-conflict"]
+        self.assertIn("传播冲突", conflict["conflict"], conflict)
+        self.assertIn("conflicts: it-b", conflict["conflict"], conflict)
+        self.assertTrue(conflict["applyDisabled"], conflict)
+        error = by_step["prop-error"]
+        self.assertIn("传播失败", error["error"], error)
+        self.assertIn("validation", error["error"], error)
+        self.assertIn("parent_not_available", error["error"], error)
+        self.assertTrue(error["applyDisabled"], error)
+
+    def test_propagation_decided_override_toggle_and_bodies(self):
+        """CP6.1 + CP6.2 L1 (wire §7.2/§7.5/§8.1): ``decided`` rows render the
+        existing-decision summary and a 将覆盖 marker when overridden; override
+        ticks are sent in BOTH preview and apply bodies; toggling sends nothing;
+        opening the panel starts with empty ticks, while a successful preview
+        adopts the response-echoed ticks (no reset). An overridden ``ready``
+        member keeps its override checkbox so it can be unticked back to
+        ``decided`` (kept, not written)."""
+        by_step = self._run_harness()
+        opened = by_step["ov-open"]
+        # Opening sends nothing and leaves no override ticks.
+        self.assertEqual(opened["posts"], 0, opened)
+        self.assertEqual(opened["overrides"], "", opened)
+        self.assertTrue(opened["applyDisabled"], opened)
+        preview = by_step["ov-preview"]
+        self.assertEqual(len(preview["posts"]), 1, preview)
+        body = preview["posts"][0]
+        self.assertIs(body["dry_run"], True, body)
+        self.assertEqual(body["overrides"], [], body)
+        self.assertEqual(body["exclusions"], [], body)
+        # The decided row renders 已有决定（默认保留） + the existing summary.
+        for marker in ("已有决定（默认保留）", "已有条目", "状态 confirmed",
+                       "动作 set_header_rows",
+                       "策略 use_first_row_header@v1", "统计：",
+                       "已有决定 1"):
+            self.assertIn(marker, preview["members"], preview)
+        self.assertNotIn("将覆盖", preview["members"], preview)
+        # The override list has the decided member's checkbox.
+        for marker in ("propagate-override", "it-d", "已有条目"):
+            self.assertIn(marker, preview["overrides"], preview)
+        # The locked member keeps apply disabled until it is excluded.
+        self.assertTrue(preview["applyDisabled"], preview)
+        toggled = by_step["ov-toggled"]
+        # Ticking exclusion/override only repaints: no request is sent.
+        self.assertEqual(toggled["posts"], 1, toggled)
+        self.assertIn("将覆盖", toggled["members"], toggled)
+        self.assertIn("checked", toggled["overrides"], toggled)
+        self.assertIn("it-d", toggled["overrides"], toggled)
+        self.assertFalse(toggled["applyDisabled"], toggled)
+        # CP6.2 L1: the preview echoes the active ticks and the UI adopts them
+        # as the current selection instead of resetting to [].
+        repreview = by_step["ov-repreview"]
+        self.assertEqual(len(repreview["posts"]), 2, repreview)
+        preview_body = repreview["posts"][1]
+        self.assertIs(preview_body["dry_run"], True, preview_body)
+        self.assertEqual(preview_body["exclusions"], ["it-b"], preview_body)
+        self.assertEqual(preview_body["overrides"], ["it-d"], preview_body)
+        self.assertEqual(repreview["state"],
+                         {"exclusions": ["it-b"], "overrides": ["it-d"]},
+                         repreview)
+        # it-d is now ``ready`` but still carries ``existing``, so its override
+        # checkbox stays listed and checked; the checked row renders 将覆盖.
+        self.assertIn("将覆盖", repreview["members"], repreview)
+        self.assertIn("就绪", repreview["members"], repreview)
+        self.assertIn("已有条目", repreview["members"], repreview)
+        self.assertIn("已排除 1", repreview["members"], repreview)
+        self.assertIn("propagate-override", repreview["overrides"], repreview)
+        self.assertIn("it-d", repreview["overrides"], repreview)
+        self.assertIn("checked", repreview["overrides"], repreview)
+        self.assertFalse(repreview["applyDisabled"], repreview)
+        # Apply without re-ticking: the body carries the same lists the preview
+        # was computed with, so the member shown 已排除 is not written.
+        applied = by_step["ov-applied"]
+        self.assertEqual(len(applied["posts"]), 3, applied)
+        apply_body = applied["posts"][2]
+        self.assertIs(apply_body["dry_run"], False, apply_body)
+        self.assertEqual(apply_body["exclusions"], ["it-b"], apply_body)
+        self.assertEqual(apply_body["overrides"], ["it-d"], apply_body)
+        self.assertIn("传播 diff", applied["diff"], applied)
+        self.assertIn("新增 3", applied["diff"], applied)
+        self.assertIn("it-d", applied["diff"], applied)
+        self.assertNotIn("it-b", applied["diff"], applied)
+        self.assertIn("未确认、未构建、未发布", applied["msg"], applied)
+        self.assertTrue(applied["applyDisabled"], applied)
+        # Untick the overridden ready+existing member: the toggle sends nothing
+        # and a fresh preview returns it to ``decided`` (kept).
+        unticked = by_step["ov-unticked"]
+        self.assertEqual(unticked["posts"], 3, unticked)
+        self.assertEqual(unticked["state"],
+                         {"exclusions": ["it-b"], "overrides": []}, unticked)
+        self.assertNotIn("将覆盖", unticked["members"], unticked)
+        self.assertIn("propagate-override", unticked["overrides"], unticked)
+        self.assertIn("it-d", unticked["overrides"], unticked)
+        self.assertNotIn("checked", unticked["overrides"], unticked)
+        self.assertTrue(unticked["applyDisabled"], unticked)
+        untick_preview = by_step["ov-untick-preview"]
+        self.assertEqual(len(untick_preview["posts"]), 4, untick_preview)
+        untick_preview_body = untick_preview["posts"][3]
+        self.assertIs(untick_preview_body["dry_run"], True,
+                      untick_preview_body)
+        self.assertEqual(untick_preview_body["exclusions"], ["it-b"],
+                         untick_preview_body)
+        self.assertEqual(untick_preview_body["overrides"], [],
+                         untick_preview_body)
+        self.assertEqual(untick_preview["state"],
+                         {"exclusions": ["it-b"], "overrides": []},
+                         untick_preview)
+        self.assertIn("已有决定（默认保留）", untick_preview["members"],
+                      untick_preview)
+        self.assertNotIn("将覆盖", untick_preview["members"], untick_preview)
+        self.assertIn("propagate-override", untick_preview["overrides"],
+                      untick_preview)
+        self.assertIn("it-d", untick_preview["overrides"], untick_preview)
+        self.assertNotIn("checked", untick_preview["overrides"],
+                         untick_preview)
+        self.assertFalse(untick_preview["applyDisabled"], untick_preview)
+        # Apply after the untick sends ``overrides:[]`` and does not write it-d.
+        untick_applied = by_step["ov-untick-applied"]
+        self.assertEqual(len(untick_applied["posts"]), 5, untick_applied)
+        untick_apply_body = untick_applied["posts"][4]
+        self.assertIs(untick_apply_body["dry_run"], False, untick_apply_body)
+        self.assertEqual(untick_apply_body["exclusions"], ["it-b"],
+                         untick_apply_body)
+        self.assertEqual(untick_apply_body["overrides"], [], untick_apply_body)
+        self.assertIn("传播 diff", untick_applied["diff"], untick_applied)
+        self.assertIn("新增 2", untick_applied["diff"], untick_applied)
+        self.assertNotIn("it-d", untick_applied["diff"], untick_applied)
+        self.assertNotIn("it-b", untick_applied["diff"], untick_applied)
+        self.assertTrue(untick_applied["applyDisabled"], untick_applied)
+        reopened = by_step["ov-reopen"]
+        self.assertEqual(reopened["newPosts"], 0, reopened)
+        self.assertEqual(reopened["state"],
+                         {"exclusions": [], "overrides": []}, reopened)

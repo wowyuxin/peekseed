@@ -18,8 +18,12 @@ import os
 import time
 import unittest
 
-from tests.fixtures import (DEFAULT_REPORT, EMBED_CHUNK, FakeModelServer,
-                            FakePeelfeedCli, make_pdf, make_peel,
+from tests.fixtures import (DEFAULT_REPORT, DEFAULT_REVIEW,
+                            DEFAULT_VLM_DISCUSS, EMBED_CHUNK,
+                            FakeModelServer, FakePeelfeedCli,
+                            REVIEW_VLM, VLM_CONFIRMATION, VLM_DISCUSS_PATCH,
+                            VLM_LINK_BASE, VLM_LINK_ID, VLM_LINK_KEY,
+                            VLM_LINK_KEY_ENV, VLM_MODEL, make_pdf, make_peel,
                             temp_data_root, write_peel_build)
 
 _PEELFEED_ENV_KEYS = ("PEEKSEED_PEELFEED_CLI", "PEEKSEED_PEELFEED_PYTHON",
@@ -139,6 +143,57 @@ def _wait_review_job(client, base, job_id, timeout=10.0):
             return state
         time.sleep(0.02)
     raise AssertionError("review job %s did not finish: %r" % (job_id, state))
+
+
+def _answer_link(**overrides):
+    """Create the enabled default answer link used by VLM report/discuss."""
+    from peekseed import links
+    data = {"id": VLM_LINK_ID, "role": "answer", "label": "Review VLM",
+            "protocol": "openai", "base_url": VLM_LINK_BASE,
+            "api_key_env": VLM_LINK_KEY_ENV, "model": VLM_MODEL,
+            "enabled": True}
+    data.update(overrides)
+    return links.create(data)
+
+
+@contextlib.contextmanager
+def vlm_answer_key():
+    """Set the answer link's API key env for one test (never stored in links)."""
+    saved = os.environ.get(VLM_LINK_KEY_ENV)
+    os.environ[VLM_LINK_KEY_ENV] = VLM_LINK_KEY
+    try:
+        yield
+    finally:
+        if saved is None:
+            os.environ.pop(VLM_LINK_KEY_ENV, None)
+        else:
+            os.environ[VLM_LINK_KEY_ENV] = saved
+
+
+def _confirmation(**overrides):
+    """A copy of the frozen privacy confirmation with field overrides."""
+    value = copy.deepcopy(VLM_CONFIRMATION)
+    for key, item in overrides.items():
+        value[key] = item
+    return value
+
+
+def _confirmation_scope(**overrides):
+    value = copy.deepcopy(VLM_CONFIRMATION)
+    value["scope"].update(overrides)
+    return value
+
+
+def _discuss_request(**overrides):
+    value = {
+        "conversation_id": None,
+        "scope": {"cluster_id": "cl-0f1e2d3c4b5a"},
+        "message": "为什么把第 0 行作为表头？",
+        "base_plan_version": 0,
+        "confirmation": copy.deepcopy(VLM_CONFIRMATION),
+    }
+    value.update(overrides)
+    return value
 
 
 def _confirm_operation_entry(client, base, item_id="it-3f9c2a4b6d8e0f1a",
@@ -1477,8 +1532,14 @@ class PeelfeedApiTests(unittest.TestCase):
                 operation = rows["it-3f9c2a4b6d8e0f1a"]
                 self.assertEqual(set(operation), {
                     "item_id", "entry_id", "strategy", "action", "status",
-                    "revision", "replaced_existing"})
+                    "source", "origin", "revision", "replaced_existing"})
                 self.assertEqual(operation["status"], "confirmed")
+                # CP5.1 H5 (wire §10.5): accepted entries record the actual
+                # source and the report origin (job id/model/prompt version).
+                self.assertEqual(operation["source"], "rule")
+                self.assertEqual(set(operation["origin"]), {
+                    "kind", "job_id", "model", "prompt_version"})
+                self.assertEqual(operation["origin"]["kind"], "report")
                 self.assertEqual(operation["revision"], 1)
                 self.assertFalse(operation["replaced_existing"])
                 self.assertEqual(operation["action"], {
@@ -2055,10 +2116,12 @@ class PeelfeedApiTests(unittest.TestCase):
                     "cluster_ids": ["cl-0f1e2d3c4b5a"]})
                 bad = client.post(route, json={"item_ids": "it-x"})
                 self.assertEqual(bad.status_code, 400, bad.text)
+                # CP5: VLM mode is accepted but requires the frozen privacy
+                # confirmation; an empty one is a 400 before any CLI call.
                 vlm = client.post(route, json={"mode": "vlm",
                                                "confirmation": {}})
                 self.assertEqual(vlm.status_code, 400, vlm.text)
-                self.assertIn("VLM", vlm.json()["detail"])
+                self.assertIn("confirmation", vlm.json()["detail"])
                 unknown = client.post(route, json={"tier": "R2"})
                 self.assertEqual(unknown.status_code, 400, unknown.text)
                 # peelfeed failure maps to 400/502, never a silent success
@@ -2737,12 +2800,1778 @@ class PeelfeedApiTests(unittest.TestCase):
             self.assertTrue(search.json()["results"])
 
 
+@contextlib.contextmanager
+def _cp5_env(root, *, link=True, key=True, link_overrides=None):
+    """Fake CLI + optional default answer link/key for one CP5 test."""
+    cli = FakePeelfeedCli(root / "fake")
+    saved_key = os.environ.get(VLM_LINK_KEY_ENV)
+    with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+        from peekseed import links
+        links.reset_cache()
+        if link:
+            _answer_link(**(link_overrides or {}))
+        if key:
+            os.environ[VLM_LINK_KEY_ENV] = VLM_LINK_KEY
+        try:
+            yield cli
+        finally:
+            if saved_key is None:
+                os.environ.pop(VLM_LINK_KEY_ENV, None)
+            else:
+                os.environ[VLM_LINK_KEY_ENV] = saved_key
+            links.reset_cache()
+
+
+class Cp5VlmClientTests(unittest.TestCase):
+    def test_vlm_report_client_argv_stdin_and_child_only_env(self):
+        """CP5 K1 (wire §1.3/§2.1): ``--with-vlm --input -``, token env-only."""
+        with temp_data_root() as root:
+            source = make_pdf(root / "manual.pdf")
+            with _cp5_env(root) as cli:
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                confirmation = copy.deepcopy(VLM_CONFIRMATION)
+                result = engine.review_report(
+                    peel_id, mode="vlm", confirmation=confirmation)
+                self.assertEqual(result["status"], "queued")
+                self.assertTrue(result["job_id"].startswith("report-"))
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "review-report")
+                # ``review-report <peel> --with-vlm --input - --root … --json``
+                self.assertEqual(call["argv"][1:3], [peel_id, "--with-vlm"])
+                self.assertEqual(call["argv"][3:5], ["--input", "-"])
+                self.assertIn("--root", call["argv"])
+                self.assertIn("--json", call["argv"])
+                self.assertNotIn(VLM_LINK_KEY, " ".join(call["argv"]))
+                # The token reaches exactly this child's env (wire §1.3).
+                self.assertEqual(call["llm_env"], {
+                    "PEELFEED_LLM_BASE": VLM_LINK_BASE,
+                    "PEELFEED_LLM_MODEL": VLM_MODEL,
+                    "PEELFEED_LLM_TOKEN": VLM_LINK_KEY,
+                    "PEELFEED_LLM_LINK_ID": VLM_LINK_ID,
+                })
+                # Frozen stdin: mode + confirmation only, no token.
+                self.assertEqual(cli.state()["review_vlm_requests"][-1], {
+                    "mode": "vlm", "confirmation": confirmation})
+                self.assertNotIn(VLM_LINK_KEY, json.dumps(cli.state()))
+                # Filters ride the same VLM request.
+                engine.review_report(
+                    peel_id, item_ids=["it-3f9c2a4b6d8e0f1a"],
+                    cluster_ids=["cl-0f1e2d3c4b5a"], mode="vlm",
+                    confirmation=confirmation)
+                request = cli.state()["review_vlm_requests"][-1]
+                self.assertEqual(request["item_ids"], ["it-3f9c2a4b6d8e0f1a"])
+                self.assertEqual(request["cluster_ids"],
+                                 ["cl-0f1e2d3c4b5a"])
+                # Rules reports keep their CP3 stdin and get NO LLM env.
+                engine.review_report(peel_id, item_ids=["it-3f9c2a4b6d8e0f1a"])
+                rules_call = [item for item in cli.calls()
+                              if item["argv"][0] == "review-report"][-1]
+                self.assertNotIn("--with-vlm", rules_call["argv"])
+                self.assertEqual(rules_call["llm_env"], {})
+                self.assertEqual(cli.state()["review_report_requests"][-1],
+                                 {"item_ids": ["it-3f9c2a4b6d8e0f1a"]})
+
+    def test_vlm_unavailable_without_link_or_key(self):
+        """CP5 K1: no link / missing key -> 503 before any CLI call."""
+        with temp_data_root() as root:
+            source = make_pdf(root / "manual.pdf")
+            with _cp5_env(root, link=False, key=False) as cli:
+                from peekseed import links, peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                for call in (
+                        lambda: engine.review_report(
+                            peel_id, mode="vlm",
+                            confirmation=copy.deepcopy(VLM_CONFIRMATION)),
+                        lambda: engine.discuss(peel_id, _discuss_request())):
+                    with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                        call()
+                    self.assertEqual(caught.exception.status, 503)
+                    self.assertIn("vlm_unavailable",
+                                  caught.exception.detail)
+                self.assertFalse([item for item in cli.calls()
+                                  if item["argv"][0] in ("review-report",
+                                                         "discuss")])
+                # A link without its key env is also 503, still no CLI call.
+                links.reset_cache()
+                _answer_link()
+                os.environ.pop(VLM_LINK_KEY_ENV, None)
+                with self.assertRaises(peelfeed.PeelfeedError) as caught:
+                    engine.review_report(
+                        peel_id, mode="vlm",
+                        confirmation=copy.deepcopy(VLM_CONFIRMATION))
+                self.assertEqual(caught.exception.status, 503)
+                self.assertIn("vlm_unavailable", caught.exception.detail)
+                self.assertFalse([item for item in cli.calls()
+                                  if item["argv"][0] == "review-report"])
+
+    def test_discuss_and_plan_patch_client_shapes(self):
+        """CP5 K2/K3 (wire §2.1/§4/§5): discuss job, sync plan patch, no LLM env."""
+        with temp_data_root() as root:
+            source = make_pdf(root / "manual.pdf")
+            with _cp5_env(root) as cli:
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                request = _discuss_request()
+                result = engine.discuss(peel_id, request)
+                self.assertTrue(result["job_id"].startswith("discuss-"))
+                self.assertTrue(result["conversation_id"].startswith("conv-"))
+                self.assertEqual(result["status"], "queued")
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "discuss")
+                self.assertEqual(call["argv"][1:4],
+                                 [peel_id, "--input", "-"])
+                self.assertIn("--root", call["argv"])
+                self.assertIn("--json", call["argv"])
+                self.assertNotIn(VLM_LINK_KEY, " ".join(call["argv"]))
+                self.assertEqual(call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                self.assertEqual(cli.state()["discuss_requests"][-1],
+                                 request)
+                # plan patch is synchronous, no model call, no LLM env.
+                # CP5.1 H5: source vlm needs the archived conversation+turn,
+                # so the client-shape test uses a user-sourced patch.
+                patch_request = {"base_plan_version": 0,
+                                 "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                                 "source": "user"}
+                response = engine.plan_patch(peel_id, patch_request)
+                self.assertEqual(response["plan_version"], 1)
+                self.assertEqual(response["diff"]["added"][0]["item_id"],
+                                 "it-3f9c2a4b6d8e0f1a")
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "plan")
+                self.assertEqual(call["argv"][1:5],
+                                 [peel_id, "patch", "--input", "-"])
+                self.assertEqual(call["llm_env"], {})
+                self.assertEqual(cli.state()["plan_patch_requests"][-1],
+                                 patch_request)
+                self.assertNotIn(VLM_LINK_KEY,
+                                 json.dumps(cli.state()["plan"]))
+
+
+@contextlib.contextmanager
+def _peelfeed_llm_env(**values):
+    """Set peekseed's own ``PEELFEED_LLM_*`` env (the env-first provider)."""
+    keys = ("PEELFEED_LLM_BASE", "PEELFEED_LLM_MODEL",
+            "PEELFEED_LLM_TOKEN", "PEELFEED_LLM_LINK_ID")
+    saved = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    for key, value in values.items():
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key in keys:
+            os.environ.pop(key, None)
+        for key, value in saved.items():
+            if value is not None:
+                os.environ[key] = value
+
+
+class Cp5VlmCapabilityOverlayTests(unittest.TestCase):
+    """CP5 wire §2.3: the review payload must carry the truth about VLM.
+
+    peelfeed's ``capabilities`` child never receives the provider env (only
+    report/discuss children do), so peekseed overlays the resolved
+    ``capabilities.vlm*`` block itself (Lead review note 1).
+    """
+
+    def test_review_payload_overlays_the_answer_link_provider(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                payload = client.get(base + "/review?group=cluster").json()
+                caps = payload["capabilities"]
+                self.assertTrue(caps["vlm"])
+                self.assertIsNone(caps["vlm_detail"])
+                self.assertEqual(caps["vlm_provider"], "answer_link")
+                self.assertEqual(caps["vlm_model"], VLM_MODEL)
+                self.assertEqual(caps["vlm_link_id"], VLM_LINK_ID)
+                self.assertIn("vlm_vision", caps)
+                # The single-item route also carries the overlay (additive).
+                item = payload["items"][0]["id"]
+                one = client.get(base + "/review/items/" + item)
+                self.assertEqual(one.status_code, 200, one.text)
+                self.assertTrue(one.json()["capabilities"]["vlm"])
+                self.assertEqual(one.json()["capabilities"]["vlm_provider"],
+                                 "answer_link")
+                # Removing the link/key turns the overlay off with a reason;
+                # the rules report path is unaffected.
+                from peekseed import links
+                links.reset_cache()
+                for existing in links.links("answer"):
+                    links.delete(existing["id"])
+                os.environ.pop(VLM_LINK_KEY_ENV, None)
+                payload = client.get(base + "/review").json()
+                caps = payload["capabilities"]
+                self.assertFalse(caps["vlm"])
+                self.assertIn("VLM 不可用", caps["vlm_detail"])
+                self.assertIsNone(caps["vlm_model"])
+                self.assertIsNone(caps["vlm_link_id"])
+                report = client.post(base + "/review/reports", json={})
+                self.assertEqual(report.status_code, 202, report.text)
+
+    def test_peelfeed_llm_env_wins_and_is_injected_child_only(self):
+        """Phase 4: ``PEELFEED_LLM_*`` env first, else the answer link."""
+        env_model = "env-vlm-model"
+        env_link = "vlm-env"
+        env_token = "sk-env-vlm-secret"
+        with temp_data_root() as root:
+            with _cp5_env(root, link=False, key=False) as cli, \
+                    _peelfeed_llm_env(
+                        PEELFEED_LLM_BASE="http://127.0.0.1:9000/v1",
+                        PEELFEED_LLM_MODEL=env_model,
+                        PEELFEED_LLM_TOKEN=env_token,
+                        PEELFEED_LLM_LINK_ID=env_link):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                payload = client.get(base + "/review").json()
+                caps = payload["capabilities"]
+                self.assertTrue(caps["vlm"])
+                self.assertEqual(caps["vlm_provider"], "env")
+                self.assertEqual(caps["vlm_model"], env_model)
+                self.assertEqual(caps["vlm_link_id"], env_link)
+                confirmation = copy.deepcopy(VLM_CONFIRMATION)
+                confirmation.update({"provider": "env", "link_id": env_link,
+                                     "model": env_model})
+                cli.clear_calls()
+                response = client.post(base + "/review/reports", json={
+                    "mode": "vlm", "confirmation": confirmation})
+                self.assertEqual(response.status_code, 202, response.text)
+                report_call = next(item for item in cli.calls()
+                                   if item["argv"][0] == "review-report")
+                self.assertEqual(report_call["llm_env"], {
+                    "PEELFEED_LLM_BASE": "http://127.0.0.1:9000/v1",
+                    "PEELFEED_LLM_MODEL": env_model,
+                    "PEELFEED_LLM_TOKEN": env_token,
+                    "PEELFEED_LLM_LINK_ID": env_link,
+                })
+                self.assertNotIn(env_token, " ".join(report_call["argv"]))
+                # Rules reports never get the env provider.
+                rules = client.post(base + "/review/reports", json={})
+                self.assertEqual(rules.status_code, 202, rules.text)
+                rules_call = [item for item in cli.calls()
+                              if item["argv"][0] == "review-report"][-1]
+                self.assertEqual(rules_call["llm_env"], {})
+                # A discussion with the env provider also gets the child env.
+                discuss = client.post(base + "/review/discussions", json={
+                    "scope": {"peel": True}, "message": "解释一下这个簇",
+                    "base_plan_version": 0, "confirmation": confirmation})
+                self.assertEqual(discuss.status_code, 202, discuss.text)
+                discuss_call = next(item for item in cli.calls()
+                                    if item["argv"][0] == "discuss")
+                self.assertEqual(discuss_call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 env_token)
+                # The confirmation must name the resolved provider.
+                wrong = copy.deepcopy(confirmation)
+                wrong["provider"] = "answer_link"
+                mismatch = client.post(base + "/review/reports", json={
+                    "mode": "vlm", "confirmation": wrong})
+                self.assertEqual(mismatch.status_code, 400, mismatch.text)
+                self.assertIn("privacy_confirmation_required",
+                              mismatch.json()["detail"])
+                self.assertNotIn(env_token, json.dumps(cli.state()))
+
+    def test_incomplete_env_provider_falls_back_to_the_answer_link(self):
+        """Only the complete trio (BASE/MODEL/TOKEN) activates the env provider."""
+        with temp_data_root() as root:
+            with _cp5_env(root, link=False, key=False) as cli, \
+                    _peelfeed_llm_env(PEELFEED_LLM_BASE="http://x/v1",
+                                      PEELFEED_LLM_MODEL="m"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                caps = client.get(base + "/review").json()["capabilities"]
+                self.assertFalse(caps["vlm"])
+                self.assertIn("VLM 不可用", caps["vlm_detail"])
+                cli.clear_calls()
+                response = client.post(base + "/review/reports", json={
+                    "mode": "vlm",
+                    "confirmation": copy.deepcopy(VLM_CONFIRMATION)})
+                self.assertEqual(response.status_code, 503, response.text)
+                self.assertIn("vlm_unavailable", response.json()["detail"])
+                self.assertFalse([item for item in cli.calls()
+                                  if item["argv"][0] == "review-report"])
+
+
+class Cp5VlmReportRouteTests(unittest.TestCase):
+    def test_vlm_report_route_creates_a_job_and_keeps_the_token_child_only(self):
+        """CP5 K1/K6 (wire §6.1/§6.4): 202 job, descriptor, no token persisted."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                dataset_id = base.split("/")[3]
+                sha = base.split("/")[5]
+                cli.clear_calls()
+                response = client.post(base + "/review/reports", json={
+                    "mode": "vlm",
+                    "confirmation": copy.deepcopy(VLM_CONFIRMATION)})
+                self.assertEqual(response.status_code, 202, response.text)
+                payload = response.json()
+                self.assertEqual(set(payload), {"job_id", "status"})
+                self.assertEqual(payload["status"], "queued")
+                self.assertTrue(payload["job_id"].startswith("report-"))
+                job = _wait_review_job(client, base, payload["job_id"])
+                self.assertEqual(job["type"], "report")
+                self.assertEqual(job["status"], "done")
+                self.assertEqual(job["result_ref"], "report.json")
+                # Frozen stdin shape (no token) reached the fake CLI.
+                self.assertEqual(cli.state()["review_vlm_requests"][-1], {
+                    "mode": "vlm",
+                    "confirmation": VLM_CONFIRMATION})
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "review-report")
+                self.assertIn("--with-vlm", call["argv"])
+                self.assertEqual(call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                # Token is not in argv, the dataset file or the descriptor.
+                self.assertNotIn(VLM_LINK_KEY, " ".join(call["argv"]))
+                dataset_text = (
+                    root.parent / "home" / "datasets" / dataset_id
+                    / "dataset.json").read_text(encoding="utf-8")
+                self.assertNotIn(VLM_LINK_KEY, dataset_text)
+                rows = _sources(client, dataset_id)
+                row = next(item for item in rows if item["sha256"] == sha)
+                descriptor = row["extraction"]["review_jobs"][payload["job_id"]]
+                self.assertEqual(descriptor["type"], "report")
+                self.assertIsNone(descriptor["batch_id"])
+                self.assertIsNone(descriptor["conversation_id"])
+                self.assertNotIn(VLM_LINK_KEY, json.dumps(descriptor))
+                # A rules report afterwards is unchanged and gets no LLM env.
+                rules = client.post(base + "/review/reports", json={})
+                self.assertEqual(rules.status_code, 202, rules.text)
+                rules_call = [item for item in cli.calls()
+                              if item["argv"][0] == "review-report"][-1]
+                self.assertEqual(rules_call["llm_env"], {})
+                self.assertNotIn("--with-vlm", rules_call["argv"])
+
+    def test_vlm_report_rejections_create_no_job(self):
+        """CP5 K1/K5 (wire §6.1/§6.5): validation/privacy/unavailable mapping."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                dataset_id = base.split("/")[3]
+                sha = base.split("/")[5]
+                route = base + "/review/reports"
+
+                def jobs():
+                    rows = _sources(client, dataset_id)
+                    row = next(item for item in rows
+                               if item["sha256"] == sha)
+                    return row["extraction"]["review_jobs"]
+
+                cli.clear_calls()
+                before = jobs()
+                bad_bodies = [
+                    {"tier": "R2"},
+                    {"mode": "rules"},
+                    {"confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"mode": "vlm"},
+                    {"mode": "vlm", "confirmation": []},
+                    {"mode": "vlm", "confirmation": _confirmation(
+                        confirmed=False)},
+                    {"mode": "vlm", "confirmation": _confirmation(
+                        confirmed="true")},
+                    {"mode": "vlm", "confirmation": _confirmation(
+                        unknown="x")},
+                    {"mode": "vlm", "confirmation": _confirmation_scope(
+                        bogus=True)},
+                    {"mode": "vlm", "confirmation": _confirmation(
+                        provider="env")},
+                    {"mode": "vlm", "confirmation": _confirmation(
+                        link_id="other-link")},
+                    {"mode": "vlm", "confirmation": _confirmation(
+                        model="other-model")},
+                    {"mode": "vlm", "confirmation": _confirmation_scope(
+                        item_ids=["b", "a"])},
+                    {"mode": "vlm", "confirmation": _confirmation_scope(
+                        include_crop="true")},
+                    {"mode": "vlm", "confirmation": _confirmation_scope(
+                        item_ids=["it-a", "it-a"])},
+                ]
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                # Privacy mismatches carry the frozen code.
+                for body in bad_bodies[9:12]:
+                    response = client.post(route, json=body)
+                    self.assertIn("privacy_confirmation_required",
+                                  response.json()["detail"])
+                # No rejected request created a job or invoked the CLI.
+                self.assertEqual(jobs(), before)
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "review-report"], [])
+                # No answer link -> 503 vlm_unavailable, still no job.
+                from peekseed import links
+                links.reset_cache()
+                for existing in links.links("answer"):
+                    links.delete(existing["id"])
+                unconfigured = client.post(route, json={
+                    "mode": "vlm",
+                    "confirmation": copy.deepcopy(VLM_CONFIRMATION)})
+                self.assertEqual(unconfigured.status_code, 503,
+                                 unconfigured.text)
+                self.assertIn("vlm_unavailable",
+                              unconfigured.json()["detail"])
+                self.assertEqual(jobs(), before)
+                # A link whose key env is missing is also 503 with no job.
+                _answer_link()
+                os.environ.pop(VLM_LINK_KEY_ENV, None)
+                missing_key = client.post(route, json={
+                    "mode": "vlm",
+                    "confirmation": copy.deepcopy(VLM_CONFIRMATION)})
+                self.assertEqual(missing_key.status_code, 503,
+                                 missing_key.text)
+                self.assertIn("vlm_unavailable",
+                              missing_key.json()["detail"])
+                self.assertEqual(jobs(), before)
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "review-report"], [])
+
+
+class Cp5DiscussionRouteTests(unittest.TestCase):
+    def test_discussion_route_creates_a_job_with_conversation_descriptor(self):
+        """CP5 K2/K6 (wire §6.2/§6.4): 202 job, descriptor + conversation_id."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                dataset_id = base.split("/")[3]
+                sha = base.split("/")[5]
+                cli.clear_calls()
+                response = client.post(base + "/review/discussions",
+                                       json=_discuss_request())
+                self.assertEqual(response.status_code, 202, response.text)
+                payload = response.json()
+                self.assertEqual(set(payload),
+                                 {"job_id", "conversation_id", "status"})
+                self.assertTrue(payload["job_id"].startswith("discuss-"))
+                self.assertTrue(payload["conversation_id"].startswith("conv-"))
+                self.assertEqual(payload["status"], "queued")
+                job = _wait_review_job(client, base, payload["job_id"])
+                self.assertEqual(job["type"], "discuss")
+                self.assertEqual(job["status"], "done")
+                self.assertEqual(job["result_ref"],
+                                 "conversations/%s.jsonl"
+                                 % payload["conversation_id"])
+                row = next(item for item in _sources(client, dataset_id)
+                           if item["sha256"] == sha)
+                descriptor = row["extraction"]["review_jobs"][
+                    payload["job_id"]]
+                self.assertEqual(descriptor["type"], "discuss")
+                self.assertEqual(descriptor["conversation_id"],
+                                 payload["conversation_id"])
+                self.assertIsNone(descriptor["batch_id"])
+                # Frozen stdin + child-only env; token never in argv/state.
+                self.assertEqual(cli.state()["discuss_requests"][-1],
+                                 _discuss_request())
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "discuss")
+                self.assertEqual(call["argv"][1:4],
+                                 ["peel-" + sha[:8], "--input", "-"])
+                self.assertEqual(call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                self.assertNotIn(VLM_LINK_KEY, " ".join(call["argv"]))
+                self.assertNotIn(VLM_LINK_KEY, json.dumps(descriptor))
+                # Follow-up turn reuses the conversation id (peelfeed appends).
+                follow = _discuss_request(
+                    conversation_id=payload["conversation_id"],
+                    message="那前两行呢？")
+                second = client.post(base + "/review/discussions",
+                                     json=follow)
+                self.assertEqual(second.status_code, 202, second.text)
+                self.assertEqual(second.json()["conversation_id"],
+                                 payload["conversation_id"])
+
+    def test_discussion_request_validation_and_error_mapping(self):
+        """CP5 K2 (wire §6.2): strict body, 503/404/400/502 mapping, no job."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/discussions"
+                cli.clear_calls()
+                bad_bodies = [
+                    {"message": "hi"},                       # missing fields
+                    {"scope": {"peel": True}, "message": "hi",
+                     "base_plan_version": 0},                # missing confirm
+                    {"scope": {"item_id": "it-a", "cluster_id": "cl-a"},
+                     "message": "hi", "base_plan_version": 0,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"scope": {}, "message": "hi", "base_plan_version": 0,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"scope": {"peel": False}, "message": "hi",
+                     "base_plan_version": 0,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"scope": {"peel": True}, "message": "",
+                     "base_plan_version": 0,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"scope": {"peel": True}, "message": "x" * 4001,
+                     "base_plan_version": 0,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"scope": {"peel": True}, "message": "hi",
+                     "base_plan_version": -1,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                    {"scope": {"peel": True}, "message": "hi",
+                     "base_plan_version": 0,
+                     "confirmation": _confirmation(provider="env")},
+                    {"scope": {"peel": True}, "message": "hi",
+                     "base_plan_version": 0, "unknown": 1,
+                     "confirmation": copy.deepcopy(VLM_CONFIRMATION)},
+                ]
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "discuss"], [])
+                # Unknown conversation -> 404 (peelfeed not_found).
+                unknown = client.post(route, json=_discuss_request(
+                    conversation_id="conv-20260101T000000-ffff"))
+                self.assertEqual(unknown.status_code, 404, unknown.text)
+                # peelfeed job-time errors map through contract §4.
+                for code, exit_code, status in (
+                        ("validation", 2, 400),
+                        ("privacy_confirmation_required", 2, 400),
+                        ("vlm_bad_response", 2, 502),
+                        ("conflict", 2, 409)):
+                    cli.update(discuss_error={"code": code, "exit": exit_code,
+                                              "message": code})
+                    response = client.post(route, json=_discuss_request())
+                    self.assertEqual(response.status_code, status,
+                                     (code, response.text))
+                cli.update(discuss_error=None)
+                # No answer link -> 503 before any CLI call.
+                from peekseed import links
+                links.reset_cache()
+                for existing in links.links("answer"):
+                    links.delete(existing["id"])
+                discuss_calls_before = len(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "discuss"])
+                unconfigured = client.post(route, json=_discuss_request())
+                self.assertEqual(unconfigured.status_code, 503,
+                                 unconfigured.text)
+                self.assertIn("vlm_unavailable",
+                              unconfigured.json()["detail"])
+                self.assertEqual(
+                    len([item for item in cli.calls()
+                         if item["argv"][0] == "discuss"]),
+                    discuss_calls_before)
+
+
+class Cp5PlanPatchRouteTests(unittest.TestCase):
+    def test_plan_patch_route_is_synchronous_and_never_applies(self):
+        """CP5 K3/K4 (wire §5/§6.3): 200 plan+diff; draft only; no LLM env."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                # CP5.1 H5: a VLM-sourced patch must name the archived assistant
+                # turn; create a discussion whose assistant turn carries the
+                # default draft patch, then adopt that exact patch.
+                cli.update(discuss_result=copy.deepcopy(DEFAULT_VLM_DISCUSS))
+                discussion = client.post(base + "/review/discussions",
+                                         json=_discuss_request())
+                self.assertEqual(discussion.status_code, 202,
+                                 discussion.text)
+                conversation_id = discussion.json()["conversation_id"]
+                cli.clear_calls()
+                body = {"base_plan_version": 0,
+                        "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                        "source": "vlm",
+                        "conversation_id": conversation_id,
+                        "turn": 2}
+                response = client.post(base + "/review/plan/patches",
+                                       json=body)
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(payload["review_schema"], 2)
+                self.assertEqual(payload["plan_version"], 1)
+                self.assertEqual(payload["diff"]["added"][0]["item_id"],
+                                 "it-3f9c2a4b6d8e0f1a")
+                self.assertEqual(payload["diff"]["changed"], [])
+                self.assertEqual(payload["diff"]["removed"], [])
+                self.assertEqual(payload["diff"]["unchanged"], 0)
+                self.assertEqual(payload["entries"][0]["status"], "draft")
+                # The archived patch was submitted unchanged -> source vlm with
+                # the conversation origin (wire §10.5).
+                self.assertEqual(payload["entries"][0]["source"], "vlm")
+                self.assertEqual(payload["entries"][0]["origin"], {
+                    "kind": "conversation",
+                    "conversation_id": conversation_id, "turn": 2,
+                    "model": VLM_MODEL, "prompt_version": "peel-reviews@1"})
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "plan")
+                self.assertEqual(call["argv"][1:5],
+                                 ["peel-" + base.split("/")[5][:8], "patch",
+                                  "--input", "-"])
+                self.assertEqual(call["llm_env"], {})
+                self.assertEqual(cli.state()["plan_patch_requests"][-1], body)
+                # The route never confirms/applies: no batch/resolution exists.
+                self.assertFalse(cli.state().get("batches"))
+                self.assertFalse(cli.state().get("resolutions"))
+                # A no-op repeat does not bump the plan version.
+                noop = client.post(base + "/review/plan/patches", json={
+                    "base_plan_version": 1,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "user"})
+                self.assertEqual(noop.status_code, 200, noop.text)
+                self.assertEqual(noop.json()["plan_version"], 1)
+                self.assertEqual(noop.json()["diff"]["unchanged"], 1)
+
+    def test_plan_patch_conflicts_and_validation(self):
+        """CP5 K4 (wire §5/§6.3): base/locked 409, validation 400, 404, no apply."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/patches"
+                # Base mismatch -> 409 conflict (source user needs no turn).
+                stale = client.post(route, json={
+                    "base_plan_version": 7,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "user"})
+                self.assertEqual(stale.status_code, 409, stale.text)
+                self.assertIn("conflict", stale.json()["detail"])
+                # Locked entry in the patch target -> 409 with conflict ids.
+                plan_version, entry_id = _confirm_operation_entry(
+                    client, base)
+                locked = client.post(base + "/review/plan", json={
+                    "base_plan_version": plan_version, "action": "lock",
+                    "entry_id": entry_id})
+                self.assertEqual(locked.status_code, 200, locked.text)
+                locked_version = locked.json()["plan_version"]
+                conflict = client.post(route, json={
+                    "base_plan_version": locked_version,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "user"})
+                self.assertEqual(conflict.status_code, 409, conflict.text)
+                self.assertIn("conflicts:", conflict.json()["detail"])
+                self.assertIn("it-3f9c2a4b6d8e0f1a",
+                              conflict.json()["detail"])
+                # The rejected patch changed nothing (entry stays locked).
+                self.assertEqual(cli.state()["plan"]["plan_version"],
+                                 locked_version)
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                # Envelope validation is a 400 and never invokes the CLI.
+                cli.clear_calls()
+                bad_bodies = [
+                    {"patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm"},
+                    {"base_plan_version": 0, "source": "vlm"},
+                    {"base_plan_version": 0, "patch": [],
+                     "source": "vlm"},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "model"},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "tier": "R2"},
+                    # CP5.1 H5 (wire §10.5): source vlm requires the archived
+                    # conversation and assistant turn number.
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm"},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1"},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1", "turn": 0},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1",
+                     "turn": True},
+                    {"base_plan_version": 0,
+                     "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                     "source": "vlm", "conversation_id": "conv-1",
+                     "turn": "2"},
+                ]
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+                # Unknown conversation -> 404 (with the required turn present).
+                unknown = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": "conv-20260101T000000-ffff",
+                    "turn": 2})
+                self.assertEqual(unknown.status_code, 404, unknown.text)
+                # Invalid strategy/params -> peelfeed validation 400 (use an
+                # item that is not locked so the conflict check does not fire).
+                bad_patch = copy.deepcopy(VLM_DISCUSS_PATCH)
+                bad_patch["scope"] = {"kind": "item",
+                                      "item_id": "it-8b7a6c5d4e3f2a10",
+                                      "cluster_id": None}
+                bad_patch["members"] = ["it-8b7a6c5d4e3f2a10"]
+                bad_patch["changes"] = [{
+                    "op": "select", "item_id": "it-8b7a6c5d4e3f2a10",
+                    "strategy": {"id": "no_such_strategy", "version": 1},
+                    "params": {},
+                }]
+                invalid = client.post(route, json={
+                    "base_plan_version": locked_version, "patch": bad_patch,
+                    "source": "user"})
+                self.assertEqual(invalid.status_code, 400, invalid.text)
+
+
+class Cp51H7EnvForwardingTests(unittest.TestCase):
+    """CP5.1 H7 (wire §10.7): tuning env reaches every child, provider does not.
+
+    peekseed forwards the non-secret ``PEELFEED_LLM_*`` tuning variables from
+    its own environment to **all** peelfeed children (read-only commands
+    included) so a deployed budget/price/timeout/vision/cap config reaches the
+    engine; ``PEELFEED_LLM_PROVIDER`` (the local/test command seam) is never
+    forwarded, and BASE/MODEL/TOKEN/LINK_ID stay child-only for report/discuss.
+    """
+
+    TUNING = {
+        "PEELFEED_LLM_PROMPT_SET": "peel-reviews@1",
+        "PEELFEED_LLM_TIMEOUT": "90",
+        "PEELFEED_LLM_BUDGET_USD": "1.50",
+        "PEELFEED_LLM_PRICE_INPUT": "0.001",
+        "PEELFEED_LLM_PRICE_OUTPUT": "0.002",
+        "PEELFEED_LLM_VISION": "1",
+        "PEELFEED_LLM_MAX_CALLS_PER_JOB": "4",
+        "PEELFEED_LLM_MAX_CALLS_PER_PEEL": "100",
+        "PEELFEED_LLM_MAX_IMAGES_PER_TURN": "6",
+        "PEELFEED_LLM_JSON_MODE": "1",
+    }
+
+    @contextlib.contextmanager
+    def _tuning_env(self):
+        saved = {key: os.environ.get(key) for key in
+                 list(self.TUNING) + ["PEELFEED_LLM_PROVIDER"]}
+        os.environ.update(self.TUNING)
+        # The seam must never reach a child: if it did, the fake CLI would
+        # execute it instead of answering from its state file.
+        os.environ["PEELFEED_LLM_PROVIDER"] = (
+            "sh -c 'echo never-forwarded; exit 2'")
+        try:
+            yield
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def test_read_only_children_get_tuning_env_but_never_provider(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli, self._tuning_env():
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                engine.capabilities()
+                engine.status_all()
+                call = cli.calls()[-1]
+                for key, value in self.TUNING.items():
+                    self.assertEqual(call["llm_env"].get(key), value, key)
+                self.assertNotIn("PEELFEED_LLM_PROVIDER", call["llm_env"])
+                self.assertNotIn("PEELFEED_LLM_TOKEN", call["llm_env"])
+                self.assertNotIn("PEELFEED_LLM_BASE", call["llm_env"])
+                self.assertNotIn("PEELFEED_LLM_MODEL", call["llm_env"])
+                # The seam is forwarded to no child and persisted nowhere.
+                self.assertNotIn("PEELFEED_LLM_PROVIDER",
+                                 json.dumps(cli.state()))
+                self.assertFalse([item for item in cli.calls()
+                                  if "never-forwarded" in item.get("argv", [])])
+
+    def test_report_and_discuss_children_get_provider_plus_tuning(self):
+        with temp_data_root() as root:
+            source = make_pdf(root / "manual.pdf")
+            with _cp5_env(root) as cli, self._tuning_env():
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                engine.review_report(
+                    peel_id, mode="vlm",
+                    confirmation=copy.deepcopy(VLM_CONFIRMATION))
+                report_call = next(item for item in cli.calls()
+                                   if item["argv"][0] == "review-report")
+                self.assertEqual(report_call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                self.assertEqual(report_call["llm_env"]["PEELFEED_LLM_MODEL"],
+                                 VLM_MODEL)
+                for key, value in self.TUNING.items():
+                    self.assertEqual(report_call["llm_env"].get(key), value,
+                                     key)
+                self.assertNotIn("PEELFEED_LLM_PROVIDER",
+                                 report_call["llm_env"])
+                engine.discuss(peel_id, _discuss_request())
+                discuss_call = next(item for item in cli.calls()
+                                    if item["argv"][0] == "discuss")
+                self.assertEqual(discuss_call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                                 VLM_LINK_KEY)
+                for key, value in self.TUNING.items():
+                    self.assertEqual(discuss_call["llm_env"].get(key), value,
+                                     key)
+                self.assertNotIn("PEELFEED_LLM_PROVIDER",
+                                 discuss_call["llm_env"])
+                # No token in argv or any persisted fake state.
+                self.assertNotIn(VLM_LINK_KEY,
+                                 " ".join(report_call["argv"]))
+                self.assertNotIn(VLM_LINK_KEY, json.dumps(cli.state()))
+
+    def test_review_capabilities_preserve_priced_and_per_peel_cap(self):
+        """The overlay must keep peelfeed's additive pricing/cap fields."""
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                review = copy.deepcopy(REVIEW_VLM)
+                review["capabilities"].update({"vlm_priced": False,
+                                               "vlm_max_calls_per_peel": 100})
+                cli.update(review=review)
+                caps = client.get(base + "/review").json()["capabilities"]
+                self.assertIs(caps["vlm_priced"], False)
+                self.assertEqual(caps["vlm_max_calls_per_peel"], 100)
+                self.assertTrue(caps["vlm"])
+                # Absent fields stay absent (no invented default).
+                self.assertNotIn("vlm_priced",
+                                 DEFAULT_REVIEW["capabilities"])
+
+
+class Cp51H5AcceptSourceTests(unittest.TestCase):
+    """CP5.1 H5 (wire §10.5): per-item adoption source + origin/ambiguity."""
+
+    ITEM_ID = "it-3f9c2a4b6d8e0f1a"
+
+    @staticmethod
+    def _suggestion(item_id, strategy_id, source, *, version=1, params=None):
+        return {
+            "item_id": item_id,
+            "strategy": {"id": strategy_id, "version": version},
+            "params": params if params is not None else {},
+            "evidence_refs": [],
+            "validator": {"status": "ready", "reasons": []},
+            "in_plan": False,
+            "state": "ready",
+            "source": source,
+        }
+
+    def _report(self, suggestions, *, job_id=None, provider=None):
+        report = copy.deepcopy(DEFAULT_REPORT)
+        report["report"]["clusters"] = [{
+            "cluster_id": "cl-0f1e2d3c4b5a",
+            "item_ids": [self.ITEM_ID],
+            "conclusion": "规则与 VLM 建议不一致。",
+            "suggestions": suggestions,
+            "clarifications": [],
+        }]
+        if job_id is not None:
+            report["report"]["job_id"] = job_id
+        if provider is not None:
+            report["report"]["provider"] = provider
+        return report
+
+    def test_ambiguous_suggestion_needs_sources_and_records_origin(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                report = self._report(
+                    [self._suggestion(self.ITEM_ID, "use_first_row_header",
+                                      "rule"),
+                     self._suggestion(self.ITEM_ID, "confirm_no_header",
+                                      "vlm")],
+                    job_id="report-20261109T031000-abc1",
+                    provider={"kind": "vlm", "model": VLM_MODEL,
+                              "prompt_version": "peel-reviews@1"})
+                cli.update(review_report=report)
+                cli.clear_calls()
+                # Without ``sources`` the differing ready suggestions are
+                # ambiguous -> 400 all-or-nothing, no plan write.
+                ambiguous = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID]})
+                self.assertEqual(ambiguous.status_code, 400, ambiguous.text)
+                self.assertIn(self.ITEM_ID + "=ambiguous_suggestion",
+                              ambiguous.json()["detail"])
+                self.assertEqual((cli.state().get("plan") or {}).get("plan_version", 0), 0)
+                self.assertFalse((cli.state().get("plan") or {}).get("entries"))
+                # With ``sources`` the requested suggestion is adopted and the
+                # plan entry/accepted row record the actual source and origin.
+                accepted = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID],
+                    "sources": {self.ITEM_ID: "vlm"}})
+                self.assertEqual(accepted.status_code, 200, accepted.text)
+                plan = accepted.json()
+                self.assertEqual(plan["accepted"][0]["source"], "vlm")
+                self.assertEqual(plan["accepted"][0]["origin"], {
+                    "kind": "report",
+                    "job_id": "report-20261109T031000-abc1",
+                    "model": VLM_MODEL,
+                    "prompt_version": "peel-reviews@1"})
+                entry = plan["entries"][0]
+                self.assertEqual(entry["source"], "vlm")
+                self.assertEqual(entry["origin"], plan["accepted"][0]["origin"])
+                self.assertEqual(entry["strategy"]["id"], "confirm_no_header")
+                # The exact stdin request carried the sources map.
+                self.assertEqual(cli.state()["accept_requests"][-1], {
+                    "base_plan_version": 0, "item_ids": [self.ITEM_ID],
+                    "sources": {self.ITEM_ID: "vlm"}})
+                # Same-identity suggestions are not ambiguous: rule preferred.
+                cli.update(plan=None)
+                cli.update(review_report=self._report([
+                    self._suggestion(self.ITEM_ID, "use_first_row_header",
+                                     "rule"),
+                    self._suggestion(self.ITEM_ID, "use_first_row_header",
+                                     "vlm")]))
+                same = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID]})
+                self.assertEqual(same.status_code, 200, same.text)
+                self.assertEqual(same.json()["accepted"][0]["source"], "rule")
+
+    def test_source_missing_and_strict_body_validation(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan"
+                cli.clear_calls()
+                # The default report only has a rule suggestion; asking for vlm
+                # is a per-item failure ``source_missing``.
+                missing = client.post(route, json={
+                    "base_plan_version": 0, "action": "accept",
+                    "item_ids": [self.ITEM_ID],
+                    "sources": {self.ITEM_ID: "vlm"}})
+                self.assertEqual(missing.status_code, 400, missing.text)
+                self.assertIn(self.ITEM_ID + "=source_missing",
+                              missing.json()["detail"])
+                self.assertEqual((cli.state().get("plan") or {}).get("plan_version", 0), 0)
+                self.assertFalse((cli.state().get("plan") or {}).get("entries"))
+                # Strict envelope: unknown field, non-object sources, unknown
+                # key, bad value are all 400 and never reach the CLI.
+                cli.clear_calls()
+                bad_bodies = [
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID], "tier": "R2"},
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID], "sources": ["rule"]},
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID],
+                     "sources": {"it-ffffffffffffffff": "rule"}},
+                    {"base_plan_version": 0, "action": "accept",
+                     "item_ids": [self.ITEM_ID],
+                     "sources": {self.ITEM_ID: "model"}},
+                ]
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+                self.assertEqual(
+                    (cli.state().get("plan") or {}).get("plan_version", 0), 0)
+
+
+class Cp51H5PlanPatchTurnTests(unittest.TestCase):
+    """CP5.1 H5 (wire §10.5): patch turn/source determination + origin."""
+
+    def _conversation(self, client, base, cli, patch=None):
+        result = copy.deepcopy(DEFAULT_VLM_DISCUSS)
+        if patch is not None:
+            result["patch"] = copy.deepcopy(patch)
+        cli.update(discuss_result=result)
+        response = client.post(base + "/review/discussions",
+                               json=_discuss_request())
+        self.assertEqual(response.status_code, 202, response.text)
+        return response.json()["conversation_id"]
+
+    def test_identical_patch_is_vlm_and_edited_patch_is_user_with_origin(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/patches"
+                conversation_id = self._conversation(client, base, cli)
+                # The archived assistant patch, submitted unchanged -> source vlm.
+                identical = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": conversation_id, "turn": 2})
+                self.assertEqual(identical.status_code, 200, identical.text)
+                entry = identical.json()["entries"][0]
+                self.assertEqual(entry["source"], "vlm")
+                self.assertEqual(entry["origin"], {
+                    "kind": "conversation",
+                    "conversation_id": conversation_id, "turn": 2,
+                    "model": VLM_MODEL, "prompt_version": "peel-reviews@1"})
+                # A user-edited patch is recorded as source user but keeps the
+                # conversation origin (wire §10.5).
+                edited_patch = copy.deepcopy(VLM_DISCUSS_PATCH)
+                edited_patch["changes"][0]["params"] = {"rows": [1]}
+                edited = client.post(route, json={
+                    "base_plan_version": identical.json()["plan_version"],
+                    "patch": edited_patch, "source": "vlm",
+                    "conversation_id": conversation_id, "turn": 2})
+                self.assertEqual(edited.status_code, 200, edited.text)
+                entry = edited.json()["entries"][0]
+                self.assertEqual(entry["source"], "user")
+                self.assertEqual(entry["origin"]["kind"], "conversation")
+                self.assertEqual(entry["origin"]["turn"], 2)
+                self.assertEqual(entry["action"]["params"], {"rows": [1]})
+
+    def test_turn_validation_and_unknown_conversation(self):
+        with temp_data_root() as root:
+            with _cp5_env(root) as cli:
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/patches"
+                conversation_id = self._conversation(client, base, cli)
+                cli.clear_calls()
+                # No archived assistant patch with that number -> validation.
+                missing_turn = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": conversation_id, "turn": 8})
+                self.assertEqual(missing_turn.status_code, 400,
+                                 missing_turn.text)
+                self.assertIn("validation", missing_turn.json()["detail"])
+                # Unknown conversation -> 404.
+                unknown = client.post(route, json={
+                    "base_plan_version": 0,
+                    "patch": copy.deepcopy(VLM_DISCUSS_PATCH),
+                    "source": "vlm",
+                    "conversation_id": "conv-20260101T000000-ffff",
+                    "turn": 2})
+                self.assertEqual(unknown.status_code, 404, unknown.text)
+                self.assertIn("not_found", unknown.json()["detail"])
+
+
+class Cp51H9ReingestTests(unittest.TestCase):
+    """CP5.1 H9 (wire §10.9): a re-extracting source is never marked early."""
+
+    def test_slow_reingest_of_ready_peel_stays_queued_until_worker_finishes(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                dataset, _pdf = _upload(client, root)
+                sha = _sources(client, dataset["id"])[0]["sha256"]
+                first = client.post(
+                    "/api/datasets/%s/sources/%s/extract"
+                    % (dataset["id"], sha), json={})
+                self.assertEqual(first.status_code, 200, first.text)
+                row = _wait_source(client, dataset["id"], sha)
+                self.assertEqual(row["extraction"]["state"], "extracted")
+                self.assertTrue(row["extraction"]["peel_id"])
+                # Re-ingest an already-ready peel: the fake keeps the previous
+                # ``ready`` peel visible for one second, exactly like peelfeed
+                # before it publishes the new build.
+                cli.update(ingest_seconds=1.0, ingest_keep_previous_state=True)
+                second = client.post(
+                    "/api/datasets/%s/sources/%s/extract"
+                    % (dataset["id"], sha), json={})
+                self.assertEqual(second.status_code, 200, second.text)
+                self.assertTrue(second.json()["peel"]["reused"], second.text)
+                # While the worker runs, GET …/sources must report only
+                # queued/running -- never the previous peel's ``extracted``.
+                deadline = time.time() + 0.6
+                window_states = []
+                while time.time() < deadline:
+                    state = _sources(client, dataset["id"])[0][
+                        "extraction"]["state"]
+                    window_states.append(state)
+                    self.assertNotIn(
+                        state, ("extracted", "failed"),
+                        "H9: source became terminal while the re-ingest "
+                        "worker was still running: %r" % (window_states,))
+                    time.sleep(0.05)
+                self.assertTrue(set(window_states) <= {"queued", "running"},
+                                window_states)
+                # An index build during the window must not see ``extracted``.
+                index = client.post("/api/datasets/%s/index" % dataset["id"],
+                                    json={})
+                self.assertEqual(index.status_code, 409, index.text)
+                self.assertIn("no_extracted_sources", index.json()["detail"])
+                # After the worker finishes its authoritative write the source
+                # is extracted again (the registry entry is gone).
+                row = _wait_source(client, dataset["id"], sha)
+                self.assertEqual(row["extraction"]["state"], "extracted")
+
+    def test_restart_recovery_is_unchanged_without_an_active_worker(self):
+        """No worker active: a terminal peelfeed state is still persisted."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                dataset, _pdf = _upload(client, root)
+                sha = _sources(client, dataset["id"])[0]["sha256"]
+                client.post("/api/datasets/%s/sources/%s/extract"
+                            % (dataset["id"], sha), json={})
+                row = _wait_source(client, dataset["id"], sha)
+                self.assertEqual(row["extraction"]["state"], "extracted")
+                from peekseed import app as app_module, config, ingest
+                directory = config.paths().datasets_dir / dataset["id"]
+                # Simulate a crashed worker: the dataset says running, peelfeed
+                # says ready, and no registry entry exists.
+                stale = dict(row["extraction"])
+                stale.update({"state": "running", "finished_at": None})
+                ingest.update_source(directory, sha, status="running",
+                                     extraction=stale)
+                recovered = _sources(client, dataset["id"])[0]
+                self.assertEqual(recovered["extraction"]["state"], "extracted")
+                self.assertFalse(app_module._extraction_active(directory, sha))
+
+
+def _propagate_body(**overrides):
+    """A frozen CP6 wire §1.1 ``plan propagate`` request (preview by default)."""
+    body = {
+        "base_plan_version": 0,
+        "scope": {"kind": "item", "item_id": "it-3f9c2a4b6d8e0f1a",
+                  "cluster_id": None, "peel": None},
+        "strategy": {"id": "use_first_row_header", "version": 1},
+        "params": {"rows": [0]},
+        "source_item_id": "it-3f9c2a4b6d8e0f1a",
+        "exclusions": [],
+        "dry_run": True,
+        "operator": "user",
+    }
+    body.update(overrides)
+    return body
+
+
+class Cp6PropagateRouteTests(unittest.TestCase):
+    """CP6 wire §1/§2: synchronous cluster-level propagation proxy."""
+
+    ITEM = "it-3f9c2a4b6d8e0f1a"
+
+    def test_client_plan_propagate_argv_stdin_and_no_llm_env(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            source = make_pdf(root / "manual.pdf")
+            with peelfeed_env(CLI=str(cli.path)):
+                from peekseed import peelfeed
+                engine = peelfeed.client()
+                peel_id = engine.ingest(str(source), llm_mode="off")[
+                    "peel"]["peel_id"]
+                cli.clear_calls()
+                body = _propagate_body()
+                result = engine.plan_propagate(peel_id, body)
+                self.assertIs(result["dry_run"], True)
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "plan")
+                self.assertEqual(call["argv"][1:5],
+                                 [peel_id, "propagate", "--input", "-"])
+                self.assertIn("--root", call["argv"])
+                self.assertIn("--json", call["argv"])
+                # No model call and no LLM env for a propagation child.
+                self.assertEqual(call["llm_env"], {})
+                self.assertEqual(cli.state()["propagate_requests"][-1], body)
+                self.assertFalse(cli.state().get("propagations"))
+
+    def test_preview_and_apply_round_trip(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                peel_id = "peel-" + base.split("/")[5][:8]
+                cli.clear_calls()
+                body = _propagate_body()
+                preview = client.post(route, json=body)
+                self.assertEqual(preview.status_code, 200, preview.text)
+                payload = preview.json()
+                self.assertIs(payload["dry_run"], True)
+                # The preview response omits apply-only fields and writes
+                # nothing (wire §1.5).
+                for key in ("propagation_id", "diff", "changed"):
+                    self.assertNotIn(key, payload)
+                self.assertEqual(payload["plan_version"], 0)
+                self.assertEqual([member["item_id"]
+                                  for member in payload["members"]],
+                                 [self.ITEM])
+                self.assertEqual(payload["members"][0]["status"], "ready")
+                self.assertEqual(payload["counts"]["members"], 1)
+                self.assertNotIn("plan", cli.state())
+                self.assertFalse(cli.state().get("propagations"))
+                # Exact frozen request reached the fake CLI; no LLM env.
+                self.assertEqual(cli.state()["propagate_requests"][-1], body)
+                call = next(item for item in cli.calls()
+                            if item["argv"][0] == "plan")
+                self.assertEqual(call["argv"][1:5],
+                                 [peel_id, "propagate", "--input", "-"])
+                self.assertEqual(call["llm_env"], {})
+                # Apply: draft entry + propagation origin + audit record.
+                applied = client.post(route,
+                                      json=_propagate_body(dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["dry_run"], False)
+                self.assertTrue(result["propagation_id"].startswith("prop-"))
+                self.assertEqual(result["plan_version"], 1)
+                self.assertIs(result["changed"], True)
+                self.assertEqual(result["diff"]["added"][0]["item_id"],
+                                 self.ITEM)
+                plan = cli.state()["plan"]
+                entry = plan["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["source"], "user")
+                self.assertEqual(entry["origin"]["kind"], "propagation")
+                self.assertEqual(entry["origin"]["propagation_id"],
+                                 result["propagation_id"])
+                record = cli.state()["propagations"][
+                    result["propagation_id"]]
+                self.assertEqual(record["operator"], "user")
+                self.assertEqual(record["selection"], [self.ITEM])
+                self.assertEqual(record["base_plan_version"], 0)
+                self.assertEqual(record["plan_version_after"], 1)
+                # A repeat apply is a no-op: changed false, no version bump,
+                # no duplicate entry, audit record still written (wire §1.3).
+                repeat = client.post(route, json=_propagate_body(
+                    base_plan_version=1, dry_run=False))
+                self.assertEqual(repeat.status_code, 200, repeat.text)
+                self.assertIs(repeat.json()["changed"], False)
+                self.assertEqual(repeat.json()["plan_version"], 1)
+                self.assertEqual(repeat.json()["diff"]["unchanged"], 1)
+                self.assertEqual(len(cli.state()["plan"]["entries"]), 1)
+                self.assertEqual(len(cli.state()["propagations"]), 2)
+
+    def test_locked_conflict_and_validation_passthrough(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                # Lock the item through the existing plan machinery.
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                locked = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "lock", "entry_id": entry_id})
+                self.assertEqual(locked.status_code, 200, locked.text)
+                version = locked.json()["plan_version"]
+                # Preview shows the locked member and writes nothing.
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                self.assertEqual(preview.json()["members"][0]["status"],
+                                 "locked")
+                self.assertFalse(cli.state().get("propagations"))
+                # Apply without excluding it -> 409 conflict (conflict ids in
+                # the readable error), plan untouched.
+                conflict = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(conflict.status_code, 409, conflict.text)
+                self.assertIn("conflicts:", conflict.json()["detail"])
+                self.assertIn(self.ITEM, conflict.json()["detail"])
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                # Explicitly excluding it allows the (no-op) apply.
+                excluded = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    exclusions=[self.ITEM]))
+                self.assertEqual(excluded.status_code, 200, excluded.text)
+                self.assertIs(excluded.json()["changed"], False)
+                self.assertEqual(excluded.json()["plan_version"], version)
+                self.assertEqual(excluded.json()["counts"]["excluded"], 1)
+                self.assertTrue(cli.state()["plan"]["entries"][0]["locked"])
+                records_before = len(cli.state().get("propagations") or {})
+                # Base mismatch -> 409 conflict.
+                stale = client.post(route, json=_propagate_body(
+                    base_plan_version=99))
+                self.assertEqual(stale.status_code, 409, stale.text)
+                self.assertIn("conflict", stale.json()["detail"])
+                # A non-excluded failing member -> 400 validation with the
+                # per-member reasons, nothing written.
+                cli.update(propagate_failed={
+                    "it-8b7a6c5d4e3f2a10": ["parent_not_available"]})
+                failed = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    scope={"kind": "item",
+                           "item_id": "it-8b7a6c5d4e3f2a10",
+                           "cluster_id": None, "peel": None},
+                    source_item_id="it-8b7a6c5d4e3f2a10",
+                    strategy={"id": "use_first_row_header", "version": 1},
+                    params={"rows": [0]}))
+                self.assertEqual(failed.status_code, 400, failed.text)
+                self.assertIn("validation", failed.json()["detail"])
+                self.assertIn("it-8b7a6c5d4e3f2a10",
+                              failed.json()["detail"])
+                self.assertEqual(len(cli.state().get("propagations") or {}),
+                                 records_before)
+
+    def test_overrides_forwarded_and_decided_entry_passthrough(self):
+        """CP6.1 wire §7.2/§7.5: the route forwards ``overrides`` exactly and
+        passes the ``decided``/``existing``/``kept``/``overridden`` semantics
+        through unchanged (kept by default; overridden written as ready)."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                # A confirmed entry whose action differs from the propagated one.
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [1]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                version = confirmed.json()["plan_version"]
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "confirmed")
+                # Preview without overrides: the member is decided (kept).
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                payload = preview.json()
+                self.assertEqual(payload["members"][0]["status"], "decided")
+                self.assertEqual(payload["members"][0]["existing"], {
+                    "kind": "entry", "status": "confirmed",
+                    "strategy": {"id": "use_first_row_header", "version": 1},
+                    "name": "set_header_rows"})
+                self.assertEqual(payload["counts"]["decided"], 1)
+                self.assertEqual(payload["overrides"], [])
+                self.assertEqual(
+                    cli.state()["propagate_requests"][-1],
+                    _propagate_body(base_plan_version=version))
+                self.assertFalse(cli.state().get("propagations"))
+                # Apply without overrides keeps the confirmed entry: no write,
+                # no resolution revert, no error (wire §7.2).
+                kept = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(kept.status_code, 200, kept.text)
+                kept_payload = kept.json()
+                self.assertIs(kept_payload["changed"], False)
+                self.assertEqual(kept_payload["plan_version"], version)
+                self.assertEqual(kept_payload["diff"]["changed"], [])
+                self.assertEqual(kept_payload["counts"]["decided"], 1)
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "confirmed")
+                record = cli.state()["propagations"][
+                    kept_payload["propagation_id"]]
+                self.assertEqual(record["kept"], [self.ITEM])
+                self.assertEqual(record["overridden"], [])
+                self.assertEqual(record["overrides"], [])
+                self.assertEqual(record["selection"], [self.ITEM])
+                # Preview with overrides: the same member is now evaluated
+                # normally (ready) but still carries its ``existing`` summary;
+                # duplicates collapse and ids are stripped.
+                override_body = _propagate_body(base_plan_version=version,
+                                                overrides=["  %s  " % self.ITEM,
+                                                           self.ITEM])
+                override_preview = client.post(route, json=override_body)
+                self.assertEqual(override_preview.status_code, 200,
+                                 override_preview.text)
+                override_payload = override_preview.json()
+                self.assertEqual(override_payload["members"][0]["status"],
+                                 "ready")
+                self.assertEqual(override_payload["members"][0]["existing"],
+                                 {"kind": "entry", "status": "confirmed",
+                                  "strategy": {"id": "use_first_row_header",
+                                               "version": 1},
+                                  "name": "set_header_rows"})
+                self.assertEqual(override_payload["counts"]["decided"], 0)
+                self.assertEqual(override_payload["overrides"], [self.ITEM])
+                self.assertEqual(
+                    cli.state()["propagate_requests"][-1],
+                    dict(override_body, overrides=[self.ITEM]))
+                # Apply with the override: the entry is replaced (revision+1,
+                # propagation origin) and listed in ``overridden``.
+                applied = client.post(route, json=dict(
+                    override_body, dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["changed"], True)
+                self.assertEqual(result["plan_version"], version + 1)
+                self.assertEqual(result["overrides"], [self.ITEM])
+                changed = result["diff"]["changed"]
+                self.assertEqual(len(changed), 1)
+                self.assertEqual(changed[0]["item_id"], self.ITEM)
+                self.assertEqual(changed[0]["after"]["status"], "draft")
+                self.assertEqual(changed[0]["after"]["revision"], 2)
+                self.assertEqual(changed[0]["after"]["origin"]["kind"],
+                                 "propagation")
+                record = cli.state()["propagations"][
+                    result["propagation_id"]]
+                self.assertEqual(record["kept"], [])
+                self.assertEqual(record["overridden"], [self.ITEM])
+                self.assertEqual(record["overrides"], [self.ITEM])
+
+    def test_decided_active_resolution_kept_then_overridden_with_r0_revert(self):
+        """CP6.1 wire §7.1/§7.2: an active R0 resolution makes the member
+        ``decided`` (kept by default); an override replaces it and reverts the
+        active R0 in the same review lock."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                deferred = client.post(base + "/review/plan", json={
+                    "base_plan_version": 0, "action": "defer",
+                    "item_id": self.ITEM, "reason_code": "other",
+                    "reason": "hold for now"})
+                self.assertEqual(deferred.status_code, 200, deferred.text)
+                version = deferred.json()["plan_version"]
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["name"] for row in resolutions],
+                                 ["defer"])
+                # Preview: decided by the active defer resolution.
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "decided")
+                self.assertEqual(member["existing"], {
+                    "kind": "resolution", "status": "active",
+                    "strategy": None, "name": "defer"})
+                self.assertEqual(preview.json()["counts"]["decided"], 1)
+                self.assertEqual(cli.state()["plan"]["plan_version"], version)
+                self.assertEqual(cli.state()["plan"]["entries"], [])
+                self.assertFalse(cli.state().get("propagations"))
+                # Default apply keeps it: no entry, no revert.
+                kept = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(kept.status_code, 200, kept.text)
+                self.assertIs(kept.json()["changed"], False)
+                self.assertEqual(kept.json()["plan_version"], version)
+                self.assertEqual(cli.state()["plan"]["entries"], [])
+                self.assertEqual(len(cli.state()["resolutions"]), 1)
+                self.assertEqual(
+                    cli.state()["propagations"][
+                        kept.json()["propagation_id"]]["kept"], [self.ITEM])
+                # Override: the entry is written and the active defer is
+                # reverted with a ``revert`` resolution row (wire §7.1).
+                applied = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    overrides=[self.ITEM]))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["changed"], True)
+                self.assertEqual(result["plan_version"], version + 1)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["item_id"], self.ITEM)
+                self.assertEqual(entry["origin"]["kind"], "propagation")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+                self.assertEqual(resolutions[-1]["name"], "defer")
+                self.assertEqual(resolutions[-1]["supersedes"],
+                                 resolutions[0]["resolution_id"])
+                record = cli.state()["propagations"][
+                    result["propagation_id"]]
+                self.assertEqual(record["overridden"], [self.ITEM])
+                self.assertEqual(record["kept"], [])
+
+    def test_confirm_known_is_not_decided_but_is_reverted_when_written(self):
+        """CP6.1 wire §7.1/§7.2: an active ``confirm_known`` does not protect a
+        member (it is ``ready``, not ``decided``), and writing the entry reverts
+        it like every other active resolution name."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                cli.update(resolutions=[{
+                    "schema_version": 1,
+                    "resolution_id": "r-confirm-known-" + self.ITEM,
+                    "change": "add",
+                    "supersedes": None,
+                    "idempotency_key": "k-confirm-known",
+                    "item_id": self.ITEM,
+                    "name": "confirm_known",
+                    "reason_code": None,
+                    "reason": None,
+                    "evidence_hash": None,
+                    "source": "auto",
+                    "recorded_at": "2026-11-05T00:00:00Z",
+                }])
+                preview = client.post(route, json=_propagate_body())
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "ready")
+                self.assertNotIn("existing", member)
+                self.assertEqual(preview.json()["counts"]["decided"], 0)
+                applied = client.post(route, json=_propagate_body(
+                    dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+                self.assertEqual(resolutions[-1]["name"], "confirm_known")
+
+    def test_overrides_peelfeed_validation_passthrough(self):
+        """CP6.1 wire §7.2: member-set/subset/overlap checks belong to peelfeed
+        and are mapped to a 400 with nothing written."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                figure = "it-8b7a6c5d4e3f2a10"
+                # Not a member of the item scope.
+                outside = client.post(route, json=_propagate_body(
+                    overrides=[figure]))
+                self.assertEqual(outside.status_code, 400, outside.text)
+                self.assertIn("overrides must be a subset",
+                              outside.json()["detail"])
+                # Overlaps the exclusions list.
+                overlap = client.post(route, json=_propagate_body(
+                    exclusions=[self.ITEM], overrides=[self.ITEM]))
+                self.assertEqual(overlap.status_code, 400, overlap.text)
+                self.assertIn("overrides must not overlap exclusions",
+                              overlap.json()["detail"])
+                self.assertFalse(cli.state().get("plan"))
+                self.assertFalse(cli.state().get("propagations"))
+
+    def test_applied_r0_entry_is_decided_and_overridden(self):
+        """CP6.1 wire §7.2: an applied R0 entry makes the member ``decided``
+        (kept by default); an override replaces it and reverts its R0."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "confirm_no_header",
+                                           "version": 1},
+                              "params": {}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                version = confirmed.json()["plan_version"]
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "applied")
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "decided")
+                self.assertEqual(member["existing"], {
+                    "kind": "entry", "status": "applied",
+                    "strategy": {"id": "confirm_no_header", "version": 1},
+                    "name": "confirm_headerless"})
+                kept = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(kept.status_code, 200, kept.text)
+                self.assertIs(kept.json()["changed"], False)
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "applied")
+                self.assertEqual(len(cli.state()["resolutions"]), 1)
+                applied = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False,
+                    overrides=[self.ITEM]))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["revision"], 2)
+                self.assertEqual(entry["origin"]["kind"], "propagation")
+                resolutions = cli.state()["resolutions"]
+                self.assertEqual([row["change"] for row in resolutions],
+                                 ["add", "revert"])
+                self.assertEqual(resolutions[-1]["name"], "confirm_headerless")
+
+    def test_confirmed_same_action_is_already_and_draft_replaced(self):
+        """CP6.1 wire §7.2: a confirmed entry with the same action is
+        ``already`` (not ``decided``, not written); a draft entry is replaced
+        directly with ``diff.changed``."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                plan_route = base + "/review/plan"
+                selected = client.post(plan_route, json={
+                    "base_plan_version": 0, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [0]}}})
+                self.assertEqual(selected.status_code, 200, selected.text)
+                entry_id = selected.json()["entry"]["entry_id"]
+                confirmed = client.post(plan_route, json={
+                    "base_plan_version": selected.json()["plan_version"],
+                    "action": "confirm", "entry_id": entry_id})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
+                version = confirmed.json()["plan_version"]
+                preview = client.post(route, json=_propagate_body(
+                    base_plan_version=version))
+                self.assertEqual(preview.status_code, 200, preview.text)
+                member = preview.json()["members"][0]
+                self.assertEqual(member["status"], "already")
+                self.assertNotIn("existing", member)
+                self.assertEqual(preview.json()["counts"]["decided"], 0)
+                repeat = client.post(route, json=_propagate_body(
+                    base_plan_version=version, dry_run=False))
+                self.assertEqual(repeat.status_code, 200, repeat.text)
+                self.assertIs(repeat.json()["changed"], False)
+                self.assertEqual(repeat.json()["diff"]["unchanged"], 1)
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "confirmed")
+                # A draft entry (not a decision) is replaced directly.
+                reselected = client.post(plan_route, json={
+                    "base_plan_version": version, "action": "select",
+                    "entry": {"item_id": self.ITEM,
+                              "strategy": {"id": "use_first_row_header",
+                                           "version": 1},
+                              "params": {"rows": [1]}}})
+                self.assertEqual(reselected.status_code, 200,
+                                 reselected.text)
+                draft_version = reselected.json()["plan_version"]
+                self.assertEqual(cli.state()["plan"]["entries"][0]["status"],
+                                 "draft")
+                applied = client.post(route, json=_propagate_body(
+                    base_plan_version=draft_version, dry_run=False))
+                self.assertEqual(applied.status_code, 200, applied.text)
+                result = applied.json()
+                self.assertIs(result["changed"], True)
+                self.assertEqual(len(result["diff"]["changed"]), 1)
+                self.assertEqual(result["diff"]["changed"][0]["item_id"],
+                                 self.ITEM)
+                entry = cli.state()["plan"]["entries"][0]
+                self.assertEqual(entry["status"], "draft")
+                self.assertEqual(entry["revision"], 3)
+
+    def test_body_validation_never_calls_the_cli(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with peelfeed_env(CLI=str(cli.path), POLL="0.05"):
+                client = _client()
+                base = _extracted_review_source(client, root)
+                route = base + "/review/plan/propagate"
+                good = _propagate_body()
+                bad_bodies = [
+                    # Unknown request/scope/strategy fields.
+                    dict(good, extra=True),
+                    dict(good, scope={"kind": "item",
+                                      "item_id": self.ITEM,
+                                      "cluster_id": None, "peel": None,
+                                      "unknown": 1}),
+                    dict(good, strategy={"id": "use_first_row_header",
+                                         "version": 1, "unknown": 1}),
+                    # Missing required fields / bad base.
+                    {"scope": good["scope"], "strategy": good["strategy"]},
+                    {"base_plan_version": 0, "strategy": good["strategy"]},
+                    {"base_plan_version": 0, "scope": good["scope"]},
+                    dict(good, base_plan_version=True),
+                    dict(good, base_plan_version=-1),
+                    dict(good, base_plan_version="0"),
+                    # Scope shape / selector rules.
+                    dict(good, scope=[]),
+                    dict(good, scope={"kind": "document",
+                                      "item_id": None, "cluster_id": None,
+                                      "peel": None}),
+                    dict(good, scope={"kind": "item", "item_id": None,
+                                      "cluster_id": None, "peel": None}),
+                    dict(good, scope={"kind": "item", "item_id": self.ITEM,
+                                      "cluster_id": "cl-0f1e2d3c4b5a",
+                                      "peel": None}),
+                    dict(good, scope={"kind": "cluster", "item_id": None,
+                                      "cluster_id": None, "peel": None}),
+                    dict(good, scope={"kind": "peel", "item_id": None,
+                                      "cluster_id": None, "peel": False}),
+                    # Strategy / params / optional fields.
+                    dict(good, strategy={}),
+                    dict(good, strategy={"id": "use_first_row_header",
+                                         "version": 0}),
+                    dict(good, strategy={"id": "use_first_row_header",
+                                         "version": True}),
+                    dict(good, params=[]),
+                    dict(good, source_item_id=7),
+                    dict(good, source_item_id="  "),
+                    dict(good, exclusions="it-x"),
+                    dict(good, exclusions=[7]),
+                    dict(good, exclusions=[""]),
+                    # CP6.1: overrides is a list of non-empty item-id strings.
+                    dict(good, overrides="it-x"),
+                    dict(good, overrides={}),
+                    dict(good, overrides=[7]),
+                    dict(good, overrides=[""]),
+                    dict(good, dry_run="true"),
+                    dict(good, operator=""),
+                ]
+                cli.clear_calls()
+                for body in bad_bodies:
+                    response = client.post(route, json=body)
+                    self.assertEqual(response.status_code, 400,
+                                     (body, response.text))
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+                # The generic plan route still rejects the propagate action.
+                wrong_action = client.post(base + "/review/plan", json={
+                    "base_plan_version": 0, "action": "propagate"})
+                self.assertEqual(wrong_action.status_code, 400,
+                                 wrong_action.text)
+                self.assertIn("action must be one of",
+                              wrong_action.json()["detail"])
+                self.assertEqual(
+                    [item for item in cli.calls()
+                     if item["argv"][0] == "plan"], [])
+
+
 class NoHttpContractTests(unittest.TestCase):
     def test_the_adapter_has_no_http_or_token_code_path(self):
+        """The seam stays CLI-only. CP5 (wire §1.3) may pass a link's
+        ``base_url`` to the report/discuss **child env**, but the adapter still
+        has no HTTP client, no Authorization header and no token in argv."""
         import inspect
         from peekseed import peelfeed
         source = inspect.getsource(peelfeed)
-        for marker in ("httpx", "base_url", "Authorization", "Bearer",
+        for marker in ("httpx", "Authorization", "Bearer",
                        "/peels/", "PEEKSEED_PEELFEED_TOKEN"):
             self.assertNotIn(marker, source)
 

@@ -49,8 +49,11 @@ are not listed.
 | POST | `/api/datasets/{id}/sources/{sha}/extract` | Ask peelfeed to build a peel (503 when unavailable) |
 | GET | `/api/datasets/{id}/sources/{sha}/review` | Structured review view: clusters/items/counts (peelfeed pass-through) |
 | GET | `/api/datasets/{id}/sources/{sha}/review/items/{item_id}` | One review item with evidence, candidates and strategies |
-| POST | `/api/datasets/{id}/sources/{sha}/review/plan` | Select/confirm/lock/unlock/defer a review plan entry |
-| POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Generate the deterministic review report (synchronous in CP1) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/plan` | Select/confirm/lock/unlock/defer a review plan entry; `accept` also takes `sources:{item_id:"rule"|"vlm"}` |
+| POST | `/api/datasets/{id}/sources/{sha}/review/reports` | Create a `report` job: rules body `{item_ids?, cluster_ids?}`, VLM body `{mode:"vlm", confirmation, item_ids?, cluster_ids?}` (202) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/discussions` | Create a `discuss` job: `{conversation_id?, scope, message, base_plan_version, confirmation}` (202) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/plan/patches` | Proxy the synchronous targeted plan patch: `{base_plan_version, patch, source, conversation_id?, turn?}` (200 plan + diff; never confirms/applies) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/plan/propagate` | Proxy the synchronous cluster-level propagation: frozen `plan propagate` body incl. CP6.1 `overrides[]` (preview with `dry_run:true` writes nothing; apply writes draft entries only; `decided` members kept unless overridden) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/check` | Probe the OCR provider (body empty or `{}`; no `provider`) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/refresh` | Create one `type=ocr` evidence-refresh job (body exactly `{item_ids:[…]}`) |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
@@ -164,9 +167,11 @@ under `PEEKSEED_SHARED_DIR`); `present` says whether that file is still on disk.
 `status`/`extraction.state` is one of `uploaded|not_extracted|queued|running|
 extracted|failed|stale|corrections_conflict` (the per-source chip).
 `extraction.review_jobs` maps a peelfeed review job id to its small descriptor
-(`{type, created_at, batch_id}`) so a restarted service can re-attach to a
-running job (M2 Phase 2+; empty in CP1). Extraction is a peelfeed job; uploading
-never parses the file.
+(`{type, created_at, batch_id, conversation_id}`) so a restarted service can
+re-attach to a running job (never re-run it automatically). `conversation_id` is
+additive for `type=discuss` jobs (`null` otherwise); dataset schema stays 4
+(the dict is open). Extraction is a peelfeed job; uploading never parses the
+file.
 
 ### `POST /api/datasets`
 
@@ -300,7 +305,9 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   params?, notes?}}`;
   `{base_plan_version, action:"confirm"|"lock"|"unlock", entry_id}`;
   `{base_plan_version, action:"defer", item_id, reason_code:
-  "unsupported_evidence"|"grid_conflict"|"not_relevant"|"other", reason?}`.
+  "unsupported_evidence"|"grid_conflict"|"not_relevant"|"other", reason?}`;
+  `{base_plan_version, action:"accept", item_ids, sources?}`;
+  `{base_plan_version, action:"clear", entry_id}`.
   `base_plan_version` is required on every action and must come from the latest
   plan payload; a stale value is `409` (optimistic concurrency). The response is
   the complete new plan: `plan_version`, `entries`, the changed `entry` and any
@@ -311,12 +318,154 @@ frozen contract: `busy → 423`, `conflict | stale | review_schema → 409`,
   change). Operation selections (`use_first_row_header`, `inherit_parent_header`,
   …) confirm to `confirmed` and wait for a future ApplyBatch, so the summary's
   `counts.confirmed` ("已确认待发布") counts operation entries only.
-- `POST …/review/reports` with optional `{item_ids?, cluster_ids?}` generates
-  the deterministic rule report and returns the ready/partial payload
-  (`status`, `report_path`, `report`, `counts`). CP1 runs it synchronously with
-  `200` and always covers the whole peel (the optional id filters are forwarded
-  but peelfeed ignores them until the Phase 2 report jobs); persisted jobs
-  replace the synchronous call in M2 Phase 2/4 (`202` + job id).
+- **Accept adoption source and origin (CP5.1 H5).** An `accept` body may carry
+  the optional `sources` map `{<item_id>: "rule"|"vlm"}`; the accept body is
+  strict (any other field, a non-object map, a key that is not one of the
+  requested item ids, or a value other than `"rule"`/`"vlm"` is `400`). Per
+  item, with `sources[item_id]` the suggestion whose source matches is adopted
+  (missing → per-item `source_missing`); without it, exactly one ready
+  suggestion is adopted, several with the **same action identity**
+  (`strategy.id` + `strategy.version` + canonical `params`) adopt the first
+  (rule preferred), and several with different identities fail the
+  all-or-nothing accept with `ambiguous_suggestion` (the 400 detail lists every
+  failing item). `accepted[]` rows and plan entries now carry `source`
+  (`rule`/`vlm`/`user`) and `origin` (`{kind:"report", job_id, model,
+  prompt_version}` for a report accept; `null` for a manual select).
+- `POST …/review/reports` creates a persistent peelfeed `report` job and
+  returns `202 {job_id, status:"queued"}`; poll it through
+  `GET …/review/jobs/{id}`. The report payload gains the additive `job_id`
+  (string|null) and, for VLM reports, per-cluster `vlm_disagrees` (bool: a rule
+  and a VLM ready suggestion with different action identities) plus the
+  additive `skipped:[{cluster_id, item_ids, reason}]` list (reasons
+  `auto_archived|applied|deferred|ocr_not_ready|informational|item_cap|
+  image_cap|call_cap|budget_exhausted|not_analyzed`; CP5.1 H2/H3). The Review
+  UI displays the skipped counts/reasons in the VLM report area and warns on
+  `vlm_disagrees`, offering a per-item 规则/VLM adoption source. The **rules** body is unchanged
+  (`{item_ids?, cluster_ids?}`). The **VLM** body is
+  `{mode:"vlm", confirmation:{…}, item_ids?, cluster_ids?}`; `mode` other than
+  `"vlm"` and any unknown field are `400`. `confirmation` is the frozen privacy
+  object (wire §1.2): `{confirmed:true, provider:"answer_link"|"env", link_id,
+  model, scope:{item_ids, cluster_ids, include_crop, include_original_page,
+  include_adjacent_pages, include_native, include_ocr}}` — every field is
+  required, `confirmed` must be exactly `true`, and the scope id lists are
+  sorted unique strings. peekseed re-resolves the VLM provider and compares
+  `provider`/`link_id`/`model` **before any CLI call or job is created**; a
+  mismatch is `400 privacy_confirmation_required`. When no provider is usable
+  (no enabled answer link / missing key, or an incomplete
+  `PEELFEED_LLM_BASE/MODEL/TOKEN` env) the route is `503 vlm_unavailable` and
+  creates no job. The job descriptor is stored in `extraction.review_jobs`
+  (`type:"report"`) for restart re-attachment; the report only updates
+  suggestions and never edits the plan.
+- **VLM provider resolution and child-only env (CP5).** peekseed's own
+  `PEELFEED_LLM_BASE`/`PEELFEED_LLM_MODEL`/`PEELFEED_LLM_TOKEN` env wins;
+  otherwise the default answer link (first enabled answer link, same as the Q&A
+  page) is used. Only the user-confirmed `review-report --with-vlm` and
+  `discuss` children receive `PEELFEED_LLM_BASE/MODEL/TOKEN/LINK_ID` in their
+  **environment**; the token is never placed in argv, stdin, `dataset.json`, a
+  job descriptor, a log line or an error message. Audit records only
+  `link_id` + `model`. Because peelfeed's read-only `capabilities` child never
+  sees the provider env, `GET …/review` (and `GET …/review/items/{id}`) overlay
+  the resolved truth onto the payload: `capabilities` gains `vlm`,
+  `vlm_detail` (Chinese reason when false), `vlm_provider` (`answer_link`/
+  `env`), `vlm_model`, `vlm_link_id`, preserving any peelfeed-provided
+  `vlm_vision`/budget fields. **CP5.1 H7:** the non-secret tuning variables
+  `PEELFEED_LLM_PROMPT_SET`/`TIMEOUT`/`BUDGET_USD`/`PRICE_INPUT`/
+  `PRICE_OUTPUT`/`VISION`/`MAX_CALLS_PER_JOB`/`MAX_CALLS_PER_PEEL`/
+  `MAX_IMAGES_PER_TURN`/`JSON_MODE` are forwarded from peekseed's own
+  environment to **all** peelfeed children (read-only ones included), while
+  `PEELFEED_LLM_PROVIDER` is never forwarded. The overlay therefore preserves
+  peelfeed's additive `vlm_priced` (bool: a price is configured) and
+  `vlm_max_calls_per_peel` (int); the UI shows `费用未计价` when
+  `vlm_priced` is false.
+- `POST …/review/discussions` creates one persistent peelfeed `discuss` job:
+  `{conversation_id?, scope:{item_id?|cluster_id?|peel:true}, message,
+  base_plan_version, confirmation}`. Exactly one scope selector is required
+  (`peel` must be `true`), `message` is non-empty (≤ 4000 chars),
+  `base_plan_version` is an int ≥ 0, and the same privacy confirmation
+  validation/comparison applies (400 `privacy_confirmation_required`, 503
+  `vlm_unavailable`, no job on rejection). Returns `202 {job_id,
+  conversation_id, status:"queued"}`; the descriptor is stored with
+  `type:"discuss"` and the additive `conversation_id` (schema 4 unchanged).
+  Follow-up turns reuse the conversation id; the job returns explanations and a
+  **draft** plan patch only — it never confirms or applies anything.
+- `POST …/review/plan/patches` proxies the synchronous targeted plan patch
+  (`{base_plan_version, patch, source:"vlm"|"user", conversation_id?, turn?}`)
+  and returns `200` with the new plan plus the targeted `diff`
+  (`added`/`changed`/`removed`/`unchanged`). **CP5.1 H5:** `turn` is the
+  assistant turn number (int ≥ 1) and is required with `source:"vlm"` (which
+  also requires `conversation_id`; missing → `400`); peelfeed compares the
+  submitted patch with the archived assistant turn — identical → the entries
+  record `source:"vlm"`, edited → `source:"user"`, either way with the
+  conversation `origin` (`{kind:"conversation", conversation_id, turn, model,
+  prompt_version}`). Errors map per contract §4: `409` for a base mismatch or
+  locked/batch-bound entries (the conflicting item ids are included in the
+  readable error), `400` for invalid strategy/params/evidence or an unknown
+  turn, `404` for an unknown conversation. This route never confirms, applies,
+  builds or publishes: adopting a patch only edits the draft plan.
+- **`POST …/review/plan/propagate` — cluster-level propagation (M2.2 CP6 /
+  CP6.1, CP6 wire §1/§2, CP6.1 §7.1/§7.2/§7.5).** Body is the frozen
+  `plan propagate` request:
+  `{base_plan_version, scope:{kind:"item"|"cluster"|"peel", item_id?,
+  cluster_id?, peel?}, strategy:{id, version}, params, source_item_id?,
+  exclusions[], overrides[], dry_run, operator?}`. The route validates the
+  envelope strictly (unknown request/scope/strategy fields, a scope without
+  exactly one selector matching `kind`, a non-object `params`, a non-string
+  `exclusions`/`overrides` entry, a non-bool `dry_run` or a non-string
+  `source_item_id`/`operator` are `400`; `overrides` is deduplicated and its
+  ids stripped) and proxies `peelfeed plan propagate` **synchronously with no
+  model call and no LLM env**; no job descriptor is created and the response is
+  passed through unchanged. `overrides` (CP6.1) lists `decided` members the
+  user explicitly wants to replace; peekseed checks the envelope/type only —
+  member-set/subset/`exclusions`-overlap validation is peelfeed's
+  all-or-nothing job (`400`). `dry_run:true` returns the member preview
+  (`members`/`positives`/`boundary_cases`/`exclusions`/`overrides`/`counts`)
+  and writes nothing; preview never reverts a resolution. Members with a
+  pre-existing decision are `decided` and carry
+  `existing:{kind,status,strategy,name}` (`kind:"entry"` for a differing
+  confirmed or applied R0 entry, `kind:"resolution"` for an active/stale
+  non-`confirm_known` R0 resolution); `counts.decided` counts them.
+  `dry_run:false` applies the propagation: peelfeed resolves the member set,
+  rebuilds and independently validates every member's action from its own
+  evidence, then writes draft plan entries with
+  `origin:{kind:"propagation", propagation_id, scope, strategy,
+  base_plan_version}` plus the immutable
+  `extract/review/propagations/<propagation_id>.json` audit record (scope,
+  operator, strategy version, confirmed base plan version, selection,
+  `overrides`, `kept`, `overridden`, per-member results, diff,
+  `plan_version_after`). Non-excluded `decided` members are **kept** by
+  default: no entry written, no resolution reverted, no error (listed in
+  `kept`, not counted in `diff.changed`). `decided` members listed in
+  `overrides` are written as `ready` and their active R0 resolution is reverted
+  in the same review lock (`overridden`); every written member's active R0
+  resolution (including `confirm_known`) is reverted the same way (§7.1).
+  Locked or batch-bound members that are not excluded are `409 conflict` with
+  `error.details.conflicts`; non-excluded
+  `not_applicable`/`failed_check` members are `400 validation` with
+  `error.details.reasons` (all-or-nothing, nothing written; `decided` is
+  neither a conflict nor an error). A repeat no-op apply returns
+  `changed:false` without bumping `plan_version`. The route never confirms,
+  builds, publishes or touches the corpus; propagated entries are normal draft
+  entries that the existing confirm/batch/publish/clear machinery handles. The
+  Review UI exposes this as the “应用到相似项” panel (`#reviewPropagate`):
+  scope 当前项/当前簇/全 peel, read-only strategy/params, explicit 预览成员
+  (`dry_run:true`, never writes), member status badges with reasons,
+  per-member action summaries and `decided` existing-decision summaries
+  (已有决定（默认保留）), 正例/边界例 lists, exclusion checkboxes, a
+  `#reviewPropagateOverrides` list of per-member override checkboxes
+  (`data-r="propagate-override"`) whose checked ids are sent as `overrides` in
+  **both** the preview and apply bodies (a ticked row renders 将覆盖; an item
+  cannot be both excluded and overridden), an apply button disabled until a
+  preview with the same `base_plan_version` succeeded and all locked/in-batch
+  conflicts are excluded (the rule is unchanged; `decided` is not a conflict),
+  the counts summary (including `decided`), the propagation diff, the 409
+  conflict list, and the 400 per-member failure list. Opening the panel starts
+  with both tick lists empty; a successful preview instead adopts the
+  response-echoed `exclusions`/`overrides` as the current ticks (CP6.2 L1, wire
+  §8.1), so the apply body carries the same lists the preview was computed with
+  unless the reviewer changes a tick and previews again. The override list also
+  includes a `ready` member carrying `existing` (a member overridden in that
+  preview), so the override can be unticked. Applied entries render with a 批量
+  origin badge.
 - `POST …/review/ocr/check` proxies `peelfeed ocr-check` (M2.1; wire §2.8) and
   returns `200` with the probe payload (`available`, `engine`, `provider`,
   `probe`, `checked_at`, `error`); `503` when OCR is unconfigured/unrunnable,

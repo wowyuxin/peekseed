@@ -2433,12 +2433,13 @@ def read_review_jobs(dataset_dir, sha):
 
 
 def record_review_job(dataset_dir, sha, job_id, *, job_type, batch_id=None,
-                      created_at=None):
+                      created_at=None, conversation_id=None):
     """Persist one peelfeed job descriptor in ``extraction.review_jobs``.
 
-    Schema-4 mapping ``{job_id: {"type", "created_at", "batch_id"}}`` (CP3 wire
-    §2.7): terminal descriptors stay so a restarted service can re-attach by id;
-    peekseed never re-runs a job automatically.
+    Schema-4 mapping ``{job_id: {"type", "created_at", "batch_id",
+    "conversation_id"}}`` (CP3 wire §2.7, CP5 wire §6.4): terminal descriptors
+    stay so a restarted service can re-attach by id; peekseed never re-runs a
+    job automatically. ``conversation_id`` is additive for ``discuss`` jobs.
     """
     identifier = str(job_id or "").strip()
     if not identifier:
@@ -2448,7 +2449,8 @@ def record_review_job(dataset_dir, sha, job_id, *, job_type, batch_id=None,
     if entry is None:
         raise IngestError("no source with sha256 '%s'." % str(sha or "")[:12])
     descriptor = contracts.review_job_descriptor(
-        job_type, created_at=created_at, batch_id=batch_id)
+        job_type, created_at=created_at, batch_id=batch_id,
+        conversation_id=conversation_id)
     block = dict(entry.get("extraction") or contracts.extraction_default())
     jobs = dict(block.get("review_jobs") or {})
     jobs[identifier] = descriptor

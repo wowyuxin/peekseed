@@ -396,6 +396,43 @@ class ApiTests(unittest.TestCase):
                 validated["sources"][0]["extraction"]["review_jobs"][job_id]
                 ["type"], "ocr")
 
+    def test_dataset_schema_4_carries_a_discuss_review_job_descriptor(self):
+        """CP5: schema 4's ``review_jobs`` accepts ``type=discuss``.
+
+        The additive ``conversation_id`` rides the open schema-4 dict, so there
+        is no dataset schema bump; an old schema-4 dataset still loads and the
+        descriptor survives validation (CP5 wire §6.4).
+        """
+        with temp_data_root() as root:
+            self.root = root
+            client = self._client()
+            dataset = self._upload(client)
+            sha = hashlib.sha256(
+                (root / "manual.pdf.tmp").read_bytes()).hexdigest()
+            make_peel(dataset["id"])
+            from peekseed import config, contracts, ingest
+
+            directory = config.paths().datasets_dir / dataset["id"]
+            job_id = "discuss-20261109T031000-a1b2"
+            conversation_id = "conv-20261109T031000-ab12"
+            descriptor = ingest.record_review_job(
+                directory, sha, job_id, job_type="discuss",
+                conversation_id=conversation_id)
+            self.assertEqual(descriptor["type"], "discuss")
+            self.assertEqual(descriptor["conversation_id"], conversation_id)
+            self.assertIsNone(descriptor["batch_id"])
+            rows = client.get(
+                "/api/datasets/%s/sources" % dataset["id"]).json()["sources"]
+            self.assertEqual(rows[0]["extraction"]["review_jobs"][job_id],
+                             descriptor)
+            raw = contracts.read_json(directory / "dataset.json")
+            self.assertEqual(raw["schema"], contracts.DATASET_SCHEMA)
+            self.assertEqual(contracts.DATASET_SCHEMA, 4)
+            validated = contracts.validate_dataset(raw)
+            self.assertEqual(
+                validated["sources"][0]["extraction"]["review_jobs"][job_id]
+                ["conversation_id"], conversation_id)
+
     def test_ocr_routes_reject_provider_overrides_before_peelfeed(self):
         """CP4.1 G1: the OCR HTTP routes never forward a caller ``provider``.
 
