@@ -194,6 +194,14 @@ version/tag policy.
 
 ### Fixed
 
+- **Review cluster list layout.** The left cluster list in the Review modal is
+  a scroll container (`.rr-clusters`, `max-height:64vh`); its rows are buttons
+  inside a column flex container. They lacked `flex:none`, so with many
+  clusters they shrank to padding+border and their text overlapped the
+  neighbouring rows (reported on the deployed CXL page: 51 clusters, all rows
+  18 px tall with overlapping titles/badges). The global button centering also
+  centered each row; rows now keep their content height, scroll inside the
+  list and are left-aligned. Regression test: `tests/test_review_layout.py`.
 - **CP1.1 review-contract sync.** An R0 plan entry (selecting
   `confirm_no_header`, `keep_visual_fallback` or `keep_original_figure`) is now
   `applied` once confirmed (the R0 resolution is written immediately, no corpus

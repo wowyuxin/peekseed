@@ -1175,10 +1175,15 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
   gap:12px;align-items:start;min-width:0;}
 .rr-clusters{display:flex;flex-direction:column;gap:6px;min-width:0;max-height:64vh;
   overflow-y:auto;overscroll-behavior:contain;padding-right:2px;}
+/* The list is a scroll container (max-height below); rows must keep their
+   content height. Without ``flex:none`` they shrink to padding+border inside
+   the max-height flex column and their text overflows/overlaps. The global
+   ``button`` rule centers children, so reset alignment for a left-aligned row. */
 .rr-cl{display:flex;flex-direction:column;gap:3px;width:100%;text-align:left;
   padding:8px 10px;border:1px solid var(--line);border-radius:10px;
   background:var(--bg-soft);color:var(--text);font:inherit;cursor:pointer;
-  min-height:0;transition:border-color .15s ease,background-color .15s ease;}
+  flex:none;align-items:stretch;justify-content:flex-start;
+  transition:border-color .15s ease,background-color .15s ease;}
 .rr-cl:hover{background:var(--panel-2);border-color:var(--line-strong);filter:none;}
 .rr-cl.is-on{border-color:var(--accent-line);background:var(--accent-soft);}
 .rr-cl-h{display:flex;flex-wrap:wrap;gap:5px;align-items:baseline;min-width:0;}
