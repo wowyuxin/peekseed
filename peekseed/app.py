@@ -39,8 +39,9 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (__version__, answer as answer_mod, config, contracts, ingest,
-               links, localmodels, peelfeed, prompts, security, workspace)
+from . import (__version__, answer as answer_mod, config, contracts, decision,
+               ingest, links, localmodels, peelfeed, prompts, security,
+               workspace)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -704,10 +705,28 @@ async def _store_uploads(name, note, files):
 # model links: probing
 # ---------------------------------------------------------------------------
 
-def _probe_link(link):
+def _probe_link(link, *, images=False):
     role = link.get("role")
     base = link.get("base_url") or ""
     try:
+        if role == "decision":
+            # Synthetic probe only: one fixed text request (or the opt-in
+            # image fixture). GET/status never call a decision provider
+            # (CP0.5 setup-contract §1 invariant 3); the key is resolved
+            # here and used only in the Authorization header.
+            result = decision.probe(link, images=bool(images),
+                                    api_key=links.api_key(link))
+            detail = "decision probe ok (%s)" % result["resolved_model"]
+            if not result.get("model_match"):
+                detail = ("decision probe ok (resolved model %s differs from "
+                          "the pinned id)" % result["resolved_model"])
+            return {"ok": True, "detail": detail,
+                    "resolved_model": result["resolved_model"],
+                    "model_match": result.get("model_match"),
+                    "usage": result.get("usage"),
+                    "latency_ms": result.get("latency_ms"),
+                    "probe_version": result.get("probe_version"),
+                    "images": result.get("images", False)}
         if role == "answer":
             client = answer_mod.ChatClient(base, links.api_key(link),
                                            link.get("model") or "")
@@ -753,6 +772,9 @@ def _probe_link(link):
                 ok = isinstance(scores, list) and len(scores) == 2
                 return {"ok": ok, "detail": "2 scores" if ok else "unexpected response"}
         return {"ok": False, "detail": "unknown link role"}
+    except decision.DecisionError as exc:
+        # Sanitized by the adapter: code + safe detail, never the body/key.
+        return {"ok": False, "detail": exc.detail, "code": exc.code}
     except Exception as exc:  # noqa: BLE001 - unreachable is a normal state
         # Type only: a provider/HTTP client message could contain a response
         # body, an API key or a machine path, and this is a UI status line.
@@ -763,9 +785,18 @@ def _probe_link(link):
 def _links_status():
     rows = {}
     all_links = links.links()
+    # Decision providers are never probed implicitly: status is a no-network
+    # row, and the synthetic Test action is the only thing that calls them
+    # (CP0.5 setup-contract §4).
+    for link in all_links:
+        if link.get("role") == "decision":
+            rows[link["id"]] = {"decision": True,
+                                "configured": bool(link.get("base_url")),
+                                "key_set": bool(links.api_key(link)),
+                                "detail": "not probed (use the synthetic Test)"}
     with ThreadPoolExecutor(max_workers=8) as pool:
         future_map = {link["id"]: pool.submit(_probe_link, link)
-                      for link in all_links}
+                      for link in all_links if link.get("role") != "decision"}
         for link_id, future in future_map.items():
             try:
                 rows[link_id] = future.result()
@@ -3544,14 +3575,30 @@ def create_app():
         return {"link": links.mask(link)}
 
     @app.post("/api/links/{link_id}/test")
-    def links_test(link_id: str):
+    def links_test(link_id: str, payload: Optional[dict] = None):
         try:
             link = links.get(link_id)
         except links.LinkConfigError as exc:
             _link_config_500(exc)
         if link is None:
             raise HTTPException(404, "no link with id '%s'" % link_id)
-        return _probe_link(link)
+        # Only decision links accept a body, and only the experimental image
+        # opt-in: {"images": true}. Every other role/field keeps the frozen
+        # no-payload probe behaviour.
+        images = False
+        if payload:
+            if link.get("role") != "decision":
+                raise HTTPException(
+                    400, "this link role does not accept a test payload")
+            unknown = set(payload) - {"images"}
+            if unknown:
+                raise HTTPException(
+                    400, "unknown test field(s): %s"
+                    % ", ".join(sorted(unknown)))
+            images = payload.get("images")
+            if not isinstance(images, bool):
+                raise HTTPException(400, "images must be true or false")
+        return _probe_link(link, images=images)
 
     @app.get("/api/links/status")
     def links_status():

@@ -2245,6 +2245,7 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
               <option value="embed">Embedding</option>
               <option value="rerank">Reranking</option>
               <option value="answer">Answer (chat)</option>
+              <option value="decision">Decision (auto-review)</option>
             </select></label>
           <label class="set-field" id="setProtocolField"><span>Protocol</span>
             <select id="setProtocol"><option value="openai">OpenAI-compatible</option></select></label>
@@ -4767,16 +4768,19 @@ $('#histModal').addEventListener('click',function(ev){
    URL, model, write-only key, use/not-use. The list is loaded on open and after
    each action and is NOT polled in the background, so a half-typed form can never
    be clobbered by a refresh. */
-const SET_ROLE_ORDER=['embed','rerank','answer'];
-const SET_ROLE_LABEL={embed:'Embedding',rerank:'Reranking',answer:'Answer (chat)'};
+const SET_ROLE_ORDER=['embed','rerank','answer','decision'];
+const SET_ROLE_LABEL={embed:'Embedding',rerank:'Reranking',answer:'Answer (chat)',
+  decision:'Decision (auto-review)'};
 /* The protocol choices each role allows, straight from the model-link contract:
    embed speaks OpenAI-compatible /embeddings or a custom /embed; rerank is the
-   custom /rerank protocol only; answer is OpenAI-compatible chat. */
+   custom /rerank protocol only; answer is OpenAI-compatible chat; decision is
+   the typed System One protocol (/v1/systemone, M3 CP0.5). */
 const SET_PROTOCOLS={
   embed:[{v:'openai',l:'OpenAI-compatible (/embeddings)'},
          {v:'custom',l:'Custom (/embed)'}],
   rerank:[{v:'custom',l:'Custom (/rerank)'}],
-  answer:[{v:'openai',l:'OpenAI-compatible (/chat/completions)'}]
+  answer:[{v:'openai',l:'OpenAI-compatible (/chat/completions)'}],
+  decision:[{v:'typesafe',l:'TypeSafe System One (/v1/systemone)'}]
 };
 let SET_TEST={}, SET_EDITING='';
 function settingsOpen(){ const m=$('#settingsModal'); return !!(m&&!m.hidden); }
@@ -4798,6 +4802,17 @@ async function loadSettings(){
 }
 function setStatusLine(status){
   if(!status) return '<div class="set-live">no live status yet</div>';
+  /* Decision links are never probed implicitly (the status route must not
+     call a decision provider): the row shows config state and points at the
+     synthetic Test button instead of reachable/unreachable. */
+  if(status.decision){
+    const bits=[];
+    if(status.configured) bits.push('endpoint configured');
+    if(status.key_set) bits.push('key set');
+    return '<div class="set-live"><span class="dot"></span> decision link — '
+      +esc(bits.join(' · ')||'not configured')
+      +' — use Test (synthetic probe)</div>';
+  }
   const ok=statusOk(status);
   let txt=ok?'reachable':'unreachable';
   const models=(status.models||[]).filter(Boolean);
@@ -4831,6 +4846,8 @@ function settingsRow(link,status){
   const envName=link.api_key_env||'';
   if(link.api_key_set) bits.push('<span>key set</span>');
   else if(envName) bits.push('<span class="bad">key missing ('+esc(envName)+')</span>');
+  if(link.model_warning) bits.push('<span class="bad">'+esc(link.model_warning)+'</span>');
+  if(role==='decision') bits.push('<span>synthetic Test only — status never calls it</span>');
   return '<div class="set-link-row" data-id="'+escAttr(link.id)+'" data-role="'+escAttr(role)+'">'
     +'<div class="set-link-main">'
     +'<div class="set-link-title"><span class="set-link-label">'+esc(link.label||link.id)+'</span>'
@@ -4961,6 +4978,8 @@ function setFormProblem(built){
     return 'That protocol is not supported for the '+SET_ROLE_LABEL[role]+' role.';
   if(role==='embed'&&!p.model)
     return 'An embedding link needs the model name the endpoint serves; it identifies the vector space.';
+  if(role==='decision'&&!p.model)
+    return 'A decision link pins one model version (e.g. jev-1.14.0); calibration binds to that id.';
   if(role==='embed'&&p.chunk===undefined)
     return 'Fill in all three chunk sizes (target, max, images) or leave all three blank.';
   if(role==='embed'&&p.chunk){
@@ -5020,7 +5039,18 @@ async function settingsAction(linkId,act){
       await loadSettings();
     } else if(act==='test'){
       settingsMsg('Testing "'+(link.label||linkId)+'"…');
-      const r=await callJSON('/api/links/'+encodeURIComponent(linkId)+'/test',{method:'POST'});
+      /* Decision links: the text probe always runs; the image probe is a
+         separate explicit opt-in (experimental, sends one synthetic image). */
+      let testBody=null;
+      if(link.role==='decision'
+         &&window.confirm('Also send the experimental image probe for "'+(link.label||linkId)
+                          +'"? (one synthetic 280x280 test image)')){
+        testBody={images:true};
+      }
+      const r=await callJSON('/api/links/'+encodeURIComponent(linkId)+'/test',{
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:testBody?JSON.stringify(testBody):undefined});
       SET_TEST[linkId]=r;
       paintSettings();
       settingsMsg(r.ok

@@ -8,6 +8,29 @@ version/tag policy.
 
 ## Unreleased
 
+### Added — decision model links (M3 CP0.5 readiness, off by default)
+
+- New model-link role `decision` (protocol `typesafe`, `POST {base_url}/v1/systemone`
+  today): typed choice/noul judgments for the M3 layered auto-review. Any
+  number may be enabled; the first enabled link is the default until per-task
+  selection lands (M3 CP5). A decision link pins a `model` version, never
+  carries chunk sizes, and keeps keys in `api_key_env` like every other link.
+- Settings can add/edit/use/not-use/delete a decision link. `POST
+  /api/links/{id}/test` runs a synthetic probe (fixed text fixture; `{"images":
+  true}` is a separate experimental opt-in that sends one generated 280x280
+  test image). `GET /api/links/status` never calls a decision provider — the
+  only network action is the explicit Test. Probe failures are sanitized
+  (`decision_unavailable|decision_timeout|decision_bad_response|decision_rate_limited`)
+  and never degrade search/ask/extract.
+- The peelfeed seam forwards non-secret `PEELFEED_DECISION_*` tuning env to
+  every engine child; the `PEELFEED_DECISION_BASE/MODEL/TOKEN/LINK_ID` secrets
+  are built only by `decision_child_env()` (env wins, else the first enabled
+  decision link) for decision children only, and `PEELFEED_DECISION_PROVIDER`
+  (the local test seam) is never forwarded.
+- Compatibility: `links.json` stays version 1; older peekseed builds reject a
+  file containing decision links (strict role allowlist), so a rollback fails
+  closed until the decision link is removed.
+
 ### Breaking
 
 - `PEEKSEED_HOME` and `PEEKSEED_SHARED_DIR` are required.

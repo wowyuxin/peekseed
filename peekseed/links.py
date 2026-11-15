@@ -37,6 +37,16 @@ Roles and protocols:
             custom  POST {base_url}/embed                 (custom text array)
     rerank  custom  POST {base_url}/rerank                (score documents)
     answer  openai  POST {base_url}/chat/completions      (streaming chat)
+    decision typesafe POST {base_url}/v1/systemone        (typed judgments)
+
+A decision link (M3 CP0.5) is a provider-independent adjudication endpoint:
+today only the ``typesafe`` protocol (System One: choice/noul judgments over a
+state, CP0.5 setup-contract §2/§3). Decision links are NOT stage links: any
+number may be enabled at once and "which task uses which link" is an explicit
+(CP0.5: first-enabled default) selection, never a mutually exclusive stage.
+They never carry ``chunk`` sizes and, like embed links, must pin a ``model``
+(the fixed version id, e.g. ``jev-1.14.0``); moving aliases are accepted but
+flagged in the mask so calibration drift is visible.
 
 At most one embed link and one rerank link may be enabled at a time; any number
 of answer links may be enabled (the UI shows a per-question picker). Enabling a
@@ -56,14 +66,16 @@ from urllib.parse import urlparse
 
 from . import config, security
 
-ROLES = ("embed", "rerank", "answer")
+ROLES = ("embed", "rerank", "answer", "decision")
 STAGE_ROLES = ("embed", "rerank")
 PROTOCOLS = {
     "embed": ("openai", "custom"),
     "rerank": ("custom",),
     "answer": ("openai",),
+    "decision": ("typesafe",),
 }
-DEFAULT_PROTOCOL = {"embed": "openai", "rerank": "custom", "answer": "openai"}
+DEFAULT_PROTOCOL = {"embed": "openai", "rerank": "custom", "answer": "openai",
+                    "decision": "typesafe"}
 ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,39}$")
 #: The only variable names a link may read its key from (a security rule).
 _KEY_ENV_RE = re.compile(r"^PEEKSEED_[A-Z0-9_]+_API_KEY$")
@@ -328,10 +340,12 @@ def validate(data, existing=None):
         model = model.strip()
         # An embedding space is identified by its link and model. Forgetting the
         # model would make two different embedders look interchangeable, so an
-        # embed link must name the model it serves.
-        if role == "embed" and not model:
-            errors.append("model is required for embed links (the model id the "
-                          "endpoint serves)")
+        # embed link must name the model it serves. A decision link must pin its
+        # model version for the same reason: calibration binds to the resolved
+        # model id, and a moving alias would silently drift (CP0.5 contract §2).
+        if role in ("embed", "decision") and not model:
+            errors.append("model is required for %s links (the model id the "
+                          "endpoint serves)" % role)
 
     enabled = given("enabled", True)
     if not isinstance(enabled, bool):
@@ -495,6 +509,27 @@ def answer_links(enabled_only=True):
             if l.get("enabled") or not enabled_only]
 
 
+#: System One model names that move between releases (CP0.5 setup-contract §2).
+DECISION_MOVING_ALIASES = ("jev-latest", "jev-preview")
+
+
+def decision_links(enabled_only=True):
+    """Decision links in insertion order -- any number may be enabled.
+
+    Unlike stage links there is no mutual-exclusion rule: adjudication picks
+    its link explicitly per task/dataset later (CP5); until then the first
+    enabled decision link is the default, mirroring ``default_answer_link``.
+    """
+    return [l for l in links("decision")
+            if l.get("enabled") or not enabled_only]
+
+
+def default_decision_link():
+    """The first enabled decision link, else None (decision is optional)."""
+    found = decision_links()
+    return found[0] if found else None
+
+
 def default_answer_link():
     """The answer link the page starts on: the first enabled one, else None."""
     found = answer_links()
@@ -518,6 +553,14 @@ def embed_space_key(link):
 def mask(link):
     """The public view of one link: NEVER the key, plus what the UI may do."""
     role = link.get("role")
+    model = link.get("model")
+    model_warning = None
+    if role == "decision" and model in DECISION_MOVING_ALIASES:
+        # Moving aliases change what answers behind the same name; the link
+        # stays usable, but the UI must say that calibration can drift
+        # (CP0.5 setup-contract §2: fixed model version, verified response id).
+        model_warning = ("%r is a moving alias; pin a versioned model id before "
+                         "trusting calibration" % model)
     return {
         "id": link.get("id"),
         "role": role,
@@ -526,12 +569,14 @@ def mask(link):
         "base_url": link.get("base_url"),
         "api_key_env": link.get("api_key_env") or "",
         "api_key_set": bool(api_key(link)),
-        "model": link.get("model"),
+        "model": model,
+        "model_warning": model_warning,
         "enabled": link.get("enabled"),
         "chunk": copy.deepcopy(link.get("chunk")),
         "chunk_set": chunk_set_name(link.get("chunk")),
         "capabilities": {
             "models": role == "answer",
+            "decision": role == "decision",
         },
     }
 

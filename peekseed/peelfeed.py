@@ -43,6 +43,8 @@ from pathlib import Path
 from . import config, contracts, links
 
 __all__ = [
+    "DECISION_ENV_KEYS",
+    "DECISION_TUNING_ENV",
     "DEFAULT_CHUNK_PROFILE",
     "DEFAULT_LLM_MODE",
     "DEFAULT_POLL",
@@ -66,6 +68,8 @@ __all__ = [
     "client",
     "config_path",
     "configured",
+    "decision_child_env",
+    "decision_provider",
     "effective",
     "extraction_available",
     "extraction_from_summary",
@@ -150,6 +154,21 @@ _PASS_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE",
 #: The child-only LLM provider variables (CP5 wire §1.3).
 VLM_ENV_KEYS = ("PEELFEED_LLM_BASE", "PEELFEED_LLM_MODEL",
                 "PEELFEED_LLM_TOKEN", "PEELFEED_LLM_LINK_ID")
+#: The child-only decision provider variables (M3 CP0.5 setup-contract §7).
+#: Injected only into a decision child (the adjudicate runner, CP4); every
+#: other peelfeed child gets them stripped, exactly like the VLM provider.
+DECISION_ENV_KEYS = ("PEELFEED_DECISION_BASE", "PEELFEED_DECISION_MODEL",
+                     "PEELFEED_DECISION_TOKEN", "PEELFEED_DECISION_LINK_ID")
+#: Non-secret decision tuning variables forwarded from peekseed's own env to
+#: **every** peelfeed child (timeout, budget, price, per-job call cap and the
+#: experimental-image switch). ``PEELFEED_DECISION_PROVIDER`` (the local/test
+#: command seam) is deliberately absent: never forwarded to a production child.
+DECISION_TUNING_ENV = ("PEELFEED_DECISION_TIMEOUT",
+                       "PEELFEED_DECISION_BUDGET_USD",
+                       "PEELFEED_DECISION_PRICE_INPUT",
+                       "PEELFEED_DECISION_MAX_CALLS_PER_JOB",
+                       "PEELFEED_DECISION_IMAGES")
+_DECISION_ENV_PREFIX = "PEELFEED_DECISION_"
 #: Non-secret peelfeed LLM tuning variables forwarded from peekseed's own env
 #: to **every** peelfeed child (CP5.1 H7 / wire §10.7), read-only commands
 #: included: prompt set, timeout, budget, prices, vision probe and the per-job/
@@ -593,6 +612,116 @@ def vlm_child_env(provider=None):
     }
 
 
+# --- decision provider resolution (M3 CP0.5 setup-contract §7) --------------
+# Same resolution order as the VLM provider: peekseed's own
+# ``PEELFEED_DECISION_*`` env wins; otherwise the first enabled decision link
+# (explicit per-task/dataset selection is CP5). The token is read here and
+# injected only into a decision child; :func:`decision_provider` returns the
+# public descriptor -- never the token.
+
+_DECISION_ENV_KEYS = ("PEELFEED_DECISION_BASE", "PEELFEED_DECISION_MODEL",
+                      "PEELFEED_DECISION_TOKEN")
+
+
+def _env_decision_provider():
+    """The provider from peekseed's own ``PEELFEED_DECISION_*`` env, or None."""
+    base = str(os.environ.get("PEELFEED_DECISION_BASE") or "").strip()
+    model = str(os.environ.get("PEELFEED_DECISION_MODEL") or "").strip()
+    token = _clean_token(os.environ.get("PEELFEED_DECISION_TOKEN"))
+    if not (base and model and token):
+        return None
+    link_id = str(os.environ.get("PEELFEED_DECISION_LINK_ID") or "").strip() \
+        or "env"
+    return {"provider": "env", "link_id": link_id, "model": model,
+            "base_url": base, "_token": token}
+
+
+def _decision_link_provider():
+    """``(provider_dict_or_None, reason)`` from the first enabled decision link."""
+    try:
+        link = links.default_decision_link()
+    except links.LinkConfigError as exc:
+        return None, "the model links config is unreadable: %s" % exc
+    if link is None:
+        return None, ("no enabled decision link: add one in Settings and set "
+                      "its api_key_env in the deploy env, or set "
+                      "PEELFEED_DECISION_BASE/MODEL/TOKEN")
+    base = str(link.get("base_url") or "").strip()
+    model = str(link.get("model") or "").strip()
+    if not base or not model:
+        return None, ("decision link '%s' needs base_url and model"
+                      % link.get("id"))
+    key = links.api_key(link)
+    if not key:
+        return None, ("the API key env for decision link '%s' is not set"
+                      % link.get("id"))
+    return {"provider": "decision_link", "link_id": str(link.get("id") or ""),
+            "model": model, "base_url": base, "_token": key}, None
+
+
+def _resolved_decision_provider():
+    """``(provider_dict_with_token_or_None, reason)``: env first, then link."""
+    env = _env_decision_provider()
+    if env is not None:
+        return env, None
+    return _decision_link_provider()
+
+
+def decision_provider():
+    """The public decision provider descriptor (never the token).
+
+    ``{provider: "env"|"decision_link", link_id, model, base_url, available,
+    reason}``; the UI overlay and capabilities payload use this to report the
+    truth without ever touching the key.
+    """
+    provider, reason = _resolved_decision_provider()
+    if provider is None:
+        return {"provider": "decision_link", "link_id": None, "model": None,
+                "base_url": None, "available": False, "reason": reason}
+    return {"provider": provider["provider"],
+            "link_id": provider["link_id"],
+            "model": provider["model"],
+            "base_url": provider["base_url"],
+            "available": True, "reason": None}
+
+
+def decision_child_env(provider=None):
+    """The child-only decision provider env for one decision child process.
+
+    Mirrors :func:`vlm_child_env`: the four ``PEELFEED_DECISION_*`` variables
+    are built here and live only in the returned dict -- never in argv, stdin,
+    a dataset/job descriptor, a log line or an error message (setup-contract
+    §7). ``provider`` may be the public descriptor from
+    :func:`decision_provider`; the token is then re-resolved from the same
+    source.
+    """
+    if provider is None:
+        provider, reason = _resolved_decision_provider()
+        if provider is None:
+            raise PeelfeedError(
+                503, "error [decision_unavailable] %s" % reason) from None
+    token = str(provider.get("_token") or "")
+    if not token:
+        if provider.get("provider") == "env":
+            env = _env_decision_provider()
+            token = env["_token"] if env is not None else ""
+        else:
+            link = links.get(str(provider.get("link_id") or ""))
+            token = links.api_key(link) if link is not None else ""
+    if not token:
+        raise PeelfeedError(
+            503,
+            "error [decision_unavailable] the decision provider token is not "
+            "set",
+        )
+    return {
+        "PEELFEED_DECISION_BASE": str(provider.get("base_url") or "").strip(),
+        "PEELFEED_DECISION_MODEL": str(provider.get("model") or "").strip(),
+        "PEELFEED_DECISION_TOKEN": token,
+        "PEELFEED_DECISION_LINK_ID": str(provider.get("link_id") or "env"),
+    }
+
+
 # --- handshake -------------------------------------------------------------
 
 
@@ -894,18 +1023,22 @@ class PeelfeedClient(object):
         **except** the provider credentials: ``PEELFEED_LLM_BASE/MODEL/TOKEN/
         LINK_ID`` are only injected for a user-confirmed report/discuss child
         via ``llm_env`` (CP5 wire §1.3) and ``PEELFEED_LLM_PROVIDER`` is never
-        forwarded at all. The non-secret tuning variables
-        (:data:`LLM_TUNING_ENV`: prompt set, timeout, budget, prices, vision and
-        the per-job/per-peel/per-turn caps) ARE forwarded to **every** child --
-        including the read-only ``capabilities``/``status``/``review`` ones --
-        so a deployed ``PEELFEED_LLM_*`` config reaches the engine that needs it
+        forwarded at all; likewise ``PEELFEED_DECISION_BASE/MODEL/TOKEN/
+        LINK_ID`` are only injected into a decision child via
+        :func:`decision_child_env` (CP0.5 setup-contract §7) and
+        ``PEELFEED_DECISION_PROVIDER`` is never forwarded. The non-secret
+        tuning variables (:data:`LLM_TUNING_ENV`, :data:`DECISION_TUNING_ENV`)
+        ARE forwarded to **every** child -- including the read-only
+        ``capabilities``/``status``/``review`` ones -- so a deployed
+        ``PEELFEED_*`` config reaches the engine that needs it
         (CP5.1 H7 / wire §10.7). peekseed's own token/API keys never pass.
         """
         env = {key: value for key, value in os.environ.items()
                if key in _PASS_ENV
                or (key.startswith("PEELFEED_")
-                   and (key in LLM_TUNING_ENV
-                        or not key.startswith(_LLM_ENV_PREFIX)))}
+                   and (key in LLM_TUNING_ENV or key in DECISION_TUNING_ENV
+                        or (not key.startswith(_LLM_ENV_PREFIX)
+                            and not key.startswith(_DECISION_ENV_PREFIX))))}
         env["PEELFEED_SHARED_DIR"] = str(config.paths().shared_dir)
         if self.cfg.get("python") and not self.cfg.get("cli"):
             repo = self.cfg.get("repo") or ""

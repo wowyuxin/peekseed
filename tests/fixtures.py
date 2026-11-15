@@ -1298,6 +1298,11 @@ def main():
             # children and never a rules report/plan/job call.
             "llm_env": {key: value for key, value in sorted(os.environ.items())
                         if key.startswith("PEELFEED_LLM_")},
+            # M3 CP0.5: same proof for the decision provider env
+            # (child-only secrets + tuning that reaches every child).
+            "decision_env": {key: value for key, value in
+                             sorted(os.environ.items())
+                             if key.startswith("PEELFEED_DECISION_")},
         }) + "\n")
     if not argv:
         return fail("missing command")
