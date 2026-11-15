@@ -3377,6 +3377,111 @@ def create_app():
         return {"auto_confirmation_id": identifier,
                 "result": result, "failures": []}
 
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/auto/"
+              "spotcheck")
+    def source_review_auto_spotcheck(dataset_id: str, sha: str,
+                                     payload: Optional[dict] = None):
+        """Record a pre-confirm blind spot-check, then reveal model conclusions.
+
+        The reviewer judges sampled auto drafts **before** seeing source/score/
+        decision; the response is the reveal after the judgement is persisted
+        (wire §8.5). No confirm/build/publish happens here.
+        """
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        body = payload or {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "spotcheck must be a JSON object")
+        unknown = set(body) - {"base_plan_version", "seed", "entry_ids",
+                               "judgements"}
+        if unknown:
+            raise HTTPException(
+                400, "unknown spotcheck field(s): %s"
+                % ", ".join(sorted(unknown)))
+        base = body.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int):
+            raise HTTPException(400, "base_plan_version must be an integer")
+        seed = str(body.get("seed") or "").strip()
+        if not seed:
+            raise HTTPException(400, "seed is required")
+        settings = review_settings.load(directory)
+        if not settings.get("blind_spotcheck", {}).get("enabled", True):
+            raise HTTPException(409, "blind spot-check is disabled")
+        entry_ids = body.get("entry_ids")
+        judgements = body.get("judgements")
+        if not isinstance(entry_ids, list) or not entry_ids:
+            raise HTTPException(400, "entry_ids must be a non-empty list")
+        if not isinstance(judgements, list) or not judgements:
+            raise HTTPException(400, "judgements must be a non-empty list")
+        cleaned = []
+        seen = set()
+        for raw in entry_ids:
+            value = str(raw or "").strip()
+            if not value or value in seen:
+                raise HTTPException(400, "entry_ids must be unique non-empty ids")
+            seen.add(value)
+            cleaned.append(value)
+        verdicts = {}
+        for judgement in judgements:
+            if not isinstance(judgement, dict):
+                raise HTTPException(400, "each judgement must be an object")
+            if set(judgement) - {"entry_id", "verdict"}:
+                raise HTTPException(400, "unknown judgement field")
+            entry_id_value = str(judgement.get("entry_id") or "").strip()
+            verdict = str(judgement.get("verdict") or "").strip()
+            if entry_id_value not in seen:
+                raise HTTPException(400, "judgement entry is not sampled")
+            if verdict not in ("correct", "incorrect"):
+                raise HTTPException(400, "verdict must be correct|incorrect")
+            if entry_id_value in verdicts:
+                raise HTTPException(400, "duplicate judgement")
+            verdicts[entry_id_value] = verdict
+        if set(verdicts) != seen:
+            raise HTTPException(400, "every sampled entry needs one judgement")
+        review_dir = _peel_review_dir(peel_id)
+        plan = _review_json(review_dir / "plan.json", default={}) or {}
+        if int(plan.get("plan_version") or 0) != base:
+            raise HTTPException(409, "base_plan_version mismatch")
+        entries = {str(item.get("entry_id")): item
+                   for item in plan.get("entries") or []
+                   if isinstance(item, dict)}
+        items = _review_json(review_dir / "items.json", default={}) or {}
+        item_map = {str(item.get("id")): item
+                    for item in items.get("items") or []
+                    if isinstance(item, dict)}
+        reveal = []
+        for entry_id_value in cleaned:
+            plan_entry = entries.get(entry_id_value)
+            if plan_entry is None or str(plan_entry.get("source") or "") not in (
+                    "decision_auto", "vlm_auto", "mixed"):
+                raise HTTPException(400, "spotcheck entry is not an auto draft")
+            if str(plan_entry.get("status") or "") != "draft":
+                raise HTTPException(400, "spotcheck entry is not a draft")
+            item = item_map.get(str(plan_entry.get("item_id") or "")) or {}
+            origin = plan_entry.get("origin") or {}
+            reveal.append({
+                "entry_id": entry_id_value,
+                "item_id": plan_entry.get("item_id"),
+                "code": item.get("code"),
+                "source": plan_entry.get("source"),
+                "decision": "keep" if (plan_entry.get("action") or {}).get(
+                    "type") == "resolution" else "apply",
+                "score": origin.get("effective_score"),
+                "origin": origin,
+            })
+        record = review_settings.append_spotcheck(directory, {
+            "dataset_id": dataset_id,
+            "peel_id": peel_id,
+            "base_plan_version": base,
+            "seed": seed,
+            "entry_ids": cleaned,
+            "judgements": [{"entry_id": key, "verdict": verdicts[key]}
+                           for key in cleaned],
+        })
+        return {"recorded": record, "reveal": reveal}
+
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/jobs/"
               "{job_id}/resume", status_code=202)
     def source_review_job_resume(dataset_id: str, sha: str, job_id: str):

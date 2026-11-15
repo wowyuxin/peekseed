@@ -74,6 +74,10 @@ class ReviewSettingsTests(unittest.TestCase):
                                 ["enabled"])
                 self.assertEqual(saved.json()["settings"]
                                  ["minimum_validated_cutoff"], 50)
+                self.assertTrue(saved.json()["settings"]
+                                ["blind_spotcheck"]["enabled"])
+                self.assertEqual(saved.json()["settings"]
+                                 ["blind_spotcheck"]["count"], 3)
                 path = _dataset_dir(dataset_id) / "review" / "settings.json"
                 self.assertTrue(path.is_file())
                 self.assertEqual(path.stat().st_mode & 0o777, 0o600)
@@ -285,6 +289,63 @@ class AutoReviewTests(unittest.TestCase):
                 rows = [json.loads(line) for line in
                         mirror.read_text().splitlines() if line.strip()]
                 self.assertEqual(rows[-1]["outcome"], "reverted")
+
+    def test_auto_spotcheck_records_blind_judgement_then_reveals(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, dataset_id, _sha = _extracted_review_source(client, root)
+                peel, review_dir = self._seed_auto(dataset_id)
+                cli.update(peels={peel["peel_id"]: {
+                    "peel_id": peel["peel_id"], "state": "ready",
+                    "source": {"sha256": _sha}}})
+                client.put(
+                    "/api/datasets/%s/review/settings" % dataset_id,
+                    json=_enable_auto())
+                spot = client.post(base + "/review/auto/spotcheck", json={
+                    "base_plan_version": 3,
+                    "seed": "spot-test-1",
+                    "entry_ids": ["e-op", "e-keep"],
+                    "judgements": [
+                        {"entry_id": "e-op", "verdict": "correct"},
+                        {"entry_id": "e-keep", "verdict": "incorrect"},
+                    ],
+                })
+                self.assertEqual(spot.status_code, 200, spot.text)
+                payload = spot.json()
+                self.assertEqual(payload["recorded"]["seed"], "spot-test-1")
+                reveal = {row["entry_id"]: row for row in payload["reveal"]}
+                self.assertEqual(reveal["e-op"]["source"], "decision_auto")
+                self.assertEqual(reveal["e-op"]["decision"], "apply")
+                self.assertEqual(reveal["e-op"]["score"], 96)
+                self.assertEqual(reveal["e-keep"]["decision"], "keep")
+                path = (_dataset_dir(dataset_id) / "review" /
+                        "spotchecks.jsonl")
+                rows = [json.loads(line) for line in
+                        path.read_text().splitlines() if line.strip()]
+                self.assertEqual(rows[-1]["judgements"][1]["verdict"],
+                                 "incorrect")
+                # Every sampled entry needs one valid judgement.
+                bad = client.post(base + "/review/auto/spotcheck", json={
+                    "base_plan_version": 3, "seed": "s",
+                    "entry_ids": ["e-op"],
+                    "judgements": [{"entry_id": "e-op",
+                                    "verdict": "maybe"}],
+                })
+                self.assertEqual(bad.status_code, 400, bad.text)
+                # Disabling spotcheck refuses the route.
+                disabled = dict(_enable_auto())
+                disabled["blind_spotcheck"] = {"enabled": False, "count": 3}
+                client.put("/api/datasets/%s/review/settings" % dataset_id,
+                           json=disabled)
+                refused = client.post(base + "/review/auto/spotcheck", json={
+                    "base_plan_version": 3, "seed": "s",
+                    "entry_ids": ["e-op"],
+                    "judgements": [{"entry_id": "e-op",
+                                    "verdict": "correct"}],
+                })
+                self.assertEqual(refused.status_code, 409, refused.text)
 
     def test_auto_trigger_after_extraction_when_enabled(self):
         with temp_data_root() as root:

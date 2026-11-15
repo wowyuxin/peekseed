@@ -34,6 +34,7 @@ __all__ = [
     "revoke_authorization",
     "save",
     "settings_path",
+    "spotchecks_path",
 ]
 
 SCHEMA_VERSION = 1
@@ -49,6 +50,7 @@ DEFAULT_SETTINGS = {
     "minimum_validated_cutoff": None,
     "breaker": {"window_days": 30, "window_records": 200,
                 "min_samples": 20, "line": 0.95},
+    "blind_spotcheck": {"enabled": True, "count": 3},
     "category_overrides": {},
 }
 
@@ -57,6 +59,7 @@ _THRESHOLD_KEYS = frozenset(("enabled", "value"))
 _CAP_KEYS = frozenset(("cap_rule_disagree", "cap_uncertain"))
 _BREAKER_KEYS = frozenset(("window_days", "window_records", "min_samples",
                            "line"))
+_SPOTCHECK_KEYS = frozenset(("enabled", "count"))
 
 
 class ReviewSettingsError(ValueError):
@@ -69,6 +72,10 @@ def review_dir(directory):
 
 def settings_path(directory):
     return review_dir(directory) / "settings.json"
+
+
+def spotchecks_path(directory):
+    return review_dir(directory) / "spotchecks.jsonl"
 
 
 def authorizations_path(directory):
@@ -172,6 +179,20 @@ def validate_settings(payload):
             "line": _number(breaker.get("line", 0.95), "breaker.line",
                             minimum=0.0, maximum=1.0),
         }
+    if "blind_spotcheck" in payload:
+        spotcheck = payload.get("blind_spotcheck")
+        if not isinstance(spotcheck, dict) or set(spotcheck) - _SPOTCHECK_KEYS:
+            raise ReviewSettingsError(
+                "blind_spotcheck must contain enabled/count")
+        merged["blind_spotcheck"] = {
+            "enabled": _bool(spotcheck.get("enabled", True),
+                             "blind_spotcheck.enabled"),
+            "count": _integer(spotcheck.get("count", 3),
+                              "blind_spotcheck.count", minimum=1),
+        }
+        if merged["blind_spotcheck"]["count"] > 20:
+            raise ReviewSettingsError(
+                "blind_spotcheck.count must be <= 20")
     if "category_overrides" in payload:
         overrides = payload.get("category_overrides")
         if not isinstance(overrides, dict):
@@ -372,6 +393,25 @@ def create_authorization(directory, payload, *, dataset_id, provider,
     }
     _append_jsonl(authorizations_path(directory), record)
     return record
+
+
+def append_spotcheck(directory, record):
+    """Append one runtime blind-spotcheck record (no secret, 0600)."""
+    if not isinstance(record, dict):
+        raise ReviewSettingsError("spotcheck must be an object")
+    row = {
+        "schema_version": SCHEMA_VERSION,
+        "dataset_id": str(record.get("dataset_id") or ""),
+        "peel_id": str(record.get("peel_id") or ""),
+        "base_plan_version": int(record.get("base_plan_version") or 0),
+        "seed": str(record.get("seed") or ""),
+        "entry_ids": list(record.get("entry_ids") or []),
+        "judgements": list(record.get("judgements") or []),
+        "actor": str(record.get("actor") or "user"),
+        "created_at": contracts.utc_now(),
+    }
+    _append_jsonl(spotchecks_path(directory), row)
+    return row
 
 
 def mirror_auto_confirmation(directory, record):

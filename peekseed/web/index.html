@@ -1954,6 +1954,7 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
     <div class="rr-ocr" id="reviewOcr"><span class="hist-empty">正在读取 OCR 能力…</span></div>
     <div class="rr-auto" id="reviewAuto"><span class="hist-empty">正在读取自动审阅状态…</span></div>
     <div class="rr-calibration" id="reviewCalibration"><span class="hist-empty">正在读取校准数据…</span></div>
+    <div class="rr-spotcheck" id="reviewAutoSpotcheck" hidden></div>
     <div class="rr-batch" id="reviewBatch"><span class="hist-empty">正在读取候选批次与后台任务…</span></div>
     <div class="hist-body settings-body">
       <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
@@ -8852,6 +8853,11 @@ function paintReviewAuto(){
     +'<label>apply ≥ <input id="autoApply" type="number" min="0" max="100" value="'+esc(apply.value)+'"></label> '
     +'<label>keep ≥ <input id="autoKeep" type="number" min="0" max="100" value="'+esc(keep.value)+'"></label> '
     +'<label>cutoff <input id="autoCutoff" type="number" min="0" max="100" value="'+esc(cutoff)+'"></label> '
+    +'<label><input type="checkbox" id="autoSpotcheck" '
+    +((s.blind_spotcheck&&s.blind_spotcheck.enabled===false)?'':'checked')
+    +'> 确认前盲抽查</label> '
+    +'<label>抽样 <input id="autoSpotcheckCount" type="number" min="1" max="20" value="'
+    +esc((s.blind_spotcheck&&s.blind_spotcheck.count)||3)+'"></label> '
     +'<button type="button" class="secondary" id="autoSave">保存设置</button> '
     +'<button type="button" class="secondary" id="autoAuthCreate">创建授权</button>'
     +(active?' <button type="button" class="secondary" id="autoAuthRevoke">撤销授权</button>':'')
@@ -8901,6 +8907,9 @@ async function reviewAutoSave(){
   payload.thresholds.keep={enabled:true,value:Number(($('#autoKeep')||{}).value||90)};
   const cutoff=($('#autoCutoff')||{}).value;
   payload.minimum_validated_cutoff=(cutoff===''||cutoff==null)?null:Number(cutoff);
+  payload.blind_spotcheck={
+    enabled:!!($('#autoSpotcheck')||{}).checked,
+    count:Number(($('#autoSpotcheckCount')||{}).value||3)};
   REVIEW_CTX.autoBusy=true;
   try{
     REVIEW_CTX.autoSettings=await reviewFetchJSON(reviewAutoSettingsUrl(),{
@@ -8936,7 +8945,81 @@ async function reviewAutoRevokeAuth(){
   }catch(e){ reviewMsg(reviewErrText(e),true); }
   finally{ REVIEW_CTX.autoBusy=false; }
 }
+function reviewAutoSpotcheckEnabled(){
+  const s=((REVIEW_CTX.autoSettings||{}).settings)||{};
+  const spot=s.blind_spotcheck||{};
+  return spot.enabled!==false;
+}
+function reviewAutoSpotcheckOpen(){
+  const auto=REVIEW_CTX.auto||{};
+  const items=(auto.items||[]);
+  const s=((REVIEW_CTX.autoSettings||{}).settings)||{};
+  const wanted=Math.max(1,Math.min(20,Number(
+    (s.blind_spotcheck&&s.blind_spotcheck.count)||3)));
+  const count=Math.min(wanted,items.length);
+  const picks=[];
+  for(let i=0;i<count;i++){
+    const index=Math.floor(i*items.length/count);
+    picks.push(items[index]);
+  }
+  const seed='spot-'+reviewNum(auto.plan_version)+'-'+Date.now();
+  REVIEW_CTX.autoSpotcheck={seed:seed,entry_ids:picks.map(function(item){
+    return item.entry_id;})};
+  let html='<div class="rr-spot-head"><b>确认前盲抽查</b> · 先判断，后揭示模型结论</div>';
+  picks.forEach(function(item){
+    const key='spot-'+item.entry_id;
+    html+='<div class="rr-spot-item"><div>'+esc(item.code||'')
+      +' · 条目 '+esc(item.item_id||'')+'</div>'
+      +'<label><input type="radio" name="'+esc(key)+'" value="correct"> 正确</label> '
+      +'<label><input type="radio" name="'+esc(key)+'" value="incorrect"> 错误</label></div>';
+  });
+  html+='<div class="rr-spot-actions"><button type="button" id="autoSpotSubmit">提交抽查</button> '
+    +'<button type="button" class="secondary" id="autoSpotCancel">跳过</button></div>';
+  const el=$('#reviewAutoSpotcheck'); if(!el) return;
+  el.hidden=false; el.innerHTML=html;
+  const submit=$('#autoSpotSubmit'); if(submit) submit.onclick=reviewAutoSpotcheckSubmit;
+  const cancel=$('#autoSpotCancel'); if(cancel) cancel.onclick=reviewAutoSpotcheckClose;
+}
+function reviewAutoSpotcheckClose(){
+  const el=$('#reviewAutoSpotcheck'); if(el){ el.hidden=true; el.innerHTML=''; }
+  REVIEW_CTX.autoSpotcheck=null;
+}
+async function reviewAutoSpotcheckSubmit(){
+  if(REVIEW_CTX.autoBusy) return;
+  const auto=REVIEW_CTX.auto||{};
+  const state=REVIEW_CTX.autoSpotcheck||{};
+  const judgements=[];
+  for(const entryId of state.entry_ids||[]){
+    const picked=document.querySelector('input[name="spot-'+entryId+'"]:checked');
+    if(!picked){ reviewMsg('每一项都要先判断“正确/错误”。',true); return; }
+    judgements.push({entry_id:entryId,verdict:picked.value});
+  }
+  REVIEW_CTX.autoBusy=true;
+  try{
+    const result=await reviewFetchJSON(
+      reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/auto/spotcheck',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({base_plan_version:auto.plan_version,
+          seed:state.seed,entry_ids:state.entry_ids,judgements:judgements})});
+    let html='<div class="rr-spot-head"><b>盲抽查已记录</b> · 揭示模型结论</div>';
+    (result.reveal||[]).forEach(function(row){
+      html+='<div class="rr-spot-item">'+esc(row.code||'')+' · '
+        +esc(row.source||'')+' · '+esc(row.decision||'')+' · score '
+        +reviewNum(row.score)+'</div>';
+    });
+    html+='<div class="rr-spot-actions"><button type="button" id="autoSpotContinue">继续确认</button></div>';
+    const el=$('#reviewAutoSpotcheck'); if(el){ el.innerHTML=html; }
+    const cont=$('#autoSpotContinue'); if(cont) cont.onclick=function(){
+      reviewAutoSpotcheckClose(); reviewAutoConfirmNow(); };
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
 async function reviewAutoConfirm(){
+  if(REVIEW_CTX.autoBusy) return;
+  if(reviewAutoSpotcheckEnabled()){ reviewAutoSpotcheckOpen(); return; }
+  await reviewAutoConfirmNow();
+}
+async function reviewAutoConfirmNow(){
   if(REVIEW_CTX.autoBusy) return;
   const auto=REVIEW_CTX.auto||{};
   const ids=[];
@@ -9070,7 +9153,8 @@ async function openReview(dsId,sha){
     /* CP6: propagation state. Opening the review never previews/applies. */
     propagate:null,
     /* CP5 auto-review state (settings/authorization/list/job). */
-    auto:null,autoSettings:null,autoBusy:false,calibration:null};
+    auto:null,autoSettings:null,autoBusy:false,calibration:null,
+    autoSpotcheck:null};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
