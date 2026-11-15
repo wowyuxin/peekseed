@@ -1016,7 +1016,7 @@ class PeelfeedClient(object):
             argv.append("--json")
         return argv
 
-    def _environment(self, llm_env=None):
+    def _environment(self, llm_env=None, decision_env=None):
         """The child environment: allowlisted vars plus explicit LLM env only.
 
         Every ``PEELFEED_*`` variable is forwarded (the OCR config is env-only)
@@ -1046,10 +1046,13 @@ class PeelfeedClient(object):
                 env["PYTHONPATH"] = repo
         if llm_env:
             env.update({str(key): str(value) for key, value in llm_env.items()})
+        if decision_env:
+            env.update({str(key): str(value)
+                        for key, value in decision_env.items()})
         return env
 
     def _run(self, args, *, timeout=None, root=True, json_flag=True,
-             stdin_text=None, llm_env=None):
+             stdin_text=None, llm_env=None, decision_env=None):
         argv = self._argv(args, root=root, json_flag=json_flag)
         try:
             completed = subprocess.run(
@@ -1059,7 +1062,8 @@ class PeelfeedClient(object):
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout or self.timeout,
-                env=self._environment(llm_env=llm_env),
+                env=self._environment(llm_env=llm_env,
+                                      decision_env=decision_env),
                 input=stdin_text,
             )
         except subprocess.TimeoutExpired:
@@ -1464,6 +1468,67 @@ class PeelfeedClient(object):
             timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
             stdin_text=json.dumps(request, ensure_ascii=False),
         )
+
+    # --- M3 CP4/CP5 adjudicate + auto confirmation ---
+    def adjudicate(self, peel_id, request, *, provider_env=None,
+                   timeout=None):
+        """``adjudicate <peel> --input -``: create one adjudicate job.
+
+        The provider tokens travel only in ``provider_env`` (decision + VLM
+        child env); the request carries public link descriptors. The CLI returns
+        ``{job_id,status,type,result_ref}`` and the detached child runs the
+        job; callers poll :meth:`job_show`.
+        """
+        return self._run(
+            ["adjudicate", str(peel_id), "--input", "-"],
+            timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False),
+            llm_env=(provider_env or {}).get("llm"),
+            decision_env=(provider_env or {}).get("decision"))
+
+    def job_resume(self, peel_id, job_id):
+        return self._run(
+            ["job", "resume", str(peel_id), "--job", str(job_id)],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def job_cancel(self, peel_id, job_id):
+        return self._run(
+            ["job", "cancel", str(peel_id), "--job", str(job_id)],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def plan_auto_confirm(self, peel_id, request):
+        return self._run(
+            ["plan", str(peel_id), "auto-confirm", "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False))
+
+    def plan_auto_revert(self, peel_id, request):
+        return self._run(
+            ["plan", str(peel_id), "auto-revert", "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False))
+
+    def plan_tag_auto_batch(self, peel_id, request):
+        return self._run(
+            ["plan", str(peel_id), "tag-batch", "--input", "-"],
+            timeout=min(SHORT_TIMEOUT, self.timeout),
+            stdin_text=json.dumps(request, ensure_ascii=False))
+
+    def calibration_export(self, peel_id, job_id):
+        return self._run(
+            ["calibration", "export", str(peel_id), "--job", str(job_id)],
+            timeout=min(SHORT_TIMEOUT, self.timeout))
+
+    def metadata_export(self, peel_id, output, *, allow_incomplete=False):
+        args = ["metadata", "export", str(peel_id), "--output", str(output)]
+        if allow_incomplete:
+            args.append("--allow-incomplete")
+        return self._run(args, timeout=self.timeout)
+
+    def metadata_import(self, peel_id, bundle):
+        return self._run(
+            ["metadata", "import", str(peel_id), "--input", str(bundle)],
+            timeout=self.timeout)
 
     # --- ApplyBatch / publish / jobs (M2 CP3; contract §4, wire §2.6) ---
     def apply(self, peel_id, entry_ids):

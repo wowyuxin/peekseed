@@ -160,9 +160,11 @@ EXTRACTION_STATES = (
 
 #: peelfeed persistent job types (contract v1.3 §11.4 / CP3 wire §2.5). ``ocr``
 #: and ``discuss`` are schema-accepted but not exposed until CP4/CP5.
-REVIEW_JOB_TYPES = ("report", "build", "rollback", "ocr", "discuss")
+REVIEW_JOB_TYPES = ("report", "build", "rollback", "ocr", "discuss",
+                    "adjudicate")
 #: peelfeed persistent job states (CP3 wire §2.5).
-REVIEW_JOB_STATUSES = ("queued", "running", "done", "failed", "interrupted")
+REVIEW_JOB_STATUSES = ("queued", "running", "paused", "done", "failed",
+                       "interrupted")
 
 # Collection-level states. ``uploaded``/``extracted`` describe storage and peel
 # state; the terminal states are ``indexed``, ``stale`` (the index no longer

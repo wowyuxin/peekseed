@@ -40,8 +40,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import (__version__, answer as answer_mod, config, contracts, decision,
-               ingest, links, localmodels, peelfeed, prompts, security,
-               workspace)
+               ingest, links, localmodels, peelfeed, prompts, review_settings,
+               security, workspace)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -2275,6 +2275,264 @@ def create_app():
             LOG.warning("could not persist review job %s for source %s: %s",
                         job_id, str(sha)[:8], _http_detail(exc))
 
+    # ---------------------------------------------------- M3 CP5 review settings
+    def _review_provider_snapshot():
+        """Public decision/VLM provider descriptors (never a token)."""
+        decision_provider = peelfeed.decision_provider()
+        vlm_provider = peelfeed.vlm_provider()
+        return {
+            "decision": {
+                "link_id": decision_provider.get("link_id"),
+                "model": decision_provider.get("model"),
+                "protocol": "typesafe",
+                "available": bool(decision_provider.get("available")),
+                "reason": decision_provider.get("reason"),
+            },
+            "vlm": {
+                "link_id": vlm_provider.get("link_id"),
+                "model": vlm_provider.get("model"),
+                "available": bool(vlm_provider.get("available")),
+                "reason": vlm_provider.get("reason"),
+            },
+        }
+
+    def _review_provider_env():
+        """Child-only provider env for an adjudicate child (decision + VLM)."""
+        env = {"decision": None, "llm": None}
+        try:
+            env["decision"] = peelfeed.decision_child_env()
+        except peelfeed.PeelfeedError:
+            env["decision"] = None
+        try:
+            env["llm"] = peelfeed.vlm_child_env()
+        except peelfeed.PeelfeedError:
+            env["llm"] = None
+        return env
+
+    def _review_auth_state(directory):
+        provider = _review_provider_snapshot()
+        records = review_settings.authorizations(directory)
+        statuses = []
+        active = None
+        for record in reversed(records):
+            status = review_settings.authorization_status(
+                record, provider=provider)
+            statuses.append({
+                "authorization_id": record.get("authorization_id"),
+                "status": status,
+                "created_at": record.get("created_at"),
+                "expires_at": record.get("expires_at"),
+                "scope": record.get("scope"),
+                "provider": record.get("provider"),
+                "note": record.get("note"),
+            })
+            if active is None and status == "active":
+                active = record
+        return active, statuses
+
+    def _review_trigger_blockers(directory):
+        settings = review_settings.load(directory)
+        provider = _review_provider_snapshot()
+        active, statuses = _review_auth_state(directory)
+        blockers = []
+        if not settings["auto_review"]["enabled"]:
+            blockers.append("auto_review_disabled")
+        if active is None:
+            blockers.append("authorization_missing_or_inactive")
+        if not provider["decision"]["available"]:
+            blockers.append("decision_unavailable")
+        return settings, provider, active, statuses, blockers
+
+    def _review_authorization_snapshot(record):
+        return {
+            "authorization_id": record.get("authorization_id"),
+            "status": "active",
+            "scope": record.get("scope") or {},
+            "expires_at": record.get("expires_at"),
+        }
+
+    def _adjudicate_request(directory, dataset_id, *, scope=None,
+                            mode="auto"):
+        settings, provider, active, _statuses, _blockers = \
+            _review_trigger_blockers(directory)
+        if active is None:
+            raise HTTPException(
+                409,
+                "auto review needs an active dataset authorization; "
+                "create one in Settings first",
+            )
+        if mode == "auto" and not settings["auto_review"]["enabled"]:
+            raise HTTPException(409, "auto review is disabled for this dataset")
+        request = {
+            "schema_version": 1,
+            "dataset_id": str(dataset_id),
+            "settings": settings,
+            "authorization": _review_authorization_snapshot(active),
+            "decision_link": {
+                "link_id": provider["decision"]["link_id"],
+                "protocol": "typesafe",
+                "model": provider["decision"]["model"],
+            },
+            "vlm_link": {
+                "link_id": provider["vlm"]["link_id"],
+                "model": provider["vlm"]["model"],
+            },
+            "scope": scope or {"all_unresolved": True},
+            "mode": mode,
+            "limits": {"decision_timeout_seconds": 60,
+                       "vlm_timeout_seconds": 300,
+                       "decision_max_calls": None,
+                       "vlm_max_attempts": 2000, "retries": 2},
+        }
+        return request, _review_provider_env()
+
+    def _peel_review_dir(peel_id):
+        paths = config.paths()
+        return Path(paths.peels_dir) / str(peel_id) / "extract" / "review"
+
+    def _review_json(path, default=None):
+        try:
+            return contracts.read_json(path, default=default)
+        except contracts.ContractError:
+            return default
+
+    def _review_latest_job(review_dir, job_type="adjudicate"):
+        directory = Path(review_dir) / "jobs"
+        if not directory.is_dir():
+            return None
+        candidates = sorted(directory.glob(job_type + "-*.json"),
+                            key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in candidates:
+            payload = _review_json(path)
+            if isinstance(payload, dict) and payload.get("type") == job_type:
+                return payload
+        return None
+
+    def _review_auto_payload(peel_id):
+        """The CP5 ``auto`` list derived from plan entries + summary (§6.1).
+
+        Peekseed reads the authoritative peelfeed files (plan/summary/items/job)
+        read-only; it never rewrites the plan. A draft is only listed when its
+        source is an auto source and it is still a draft.
+        """
+        review_dir = _peel_review_dir(peel_id)
+        plan = _review_json(review_dir / "plan.json", default={}) or {}
+        items_payload = _review_json(review_dir / "items.json", default={}) or {}
+        item_map = {str(item.get("id")): item
+                    for item in items_payload.get("items") or []
+                    if isinstance(item, dict)}
+        entries = [entry for entry in plan.get("entries") or []
+                   if isinstance(entry, dict)]
+        job = _review_latest_job(review_dir)
+        summary = None
+        if job is not None:
+            summary = _review_json(
+                review_dir / "adjudicate" / str(job.get("job_id"))
+                / "summary.json", default=None)
+        auto_sources = ("decision_auto", "vlm_auto", "mixed")
+        counts = {"apply": 0, "keep": 0, "escalate": 0,
+                  "by_code": {}, "by_source": {}}
+        groups = {}
+        listed = []
+        for entry in entries:
+            source = str(entry.get("source") or "")
+            if source not in auto_sources or entry.get("status") != "draft":
+                continue
+            item_id = str(entry.get("item_id") or "")
+            item = item_map.get(item_id) or {}
+            origin = entry.get("origin") or {}
+            action = entry.get("action") or {}
+            keep = action.get("type") == "resolution"
+            decision = "keep" if keep else "apply"
+            status = "stale" if entry.get("stale") else (
+                "failed_check" if origin.get("hard_blocks")
+                else "ready_for_confirmation")
+            score = float(origin.get("effective_score") or 0)
+            band = ("95-100" if score >= 95 else "90-94" if score >= 90
+                    else "80-89" if score >= 80 else "70-79" if score >= 70
+                    else "<70")
+            code = str(item.get("code") or "")
+            strategy = entry.get("strategy") or {}
+            group_key = "code:{}|strategy:{}|score:{}".format(
+                code, strategy.get("id"), band)
+            counts[decision] += 1
+            counts["by_code"].setdefault(code, {"apply": 0, "keep": 0})
+            counts["by_code"][code][decision] += 1
+            counts["by_source"][source] = counts["by_source"].get(source, 0) + 1
+            group = groups.setdefault(group_key, {
+                "group_key": group_key, "code": code,
+                "strategy": strategy, "score_band": band, "source": source,
+                "entry_ids": [], "count": 0,
+            })
+            group["entry_ids"].append(entry.get("entry_id"))
+            group["count"] += 1
+            listed.append({
+                "entry_id": entry.get("entry_id"),
+                "item_id": item_id,
+                "code": code,
+                "cluster_id": item.get("cluster_id"),
+                "asset_id": item.get("asset_id"),
+                "decision": decision,
+                "source": source,
+                "origin": origin,
+                "action": action,
+                "status": status,
+                "keep": keep,
+            })
+        if summary:
+            summary_counts = summary.get("counts") or {}
+            counts["escalate"] = int(summary_counts.get("manual_pending") or 0)
+        job_block = None
+        if job is not None:
+            job_block = {
+                "job_id": job.get("job_id"),
+                "status": job.get("status"),
+                "progress": job.get("progress") or {},
+                "error": job.get("error"),
+                "result_ref": job.get("result_ref"),
+                "partial_ref": job.get("partial_ref"),
+            }
+        return {
+            "schema_version": 1,
+            "peel_id": peel_id,
+            "plan_version": plan.get("plan_version") or 0,
+            "counts": counts,
+            "groups": sorted(groups.values(),
+                             key=lambda group: (-group["count"],
+                                                group["group_key"])),
+            "items": listed,
+            "job": job_block,
+            "summary": summary,
+        }
+
+    def _auto_trigger(directory, dataset_id, sha, block):
+        """After a successful extraction, create the auto adjudicate job once."""
+        if str((block or {}).get("state") or "") != "extracted":
+            return
+        peel_id = str((block or {}).get("peel_id") or "")
+        if not peel_id:
+            return
+        settings, _provider, active, _statuses, blockers = \
+            _review_trigger_blockers(directory)
+        if blockers:
+            LOG.info("auto review skipped for %s: %s", str(sha)[:8],
+                     ", ".join(blockers))
+            return
+        try:
+            request, provider_env = _adjudicate_request(
+                directory, dataset_id, scope={"all_unresolved": True},
+                mode="auto")
+            result = peelfeed.client().adjudicate(
+                peel_id, request, provider_env=provider_env)
+        except Exception as exc:  # noqa: BLE001 - extraction already succeeded
+            LOG.warning("auto review could not start for %s: %s",
+                        str(sha)[:8], _http_detail(exc))
+            return
+        job_id = str((result or {}).get("job_id") or "")
+        if job_id:
+            _record_review_job(directory, sha, job_id,
+                               job_type="adjudicate")
+
     def _source_by_sha(directory, sha):
         sha = str(sha or "").strip().lower()
         if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
@@ -2396,7 +2654,7 @@ def create_app():
                 })
                 updated["finished_at"] = contracts.utc_now()
                 _persist_extraction(directory, sha, updated, terminal=True)
-                return
+                return updated
             elif errors:
                 kind = "failed"
                 error = "validation reported %d error(s)" % errors
@@ -2409,6 +2667,7 @@ def create_app():
         # The worker's terminal write is authoritative (terminal=True) and wins
         # over any late poller observation (flake hardened in CP3 W0/W4).
         _persist_extraction(directory, sha, updated, terminal=True)
+        return updated
 
     def _run_peel_command(directory, sha, block, peel_id, command):
         """Run one long CLI command (ingest/rebuild) with a status poller.
@@ -2446,7 +2705,12 @@ def create_app():
             stop.set()
             poller.join(timeout=30.0)
         try:
-            _finish_extraction(directory, sha, block, outcome)
+            updated = _finish_extraction(directory, sha, block, outcome)
+            try:
+                _auto_trigger(directory, Path(directory).name, sha, updated)
+            except Exception as exc:  # noqa: BLE001 - extraction already done
+                LOG.warning("auto review trigger failed for %s: %s",
+                            str(sha)[:8], _http_detail(exc))
         finally:
             # H9: the source may be refreshed from peelfeed again only once the
             # authoritative terminal block is on disk.
@@ -2757,6 +3021,303 @@ def create_app():
         # capabilities child never sees the provider env, so overlay the
         # provider peekseed resolved (env-first, else default answer link).
         return _review_vlm_capabilities(payload)
+
+    # ---------------------------------------------------- M3 CP5 dataset settings
+    @app.get("/api/datasets/{dataset_id}/review/settings")
+    def dataset_review_settings(dataset_id: str):
+        """Review settings + authorizations + provider readiness (CP5 §9/§10)."""
+        directory = _dataset_dir(dataset_id)
+        settings, provider, active, statuses, blockers = \
+            _review_trigger_blockers(directory)
+        return {
+            "dataset_id": dataset_id,
+            "settings": settings,
+            "provider": provider,
+            "authorizations": statuses,
+            "active_authorization": (active or {}).get("authorization_id"),
+            "auto_trigger": {
+                "enabled": bool(settings["auto_review"]["enabled"]),
+                "ready": not blockers,
+                "blockers": blockers,
+            },
+        }
+
+    @app.put("/api/datasets/{dataset_id}/review/settings")
+    def dataset_review_settings_update(dataset_id: str,
+                                       payload: Optional[dict] = None):
+        """Replace the dataset review settings (validated; 0600 atomic write)."""
+        directory = _dataset_dir(dataset_id)
+        try:
+            saved = review_settings.save(directory, payload or {})
+        except review_settings.ReviewSettingsError as exc:
+            raise HTTPException(400, str(exc))
+        settings, provider, active, statuses, blockers = \
+            _review_trigger_blockers(directory)
+        return {
+            "dataset_id": dataset_id,
+            "settings": saved,
+            "provider": provider,
+            "authorizations": statuses,
+            "active_authorization": (active or {}).get("authorization_id"),
+            "auto_trigger": {
+                "enabled": bool(saved["auto_review"]["enabled"]),
+                "ready": not blockers,
+                "blockers": blockers,
+            },
+        }
+
+    @app.post("/api/datasets/{dataset_id}/review/authorizations",
+              status_code=201)
+    def dataset_review_authorization_create(dataset_id: str,
+                                            payload: Optional[dict] = None):
+        """Create one revocable dataset-level authorization (no secret stored)."""
+        directory = _dataset_dir(dataset_id)
+        provider = _review_provider_snapshot()
+        try:
+            record = review_settings.create_authorization(
+                directory, payload or {}, dataset_id=dataset_id,
+                provider=provider)
+        except review_settings.ReviewSettingsError as exc:
+            raise HTTPException(400, str(exc))
+        return {
+            "authorization": record,
+            "status": review_settings.authorization_status(
+                record, provider=provider),
+        }
+
+    @app.delete("/api/datasets/{dataset_id}/review/authorizations/"
+                "{authorization_id}")
+    def dataset_review_authorization_revoke(dataset_id: str,
+                                            authorization_id: str):
+        """Append a revocation row; the original authorization is kept."""
+        directory = _dataset_dir(dataset_id)
+        try:
+            record = review_settings.revoke_authorization(
+                directory, authorization_id)
+        except review_settings.ReviewSettingsError as exc:
+            message = str(exc)
+            status = 404 if "unknown authorization" in message else 400
+            raise HTTPException(status, message)
+        provider = _review_provider_snapshot()
+        return {
+            "authorization": record,
+            "status": review_settings.authorization_status(
+                record, provider=provider),
+        }
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/adjudicate",
+              status_code=202)
+    def source_review_adjudicate(dataset_id: str, sha: str,
+                                 payload: Optional[dict] = None):
+        """Manually start one adjudicate job (CP5 §2; requires authorization)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        body = payload or {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "adjudicate request must be a JSON object")
+        unknown = set(body) - {"scope"}
+        if unknown:
+            raise HTTPException(
+                400, "unknown adjudicate field(s): %s"
+                % ", ".join(sorted(unknown)))
+        scope = body.get("scope") or {"all_unresolved": True}
+        if not isinstance(scope, dict):
+            raise HTTPException(400, "scope must be a JSON object")
+        try:
+            request, provider_env = _adjudicate_request(
+                directory, dataset_id, scope=scope, mode="manual")
+        except HTTPException:
+            raise
+        result = _call_peelfeed(
+            "review adjudicate",
+            lambda: peelfeed.client().adjudicate(
+                peel_id, request, provider_env=provider_env))
+        job_id = str((result or {}).get("job_id") or "")
+        if not job_id:
+            raise HTTPException(502, "peelfeed adjudicate returned no job_id")
+        _record_review_job(directory, sha, job_id, job_type="adjudicate")
+        return {"job_id": job_id, "type": "adjudicate",
+                "status": str(result.get("status") or "queued")}
+
+    @app.get("/api/datasets/{dataset_id}/sources/{sha}/review/auto")
+    def source_review_auto(dataset_id: str, sha: str):
+        """The CP5 auto-review list derived from plan/summary (read-only)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        payload = _review_auto_payload(peel_id)
+        payload["dataset_id"] = dataset_id
+        payload["sha256"] = str(entry.get("sha256") or "")
+        return payload
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/auto/confirm")
+    def source_review_auto_confirm(dataset_id: str, sha: str,
+                                   payload: Optional[dict] = None):
+        """Confirm selected auto drafts all-or-nothing; operations get a batch."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        body = payload or {}
+        if not isinstance(body, dict):
+            raise HTTPException(400, "auto confirm must be a JSON object")
+        unknown = set(body) - {"base_plan_version", "entry_ids",
+                               "auto_confirmation_id"}
+        if unknown:
+            raise HTTPException(
+                400, "unknown auto confirm field(s): %s"
+                % ", ".join(sorted(unknown)))
+        base = body.get("base_plan_version")
+        if isinstance(base, bool) or not isinstance(base, int):
+            raise HTTPException(400, "base_plan_version must be an integer")
+        entry_ids = body.get("entry_ids")
+        if not isinstance(entry_ids, list) or not entry_ids:
+            raise HTTPException(400, "entry_ids must be a non-empty list")
+        cleaned = []
+        seen = set()
+        for raw in entry_ids:
+            value = str(raw or "").strip()
+            if not value or value in seen:
+                raise HTTPException(400, "entry_ids must be unique non-empty ids")
+            seen.add(value)
+            cleaned.append(value)
+        active, _statuses = _review_auth_state(directory)
+        if active is None:
+            raise HTTPException(
+                409, "auto confirm needs an active dataset authorization")
+        provider = _review_provider_snapshot()
+        request = {
+            "base_plan_version": base,
+            "dataset_id": dataset_id,
+            "entry_ids": cleaned,
+            "authorization": _review_authorization_snapshot(active),
+            "provider": {
+                "decision": provider["decision"],
+                "vlm": provider["vlm"],
+            },
+        }
+        supplied = body.get("auto_confirmation_id")
+        if supplied:
+            request["auto_confirmation_id"] = str(supplied)
+        result = _call_peelfeed(
+            "plan auto-confirm",
+            lambda: peelfeed.client().plan_auto_confirm(peel_id, request))
+        auto_confirmation_id = str(
+            (result or {}).get("auto_confirmation_id") or "")
+        operation_ids = list((result or {}).get("operation_entry_ids") or [])
+        confirmed = list((result or {}).get("auto_confirmed") or [])
+        batch_id = None
+        build_job_id = None
+        if operation_ids:
+            applied = _call_peelfeed(
+                "review apply",
+                lambda: peelfeed.client().apply(peel_id, operation_ids))
+            batch_id = str((applied or {}).get("batch_id") or "") or None
+            build_job_id = str((applied or {}).get("job_id") or "") or None
+            if batch_id:
+                try:
+                    peelfeed.client().plan_tag_auto_batch(peel_id, {
+                        "auto_confirmation_id": auto_confirmation_id,
+                        "batch_id": batch_id,
+                        "dataset_id": dataset_id,
+                    })
+                except Exception as exc:  # noqa: BLE001 - audit link is best-effort
+                    LOG.warning("could not tag auto batch %s: %s",
+                                batch_id, _http_detail(exc))
+            if build_job_id:
+                _record_review_job(directory, sha, build_job_id,
+                                   job_type="build", batch_id=batch_id)
+        try:
+            review_settings.mirror_auto_confirmation(directory, {
+                "auto_confirmation_id": auto_confirmation_id,
+                "dataset_id": dataset_id,
+                "peel_id": peel_id,
+                "base_plan_version": base,
+                "entry_ids": cleaned,
+                "item_ids": [item.get("item_id") for item in confirmed
+                             if isinstance(item, dict)],
+                "outcome": "confirmed",
+                "batch_id": batch_id,
+            })
+        except review_settings.ReviewSettingsError as exc:
+            LOG.warning("could not mirror auto confirmation: %s", exc)
+        return {
+            "auto_confirmation_id": auto_confirmation_id,
+            "entries": confirmed,
+            "operation_entry_ids": operation_ids,
+            "batch_id": batch_id,
+            "job_id": build_job_id,
+            "failures": [],
+        }
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/auto/"
+              "{auto_confirmation_id}/revert")
+    def source_review_auto_revert(dataset_id: str, sha: str,
+                                  auto_confirmation_id: str,
+                                  payload: Optional[dict] = None):
+        """Revert one auto-confirmed R0 group (operation batches use rollback)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        identifier = str(auto_confirmation_id or "").strip()
+        if not identifier.startswith("ac-") or len(identifier) != 19:
+            raise HTTPException(400, "invalid auto_confirmation_id")
+        body = payload or {}
+        base = body.get("base_plan_version") if isinstance(body, dict) else None
+        if isinstance(base, bool) or not isinstance(base, int):
+            raise HTTPException(400, "base_plan_version must be an integer")
+        result = _call_peelfeed(
+            "plan auto-revert",
+            lambda: peelfeed.client().plan_auto_revert(peel_id, {
+                "base_plan_version": base,
+                "dataset_id": dataset_id,
+                "auto_confirmation_id": identifier,
+            }))
+        try:
+            review_settings.mirror_auto_confirmation(directory, {
+                "auto_confirmation_id": identifier,
+                "dataset_id": dataset_id,
+                "peel_id": peel_id,
+                "base_plan_version": base,
+                "entry_ids": [],
+                "item_ids": [],
+                "outcome": "reverted",
+                "revert_of": identifier,
+            })
+        except review_settings.ReviewSettingsError as exc:
+            LOG.warning("could not mirror auto revert: %s", exc)
+        return {"auto_confirmation_id": identifier,
+                "result": result, "failures": []}
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/jobs/"
+              "{job_id}/resume", status_code=202)
+    def source_review_job_resume(dataset_id: str, sha: str, job_id: str):
+        """Resume a paused/failed adjudicate job (same job id; B11 rechecked)."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        result = _call_peelfeed(
+            "job resume",
+            lambda: peelfeed.client().job_resume(peel_id, job_id))
+        return {"job": result}
+
+    @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/jobs/"
+              "{job_id}/cancel", status_code=202)
+    def source_review_job_cancel(dataset_id: str, sha: str, job_id: str):
+        """Request cancellation at the next adjudicate stage boundary."""
+        directory = _dataset_dir(dataset_id)
+        entry = _source_by_sha(directory, sha)
+        peel_id = _peel_id_of(entry)
+        _require_review_schema()
+        result = _call_peelfeed(
+            "job cancel",
+            lambda: peelfeed.client().job_cancel(peel_id, job_id))
+        return {"job": result}
 
     @app.get("/api/datasets/{dataset_id}/sources/{sha}/review/items/{item_id}")
     def source_review_item(dataset_id: str, sha: str, item_id: str):

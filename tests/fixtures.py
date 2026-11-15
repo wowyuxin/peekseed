@@ -1468,6 +1468,140 @@ def main():
         action = values[1] if len(values) > 1 else "show"
         if action == "show":
             return emit(plan)
+        if action in ("auto-confirm", "auto-revert", "tag-batch"):
+            if option(rest, "--input") is None:
+                save_state(state)
+                return fail("--input is required for plan " + action, 2,
+                            "validation")
+            request = read_stdin_json()
+            if not isinstance(request, dict):
+                save_state(state)
+                return fail("plan " + action + " input must be an object", 2,
+                            "validation")
+            state.setdefault("plan_" + action.replace("-", "_") + "_requests",
+                             []).append(copy_json(request))
+            if action == "tag-batch":
+                record = {
+                    "schema_version": 1,
+                    "auto_confirmation_id": request.get(
+                        "auto_confirmation_id"),
+                    "batch_id": request.get("batch_id"),
+                    "dataset_id": request.get("dataset_id"),
+                }
+                state.setdefault("auto_confirmations", []).append(record)
+                save_state(state)
+                return emit(record)
+            if action == "auto-revert":
+                identifier = request.get("auto_confirmation_id")
+                reverted = [record for record in
+                            state.get("resolutions") or []
+                            if record.get("auto_confirmation_id") == identifier]
+                row = {"schema_version": 1,
+                       "auto_confirmation_id": identifier,
+                       "dataset_id": request.get("dataset_id"),
+                       "peel_id": peel_id,
+                       "base_plan_version": plan.get("plan_version") or 0,
+                       "entry_ids": [], "item_ids": [],
+                       "actor": "user", "created_at": "2026-11-15T00:00:00Z",
+                       "outcome": "reverted", "batch_id": None,
+                       "revert_of": identifier,
+                       "reverted_resolution_ids": [
+                           record.get("resolution_id") for record in reverted]}
+                state.setdefault("auto_confirmations", []).append(row)
+                save_state(state)
+                return emit({"auto_confirmation_id": identifier,
+                             "reverted_resolution_ids": row[
+                                 "reverted_resolution_ids"],
+                             "operation_entry_ids": [],
+                             "idempotent": False})
+            base = request.get("base_plan_version")
+            if isinstance(base, bool) or not isinstance(base, int):
+                save_state(state)
+                return fail("base_plan_version must be an integer", 2,
+                            "validation")
+            if base != plan.get("plan_version"):
+                save_state(state)
+                return fail("base_plan_version mismatch", 2, "conflict")
+            entry_ids = request.get("entry_ids")
+            if not isinstance(entry_ids, list) or not entry_ids:
+                save_state(state)
+                return fail("entry_ids must be a non-empty list", 2,
+                            "validation")
+            entries = {entry.get("entry_id"): entry
+                       for entry in plan.get("entries") or []
+                       if isinstance(entry, dict)}
+            selected = []
+            failures = []
+            for entry_id in entry_ids:
+                entry = entries.get(str(entry_id))
+                if entry is None:
+                    failures.append({"entry_id": str(entry_id),
+                                     "code": "entry_missing"})
+                    continue
+                if str(entry.get("source") or "") not in (
+                        "decision_auto", "vlm_auto", "mixed"):
+                    failures.append({"entry_id": str(entry_id),
+                                     "code": "not_auto_source"})
+                    continue
+                if str(entry.get("status") or "") != "draft":
+                    failures.append({"entry_id": str(entry_id),
+                                     "code": "not_draft"})
+                    continue
+                selected.append(entry)
+            if failures:
+                save_state(state)
+                return fail("auto-confirm failed", 2, "validation",
+                            {"reasons": failures})
+            identifier = request.get("auto_confirmation_id") or (
+                "ac-" + hashlib.sha256(
+                    (peel_id + "|" + ",".join(sorted(entry_ids))).encode(
+                        "utf-8")).hexdigest()[:16])
+            operation_ids = []
+            for entry in selected:
+                entry["origin"] = dict(entry.get("origin") or {})
+                entry["origin"]["auto_confirmation_id"] = identifier
+                if (entry.get("action") or {}).get("type") == "resolution":
+                    entry["status"] = "applied"
+                    state.setdefault("resolutions", []).append({
+                        "schema_version": 1,
+                        "resolution_id": "r-" + hashlib.sha256(
+                            (str(entry.get("item_id")) + "|" + identifier)
+                            .encode("utf-8")).hexdigest()[:16],
+                        "change": "add", "supersedes": None,
+                        "item_id": entry.get("item_id"),
+                        "name": (entry.get("action") or {}).get("name"),
+                        "evidence_hash": (entry.get("evidence") or {}).get(
+                            "hash"),
+                        "source": entry.get("source"),
+                        "recorded_at": "2026-11-15T00:00:00Z",
+                        "auto_confirmation_id": identifier,
+                    })
+                else:
+                    entry["status"] = "confirmed"
+                    operation_ids.append(entry["entry_id"])
+            plan["plan_version"] = int(plan.get("plan_version") or 0) + 1
+            plan["updated_at"] = "2026-11-15T00:00:00Z"
+            plan["entries"] = list(entries.values())
+            state["plan"] = plan
+            ledger = {
+                "schema_version": 1, "auto_confirmation_id": identifier,
+                "dataset_id": request.get("dataset_id"), "peel_id": peel_id,
+                "base_plan_version": base, "entry_ids": list(entry_ids),
+                "item_ids": [entry.get("item_id") for entry in selected],
+                "actor": "user", "created_at": "2026-11-15T00:00:00Z",
+                "outcome": "confirmed", "batch_id": None, "revert_of": None,
+            }
+            state.setdefault("auto_confirmations", []).append(ledger)
+            save_state(state)
+            return emit({
+                "peel_id": peel_id, "review_schema": 2,
+                "plan_version": plan["plan_version"],
+                "updated_at": plan["updated_at"],
+                "entries": plan["entries"],
+                "auto_confirmed": selected,
+                "operation_entry_ids": operation_ids,
+                "auto_confirmation_id": identifier,
+            })
         if action == "patch":
             # CP5 wire §5: synchronous targeted plan patch (no model call).
             # stdin {base_plan_version, patch, source:"vlm|user",
@@ -2826,6 +2960,38 @@ def main():
         return emit({"job_id": job["job_id"], "status": "queued",
                      "result_ref": None})
 
+    if command == "adjudicate":
+        peel_id = first_positional(rest)
+        if peel_id not in peels:
+            return fail("no such peel", 3, "not_found")
+        if option(rest, "--input") is None:
+            return fail("--input is required for adjudicate", 2, "validation")
+        request = read_stdin_json()
+        if not isinstance(request, dict):
+            return fail("adjudicate input must be a JSON object", 2,
+                        "validation")
+        for key in ("dataset_id", "settings", "authorization", "scope"):
+            if key not in request:
+                return fail("adjudicate input is missing " + key, 2,
+                            "validation")
+        state.setdefault("adjudicate_requests", []).append(copy_json(request))
+        job = new_job("adjudicate",
+                      result_ref="adjudicate/" + str(len(
+                          state.get("jobs") or {})) + "/summary.json")
+        job["status"] = "done"
+        job["progress"] = {"stage": "done", "done": 1, "total": 1}
+        job["payload"] = {"snapshot": {
+            "dataset_id": request.get("dataset_id"),
+            "provider": {"decision": request.get("decision_link") or {},
+                         "vlm": request.get("vlm_link") or {}},
+            "scope_item_ids": [],
+        }}
+        state.setdefault("jobs", {})[job["job_id"]] = job
+        save_state(state)
+        return emit({"job_id": job["job_id"], "status": "done",
+                     "type": "adjudicate",
+                     "result_ref": job.get("result_ref")})
+
     if command == "apply":
         peel_id = first_positional(rest)
         if peel_id not in peels:
@@ -3013,6 +3179,29 @@ def main():
                     "message": "the job process is no longer running"}
                 payload["derived_interrupted"] = True
             return emit(payload)
+        if action in ("resume", "cancel"):
+            job_id = option(rest, "--job")
+            if not job_id:
+                return fail("--job is required for job " + action, 2,
+                            "validation")
+            job = jobs.get(str(job_id))
+            if not isinstance(job, dict):
+                return fail("unknown job: " + str(job_id), 3, "not_found")
+            if action == "resume":
+                if job.get("status") not in ("paused", "failed",
+                                             "interrupted"):
+                    return fail("job is not resumable", 2, "conflict")
+                job["status"] = "queued"
+                job["error"] = None
+            else:
+                job["status"] = "interrupted"
+                job.setdefault("payload", {})["cancel_requested"] = True
+                job["error"] = {"code": "cancelled",
+                                "message": "cancelled"}
+            jobs[str(job_id)] = job
+            state["jobs"] = jobs
+            save_state(state)
+            return emit(copy_json(job))
         if action == "list":
             status_filter = option(rest, "--status")
             rows = [copy_json(job) for job in jobs.values()
