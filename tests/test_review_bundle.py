@@ -73,6 +73,8 @@ def _bundle(peel, manifest, build, *, path, tamper=None, plan_version=2,
                 ("review/plan.json", json.dumps({"plan_version": plan_version,
                                                 "entries": []})),
                 ("review/items.json", json.dumps({"items": []})),
+                ("review/conversations/conv-1.jsonl",
+                 json.dumps({"turn": 1})),
                 ("corpus/review_facts.json", json.dumps({"facts": True})),
                 ("ocr/figure-1/evidence.json", json.dumps({"labels": []}))):
             blob = body.encode("utf-8")
@@ -104,6 +106,8 @@ class ReviewBundleImportTests(unittest.TestCase):
                              "review_facts.json").is_file())
             self.assertTrue((peel_dir / "extract" / "ocr" / "figure-1" /
                              "evidence.json").is_file())
+            self.assertTrue((peel_dir / "extract" / "review" /
+                             "conversations" / "conv-1.jsonl").is_file())
             imports = (paths.root / "review-bundles" /
                        "imports.jsonl").read_text().splitlines()
             self.assertEqual(json.loads(imports[-1])["status"], "imported")
@@ -147,6 +151,19 @@ class ReviewBundleImportTests(unittest.TestCase):
                 bundle.name
             self.assertTrue(staged.is_file())
             self.assertEqual(staged.stat().st_mode & 0o777, 0o600)
+
+    def test_corrupt_bundle_is_invalid(self):
+        with temp_data_root() as root:
+            from peekseed import config, review_bundle
+            paths = config.paths()
+            peel = {"peel_id": "corrupt-peel"}
+            bundle = paths.root / "review-bundles" / "corrupt-peel" / \
+                "bad.tar.gz"
+            bundle.parent.mkdir(parents=True, exist_ok=True)
+            bundle.write_bytes(b"this is not a tar archive")
+            report = review_bundle.import_all(paths)
+            self.assertEqual(report["invalid"], 1, report)
+            self.assertFalse((paths.peels_dir / "corrupt-peel").exists())
 
     def test_unsafe_tar_member_is_rejected(self):
         with temp_data_root() as root:

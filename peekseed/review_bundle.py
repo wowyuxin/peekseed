@@ -239,26 +239,6 @@ def import_one(paths, bundle, *, dry_run=False):
                 "files": previous.get("files", 0),
                 "skipped": previous.get("skipped", 0)}
     peel_dir = Path(paths.peels_dir) / peel_id
-    if not peel_dir.is_dir():
-        staging = Path(paths.root) / "review-restore" / peel_id
-        staging.mkdir(parents=True, exist_ok=True)
-        target = staging / bundle.name
-        if not dry_run:
-            shutil.copyfile(str(bundle), str(target))
-            try:
-                target.chmod(0o600)
-            except OSError:
-                pass
-            _record(paths, {
-                "schema_version": 1,
-                "bundle": str(bundle), "bundle_sha256": bundle_sha,
-                "peel_id": peel_id, "status": "staged",
-                "staged_at": contracts.utc_now(),
-                "reason": "peel_missing; re-extract the source, then import",
-            })
-        return {"status": "staged", "bundle": str(bundle),
-                "peel_id": peel_id, "staged_to": str(target),
-                "reason": "peel_missing; re-extract the source, then import"}
     try:
         with tarfile.open(bundle, "r:gz") as tar:
             members = _safe_members(tar)
@@ -270,6 +250,29 @@ def import_one(paths, bundle, *, dry_run=False):
                     return {"status": "invalid", "bundle": str(bundle),
                             "peel_id": peel_id,
                             "reason": "bundle manifest is missing"}
+                if not peel_dir.is_dir():
+                    staging = Path(paths.root) / "review-restore" / peel_id
+                    staging.mkdir(parents=True, exist_ok=True)
+                    target = staging / bundle.name
+                    if not dry_run:
+                        shutil.copyfile(str(bundle), str(target))
+                        try:
+                            target.chmod(0o600)
+                        except OSError:
+                            pass
+                        _record(paths, {
+                            "schema_version": 1,
+                            "bundle": str(bundle),
+                            "bundle_sha256": bundle_sha,
+                            "peel_id": peel_id, "status": "staged",
+                            "staged_at": contracts.utc_now(),
+                            "reason": ("peel_missing; re-extract the source, "
+                                       "then import"),
+                        })
+                    return {"status": "staged", "bundle": str(bundle),
+                            "peel_id": peel_id, "staged_to": str(target),
+                            "reason": ("peel_missing; re-extract the source, "
+                                       "then import")}
                 current = _current_identity(peel_dir)
                 validation = _validate_manifest(manifest, current)
                 if validation["status"] != "ok":
