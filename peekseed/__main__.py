@@ -219,6 +219,25 @@ def cmd_serve(args):
     return 0
 
 
+def cmd_review_import(args):
+    """Import selective review-metadata bundles (CP3 addendum B9)."""
+    import json
+    from . import config, review_bundle
+    paths = config.paths()
+    report = review_bundle.import_all(paths, dry_run=bool(args.dry_run))
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+    else:
+        print("bundles: %d imported=%d staged=%d stale=%d invalid=%d"
+              % (report["bundles"], report["imported"], report["staged"],
+                 report["stale"], report["invalid"]))
+        for row in report["results"]:
+            print("  %-8s %s%s" % (
+                row.get("status"), row.get("peel_id"),
+                " (%s)" % row.get("reason") if row.get("reason") else ""))
+    return 0 if report["invalid"] == 0 else 1
+
+
 def cmd_version(args):
     from . import __version__
     print("peekseed %s" % __version__)
@@ -264,6 +283,13 @@ def build_parser():
     p.add_argument("--file", action="append", default=[], help="PDF to store (repeatable)")
     p.add_argument("--note", default="", help="optional note")
     p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser("review-import",
+                       help="import selective review-metadata bundles")
+    p.add_argument("--dry-run", action="store_true",
+                   help="validate and report; write nothing")
+    p.add_argument("--json", action="store_true", help="machine-readable report")
+    p.set_defaults(func=cmd_review_import)
 
     p = sub.add_parser("version", help="print the version")
     p.set_defaults(func=cmd_version)

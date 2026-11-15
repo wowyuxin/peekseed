@@ -3288,7 +3288,11 @@ class ReviewUiCp5AutoTests(unittest.TestCase):
                 "'/auto/'", "'/jobs/'", "reviewAutoSettingsUrl",
                 "/review/settings", "/authorizations",
                 "确认自动处理", "撤销上次确认（R0）", "续跑", "取消",
-                "自动草稿", "没有待确认的自动草稿", "未就绪"):
+                "自动草稿", "没有待确认的自动草稿", "未就绪",
+                'id="reviewCalibration"', "reviewLoadCalibration",
+                "paintReviewCalibration", "reviewCiText",
+                "校准 / 留出", "95% CI", "熔断", "lost_labels",
+                "尚无校准记录"):
             self.assertIn(marker, text)
         dialog = text.index('id="reviewModal"')
         ocr = text.index('id="reviewOcr"')
@@ -3315,3 +3319,5 @@ class ReviewUiCp5AutoTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             self.assertIn('id="reviewAuto"', response.text)
             self.assertIn("reviewLoadAuto", response.text)
+            self.assertIn('id="reviewCalibration"', response.text)
+            self.assertIn("reviewLoadCalibration", response.text)

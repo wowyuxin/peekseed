@@ -122,7 +122,9 @@ class CliTests(unittest.TestCase):
         with contextlib.redirect_stdout(buffer):
             parser.print_help()
         text = buffer.getvalue()
-        self.assertNotIn("import", text)
+        commands = parser._subparsers._group_actions[0].choices
+        self.assertNotIn("import", commands)
+        self.assertIn("review-import", commands)
         self.assertIn("index", text)
 
     def test_index_stores_without_extraction(self):

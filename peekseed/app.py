@@ -39,9 +39,9 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import (__version__, answer as answer_mod, config, contracts, decision,
-               ingest, links, localmodels, peelfeed, prompts, review_settings,
-               security, workspace)
+from . import (__version__, answer as answer_mod, calibration as calibration_mod,
+               config, contracts, decision, ingest, links, localmodels,
+               peelfeed, prompts, review_settings, security, workspace)
 from .engine import IndexStore
 
 LOG = logging.getLogger("peekseed.app")
@@ -3065,6 +3065,23 @@ def create_app():
                 "blockers": blockers,
             },
         }
+
+    @app.get("/api/datasets/{dataset_id}/review/calibration")
+    def dataset_review_calibration(dataset_id: str):
+        """Cross-peel calibration/acceptance table + breaker state (CP5 §8)."""
+        directory = _dataset_dir(dataset_id)
+        settings = review_settings.load(directory)
+        paths = config.paths()
+        result = calibration_mod.summary(
+            paths.root, paths.shared_dir, dataset_id=dataset_id,
+            settings=settings)
+        result["settings"] = {
+            "thresholds": settings.get("thresholds"),
+            "minimum_validated_cutoff": settings.get(
+                "minimum_validated_cutoff"),
+            "breaker": settings.get("breaker"),
+        }
+        return result
 
     @app.post("/api/datasets/{dataset_id}/review/authorizations",
               status_code=201)

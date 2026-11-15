@@ -1953,6 +1953,7 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
          M2.1 OCR is configured only by the deploy env PEELFEED_OCR_*. -->
     <div class="rr-ocr" id="reviewOcr"><span class="hist-empty">正在读取 OCR 能力…</span></div>
     <div class="rr-auto" id="reviewAuto"><span class="hist-empty">正在读取自动审阅状态…</span></div>
+    <div class="rr-calibration" id="reviewCalibration"><span class="hist-empty">正在读取校准数据…</span></div>
     <div class="rr-batch" id="reviewBatch"><span class="hist-empty">正在读取候选批次与后台任务…</span></div>
     <div class="hist-body settings-body">
       <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
@@ -9001,6 +9002,62 @@ async function reviewAutoJobCancel(){
   finally{ REVIEW_CTX.autoBusy=false; }
 }
 
+async function reviewLoadCalibration(){
+  if(!REVIEW_CTX.dataset) return;
+  try{
+    REVIEW_CTX.calibration=await reviewFetchJSON(
+      '/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)+'/review/calibration');
+  }catch(e){ REVIEW_CTX.calibration=null; }
+  paintReviewCalibration();
+}
+function reviewCiText(ci){
+  if(!ci||ci.length!==2) return '—';
+  return (ci[0]*100).toFixed(1)+'%–'+(ci[1]*100).toFixed(1)+'%';
+}
+function reviewCalibrationRows(rows){
+  if(!rows||!rows.length) return '<tr><td colspan="8" class="hist-empty">暂无记录</td></tr>';
+  return rows.map(function(row){
+    const bits=String(row.key||'').split('|');
+    const decision=bits[3]||'—';
+    const source=bits[1]||'—';
+    const modality=bits[2]||'—';
+    return '<tr><td>'+esc(source)+'</td><td>'+esc(modality)+'</td><td>'+esc(decision)
+      +'</td><td>'+reviewNum(row.total)+'</td><td>'+reviewNum(row.evaluated)
+      +'</td><td>'+(row.accuracy==null?'—':(row.accuracy*100).toFixed(1)+'%')
+      +'</td><td>'+reviewCiText(row.ci)+'</td><td>'
+      +(row.acceptance_rate==null?'—':(row.acceptance_rate*100).toFixed(1)+'%')
+      +'</td><td>'+reviewNum(row.harmful)+'</td><td>'+reviewNum(row.lost_labels)
+      +'</td></tr>';
+  }).join('');
+}
+function paintReviewCalibration(){
+  const el=$('#reviewCalibration'); if(!el) return;
+  const cal=REVIEW_CTX.calibration;
+  if(!cal){
+    el.innerHTML='<span class="hist-empty">校准数据不可用。</span>';
+    return;
+  }
+  const breaker=cal.breaker||{};
+  let html='<div class="rr-cal-head"><b>校准 / 留出</b> · 记录 '+reviewNum(cal.records)
+    +' · 已评估 '+reviewNum(cal.evaluated)
+    +' · 熔断 '+esc(breaker.state||'—')
+    +(breaker.accuracy==null?'':' · 观测正确率 '+(breaker.accuracy*100).toFixed(1)+'%')
+    +' · 95% CI '+reviewCiText(breaker.ci)+'</div>';
+  if(cal.empty){
+    html+='<div class="hist-empty">'+esc(cal.note||'尚无校准记录。')+'</div>';
+  }else{
+    html+='<table class="rr-cal-table"><thead><tr><th>来源</th><th>模态</th><th>决定</th>'
+      +'<th>总数</th><th>已评估</th><th>正确率</th><th>95% CI</th>'
+      +'<th>接受率</th><th>有害</th><th>lost_labels</th></tr></thead><tbody>'
+      +reviewCalibrationRows(cal.calibration)+'</tbody></table>';
+    if((cal.holdout||[]).length){
+      html+='<div class="rr-cal-sub">留出集</div><table class="rr-cal-table"><tbody>'
+        +reviewCalibrationRows(cal.holdout)+'</tbody></table>';
+    }
+  }
+  el.innerHTML=html;
+}
+
 async function openReview(dsId,sha){
   REVIEW_CTX={dataset:dsId,sha:sha,data:null,itemsById:{},selected:null,busy:false,
     source:null,conflict:null,jobs:{},batchesById:{},candidateBatchId:null,
@@ -9013,7 +9070,7 @@ async function openReview(dsId,sha){
     /* CP6: propagation state. Opening the review never previews/applies. */
     propagate:null,
     /* CP5 auto-review state (settings/authorization/list/job). */
-    auto:null,autoSettings:null,autoBusy:false};
+    auto:null,autoSettings:null,autoBusy:false,calibration:null};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -9029,6 +9086,8 @@ async function openReview(dsId,sha){
   if(ocr) ocr.innerHTML='<span class="hist-empty">正在读取 OCR 能力…</span>';
   const auto=$('#reviewAuto');
   if(auto) auto.innerHTML='<span class="hist-empty">正在读取自动审阅状态…</span>';
+  const cal=$('#reviewCalibration');
+  if(cal) cal.innerHTML='<span class="hist-empty">正在读取校准数据…</span>';
   reviewOcrConfigClose();
   /* CP5: reset the VLM panels; the bar/provider/clarification paints below
      read only the review payload (never an implicit provider call). */
@@ -9078,6 +9137,7 @@ async function openReview(dsId,sha){
      items and no type=ocr descriptor exists. Never auto-retries. */
   await reviewMaybeAutoOcr();
   await reviewLoadAuto();
+  await reviewLoadCalibration();
   setTimeout(function(){ const c=$('#reviewClose'); if(c) c.focus(); },30);
 }
 async function generateReviewReport(){

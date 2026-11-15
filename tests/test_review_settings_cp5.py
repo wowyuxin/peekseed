@@ -371,3 +371,81 @@ class ReviewJobRoutesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CalibrationTests(unittest.TestCase):
+    def test_clopper_pearson_known_intervals(self):
+        from peekseed import calibration
+        low, high = calibration.clopper_pearson(0, 56)
+        self.assertEqual(low, 0.0)
+        self.assertAlmostEqual(high, 0.0636, places=3)
+        low, high = calibration.clopper_pearson(56, 56)
+        self.assertAlmostEqual(low, 0.9364, places=3)
+        self.assertEqual(high, 1.0)
+        self.assertIsNone(calibration.clopper_pearson(0, 0))
+
+    def test_calibration_route_ingests_and_aggregates(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, dataset_id, _sha = _extracted_review_source(client, root)
+                peel = make_peel(dataset_id)
+                calibration_dir = (Path(peel["peel_dir"]) / "extract" /
+                                   "review")
+                rows = []
+                for index in range(24):
+                    rows.append({
+                        "schema_version": 1,
+                        "record_id": "cal-adj-%02d" % index,
+                        "dataset_id": dataset_id,
+                        "peel_id": peel["peel_id"],
+                        "item_id": "it-%02d" % index,
+                        "source": "decision",
+                        "partition": "calibration",
+                        "modality": "text",
+                        "decision": "apply",
+                        "observed_correctness": index < 22,
+                        "acceptance": True,
+                        "harmful_error": False,
+                        "lost_labels": 0,
+                        "created_at": "2026-11-15T00:00:00Z",
+                        "version_bundle_hash": "v1",
+                    })
+                _write_json(calibration_dir / "calibration.jsonl", rows)
+                # write_json writes a JSON list; calibration.jsonl must be JSONL.
+                (calibration_dir / "calibration.jsonl").write_text(
+                    "\n".join(json.dumps(row) for row in rows) + "\n")
+                response = client.get(
+                    "/api/datasets/%s/review/calibration" % dataset_id)
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertEqual(payload["records"], 24)
+                self.assertEqual(payload["evaluated"], 24)
+                self.assertFalse(payload["empty"])
+                bucket = payload["calibration"][0]
+                self.assertEqual(bucket["correct"], 22)
+                self.assertEqual(bucket["evaluated"], 24)
+                self.assertAlmostEqual(bucket["accuracy"], 22 / 24, places=5)
+                self.assertIsNotNone(bucket["ci"])
+                self.assertLess(bucket["ci"][0], bucket["ci"][1])
+                self.assertEqual(payload["breaker"]["state"], "paused_accuracy")
+                # Second read is idempotent (no duplicate record rows).
+                again = client.get(
+                    "/api/datasets/%s/review/calibration" % dataset_id)
+                self.assertEqual(again.json()["records"], 24)
+
+    def test_calibration_empty_state_is_explicit(self):
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                _base, dataset_id, _sha = _extracted_review_source(client, root)
+                response = client.get(
+                    "/api/datasets/%s/review/calibration" % dataset_id)
+                self.assertEqual(response.status_code, 200, response.text)
+                payload = response.json()
+                self.assertTrue(payload["empty"])
+                self.assertEqual(payload["records"], 0)
+                self.assertEqual(payload["breaker"]["state"], "insufficient")
+                self.assertIn("CP1/CP2", payload["note"])
