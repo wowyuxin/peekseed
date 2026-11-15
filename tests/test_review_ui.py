@@ -3268,3 +3268,50 @@ class ReviewUiCp5BehaviorTests(unittest.TestCase):
         self.assertEqual(reopened["newPosts"], 0, reopened)
         self.assertEqual(reopened["state"],
                          {"exclusions": [], "overrides": []}, reopened)
+
+
+class ReviewUiCp5AutoTests(unittest.TestCase):
+    """CP5: the auto-review panel is served and wired to the frozen routes."""
+
+    def test_auto_panel_ships_controls_and_routes(self):
+        text = _ui()
+        for marker in (
+                'id="reviewAuto"', "reviewLoadAuto", "paintReviewAuto",
+                "reviewAutoStatusText", "reviewAutoSave",
+                "reviewAutoCreateAuth", "reviewAutoRevokeAuth",
+                "reviewAutoConfirm", "reviewAutoRevert",
+                "reviewAutoJobResume", "reviewAutoJobCancel",
+                'id="autoEnabled"', 'id="autoApply"', 'id="autoKeep"',
+                'id="autoCutoff"', 'id="autoSave"', 'id="autoConfirm"',
+                'id="autoRevert"', 'id="autoJobResume"', 'id="autoJobCancel"',
+                "reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/auto/confirm'",
+                "'/auto/'", "'/jobs/'", "reviewAutoSettingsUrl",
+                "/review/settings", "/authorizations",
+                "确认自动处理", "撤销上次确认（R0）", "续跑", "取消",
+                "自动草稿", "没有待确认的自动草稿", "未就绪"):
+            self.assertIn(marker, text)
+        dialog = text.index('id="reviewModal"')
+        ocr = text.index('id="reviewOcr"')
+        auto = text.index('id="reviewAuto"')
+        batch = text.index('id="reviewBatch"')
+        clusters = text.index('id="reviewClusters"')
+        self.assertLess(dialog, ocr)
+        self.assertLess(ocr, auto)
+        self.assertLess(auto, batch)
+        self.assertLess(batch, clusters)
+        # The panel never confirms/builds/publishes on open: the request
+        # snippets live inside explicit button handlers.
+        confirm_at = text.index("async function reviewAutoConfirm")
+        confirm_body = text[confirm_at:text.index("async function reviewAutoRevert")]
+        self.assertIn("method:'POST'", confirm_body)
+        self.assertIn("base_plan_version:auto.plan_version", confirm_body)
+
+    def test_served_page_contains_the_auto_panel(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+            client = TestClient(app_module.create_app())
+            response = client.get("/")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('id="reviewAuto"', response.text)
+            self.assertIn("reviewLoadAuto", response.text)

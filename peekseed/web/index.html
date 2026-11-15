@@ -1952,6 +1952,7 @@ body.ask-full .ask-backdrop[hidden]{display:none;}
          [检查 OCR] probe and the read-only config dialog never write config:
          M2.1 OCR is configured only by the deploy env PEELFEED_OCR_*. -->
     <div class="rr-ocr" id="reviewOcr"><span class="hist-empty">正在读取 OCR 能力…</span></div>
+    <div class="rr-auto" id="reviewAuto"><span class="hist-empty">正在读取自动审阅状态…</span></div>
     <div class="rr-batch" id="reviewBatch"><span class="hist-empty">正在读取候选批次与后台任务…</span></div>
     <div class="hist-body settings-body">
       <div class="rr-sum" id="reviewSummary"><span class="hist-empty">正在读取审阅报告…</span></div>
@@ -8784,6 +8785,222 @@ async function refreshReview(successText){
     reviewMsg(reviewLoadErrText(e),true);
   }
 }
+/* ---------------------------------------------------------- CP5 auto review
+   The auto panel is read-only on open: it reads the dataset settings, the
+   authorization ledger and the peelfeed plan/summary-derived auto list. It
+   never confirms, builds or publishes until the reviewer presses a button. */
+function reviewAutoSettingsUrl(){
+  return '/api/datasets/'+encodeURIComponent(REVIEW_CTX.dataset)+'/review/settings';
+}
+async function reviewLoadAuto(){
+  if(!REVIEW_CTX.dataset||!REVIEW_CTX.sha) return;
+  try{
+    REVIEW_CTX.autoSettings=await reviewFetchJSON(reviewAutoSettingsUrl());
+  }catch(e){ REVIEW_CTX.autoSettings=null; }
+  try{
+    REVIEW_CTX.auto=await reviewFetchJSON(reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/auto');
+  }catch(e){ REVIEW_CTX.auto=null; }
+  paintReviewAuto();
+}
+function reviewAutoStatusText(auto){
+  const job=(auto&&auto.job)||null;
+  if(!job) return '尚无自动审阅任务';
+  const p=job.progress||{};
+  return '任务 '+reviewStr(job.job_id)+' · '+reviewStr(job.status)
+    +' · 阶段 '+reviewStr(p.stage||'—')
+    +' · '+reviewNum(p.done)+'/'+reviewNum(p.total)
+    +' · 调用 decision='+reviewNum((p.calls||{}).decision)
+    +' vlm='+reviewNum((p.calls||{}).vlm);
+}
+function paintReviewAuto(){
+  const el=$('#reviewAuto'); if(!el) return;
+  const settings=(REVIEW_CTX.autoSettings||{}).settings||null;
+  const auto=REVIEW_CTX.auto||null;
+  if(!settings&&!auto){
+    el.innerHTML='<span class="hist-empty">自动审阅状态不可用（peelfeed 或 settings 读取失败）。</span>';
+    return;
+  }
+  const provider=(REVIEW_CTX.autoSettings||{}).provider||{};
+  const blockers=((REVIEW_CTX.autoSettings||{}).auto_trigger||{}).blockers||[];
+  const auth=((REVIEW_CTX.autoSettings||{}).authorizations||[]);
+  const active=((REVIEW_CTX.autoSettings||{}).active_authorization)||null;
+  const s=settings||{};
+  const thresholds=s.thresholds||{};
+  const apply=thresholds.apply||{enabled:false,value:90};
+  const keep=thresholds.keep||{enabled:false,value:90};
+  const cutoff=(s.minimum_validated_cutoff==null?'':s.minimum_validated_cutoff);
+  const enabled=!!((s.auto_review||{}).enabled);
+  const items=(auto&&auto.items)||[];
+  const counts=(auto&&auto.counts)||{};
+  const acIds={};
+  items.forEach(function(item){
+    const ac=((item.origin||{}).auto_confirmation_id)||'';
+    if(ac) acIds[ac]=true;
+  });
+  const acList=Object.keys(acIds);
+  let html='<div class="rr-auto-head"><b>自动审阅</b> · '
+    +'decision '+(provider.decision&&provider.decision.available?'可用':'不可用')
+    +' · VLM '+(provider.vlm&&provider.vlm.available?'可用':'不可用')
+    +' · 授权 '+(active?('有效 '+esc(active)):'无有效授权')
+    +'</div>';
+  if(blockers.length){
+    html+='<div class="rr-auto-blockers">未就绪：'+esc(blockers.join(' · '))+'</div>';
+  }
+  html+='<div class="rr-auto-settings">'
+    +'<label><input type="checkbox" id="autoEnabled" '+(enabled?'checked':'')+'> 启用自动草稿</label> '
+    +'<label>apply ≥ <input id="autoApply" type="number" min="0" max="100" value="'+esc(apply.value)+'"></label> '
+    +'<label>keep ≥ <input id="autoKeep" type="number" min="0" max="100" value="'+esc(keep.value)+'"></label> '
+    +'<label>cutoff <input id="autoCutoff" type="number" min="0" max="100" value="'+esc(cutoff)+'"></label> '
+    +'<button type="button" class="secondary" id="autoSave">保存设置</button> '
+    +'<button type="button" class="secondary" id="autoAuthCreate">创建授权</button>'
+    +(active?' <button type="button" class="secondary" id="autoAuthRevoke">撤销授权</button>':'')
+    +'</div>';
+  html+='<div class="rr-auto-status">'+esc(reviewAutoStatusText(auto))
+    +(auto?(' · 计划版本 '+reviewNum(auto.plan_version)+' · apply '+reviewNum(counts.apply)
+            +' / keep '+reviewNum(counts.keep)+' / 待人工 '+reviewNum(counts.escalate)):'')
+    +'</div>';
+  if(auto&&auto.job&&(auto.job.status==='paused'||auto.job.status==='failed'||auto.job.status==='interrupted')){
+    html+='<div class="rr-auto-actions">'
+      +'<button type="button" class="secondary" id="autoJobResume">续跑</button> '
+      +'<button type="button" class="secondary" id="autoJobCancel">取消</button></div>';
+  }
+  if(!items.length){
+    html+='<div class="hist-empty">没有待确认的自动草稿。</div>';
+  }else{
+    html+='<div class="rr-auto-list">';
+    items.forEach(function(item){
+      html+='<label class="rr-auto-item"><input type="checkbox" class="autoPick" data-entry-id="'
+        +esc(item.entry_id)+'" checked> '
+        +'<span>'+esc(item.code||'')+'</span> · '+esc(item.source||'')+' · '
+        +esc(item.decision||'')+' · score '+reviewNum((item.origin||{}).effective_score)
+        +' · '+esc(item.status||'')+'</label>';
+    });
+    html+='</div><div class="rr-auto-actions">'
+      +'<button type="button" id="autoConfirm">确认自动处理</button>'
+      +(acList.length?' <button type="button" class="secondary" id="autoRevert" data-ac="'
+        +esc(acList[0])+'">撤销上次确认（R0）</button>':'')
+      +'</div>';
+  }
+  el.innerHTML=html;
+  const save=$('#autoSave'); if(save) save.onclick=reviewAutoSave;
+  const create=$('#autoAuthCreate'); if(create) create.onclick=reviewAutoCreateAuth;
+  const revoke=$('#autoAuthRevoke'); if(revoke) revoke.onclick=reviewAutoRevokeAuth;
+  const confirm=$('#autoConfirm'); if(confirm) confirm.onclick=reviewAutoConfirm;
+  const revert=$('#autoRevert'); if(revert) revert.onclick=reviewAutoRevert;
+  const resume=$('#autoJobResume'); if(resume) resume.onclick=reviewAutoJobResume;
+  const cancel=$('#autoJobCancel'); if(cancel) cancel.onclick=reviewAutoJobCancel;
+}
+async function reviewAutoSave(){
+  if(REVIEW_CTX.autoBusy) return;
+  const current=((REVIEW_CTX.autoSettings||{}).settings)||{};
+  const payload=JSON.parse(JSON.stringify(current));
+  payload.auto_review={enabled:!!($('#autoEnabled')||{}).checked};
+  payload.thresholds=payload.thresholds||{};
+  payload.thresholds.apply={enabled:true,value:Number(($('#autoApply')||{}).value||90)};
+  payload.thresholds.keep={enabled:true,value:Number(($('#autoKeep')||{}).value||90)};
+  const cutoff=($('#autoCutoff')||{}).value;
+  payload.minimum_validated_cutoff=(cutoff===''||cutoff==null)?null:Number(cutoff);
+  REVIEW_CTX.autoBusy=true;
+  try{
+    REVIEW_CTX.autoSettings=await reviewFetchJSON(reviewAutoSettingsUrl(),{
+      method:'PUT',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    reviewMsg('自动审阅设置已保存。');
+    paintReviewAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoCreateAuth(){
+  if(REVIEW_CTX.autoBusy) return;
+  REVIEW_CTX.autoBusy=true;
+  try{
+    await reviewFetchJSON(reviewAutoSettingsUrl().replace('/settings','/authorizations'),{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({scope:{text:true,decision:true}})});
+    reviewMsg('已创建 dataset 级授权。');
+    await reviewLoadAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoRevokeAuth(){
+  if(REVIEW_CTX.autoBusy) return;
+  const active=((REVIEW_CTX.autoSettings||{}).active_authorization)||'';
+  if(!active) return;
+  REVIEW_CTX.autoBusy=true;
+  try{
+    await reviewFetchJSON(reviewAutoSettingsUrl().replace('/settings','/authorizations/')
+      +encodeURIComponent(active),{method:'DELETE'});
+    reviewMsg('授权已撤销。');
+    await reviewLoadAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoConfirm(){
+  if(REVIEW_CTX.autoBusy) return;
+  const auto=REVIEW_CTX.auto||{};
+  const ids=[];
+  document.querySelectorAll('#reviewAuto .autoPick').forEach(function(el){
+    if(el.checked) ids.push(el.getAttribute('data-entry-id'));
+  });
+  if(!ids.length){ reviewMsg('请至少勾选一个自动草稿。',true); return; }
+  REVIEW_CTX.autoBusy=true;
+  try{
+    const result=await reviewFetchJSON(reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/auto/confirm',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base_plan_version:auto.plan_version,entry_ids:ids})});
+    reviewMsg('已确认自动处理：'+reviewStr(result.auto_confirmation_id)
+      +(result.batch_id?(' · 批次 '+reviewStr(result.batch_id)):'')
+      +(result.job_id?(' · 构建任务 '+reviewStr(result.job_id)):''));
+    await reviewLoadAuto();
+    await reviewLoadJobs();
+    await reviewLoadBatches();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoRevert(){
+  if(REVIEW_CTX.autoBusy) return;
+  const btn=$('#autoRevert');
+  const ac=btn?btn.getAttribute('data-ac'):'';
+  if(!ac) return;
+  const auto=REVIEW_CTX.auto||{};
+  REVIEW_CTX.autoBusy=true;
+  try{
+    await reviewFetchJSON(reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/auto/'
+      +encodeURIComponent(ac)+'/revert',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({base_plan_version:auto.plan_version})});
+    reviewMsg('已撤销自动确认组 '+ac+' 的 R0。');
+    await reviewLoadAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoJobResume(){
+  if(REVIEW_CTX.autoBusy) return;
+  const job=(REVIEW_CTX.auto||{}).job||{};
+  if(!job.job_id) return;
+  REVIEW_CTX.autoBusy=true;
+  try{
+    await reviewFetchJSON(reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/jobs/'
+      +encodeURIComponent(job.job_id)+'/resume',{method:'POST'});
+    reviewMsg('已请求续跑任务 '+job.job_id+'。');
+    await reviewLoadAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoJobCancel(){
+  if(REVIEW_CTX.autoBusy) return;
+  const job=(REVIEW_CTX.auto||{}).job||{};
+  if(!job.job_id) return;
+  REVIEW_CTX.autoBusy=true;
+  try{
+    await reviewFetchJSON(reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/jobs/'
+      +encodeURIComponent(job.job_id)+'/cancel',{method:'POST'});
+    reviewMsg('已请求取消任务 '+job.job_id+'。');
+    await reviewLoadAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+
 async function openReview(dsId,sha){
   REVIEW_CTX={dataset:dsId,sha:sha,data:null,itemsById:{},selected:null,busy:false,
     source:null,conflict:null,jobs:{},batchesById:{},candidateBatchId:null,
@@ -8794,7 +9011,9 @@ async function openReview(dsId,sha){
     vlmBusy:false,vlmConfirm:null,discussTurns:[],discussConversationId:'',
     pendingPatch:null,patchDiff:null,patchConflict:'',pendingPatchTurn:null,
     /* CP6: propagation state. Opening the review never previews/applies. */
-    propagate:null};
+    propagate:null,
+    /* CP5 auto-review state (settings/authorization/list/job). */
+    auto:null,autoSettings:null,autoBusy:false};
   const m=$('#reviewModal'); if(!m) return;
   m.hidden=false;
   reviewMsg('');
@@ -8808,6 +9027,8 @@ async function openReview(dsId,sha){
   if(batch) batch.innerHTML='<span class="hist-empty">正在读取候选批次与后台任务…</span>';
   const ocr=$('#reviewOcr');
   if(ocr) ocr.innerHTML='<span class="hist-empty">正在读取 OCR 能力…</span>';
+  const auto=$('#reviewAuto');
+  if(auto) auto.innerHTML='<span class="hist-empty">正在读取自动审阅状态…</span>';
   reviewOcrConfigClose();
   /* CP5: reset the VLM panels; the bar/provider/clarification paints below
      read only the review payload (never an implicit provider call). */
@@ -8856,6 +9077,7 @@ async function openReview(dsId,sha){
      source when OCR is available, coverage has uncovered no_native_labels
      items and no type=ocr descriptor exists. Never auto-retries. */
   await reviewMaybeAutoOcr();
+  await reviewLoadAuto();
   setTimeout(function(){ const c=$('#reviewClose'); if(c) c.focus(); },30);
 }
 async function generateReviewReport(){

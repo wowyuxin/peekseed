@@ -503,3 +503,72 @@ class DecisionApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DecisionCp5KeylessAndEchoTests(unittest.TestCase):
+    """CP5: keyless local decision seam + peekseed-side image-echo rejection."""
+
+    def test_keyless_local_decision_link_is_available(self):
+        with temp_data_root():
+            from peekseed import links, peelfeed
+            saved = links.create(_decision_link(api_key_env=""))
+            self.assertEqual(saved["api_key_env"], "")
+            provider = peelfeed.decision_provider()
+            self.assertTrue(provider["available"], provider)
+            self.assertEqual(provider["link_id"], saved["id"])
+            env = peelfeed.decision_child_env()
+            self.assertEqual(env["PEELFEED_DECISION_TOKEN"], "")
+            self.assertEqual(env["PEELFEED_DECISION_MODEL"], "jev-1.14.0")
+
+    def test_keyless_env_provider_is_available(self):
+        previous = {key: os.environ.get(key) for key in (
+            "PEELFEED_DECISION_BASE", "PEELFEED_DECISION_MODEL",
+            "PEELFEED_DECISION_TOKEN", "PEELFEED_DECISION_LINK_ID")}
+        os.environ.update({
+            "PEELFEED_DECISION_BASE": "http://127.0.0.1:9/v1",
+            "PEELFEED_DECISION_MODEL": "jev-1.14.0",
+            "PEELFEED_DECISION_LINK_ID": "env",
+        })
+        os.environ.pop("PEELFEED_DECISION_TOKEN", None)
+        try:
+            from peekseed import peelfeed
+            peelfeed.reset_cache()
+            provider = peelfeed.decision_provider()
+            self.assertTrue(provider["available"], provider)
+            self.assertEqual(peelfeed.decision_child_env()
+                             ["PEELFEED_DECISION_TOKEN"], "")
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            from peekseed import peelfeed as _p
+            _p.reset_cache()
+
+    def test_peekseed_rejects_extra_answer_keys_and_image_echo(self):
+        from peekseed import decision
+        questions = decision.text_probe_fixture()["questions"]
+        good = {
+            "model": "jev-1.14.0",
+            "answers": {
+                "probe_mentions_dog": {"type": "noul", "noul": 0.9},
+                "probe_animal": {
+                    "type": "choice", "choice": "dog", "confidence": 0.9,
+                    "probabilities": {"fox": 0.1, "dog": 0.8, "cat": 0.1},
+                },
+            },
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        echoed = json.loads(json.dumps(good))
+        echoed["answers"]["probe_animal"]["data_base64"] = (
+            "data:image/png;base64,AAAA")
+        with self.assertRaises(decision.DecisionError) as ctx:
+            decision.validate_response(echoed, questions)
+        self.assertEqual(ctx.exception.code, decision.DECISION_BAD_RESPONSE)
+        long_value = json.loads(json.dumps(good))
+        long_value["answers"]["probe_animal"]["confidence"] = (
+            "data:image/png;base64," + "A" * 9000)
+        with self.assertRaises(decision.DecisionError) as ctx:
+            decision.validate_response(long_value, questions)
+        self.assertEqual(ctx.exception.code, decision.DECISION_BAD_RESPONSE)

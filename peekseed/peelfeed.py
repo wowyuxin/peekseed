@@ -627,8 +627,10 @@ def _env_decision_provider():
     """The provider from peekseed's own ``PEELFEED_DECISION_*`` env, or None."""
     base = str(os.environ.get("PEELFEED_DECISION_BASE") or "").strip()
     model = str(os.environ.get("PEELFEED_DECISION_MODEL") or "").strip()
+    # CP5 keyless seam: a local decision endpoint may be unauthenticated; the
+    # token is optional (base+model are required).
     token = _clean_token(os.environ.get("PEELFEED_DECISION_TOKEN"))
-    if not (base and model and token):
+    if not (base and model):
         return None
     link_id = str(os.environ.get("PEELFEED_DECISION_LINK_ID") or "").strip() \
         or "env"
@@ -652,7 +654,10 @@ def _decision_link_provider():
         return None, ("decision link '%s' needs base_url and model"
                       % link.get("id"))
     key = links.api_key(link)
-    if not key:
+    # CP5 keyless seam: only an explicitly configured api_key_env makes a
+    # missing key an error; a link with no api_key_env is a local keyless
+    # endpoint and is allowed (setup-contract §7).
+    if not key and str(link.get("api_key_env") or "").strip():
         return None, ("the API key env for decision link '%s' is not set"
                       % link.get("id"))
     return {"provider": "decision_link", "link_id": str(link.get("id") or ""),
@@ -708,12 +713,7 @@ def decision_child_env(provider=None):
         else:
             link = links.get(str(provider.get("link_id") or ""))
             token = links.api_key(link) if link is not None else ""
-    if not token:
-        raise PeelfeedError(
-            503,
-            "error [decision_unavailable] the decision provider token is not "
-            "set",
-        )
+    # A keyless local endpoint is valid: PEELFEED_DECISION_TOKEN may be empty.
     return {
         "PEELFEED_DECISION_BASE": str(provider.get("base_url") or "").strip(),
         "PEELFEED_DECISION_MODEL": str(provider.get("model") or "").strip(),

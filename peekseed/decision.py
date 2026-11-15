@@ -25,6 +25,7 @@ envelope can be reused from tests and the peelfeed-facing seam.
 """
 
 import base64
+import re
 import math
 import struct
 import time
@@ -238,6 +239,33 @@ def _validate_choice_answer(question, answer):
                             "choice answer has no confidence in [0, 1]")
 
 
+#: CP3 addendum B13 (CP5): exact answer key sets and image-echo rejection.
+_ANSWER_KEYS = {
+    "noul": frozenset(("type", "noul")),
+    "choice": frozenset(("type", "choice", "confidence", "probabilities")),
+}
+_IMAGE_ECHO_RE = re.compile(
+    r"(?i)(data:[a-z0-9.+-]+/[a-z0-9.+-]+;base64,|;base64,|data:image/)")
+_MAX_TEXT_FIELD = 8192
+
+
+def _reject_image_echo(value, where):
+    if isinstance(value, str):
+        if len(value) > _MAX_TEXT_FIELD or _IMAGE_ECHO_RE.search(value):
+            raise DecisionError(
+                DECISION_BAD_RESPONSE,
+                "%s contains image data or an oversized string" % where)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _reject_image_echo(key, where)
+            _reject_image_echo(item, where)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _reject_image_echo(item, where)
+
+
 def _validate_noul_answer(answer):
     if not _finite01(answer.get("noul")):
         raise DecisionError(DECISION_BAD_RESPONSE,
@@ -275,6 +303,13 @@ def validate_response(payload, questions):
         if answer.get("type") != qtype:
             raise DecisionError(DECISION_BAD_RESPONSE,
                                 "answer %r has the wrong type" % qid)
+        allowed = _ANSWER_KEYS.get(qtype)
+        if allowed is not None and set(answer) != set(allowed):
+            raise DecisionError(
+                DECISION_BAD_RESPONSE,
+                "answer %r has unexpected keys (expected %s)"
+                % (qid, ", ".join(sorted(allowed))))
+        _reject_image_echo(answer, "answer %r" % qid)
         if qtype == "choice":
             _validate_choice_answer(question, answer)
         elif qtype == "noul":
