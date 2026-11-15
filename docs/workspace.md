@@ -68,6 +68,22 @@ These are enforced by tests, not just documented:
 5. **Content is identity.** A PDF is identified by its sha256; re-uploading the
    same bytes is idempotent, and two datasets share the one stored file.
 
+## Dataset review files (M3 CP5)
+
+`$PEEKSEED_HOME/datasets/<id>/review/` holds the additive auto-review state; it
+is not part of `dataset.json` and does not change `DATASET_SCHEMA`:
+
+- `settings.json` — auto-review enable, `apply`/`keep` thresholds, caps,
+  `minimum_validated_cutoff`, breaker window/line (0600, atomic write);
+- `authorizations.jsonl` — append-only dataset-level authorizations; no secret
+  is stored (only provider/link/model/scope/expiry and optional `api_key_env`
+  name); revocation appends a row;
+- `auto_confirmations.jsonl` — peekseed audit mirror of peelfeed's authoritative
+  `extract/review/auto_confirmations.jsonl`.
+
+The peelfeed plan/summary files remain authoritative for the auto list; peekseed
+reads them read-only and never confirms, builds or publishes on its own.
+
 ## Backups
 
 Back up `$PEEKSEED_HOME` (except `env/venv`, `env/uv-cache`, `logs/` and

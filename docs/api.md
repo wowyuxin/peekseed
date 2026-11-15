@@ -56,6 +56,14 @@ are not listed.
 | POST | `/api/datasets/{id}/sources/{sha}/review/plan/propagate` | Proxy the synchronous cluster-level propagation: frozen `plan propagate` body incl. CP6.1 `overrides[]` (preview with `dry_run:true` writes nothing; apply writes draft entries only; `decided` members kept unless overridden) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/check` | Probe the OCR provider (body empty or `{}`; no `provider`) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/ocr/refresh` | Create one `type=ocr` evidence-refresh job (body exactly `{item_ids:[…]}`) |
+| GET/PUT | `/api/datasets/{id}/review/settings` | Dataset auto-review settings (auto toggle, apply/keep thresholds, caps, validated cutoff, breaker); additive files, no dataset-schema change |
+| GET/POST | `/api/datasets/{id}/review/authorizations` | Dataset-level authorization ledger; POST `{scope, expires_at?, note?}`, DELETE `…/authorizations/{id}` revokes by append (no secret stored) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/adjudicate` | Start one manual `adjudicate` job (body `{scope?}`; an active authorization is required) |
+| GET | `/api/datasets/{id}/sources/{sha}/review/auto` | Auto-review list derived from peelfeed plan/summary: counts/groups/items/job status (read-only) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/auto/confirm` | Confirm auto drafts all-or-nothing: `{base_plan_version, entry_ids, auto_confirmation_id?}`; operations get a separate batch + build job |
+| POST | `/api/datasets/{id}/sources/{sha}/review/auto/{ac}/revert` | Revert one auto-confirmed R0 group: `{base_plan_version}` |
+| POST | `/api/datasets/{id}/sources/{sha}/review/jobs/{job_id}/resume` | Resume a paused/failed adjudicate job (same id; authorization/provider/plan/evidence rechecked) |
+| POST | `/api/datasets/{id}/sources/{sha}/review/jobs/{job_id}/cancel` | Request cancellation at the next adjudicate stage boundary |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
 | GET | `/api/datasets/{id}/sources/{sha}/assets/{path}` | Proxy one peel/corpus asset (crop, page image, table) |
 | DELETE | `/api/datasets/{id}/sources/{sha}` | Remove a source; `?peel=keep|delete` |

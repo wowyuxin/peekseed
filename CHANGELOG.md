@@ -8,6 +8,28 @@ version/tag policy.
 
 ## Unreleased
 
+### Added — M3 CP5 dataset auto-review (off by default)
+
+- Dataset review settings are additive files under
+  `$PEEKSEED_HOME/datasets/<id>/review/` (`settings.json`): auto-review enable,
+  separate `apply`/`keep` thresholds, caps, `minimum_validated_cutoff` and
+  breaker window/line. `DATASET_SCHEMA` stays 4; old checkouts ignore the files.
+- Dataset-level authorization ledger (`authorizations.jsonl`, append-only,
+  0600, no secret): provider/link/model/scope/expiry binding, revoke by append.
+  The provider/link/model changing invalidates an authorization.
+- `POST …/review/adjudicate` starts one manual adjudicate job (authorization
+  required); extraction completion triggers one auto job only when auto-review
+  is enabled, an active authorization exists and a decision provider is
+  available. `GET …/review/auto`, `POST …/review/auto/confirm`,
+  `POST …/review/auto/{ac}/revert`, and job resume/cancel proxy the frozen
+  peelfeed seams; operation auto-confirmations get a separate batch + build job.
+- The Review modal now shows an auto-review panel: settings/auth controls,
+  job stage/calls/failures/resume, grouped auto drafts with per-item source,
+  score and status, an all-or-nothing confirm and an R0 group revert.
+- Keyless local decision endpoints are supported (no `api_key_env`/token); the
+  peekseed decision adapter now rejects extra answer keys and image-data echo
+  (data URI/base64/oversized strings) like the peelfeed adapter.
+
 ### Added — decision model links (M3 CP0.5 readiness, off by default)
 
 - New model-link role `decision` (protocol `typesafe`, `POST {base_url}/v1/systemone`
