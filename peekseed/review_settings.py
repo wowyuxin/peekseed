@@ -395,6 +395,9 @@ def mirror_auto_confirmation(directory, record):
         "batch_id": record.get("batch_id"),
         "revert_of": record.get("revert_of"),
     }
+    for key in ("job_id", "operation_entry_ids"):
+        if record.get(key) is not None:
+            row[key] = record.get(key)
     _append_jsonl(auto_confirmations_path(directory), row)
     return row
 

@@ -2386,6 +2386,62 @@ def create_app():
         }
         return request, _review_provider_env()
 
+    def _auto_confirmation_replay(peel_id, auto_confirmation_id, entry_ids):
+        """Authoritative replay check against peelfeed's ledger (wire §6.3).
+
+        Returns the recorded outcome when the same id+entry set is replayed, a
+        ``conflict`` marker for a different set, or ``None`` when unknown.
+        """
+        review_dir = _peel_review_dir(peel_id)
+        ledger = []
+        try:
+            lines = (review_dir / "auto_confirmations.jsonl").read_text(
+                encoding="utf-8").splitlines()
+        except OSError:
+            lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                ledger.append(row)
+        confirmed = [row for row in ledger
+                     if row.get("auto_confirmation_id")
+                     == auto_confirmation_id
+                     and row.get("outcome") == "confirmed"]
+        if not confirmed:
+            return None
+        recorded = list(confirmed[0].get("entry_ids") or [])
+        if sorted(recorded) != sorted(entry_ids):
+            return {"conflict": True,
+                    "recorded_entry_ids": recorded}
+        batch_id = None
+        for row in ledger:
+            if row.get("auto_confirmation_id") == auto_confirmation_id \
+                    and row.get("event") == "batch_linked":
+                batch_id = row.get("batch_id")
+        plan = _review_json(review_dir / "plan.json", default={}) or {}
+        entries = [entry for entry in plan.get("entries") or []
+                   if isinstance(entry, dict)
+                   and (entry.get("origin") or {}).get(
+                       "auto_confirmation_id") == auto_confirmation_id]
+        operation_ids = [entry.get("entry_id") for entry in entries
+                         if (entry.get("action") or {}).get("type")
+                         != "resolution"]
+        return {
+            "auto_confirmation_id": auto_confirmation_id,
+            "entries": entries,
+            "operation_entry_ids": operation_ids,
+            "batch_id": batch_id,
+            "job_id": None,
+            "idempotent": True,
+            "failures": [],
+        }
+
     def _peel_review_dir(peel_id):
         paths = config.paths()
         return Path(paths.peels_dir) / str(peel_id) / "extract" / "review"
@@ -3218,6 +3274,15 @@ def create_app():
         }
         supplied = body.get("auto_confirmation_id")
         if supplied:
+            replay = _auto_confirmation_replay(
+                peel_id, str(supplied), cleaned)
+            if replay is not None:
+                if replay.get("conflict"):
+                    raise HTTPException(
+                        409,
+                        "auto_confirmation_id {} was used for a different "
+                        "entry set".format(supplied))
+                return replay
             request["auto_confirmation_id"] = str(supplied)
         result = _call_peelfeed(
             "plan auto-confirm",
@@ -3258,6 +3323,8 @@ def create_app():
                              if isinstance(item, dict)],
                 "outcome": "confirmed",
                 "batch_id": batch_id,
+                "job_id": build_job_id,
+                "operation_entry_ids": operation_ids,
             })
         except review_settings.ReviewSettingsError as exc:
             LOG.warning("could not mirror auto confirmation: %s", exc)

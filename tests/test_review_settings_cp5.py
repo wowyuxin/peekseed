@@ -264,6 +264,20 @@ class AutoReviewTests(unittest.TestCase):
                 self.assertEqual(rows[-1]["outcome"], "confirmed")
                 self.assertEqual(rows[-1]["auto_confirmation_id"],
                                  payload["auto_confirmation_id"])
+                # Repeat confirm with the same id+set is idempotent and does not
+                # create another batch/build job.
+                applies = len(cli.state().get("apply_requests") or [])
+                again = client.post(base + "/review/auto/confirm", json={
+                    "base_plan_version": 4,
+                    "entry_ids": ["e-op", "e-keep"],
+                    "auto_confirmation_id": payload["auto_confirmation_id"],
+                })
+                self.assertEqual(again.status_code, 200, again.text)
+                self.assertTrue(again.json().get("idempotent"))
+                self.assertEqual(again.json()["batch_id"],
+                                 payload["batch_id"])
+                self.assertEqual(len(cli.state().get("apply_requests") or []),
+                                 applies)
                 reverted = client.post(
                     base + "/review/auto/" + payload["auto_confirmation_id"]
                     + "/revert", json={"base_plan_version": 4})

@@ -717,6 +717,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 STATE = %(state)r
 LOG = %(log)r
@@ -1487,8 +1488,17 @@ def main():
                         "auto_confirmation_id"),
                     "batch_id": request.get("batch_id"),
                     "dataset_id": request.get("dataset_id"),
+                    "event": "batch_linked",
                 }
                 state.setdefault("auto_confirmations", []).append(record)
+                shared = os.environ.get("PEELFEED_SHARED_DIR")
+                if shared:
+                    ledger_dir = (Path(shared) / "peels" / peel_id /
+                                  "extract" / "review")
+                    ledger_dir.mkdir(parents=True, exist_ok=True)
+                    with (ledger_dir / "auto_confirmations.jsonl").open(
+                            "a", encoding="utf-8") as stream:
+                        stream.write(json.dumps(record) + "\n")
                 save_state(state)
                 return emit(record)
             if action == "auto-revert":
@@ -1592,6 +1602,14 @@ def main():
                 "outcome": "confirmed", "batch_id": None, "revert_of": None,
             }
             state.setdefault("auto_confirmations", []).append(ledger)
+            shared = os.environ.get("PEELFEED_SHARED_DIR")
+            if shared:
+                ledger_dir = (Path(shared) / "peels" / peel_id / "extract" /
+                              "review")
+                ledger_dir.mkdir(parents=True, exist_ok=True)
+                with (ledger_dir / "auto_confirmations.jsonl").open(
+                        "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(ledger) + "\n")
             save_state(state)
             return emit({
                 "peel_id": peel_id, "review_schema": 2,
