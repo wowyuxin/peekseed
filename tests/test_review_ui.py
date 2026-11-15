@@ -3321,3 +3321,228 @@ class ReviewUiCp5AutoTests(unittest.TestCase):
             self.assertIn("reviewLoadAuto", response.text)
             self.assertIn('id="reviewCalibration"', response.text)
             self.assertIn("reviewLoadCalibration", response.text)
+
+
+NODE_CP5_AUTO_HARNESS = r"""
+/* CP5 auto-review panel behaviour with a stub DOM + canned fetch. */
+const fs = require("fs");
+const vm = require("vm");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const start = html.indexOf("/* ---- review report dialog", 150000);
+const end = html.indexOf("/* ---- workspace dialog", start);
+if (start < 0 || end < 0) throw new Error("review block markers not found");
+const block = html.slice(start, end);
+
+const elements = new Map();
+function element(key) {
+  if (elements.has(key)) return elements.get(key);
+  const value = {
+    id: key, innerHTML: "", textContent: "", hidden: true, disabled: false,
+    value: "", checked: false, onclick: null,
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    addEventListener() {}, appendChild() {}, focus() {}, blur() {},
+    closest() { return null; }, remove() {},
+    querySelector() { return element(key + ":child"); },
+    querySelectorAll() { return []; }, getAttribute() { return null; },
+    setAttribute() {}, style: {}, dataset: {}, scrollIntoView() {},
+    isConnected: true,
+  };
+  elements.set(key, value);
+  return value;
+}
+const picks = [
+  Object.assign(element("#pick-e-1"), { checked: true,
+    getAttribute: function (name) { return name === "data-entry-id" ? "e-1" : null; } }),
+  Object.assign(element("#pick-e-2"), { checked: true,
+    getAttribute: function (name) { return name === "data-entry-id" ? "e-2" : null; } }),
+];
+const document = {
+  querySelector(selector) { return element(selector); },
+  querySelectorAll(selector) {
+    if (String(selector).indexOf("autoPick") >= 0) return picks;
+    return [];
+  },
+  addEventListener() {}, getElementById(id) { return element("#" + id); },
+  createElement() { return element("created"); },
+  createTextNode() { return {}; },
+  body: { style: {}, classList: { toggle() {} }, appendChild() {} },
+  documentElement: { style: {}, classList: { toggle() {} } },
+  head: { appendChild() {} },
+};
+
+const calls = [];
+const settings = {
+  settings: {
+    schema_version: 1, auto_review: { enabled: true },
+    thresholds: { apply: { enabled: true, value: 90 },
+                  keep: { enabled: true, value: 90 } },
+    caps: { cap_rule_disagree: 50, cap_uncertain: 70 },
+    minimum_validated_cutoff: 50,
+    breaker: { window_days: 30, window_records: 200, min_samples: 20,
+               line: 0.95 },
+    category_overrides: {},
+  },
+  provider: { decision: { available: true, link_id: "d", model: "m" },
+              vlm: { available: true, link_id: "v", model: "vm" } },
+  authorizations: [], active_authorization: "auth-1",
+  auto_trigger: { enabled: true, ready: true, blockers: [] },
+};
+const auto = {
+  schema_version: 1, peel_id: "peel", plan_version: 3,
+  counts: { apply: 1, keep: 1, escalate: 0,
+            by_code: {}, by_source: { decision_auto: 1, vlm_auto: 1 } },
+  groups: [], items: [
+    { entry_id: "e-1", item_id: "it-1", code: "table_header_absent",
+      source: "decision_auto", decision: "apply", keep: false,
+      origin: { effective_score: 95, auto_confirmation_id: "ac-1" },
+      status: "ready_for_confirmation",
+      action: { type: "operation", name: "set_header_rows",
+                params: { rows: [0] } } },
+    { entry_id: "e-2", item_id: "it-2", code: "visual_only_page",
+      source: "vlm_auto", decision: "keep", keep: true,
+      origin: { effective_score: 91, auto_confirmation_id: null },
+      status: "ready_for_confirmation",
+      action: { type: "resolution", name: "defer", params: {} } },
+  ],
+  job: { job_id: "j-1", status: "paused",
+         progress: { stage: "vlm", done: 1, total: 2,
+                     calls: { decision: 1, vlm: 1 } },
+         result_ref: null, partial_ref: "p.json" },
+  summary: { counts: { manual_pending: 1 } },
+};
+const calibration = {
+  schema_version: 1, records: 2, evaluated: 2, empty: false,
+  calibration: [{ key: "calibration|decision|text|apply", total: 2,
+                  evaluated: 2, correct: 2, accuracy: 1.0,
+                  ci: [0.1, 1.0], acceptance_rate: 1.0,
+                  acceptance_n: 2, accepted: 2, harmful: 0, lost_labels: 0 }],
+  holdout: [], breaker: { state: "ok", accuracy: 1.0, ci: [0.1, 1.0],
+                          records: 2, evaluated: 2 },
+  note: null,
+};
+function response(url) {
+  if (url.indexOf("/review/settings") >= 0) return settings;
+  if (url.indexOf("/review/auto/confirm") >= 0) {
+    return { auto_confirmation_id: "ac-1", entries: [],
+             operation_entry_ids: ["e-1"], batch_id: "batch-1",
+             job_id: "build-1", failures: [] };
+  }
+  if (url.indexOf("/review/auto") >= 0) return auto;
+  if (url.indexOf("/review/calibration") >= 0) return calibration;
+  if (url.indexOf("/jobs/") >= 0) return { job_id: "j-1", status: "queued" };
+  return {};
+}
+async function fetchStub(url, opts) {
+  calls.push({ url: String(url), method: (opts && opts.method) || "GET",
+               body: (opts && opts.body) || null });
+  return { ok: true, status: 200, json: async function () {
+    return response(String(url)); } };
+}
+const sandbox = {
+  console, JSON, Math, Number, String, Object, Array, Date, RegExp, Error,
+  setTimeout: function (fn) { return 0; }, clearTimeout: function () {},
+  setInterval: function () { return 0; }, clearInterval: function () {},
+  fetch: fetchStub, document,
+  window: { location: { search: "", hash: "" }, addEventListener() {},
+            localStorage: { getItem() { return null; }, setItem() {} } },
+  location: { search: "", hash: "" },
+  localStorage: { getItem() { return null; }, setItem() {} },
+  navigator: { clipboard: {} }, URLSearchParams,
+  REVIEW_CTX: { dataset: "docs", sha: "a".repeat(64) },
+};
+sandbox.$ = function (selector) { return element(selector); };
+sandbox.esc = function (value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+             "'": "&#39;" }[ch];
+  });
+};
+sandbox.reviewNum = function (value) {
+  return Number(value || 0).toLocaleString();
+};
+sandbox.reviewStr = function (value, fallback) {
+  if (value == null || value === "") return fallback || "";
+  return String(value);
+};
+vm.createContext(sandbox);
+vm.runInContext(block + "\n;globalThis.__auto = {" +
+  "reviewLoadAuto, reviewLoadCalibration, paintReviewAuto, paintReviewCalibration," +
+  "reviewAutoConfirm, reviewAutoSave, reviewAutoJobResume," +
+  "getContext: function () { return REVIEW_CTX; }}" +
+  "\n;reviewLoadJobs = async function () {};" +
+  "reviewLoadBatches = async function () {};", sandbox);
+
+async function tick() { await new Promise(function (r) { setTimeout(r, 5); }); }
+async function main() {
+  const ctx = sandbox.__auto.getContext();
+  ctx.dataset = "docs"; ctx.sha = "a".repeat(64);
+  await sandbox.__auto.reviewLoadAuto();
+  await tick(10);
+  const autoHtml = document.querySelector("#reviewAuto").innerHTML;
+  await sandbox.__auto.reviewLoadCalibration();
+  await tick(10);
+  const calHtml = document.querySelector("#reviewCalibration").innerHTML;
+  document.querySelector("#autoApply").value = "92";
+  document.querySelector("#autoKeep").value = "93";
+  document.querySelector("#autoCutoff").value = "60";
+  document.querySelector("#autoEnabled").checked = true;
+  await sandbox.__auto.reviewAutoSave();
+  await tick(10);
+  await sandbox.__auto.reviewAutoConfirm();
+  await tick(10);
+  await sandbox.__auto.reviewAutoJobResume();
+  await tick(10);
+  console.log(JSON.stringify({
+    autoHtml: autoHtml,
+    calHtml: calHtml,
+    calls: calls.map(function (call) {
+      return { url: call.url, method: call.method,
+               body: call.body ? JSON.parse(call.body) : null };
+    }),
+  }));
+}
+main().catch(function (error) {
+  console.error((error && error.stack) || error);
+  process.exit(1);
+});
+"""
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed for the CP5 auto DOM behaviour harness")
+class ReviewUiCp5AutoBehaviorTests(unittest.TestCase):
+    def _run(self):
+        base = Path(tempfile.mkdtemp(prefix="peekseed-cp5-auto-"))
+        try:
+            harness = base / "auto.js"
+            harness.write_text(NODE_CP5_AUTO_HARNESS, encoding="utf-8")
+            completed = subprocess.run(
+                [shutil.which("node"), str(harness), str(UI_PATH)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stderr or completed.stdout)
+            return json.loads(completed.stdout)
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
+
+    def test_auto_panel_paints_and_sends_the_frozen_bodies(self):
+        result = self._run()
+        for marker in ("自动审阅", "decision 可用", "VLM 可用",
+                       "授权 有效 auth-1", "apply", "keep",
+                       "score 95", "确认自动处理", "撤销上次确认（R0）"):
+            self.assertIn(marker, result["autoHtml"])
+        for marker in ("校准 / 留出", "95% CI", "熔断", "lost_labels"):
+            self.assertIn(marker, result["calHtml"])
+        calls = result["calls"]
+        puts = [call for call in calls if call["method"] == "PUT"]
+        self.assertTrue(puts)
+        self.assertTrue(puts[0]["body"]["auto_review"]["enabled"])
+        self.assertEqual(puts[0]["body"]["thresholds"]["apply"]["value"], 92)
+        self.assertEqual(puts[0]["body"]["minimum_validated_cutoff"], 60)
+        posts = [call for call in calls if call["method"] == "POST"]
+        confirm = next(call for call in posts
+                       if "/auto/confirm" in call["url"])
+        self.assertEqual(confirm["body"]["base_plan_version"], 3)
+        self.assertEqual(confirm["body"]["entry_ids"], ["e-1", "e-2"])
+        resume = next(call for call in posts if "/jobs/j-1/resume" in call["url"])
+        self.assertEqual(resume["url"].split("/jobs/")[-1], "j-1/resume")
