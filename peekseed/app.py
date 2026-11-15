@@ -790,10 +790,24 @@ def _links_status():
     # (CP0.5 setup-contract §4).
     for link in all_links:
         if link.get("role") == "decision":
-            rows[link["id"]] = {"decision": True,
-                                "configured": bool(link.get("base_url")),
-                                "key_set": bool(links.api_key(link)),
-                                "detail": "not probed (use the synthetic Test)"}
+            images = str(_env("PEELFEED_DECISION_IMAGES")).strip().lower() in (
+                "1", "true", "yes", "on")
+            rows[link["id"]] = {
+                "decision": True,
+                "configured": bool(link.get("base_url")),
+                "key_set": bool(links.api_key(link)),
+                "detail": "not probed (use the synthetic Test)",
+                # CP5: the Settings row shows the provider's fixed model and
+                # declared capability envelope (no probe, no network).
+                "model": link.get("model"),
+                "protocol": link.get("protocol"),
+                "types": ["choice", "noul"],
+                "modalities": ["text", "image"] if images else ["text"],
+                "limits": {"image_px_per_side": [
+                    decision.IMAGE_SIDE_MIN, decision.IMAGE_SIDE_MAX]},
+                "experimental": ["images"],
+                "timeout_seconds": decision.DEFAULT_TIMEOUT,
+            }
     with ThreadPoolExecutor(max_workers=8) as pool:
         future_map = {link["id"]: pool.submit(_probe_link, link)
                       for link in all_links if link.get("role") != "decision"}

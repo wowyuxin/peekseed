@@ -4812,6 +4812,15 @@ function setStatusLine(status){
     const bits=[];
     if(status.configured) bits.push('endpoint configured');
     if(status.key_set) bits.push('key set');
+    if(status.model) bits.push('model '+status.model);
+    if(status.protocol) bits.push(status.protocol);
+    const mods=(status.modalities||[]).join('+')||'text';
+    bits.push(mods);
+    if(status.limits&&status.limits.image_px_per_side){
+      bits.push('image '+status.limits.image_px_per_side[0]+'–'
+        +status.limits.image_px_per_side[1]+' px');
+    }
+    if((status.experimental||[]).indexOf('images')>=0) bits.push('images experimental');
     return '<div class="set-live"><span class="dot"></span> decision link — '
       +esc(bits.join(' · ')||'not configured')
       +' — use Test (synthetic probe)</div>';

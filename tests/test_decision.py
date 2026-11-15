@@ -478,6 +478,13 @@ class DecisionApiTests(unittest.TestCase):
             self.assertTrue(row["configured"])
             self.assertFalse(row["key_set"])
             self.assertIn("not probed", row["detail"])
+            # CP5: fixed model + declared capability envelope, no probe.
+            self.assertEqual(row["model"], "jev-1.14.0")
+            self.assertEqual(row["protocol"], "typesafe")
+            self.assertEqual(row["types"], ["choice", "noul"])
+            self.assertEqual(row["modalities"], ["text"])
+            self.assertEqual(row["limits"]["image_px_per_side"], [280, 1568])
+            self.assertEqual(row["experimental"], ["images"])
 
     def test_test_failure_is_a_sanitized_200(self):
         with temp_data_root():
