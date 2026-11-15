@@ -8862,6 +8862,9 @@ function paintReviewAuto(){
     +'<button type="button" class="secondary" id="autoAuthCreate">创建授权</button>'
     +(active?' <button type="button" class="secondary" id="autoAuthRevoke">撤销授权</button>':'')
     +'</div>';
+  if(auto&&auto.job&&['queued','running','paused'].indexOf(auto.job.status)>=0){
+    html+='<div class="rr-auto-busy">自动审阅进行中；Build index 不会被阻塞。</div>';
+  }
   html+='<div class="rr-auto-status">'+esc(reviewAutoStatusText(auto))
     +(auto?(' · 计划版本 '+reviewNum(auto.plan_version)+' · apply '+reviewNum(counts.apply)
             +' / keep '+reviewNum(counts.keep)+' / 待人工 '+reviewNum(counts.escalate)):'')
@@ -8880,7 +8883,9 @@ function paintReviewAuto(){
         +esc(item.entry_id)+'" checked> '
         +'<span>'+esc(item.code||'')+'</span> · '+esc(item.source||'')+' · '
         +esc(item.decision||'')+' · score '+reviewNum((item.origin||{}).effective_score)
-        +' · '+esc(item.status||'')+'</label>';
+        +' · '+esc(item.status||'')+'</label> '
+        +'<button type="button" class="secondary autoDrop" data-entry-id="'
+        +esc(item.entry_id)+'">移回人工</button>';
     });
     html+='</div><div class="rr-auto-actions">'
       +'<button type="button" id="autoConfirm">确认自动处理</button>'
@@ -8893,6 +8898,9 @@ function paintReviewAuto(){
   const create=$('#autoAuthCreate'); if(create) create.onclick=reviewAutoCreateAuth;
   const revoke=$('#autoAuthRevoke'); if(revoke) revoke.onclick=reviewAutoRevokeAuth;
   const confirm=$('#autoConfirm'); if(confirm) confirm.onclick=reviewAutoConfirm;
+  document.querySelectorAll('#reviewAuto .autoDrop').forEach(function(el){
+    el.onclick=function(){ reviewAutoDrop(el.getAttribute('data-entry-id')); };
+  });
   const revert=$('#autoRevert'); if(revert) revert.onclick=reviewAutoRevert;
   const resume=$('#autoJobResume'); if(resume) resume.onclick=reviewAutoJobResume;
   const cancel=$('#autoJobCancel'); if(cancel) cancel.onclick=reviewAutoJobCancel;
@@ -9011,6 +9019,21 @@ async function reviewAutoSpotcheckSubmit(){
     const el=$('#reviewAutoSpotcheck'); if(el){ el.innerHTML=html; }
     const cont=$('#autoSpotContinue'); if(cont) cont.onclick=function(){
       reviewAutoSpotcheckClose(); reviewAutoConfirmNow(); };
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+async function reviewAutoDrop(entryId){
+  if(REVIEW_CTX.autoBusy||!entryId) return;
+  const auto=REVIEW_CTX.auto||{};
+  REVIEW_CTX.autoBusy=true;
+  try{
+    await reviewFetchJSON(reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/plan',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action:'clear',
+        base_plan_version:auto.plan_version,entry_id:entryId})});
+    reviewMsg('已把该自动草稿移回人工。');
+    await reviewLoadAuto();
+    await reviewLoadCalibration();
   }catch(e){ reviewMsg(reviewErrText(e),true); }
   finally{ REVIEW_CTX.autoBusy=false; }
 }

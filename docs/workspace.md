@@ -79,7 +79,10 @@ is not part of `dataset.json` and does not change `DATASET_SCHEMA`:
   is stored (only provider/link/model/scope/expiry and optional `api_key_env`
   name); revocation appends a row;
 - `auto_confirmations.jsonl` — peekseed audit mirror of peelfeed's authoritative
-  `extract/review/auto_confirmations.jsonl`.
+  `extract/review/auto_confirmations.jsonl`;
+- `spotchecks.jsonl` — pre-confirm runtime blind spot-check records (seed,
+  sampled entry ids, blind verdicts, timestamps; no model conclusions before
+  the judgement).
 
 The peelfeed plan/summary files remain authoritative for the auto list; peekseed
 reads them read-only and never confirms, builds or publishes on its own.

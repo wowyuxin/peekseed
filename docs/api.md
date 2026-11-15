@@ -62,6 +62,7 @@ are not listed.
 | GET | `/api/datasets/{id}/sources/{sha}/review/auto` | Auto-review list derived from peelfeed plan/summary: counts/groups/items/job status (read-only) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/auto/confirm` | Confirm auto drafts all-or-nothing: `{base_plan_version, entry_ids, auto_confirmation_id?}`; operations get a separate batch + build job |
 | POST | `/api/datasets/{id}/sources/{sha}/review/auto/{ac}/revert` | Revert one auto-confirmed R0 group: `{base_plan_version}` |
+| POST | `/api/datasets/{id}/sources/{sha}/review/auto/spotcheck` | Record a pre-confirm blind spot-check: `{base_plan_version, seed, entry_ids, judgements:[{entry_id,verdict:"correct"|"incorrect"}]}`; returns the model conclusions **after** the judgement is persisted |
 | POST | `/api/datasets/{id}/sources/{sha}/review/jobs/{job_id}/resume` | Resume a paused/failed adjudicate job (same id; authorization/provider/plan/evidence rechecked) |
 | POST | `/api/datasets/{id}/sources/{sha}/review/jobs/{job_id}/cancel` | Request cancellation at the next adjudicate stage boundary |
 | POST | `/api/datasets/{id}/sources/{sha}/events` | Append an `embed`/`feedback` event to the peel |
