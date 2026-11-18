@@ -3550,3 +3550,272 @@ class ReviewUiCp5AutoBehaviorTests(unittest.TestCase):
         self.assertEqual(confirm["body"]["entry_ids"], ["e-1", "e-2"])
         resume = next(call for call in posts if "/jobs/j-1/resume" in call["url"])
         self.assertEqual(resume["url"].split("/jobs/")[-1], "j-1/resume")
+
+
+# CP5 F5 (O-1): the manual re-run entry. Static served-HTML markers + a Node
+# stub-DOM behaviour harness (button present, POST payload correct, disabled
+# without authorization, done-job re-run creates a NEW job per manual
+# semantics). No browser, no network: fetch is stubbed.
+class ReviewUiCp5ManualAdjudicateTests(unittest.TestCase):
+    def test_auto_panel_ships_the_manual_adjudicate_entry(self):
+        text = _ui()
+        for marker in (
+                'id="autoAdjudicate"', "reviewAutoAdjudicate",
+                "运行自动审阅 / Run auto-review",
+                "/review/adjudicate",
+                "需有效授权才能手动运行", "创建授权",
+                "if(type==='adjudicate')"):
+            self.assertIn(marker, text)
+        # The handler POSTs the frozen manual route with a JSON body and
+        # never sends an explicit dedupe key (manual = new intent, N-8).
+        at = text.index("async function reviewAutoAdjudicate")
+        body = text[at:text.index("async function reviewLoadCalibration")]
+        self.assertIn("method:'POST'", body)
+        self.assertIn("+'/adjudicate'", body)
+        self.assertIn("body:JSON.stringify({})", body)
+        self.assertNotIn("dedupe_key", body)
+        self.assertIn("active_authorization", body)
+        # The button is wired in paintReviewAuto and disabled without auth.
+        paint_at = text.index("function paintReviewAuto")
+        paint = text[paint_at:text.index("async function reviewAutoSave")]
+        self.assertIn("adjudicate.onclick=reviewAutoAdjudicate", paint)
+        self.assertIn("canAdjudicate?'':' disabled", paint)
+
+    def test_served_page_contains_the_manual_adjudicate_entry(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+            client = TestClient(app_module.create_app())
+            response = client.get("/")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('id="autoAdjudicate"', response.text)
+            self.assertIn("reviewAutoAdjudicate", response.text)
+            self.assertIn("运行自动审阅 / Run auto-review", response.text)
+
+
+NODE_CP5_MANUAL_HARNESS = r"""
+/* CP5 F5 manual re-run behaviour with a stub DOM + canned fetch. */
+const fs = require("fs");
+const vm = require("vm");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const start = html.indexOf("/* ---- review report dialog", 150000);
+const end = html.indexOf("/* ---- workspace dialog", start);
+if (start < 0 || end < 0) throw new Error("review block markers not found");
+const block = html.slice(start, end);
+
+const elements = new Map();
+function element(key) {
+  if (elements.has(key)) return elements.get(key);
+  const value = {
+    id: key, innerHTML: "", textContent: "", hidden: true, disabled: false,
+    value: "", checked: false, onclick: null,
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    addEventListener() {}, appendChild() {}, focus() {}, blur() {},
+    closest() { return null; }, remove() {},
+    querySelector() { return element(key + ":child"); },
+    querySelectorAll() { return []; }, getAttribute() { return null; },
+    setAttribute() {}, style: {}, dataset: {}, scrollIntoView() {},
+    isConnected: true,
+  };
+  elements.set(key, value);
+  return value;
+}
+const document = {
+  querySelector(selector) { return element(selector); },
+  querySelectorAll() { return []; },
+  addEventListener() {}, getElementById(id) { return element("#" + id); },
+  createElement() { return element("created"); },
+  createTextNode() { return {}; },
+  body: { style: {}, classList: { toggle() {} }, appendChild() {} },
+  documentElement: { style: {}, classList: { toggle() {} } },
+  head: { appendChild() {} },
+};
+
+const calls = [];
+const settings = {
+  settings: {
+    schema_version: 1, auto_review: { enabled: true },
+    thresholds: { apply: { enabled: true, value: 90 },
+                  keep: { enabled: true, value: 90 } },
+    minimum_validated_cutoff: 50,
+    blind_spotcheck: { enabled: false, count: 3 },
+  },
+  provider: { decision: { available: true, link_id: "d", model: "m" },
+              vlm: { available: true, link_id: "v", model: "vm" } },
+  authorizations: [], active_authorization: "auth-1",
+  auto_trigger: { enabled: true, ready: true, blockers: [] },
+};
+/* The auto job for this conversion is DONE (the N-8 idempotent exit). */
+let auto = {
+  schema_version: 1, peel_id: "peel", plan_version: 3,
+  counts: { apply: 0, keep: 0, escalate: 0, by_code: {}, by_source: {} },
+  groups: [], items: [],
+  job: { job_id: "j-1", status: "done",
+         progress: { stage: "done", done: 1, total: 1,
+                     calls: { decision: 1, vlm: 1 } },
+         result_ref: "adjudicate/j-1/summary.json", partial_ref: null },
+  summary: { counts: { manual_pending: 0 },
+             attempts: { decision: 1, vlm: 1 }, calls: { decision: 1, vlm: 1 } },
+};
+function response(url) {
+  if (url.indexOf("/review/settings") >= 0) return settings;
+  if (url.indexOf("/review/adjudicate") >= 0) {
+    return { job_id: "j-2", type: "adjudicate", status: "queued" };
+  }
+  if (url.indexOf("/review/auto") >= 0) return auto;
+  if (url.indexOf("/jobs/") >= 0) return { job_id: "j-1", status: "done" };
+  return {};
+}
+async function fetchStub(url, opts) {
+  calls.push({ url: String(url), method: (opts && opts.method) || "GET",
+               body: (opts && opts.body) || null });
+  return { ok: true, status: 200, json: async function () {
+    return response(String(url)); } };
+}
+const sandbox = {
+  console, JSON, Math, Number, String, Object, Array, Date, RegExp, Error,
+  setTimeout: function (fn) { return 0; }, clearTimeout: function () {},
+  setInterval: function () { return 0; }, clearInterval: function () {},
+  fetch: fetchStub, document,
+  window: { location: { search: "", hash: "" }, addEventListener() {},
+            localStorage: { getItem() { return null; }, setItem() {} } },
+  location: { search: "", hash: "" },
+  localStorage: { getItem() { return null; }, setItem() {} },
+  navigator: { clipboard: {} }, URLSearchParams,
+  REVIEW_CTX: { dataset: "docs", sha: "a".repeat(64) },
+};
+sandbox.$ = function (selector) { return element(selector); };
+sandbox.esc = function (value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+             "'": "&#39;" }[ch];
+  });
+};
+sandbox.reviewNum = function (value) { return Number(value || 0).toLocaleString(); };
+sandbox.reviewStr = function (value, fallback) {
+  if (value == null || value === "") return fallback || "";
+  return String(value);
+};
+vm.createContext(sandbox);
+vm.runInContext(block + "\n;globalThis.__manual = {" +
+  "reviewLoadAuto, paintReviewAuto, reviewAutoAdjudicate, reviewRetryJob," +
+  "getContext: function () { return REVIEW_CTX; }}" +
+  "\n;reviewLoadJobs = async function () {};" +
+  "reviewLoadBatches = async function () {};", sandbox);
+
+async function tick() { await new Promise(function (r) { setTimeout(r, 5); }); }
+function adjudicatePosts() {
+  return calls.filter(function (call) {
+    return call.method === "POST" && call.url.indexOf("/review/adjudicate") >= 0;
+  });
+}
+async function main() {
+  const ctx = sandbox.__manual.getContext();
+  ctx.dataset = "docs"; ctx.sha = "a".repeat(64);
+  /* 1) DONE auto job + active authorization: the manual entry is present
+        and enabled; clicking it POSTs the manual route (new intent). */
+  await sandbox.__manual.reviewLoadAuto();
+  await tick();
+  const htmlDone = document.querySelector("#reviewAuto").innerHTML;
+  const button = document.querySelector("#autoAdjudicate");
+  if (typeof button.onclick !== "function") throw new Error("button not wired");
+  button.onclick();
+  await tick();
+  /* The handler reloads the auto payload: the NEW job j-2 is now shown. */
+  auto = Object.assign({}, auto, {
+    job: { job_id: "j-2", status: "running",
+           progress: { stage: "decision", done: 0, total: 2 },
+           result_ref: null, partial_ref: null },
+    summary: null,
+  });
+  await sandbox.__manual.reviewLoadAuto();
+  await tick();
+  const htmlNewJob = document.querySelector("#reviewAuto").innerHTML;
+  const postsAfterClick = adjudicatePosts().length;
+  /* 2) No active authorization: disabled + hint, and no request is sent. */
+  settings.active_authorization = null;
+  await sandbox.__manual.reviewLoadAuto();
+  await tick();
+  const htmlNoAuth = document.querySelector("#reviewAuto").innerHTML;
+  await sandbox.__manual.reviewAutoAdjudicate();
+  await tick();
+  const postsAfterNoAuth = adjudicatePosts().length;
+  const msgNoAuth = document.querySelector("#reviewMsg").innerHTML;
+  /* 3) The jobs-panel retry handler routes adjudicate to the same action. */
+  settings.active_authorization = "auth-1";
+  const retryBtn = { getAttribute: function (name) {
+    return name === "data-type" ? "adjudicate" : null; } };
+  await sandbox.__manual.reviewRetryJob(retryBtn);
+  await tick();
+  const postsAfterRetry = adjudicatePosts().length;
+  console.log(JSON.stringify({
+    htmlDone: htmlDone, htmlNewJob: htmlNewJob, htmlNoAuth: htmlNoAuth,
+    msgNoAuth: msgNoAuth,
+    postsAfterClick: postsAfterClick,
+    postsAfterNoAuth: postsAfterNoAuth,
+    postsAfterRetry: postsAfterRetry,
+    calls: calls.map(function (call) {
+      return { url: call.url, method: call.method,
+               body: call.body ? JSON.parse(call.body) : null };
+    }),
+  }));
+}
+main().catch(function (error) {
+  console.error((error && error.stack) || error);
+  process.exit(1);
+});
+"""
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed for the CP5 manual DOM behaviour harness")
+class ReviewUiCp5ManualBehaviorTests(unittest.TestCase):
+    def _run(self):
+        base = Path(tempfile.mkdtemp(prefix="peekseed-cp5-manual-"))
+        try:
+            harness = base / "manual.js"
+            harness.write_text(NODE_CP5_MANUAL_HARNESS, encoding="utf-8")
+            completed = subprocess.run(
+                [shutil.which("node"), str(harness), str(UI_PATH)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stderr or completed.stdout)
+            return json.loads(completed.stdout)
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
+
+    def test_manual_entry_posts_new_job_and_is_gated_by_authorization(self):
+        result = self._run()
+        # 1) Done-job state: the manual entry is present and ENABLED.
+        self.assertIn('id="autoAdjudicate"', result["htmlDone"])
+        self.assertIn("运行自动审阅 / Run auto-review", result["htmlDone"])
+        self.assertNotIn("需有效授权才能手动运行", result["htmlDone"])
+        self.assertNotIn("disabled title", result["htmlDone"])
+        # A done job offers no resume button (resume is paused/failed only).
+        self.assertNotIn('id="autoJobResume"', result["htmlDone"])
+        # The click POSTs the frozen manual route with the empty JSON body
+        # (exactly one POST at click time; the retry below adds a second).
+        self.assertEqual(result["postsAfterClick"], 1)
+        posts = [call for call in result["calls"]
+                 if call["method"] == "POST"
+                 and call["url"].endswith("/review/adjudicate")]
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(
+            posts[0]["url"],
+            "/api/datasets/docs/sources/" + "a" * 64 + "/review/adjudicate")
+        self.assertEqual(posts[0]["body"], {})
+        # No resume/cancel request is sent for a done job.
+        self.assertFalse([call for call in result["calls"]
+                          if call["method"] == "POST"
+                          and "/resume" in call["url"]])
+        # The resulting NEW job state is shown (manual = new intent, N-8).
+        self.assertIn("j-2", result["htmlNewJob"])
+        self.assertIn("running", result["htmlNewJob"])
+        # 2) Without authorization: disabled + clear hint, nothing sent.
+        self.assertIn("disabled title", result["htmlNoAuth"])
+        self.assertIn("需有效授权才能手动运行", result["htmlNoAuth"])
+        self.assertIn("创建授权", result["htmlNoAuth"])
+        self.assertEqual(result["postsAfterNoAuth"], 1)
+        self.assertIn("授权", result["msgNoAuth"])
+        # 3) reviewRetryJob(adjudicate) routes to the same manual action.
+        self.assertEqual(result["postsAfterRetry"], 2)

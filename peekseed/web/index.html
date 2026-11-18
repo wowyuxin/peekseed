@@ -8748,6 +8748,12 @@ async function reviewRetryJob(btn){
     await reviewStartOcrRefresh(ids,{auto:false});
     return;
   }
+  if(type==='adjudicate'){
+    /* CP5 F5: the jobs-panel retry routes to the SAME explicit manual
+       re-run as the auto-panel button (new intent -> new job). */
+    await reviewAutoAdjudicate();
+    return;
+  }
   reviewMsg('该任务类型暂不支持手动重试。',true);
 }
 function reviewRunAction(fn){
@@ -8878,6 +8884,19 @@ function paintReviewAuto(){
     +(auto?(' · 计划版本 '+reviewNum(auto.plan_version)+' · apply '+reviewNum(counts.apply)
             +' / keep '+reviewNum(counts.keep)+' / 待人工 '+reviewNum(counts.escalate)):'')
     +'</div>';
+  /* CP5 F5 (O-1): the explicit manual re-run entry. The auto re-trigger is
+     idempotent per conversion (N-8), so after a settings change on the SAME
+     conversion the documented escape hatch is a manual adjudicate — a new
+     intent that creates a NEW job even when the auto job is done. It requires
+     an active authorization (never bypassed); without one the button is
+     disabled with a hint to create one. */
+  const canAdjudicate=!!active;
+  html+='<div class="rr-auto-actions">'
+    +'<button type="button" class="secondary" id="autoAdjudicate"'
+    +(canAdjudicate?'':' disabled title="需要有效授权：请先点“创建授权”"')
+    +'>运行自动审阅 / Run auto-review</button>'
+    +(canAdjudicate?'':' <span class="hist-empty">需有效授权才能手动运行；请先点“创建授权”。</span>')
+    +'</div>';
   if(auto&&auto.job&&(auto.job.status==='paused'||auto.job.status==='failed'||auto.job.status==='interrupted')){
     html+='<div class="rr-auto-actions">'
       +'<button type="button" class="secondary" id="autoJobResume">续跑</button> '
@@ -8913,6 +8932,7 @@ function paintReviewAuto(){
   const revert=$('#autoRevert'); if(revert) revert.onclick=reviewAutoRevert;
   const resume=$('#autoJobResume'); if(resume) resume.onclick=reviewAutoJobResume;
   const cancel=$('#autoJobCancel'); if(cancel) cancel.onclick=reviewAutoJobCancel;
+  const adjudicate=$('#autoAdjudicate'); if(adjudicate) adjudicate.onclick=reviewAutoAdjudicate;
 }
 async function reviewAutoSave(){
   if(REVIEW_CTX.autoBusy) return;
@@ -9113,6 +9133,28 @@ async function reviewAutoJobCancel(){
       +encodeURIComponent(job.job_id)+'/cancel',{method:'POST'});
     reviewMsg('已请求取消任务 '+job.job_id+'。');
     await reviewLoadAuto();
+  }catch(e){ reviewMsg(reviewErrText(e),true); }
+  finally{ REVIEW_CTX.autoBusy=false; }
+}
+/* CP5 F5 (O-1): manual re-run — POST /api/datasets/{id}/sources/{sha}/review/adjudicate.
+   A manual request is a NEW intent (the engine computes the dedupe key, no
+   explicit auto key), so it creates a NEW job even when this conversion's
+   auto job is done — the documented exit after settings changes (N-8/O-1).
+   Authorization is enforced server-side too; the UI never bypasses it. */
+async function reviewAutoAdjudicate(){
+  if(REVIEW_CTX.autoBusy) return;
+  const active=((REVIEW_CTX.autoSettings||{}).active_authorization)||null;
+  if(!active){ reviewMsg('手动运行需要有效授权；请先点“创建授权”。',true); return; }
+  REVIEW_CTX.autoBusy=true;
+  try{
+    const result=await reviewFetchJSON(
+      reviewBase(REVIEW_CTX.dataset,REVIEW_CTX.sha)+'/adjudicate',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({})});
+    reviewMsg('已创建手动审阅任务 '+reviewStr(result.job_id)
+      +' · '+reviewStr(result.status)+'。');
+    await reviewLoadAuto();
+    await reviewLoadJobs();
   }catch(e){ reviewMsg(reviewErrText(e),true); }
   finally{ REVIEW_CTX.autoBusy=false; }
 }
