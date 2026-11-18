@@ -27,6 +27,15 @@ def _peel_with_review():
         (peel_dir / "extract" / "corpus" / "manifest.json").read_text())
     build = json.loads(
         (peel_dir / "extract" / "corpus" / "build_summary.json").read_text())
+    # CP5 F3: the fixture peel is UNPUBLISHED — corpus/manifest.json carries
+    # no build_id/engine_fingerprint (those live in build_summary.json until a
+    # publish binds them into the manifest), exactly like a real peelfeed peel
+    # before its first publish. The facts file lives under corpus/ like
+    # peelfeed's store.review_facts_path.
+    _write_json(peel_dir / "extract" / "corpus" / "review_facts.json", {
+        "schema_version": 1,
+        "uncorrected_identity": manifest.get("uncorrected_identity"),
+    })
     _write_json(peel_dir / "extract" / "review" / "items.json", {
         "schema_version": 2,
         "derived_from": {
@@ -42,27 +51,57 @@ def _peel_with_review():
     return dataset, peel, peel_dir, manifest, build
 
 
+def _publish(peel_dir, manifest, build):
+    """Simulate a peelfeed publish: bind the current build identity into
+    corpus/manifest.json (the ONLY identity source peelfeed export reads)."""
+    published = dict(manifest)
+    published["build_id"] = build.get("build_id")
+    published["engine_fingerprint"] = (build.get("engine") or {}).get(
+        "fingerprint")
+    _write_json(peel_dir / "extract" / "corpus" / "manifest.json", published)
+    return published
+
+
+def _uncorrected_identity(manifest):
+    """The peelfeed export shape (items.uncorrected_identity): the facts +
+    manifest snapshot dict, not the bare identity string."""
+    return {
+        "uncorrected_identity": str(manifest.get("uncorrected_identity")
+                                    or ""),
+        "converter_code_hash": "",
+        "profile": str(manifest.get("profile") or ""),
+        "manifest": manifest,
+    }
+
+
 def _bundle(peel, manifest, build, *, path, tamper=None, plan_version=2,
-            extra_member=None):
+            extra_member=None, drop=()):
+    # CP5 F3: a peelfeed export manifest reads build_id/engine_fingerprint
+    # from corpus/manifest.json (None when unpublished) — NEVER from
+    # build_summary.json. ``build`` is kept in the signature so tests can
+    # tamper with the candidate-build values explicitly.
     payload = {
         "schema_version": 1,
         "peel_id": peel["peel_id"],
         "source_sha256": manifest.get("source_sha256"),
-        "uncorrected_identity": manifest.get("uncorrected_identity"),
-        "build_id": build.get("build_id"),
+        "uncorrected_identity": _uncorrected_identity(manifest),
+        "build_id": manifest.get("build_id"),
         "conversion_id": manifest.get("conversion_id"),
-        "engine_fingerprint": build["engine"]["fingerprint"],
+        "engine_fingerprint": manifest.get("engine_fingerprint"),
         "effective_corrections_hash": manifest.get(
             "effective_corrections_hash"),
         "correction_engine_version": manifest.get(
             "correction_engine_version"),
-        "chunk_sets": [],
+        "chunk_sets": manifest.get("chunk_sets") or [],
         "plan_version": plan_version,
         "evidence_hashes": {"it-1": "h-1"},
-        "schema_versions": {"items": 2},
+        "schema_versions": {"items": 2, "review_facts": 1,
+                            "batch": 1, "job": 1},
     }
     if tamper:
         payload.update(tamper)
+    for key in drop:
+        payload.pop(key, None)
     path.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(path, "w:gz") as tar:
         data = json.dumps(payload).encode("utf-8")
@@ -193,6 +232,155 @@ class ReviewBundleImportTests(unittest.TestCase):
             current = json.loads((peel_dir / "extract" / "review" /
                                   "plan.json").read_text())
             self.assertEqual(current["plan_version"], 2)
+
+
+class ReviewBundleIdentityParityTests(unittest.TestCase):
+    """CP5 F3: peekseed review-import accepts/rejects EXACTLY the bundles
+    peelfeed ``metadata import`` accepts/rejects (same fields, same sources,
+    same unpublished/published handling).
+
+    peelfeed's export/current identity reads ``corpus/manifest.json`` only
+    (``metadata_bundle._manifest`` / ``_current_identity``): a never-published
+    peel has ``build_id=None``/``engine_fingerprint=None`` on BOTH sides, so
+    its bundles import cleanly; a published peel binds the current build into
+    the manifest. ``build_summary.json`` (the latest candidate build, published
+    or not) is never an identity source. Real CLI-vs-app parity on real peels
+    is re-verified by the CP5 retest harness; these tests pin the semantics.
+    """
+
+    def _import(self, paths, peel, manifest, build, **kwargs):
+        from peekseed import review_bundle
+        bundle = _bundle(peel, manifest, build,
+                         path=paths.root / "review-bundles" /
+                         peel["peel_id"] / "b1.tar.gz", **kwargs)
+        return review_bundle.import_one(paths, bundle)
+
+    def test_unpublished_peelfeed_style_bundle_is_accepted(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, peel_dir, manifest, build = _peel_with_review()
+            # The candidate build exists (build_summary.json) but the peel was
+            # never published: the peelfeed export manifest carries None.
+            self.assertTrue((peel_dir / "extract" / "corpus" /
+                             "build_summary.json").is_file())
+            self.assertIsNone(manifest.get("build_id"))
+            result = self._import(paths, peel, manifest, build)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertGreaterEqual(result["files"], 1)
+
+    def test_unpublished_candidate_build_identity_is_rejected(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, _peel_dir, manifest, build = _peel_with_review()
+            # A bundle claiming the CANDIDATE build identity (build_summary)
+            # is stale for peelfeed (current manifest binding is None) and
+            # must be stale for peekseed too — the pre-F3 divergence.
+            result = self._import(paths, peel, manifest, build, tamper={
+                "build_id": build.get("build_id"),
+                "engine_fingerprint": build["engine"]["fingerprint"],
+            })
+            self.assertEqual(result["status"], "stale", result)
+            self.assertIn("build_id", result["mismatches"])
+            self.assertIn("engine_fingerprint", result["mismatches"])
+            self.assertIsNone(result["mismatches"]["build_id"]["current"])
+
+    def test_unpublished_tamper_matrix_matches_peelfeed(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, _peel_dir, manifest, build = _peel_with_review()
+            identity = _uncorrected_identity(manifest)
+            forged_identity = dict(identity)
+            forged_identity["uncorrected_identity"] = "forged"
+            cases = [
+                ({"peel_id": "other-peel"}, "peel_id"),
+                ({"source_sha256": "f" * 64}, "source_sha256"),
+                ({"conversion_id": "forged"}, "conversion_id"),
+                ({"effective_corrections_hash": "forged"},
+                 "effective_corrections_hash"),
+                ({"correction_engine_version": "forged"},
+                 "correction_engine_version"),
+                ({"chunk_sets": ["forged"]}, "chunk_sets"),
+                ({"evidence_hashes": {"it-1": "forged"}}, "evidence_hashes"),
+                ({"uncorrected_identity": forged_identity},
+                 "uncorrected_identity"),
+                ({"schema_versions": {"items": 99}}, "schema:items"),
+            ]
+            for tamper, key in cases:
+                result = self._import(paths, peel, manifest, build,
+                                      tamper=tamper)
+                self.assertEqual(result["status"], "stale",
+                                 (tamper, result))
+                self.assertIn(key, result["mismatches"], (tamper, result))
+
+    def test_missing_required_fields_are_invalid(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, _peel_dir, manifest, build = _peel_with_review()
+            for field in ("peel_id", "schema_versions", "build_id",
+                          "engine_fingerprint", "evidence_hashes"):
+                result = self._import(paths, peel, manifest, build,
+                                      drop=(field,))
+                self.assertEqual(result["status"], "invalid",
+                                 (field, result))
+                self.assertIn(field, result["reason"])
+
+    def test_published_bundle_aligned_to_manifest_is_accepted(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, peel_dir, manifest, build = _peel_with_review()
+            published = _publish(peel_dir, manifest, build)
+            result = self._import(paths, peel, published, build)
+            self.assertEqual(result["status"], "imported", result)
+
+    def test_published_rejects_unpublished_style_bundle(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, peel_dir, manifest, build = _peel_with_review()
+            _publish(peel_dir, manifest, build)
+            # The bundle was exported BEFORE the publish (build_id None):
+            # peelfeed rejects it as stale now; peekseed must too.
+            result = self._import(paths, peel, manifest, build)
+            self.assertEqual(result["status"], "stale", result)
+            self.assertIn("build_id", result["mismatches"])
+            self.assertIn("engine_fingerprint", result["mismatches"])
+            self.assertIn("uncorrected_identity", result["mismatches"])
+
+    def test_published_rejects_bundle_from_a_previous_build(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, peel_dir, manifest, build = _peel_with_review()
+            first = _publish(peel_dir, manifest, build)
+            # A second publish rebinds the manifest to a new build.
+            newer_build = dict(build)
+            newer_build["build_id"] = "b-newer-build"
+            newer_build["engine"] = dict(build["engine"])
+            newer_build["engine"]["fingerprint"] = "fp-newer"
+            _publish(peel_dir, manifest, newer_build)
+            result = self._import(paths, peel, first, build)
+            self.assertEqual(result["status"], "stale", result)
+            self.assertIn("build_id", result["mismatches"])
+            self.assertIn("engine_fingerprint", result["mismatches"])
+
+    def test_stale_rejection_writes_nothing_into_the_peel(self):
+        with temp_data_root():
+            from peekseed import config
+            paths = config.paths()
+            _dataset, peel, peel_dir, manifest, build = _peel_with_review()
+            plan_path = peel_dir / "extract" / "review" / "plan.json"
+            before = plan_path.read_bytes()
+            result = self._import(paths, peel, manifest, build,
+                                  tamper={"build_id": "forged"})
+            self.assertEqual(result["status"], "stale", result)
+            self.assertEqual(plan_path.read_bytes(), before)
+            self.assertFalse((peel_dir / "extract" / "review" /
+                              "conversations").exists())
 
 
 if __name__ == "__main__":

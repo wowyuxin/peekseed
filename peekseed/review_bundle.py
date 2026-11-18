@@ -3,16 +3,31 @@
 Peelfeed exports ``$PEEKSEED_HOME/review-bundles/<peel_id>/<ts>.tar.gz``. This
 module imports them on the peekseed side:
 
-* validate the bundle manifest against the current peel
-  (source sha256/uncorrected identity/build/conversion/engine fingerprint/
-  correction engine/chunk sets/evidence hashes) — mismatch is ``stale``;
+* validate the bundle manifest against the current peel with EXACTLY peelfeed
+  ``metadata import`` semantics (CP5 F3: a faithful port of
+  ``peelfeed/review/metadata_bundle.py`` ``_current_identity`` /
+  ``_validate_manifest`` — same fields, same sources, same
+  unpublished/published handling). Identity/fingerprint bindings come from
+  ``corpus/manifest.json`` ONLY (``None`` for a never-published peel), never
+  from ``build_summary.json``; the source sha256 is the source-file hash; the
+  uncorrected identity is the facts+manifest snapshot peelfeed computes.
+  Mismatch is ``stale``;
 * peel exists: atomically merge ``review/`` (and ``ocr/`` + ``review_facts``),
   byte-identical files skipped (idempotent), an older bundle never regresses a
-  newer plan/ledger, no provider call, no auto-confirm/publish;
+  newer plan/ledger, the append-only ledgers are ALWAYS row-level
+  append-merged (CP5 F4, the engine's N-3), no provider call, no
+  auto-confirm/publish;
 * peel missing: never create a fake peel; stage the bundle under
   ``$PEEKSEED_HOME/review-restore/<peel_id>/`` and warn;
 * path-check tar members (absolute/``..``/links/devices rejected);
 * record every attempt in ``review-bundles/imports.jsonl``.
+
+The verification is ported rather than delegated to the peelfeed CLI so
+``python -m peekseed review-import`` stays a standalone command (no configured
+peelfeed CLI required, structured ``mismatches`` preserved, missing-peel
+staging stays peekseed-side). The frozen schema versions below mirror
+``peelfeed/review/store.py``; the real CLI-vs-app parity is re-verified by the
+CP5 retest harness on real peels.
 """
 from __future__ import annotations
 
@@ -50,12 +65,6 @@ def _read_json(path, default=None):
     return payload
 
 
-def _identity(value):
-    if isinstance(value, dict):
-        return value.get("uncorrected_identity")
-    return value
-
-
 def _source_sha(peel_dir):
     source = Path(peel_dir) / "source"
     if not source.is_dir():
@@ -66,34 +75,70 @@ def _source_sha(peel_dir):
     return _sha_file(files[0])
 
 
+def _converter_code_hash(manifest):
+    """Port of peelfeed ``items._converter_code_hash`` (diagnostic only)."""
+    hashes = manifest.get("converter_hashes") or {}
+    if not hashes:
+        return ""
+    return hashlib.sha256(
+        json.dumps(hashes, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+
+def _uncorrected_identity(peel_dir, manifest):
+    """Port of peelfeed ``items.uncorrected_identity`` (facts + manifest).
+
+    peelfeed computes this live from ``review_facts.json`` (``facts.ensure``)
+    and ``corpus/manifest.json``; peekseed reads the same two files read-only
+    (a normal peelfeed export guarantees the facts file exists — it is a
+    required export artifact). The full snapshot dict is compared, exactly
+    like peelfeed's ``_validate_manifest``.
+    """
+    facts = _read_json(Path(peel_dir) / "extract" / "corpus" /
+                       "review_facts.json", default={}) or {}
+    return {
+        "uncorrected_identity": str(facts.get("uncorrected_identity") or ""),
+        "converter_code_hash": _converter_code_hash(manifest),
+        "profile": str(manifest.get("profile") or ""),
+        "manifest": manifest,
+    }
+
+
+#: The frozen review schema versions peelfeed validates bundles against
+#: (``peelfeed/review/store.py``: ITEM_SCHEMA/REVIEW_FACTS_SCHEMA/BATCH_SCHEMA/
+#: JOB_SCHEMA). CP5 F3: same check as peelfeed ``_validate_manifest``.
+_CURRENT_SCHEMAS = {"items": 2, "review_facts": 1, "batch": 1, "job": 1}
+
+
 def _current_identity(peel_dir):
+    """CP5 F3: EXACTLY peelfeed ``metadata_bundle._current_identity`` sources.
+
+    ``build_id``/``conversion_id``/``engine_fingerprint``/correction bindings/
+    ``chunk_sets`` come from ``corpus/manifest.json`` only — ``None``/``[]``
+    for a never-published peel, exactly like the peelfeed export manifest.
+    ``build_summary.json`` is NOT an identity source (it describes the latest
+    candidate build, published or not; reading it made peekseed reject bundles
+    peelfeed accepts). ``plan_version`` is peekseed-side merge metadata (the
+    engine reads it separately in ``restore``); it is never compared here.
+    """
     peel_dir = Path(peel_dir)
     corpus = peel_dir / "extract" / "corpus"
     manifest = _read_json(corpus / "manifest.json", default={}) or {}
-    build = _read_json(corpus / "build_summary.json", default={}) or {}
     items = _read_json(peel_dir / "extract" / "review" / "items.json",
                        default={}) or {}
     plan = _read_json(peel_dir / "extract" / "review" / "plan.json",
                       default={}) or {}
-    engine = build.get("engine") if isinstance(build.get("engine"),
-                                               dict) else {}
-    derived = items.get("derived_from") if isinstance(
-        items.get("derived_from"), dict) else {}
     return {
         "peel_id": peel_dir.name,
-        "source_sha256": manifest.get("source_sha256") or _source_sha(peel_dir),
-        "uncorrected_identity": _identity(
-            derived.get("uncorrected_identity")
-            or manifest.get("uncorrected_identity")),
-        "build_id": build.get("build_id"),
+        "source_sha256": _source_sha(peel_dir),
+        "uncorrected_identity": _uncorrected_identity(peel_dir, manifest),
+        "build_id": manifest.get("build_id"),
         "conversion_id": manifest.get("conversion_id"),
-        "engine_fingerprint": engine.get("fingerprint"),
+        "engine_fingerprint": manifest.get("engine_fingerprint"),
         "effective_corrections_hash": manifest.get(
             "effective_corrections_hash"),
         "correction_engine_version": manifest.get(
             "correction_engine_version"),
-        "chunk_sets": manifest.get("chunk_sets")
-        or build.get("chunk_sets") or [],
+        "chunk_sets": manifest.get("chunk_sets") or [],
         "evidence_hashes": {
             str(item.get("id")): (item.get("evidence") or {}).get("hash")
             for item in items.get("items") or []
@@ -103,31 +148,28 @@ def _current_identity(peel_dir):
 
 
 def _validate_manifest(manifest, current):
-    required = ("source_sha256", "uncorrected_identity", "build_id",
+    """CP5 F3: EXACTLY peelfeed ``metadata_bundle._validate_manifest`` rules.
+
+    Same required fields (incl. ``peel_id``/``schema_versions``), same direct
+    value comparison (full uncorrected-identity snapshot, no normalization),
+    same evidence-hash subset check and same frozen schema-version check.
+    """
+    required = ("peel_id", "source_sha256", "uncorrected_identity", "build_id",
                 "conversion_id", "engine_fingerprint",
                 "effective_corrections_hash", "correction_engine_version",
-                "chunk_sets", "evidence_hashes")
+                "chunk_sets", "evidence_hashes", "schema_versions")
     missing = [key for key in required if key not in manifest]
     if missing:
         return {"status": "invalid",
                 "reason": "manifest missing: " + ", ".join(sorted(missing))}
     mismatches = {}
-    for key in required:
-        if key in ("evidence_hashes", "uncorrected_identity"):
-            continue
-        bundle_value = manifest.get(key)
-        current_value = current.get(key)
-        if key == "source_sha256":
-            bundle_value = str(bundle_value or "").lower()
-            current_value = str(current_value or "").lower()
-        if bundle_value != current_value:
-            mismatches[key] = {"bundle": bundle_value,
-                               "current": current_value}
-    bundle_identity = _identity(manifest.get("uncorrected_identity"))
-    current_identity = _identity(current.get("uncorrected_identity"))
-    if bundle_identity != current_identity:
-        mismatches["uncorrected_identity"] = {
-            "bundle": bundle_identity, "current": current_identity}
+    for key in ("peel_id", "source_sha256", "uncorrected_identity", "build_id",
+                "conversion_id", "engine_fingerprint",
+                "effective_corrections_hash", "correction_engine_version",
+                "chunk_sets"):
+        if manifest.get(key) != current.get(key):
+            mismatches[key] = {"bundle": manifest.get(key),
+                               "current": current.get(key)}
     bundle_hashes = manifest.get("evidence_hashes") or {}
     current_hashes = current.get("evidence_hashes") or {}
     changed = sorted(item_id for item_id, evidence_hash
@@ -135,6 +177,11 @@ def _validate_manifest(manifest, current):
                      if current_hashes.get(item_id) != evidence_hash)
     if changed:
         mismatches["evidence_hashes"] = changed
+    bundle_schemas = manifest.get("schema_versions") or {}
+    for key, value in _CURRENT_SCHEMAS.items():
+        if key in bundle_schemas and bundle_schemas.get(key) != value:
+            mismatches["schema:" + key] = {"bundle": bundle_schemas.get(key),
+                                           "current": value}
     if mismatches:
         return {"status": "stale", "reason": "identity mismatch",
                 "mismatches": mismatches}
