@@ -2993,18 +2993,40 @@ def main():
                 return fail("adjudicate input is missing " + key, 2,
                             "validation")
         state.setdefault("adjudicate_requests", []).append(copy_json(request))
+        # Mirror peelfeed create_job (§2.5/B2): an explicit dedupe_key that
+        # matches a done adjudicate job with a result_ref returns the existing
+        # job — no new job, no new provider run. Without an explicit key the
+        # fake always creates a new job (the real engine computes the
+        # plan-version-sensitive B2 key; the fake does not model the plan).
+        dedupe_key = str(request.get("dedupe_key") or "").strip()
+        if dedupe_key:
+            for existing in (state.get("jobs") or {}).values():
+                if existing.get("type") == "adjudicate" \
+                        and existing.get("status") == "done" \
+                        and existing.get("result_ref") \
+                        and (existing.get("payload") or {}).get(
+                            "dedupe_key") == dedupe_key:
+                    save_state(state)
+                    return emit({"job_id": existing["job_id"],
+                                 "status": "done", "type": "adjudicate",
+                                 "result_ref": existing.get("result_ref")})
         job = new_job("adjudicate",
                       result_ref="adjudicate/" + str(len(
                           state.get("jobs") or {})) + "/summary.json")
         job["status"] = "done"
         job["progress"] = {"stage": "done", "done": 1, "total": 1}
-        job["payload"] = {"snapshot": {
-            "dataset_id": request.get("dataset_id"),
-            "provider": {"decision": request.get("decision_link") or {},
-                         "vlm": request.get("vlm_link") or {}},
-            "scope_item_ids": [],
-        }}
+        job["payload"] = {"dedupe_key": dedupe_key or None,
+                          "snapshot": {
+                              "dataset_id": request.get("dataset_id"),
+                              "provider": {
+                                  "decision": request.get("decision_link")
+                                  or {},
+                                  "vlm": request.get("vlm_link") or {}},
+                              "scope_item_ids": [],
+                          }}
         state.setdefault("jobs", {})[job["job_id"]] = job
+        # One provider run per NEW job (a deduped create never runs).
+        state["adjudicate_runs"] = int(state.get("adjudicate_runs") or 0) + 1
         save_state(state)
         return emit({"job_id": job["job_id"], "status": "done",
                      "type": "adjudicate",

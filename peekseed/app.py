@@ -2592,6 +2592,20 @@ def create_app():
             request, provider_env = _adjudicate_request(
                 directory, dataset_id, scope={"all_unresolved": True},
                 mode="auto")
+            # N-8: the AUTO trigger passes a stable trigger-scoped dedupe key
+            # (dataset + peel + conversion). The computed B2 key includes
+            # plan_version, so after the job's own drafts an identical auto
+            # re-trigger would compute a NEW key and repeat provider calls;
+            # the explicit key keeps re-triggering the same extraction
+            # idempotent (wire §2.5). A new conversion (re-extract with a new
+            # conversion_id) is a new intent and gets a new key. MANUAL
+            # adjudicate requests keep the computed key — an explicit manual
+            # re-run is a new intent and must not become permanently
+            # idempotent.
+            conversion_id = str((block or {}).get("conversion_id") or "") \
+                or str(sha)
+            request["dedupe_key"] = "auto:{}:{}:{}".format(
+                dataset_id, peel_id, conversion_id)
             result = peelfeed.client().adjudicate(
                 peel_id, request, provider_env=provider_env)
         except Exception as exc:  # noqa: BLE001 - extraction already succeeded

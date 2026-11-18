@@ -8,6 +8,23 @@ version/tag policy.
 
 ## Unreleased
 
+### Fixed — M3 CP4 re-review N-8: auto-trigger dedupe key
+
+- The extraction-completion AUTO trigger now passes a stable trigger-scoped
+  `dedupe_key` (`auto:<dataset_id>:<peel_id>:<conversion_id>`) on the adjudicate
+  request. The computed B2 key includes `plan_version`, so after the job's own
+  drafts an identical auto re-trigger previously computed a NEW key and
+  repeated provider calls; the explicit key keeps re-triggering the same
+  extraction idempotent (same job id, no new provider run). A new conversion
+  is a new intent and gets a new key. MANUAL `POST …/review/adjudicate`
+  requests keep the computed key — an explicit manual re-run is a new intent
+  and is not made permanently idempotent.
+- Test seam: the fake peelfeed CLI mirrors the §2.5 done-dedupe for explicit
+  keys and counts one provider run per new adjudicate job; regression test
+  `tests/test_review_settings_cp5.py::AutoReviewTests::
+  test_auto_retrigger_after_drafts_is_idempotent` (auto re-trigger after
+  drafts → same job id, no new run; manual re-run → new job).
+
 ### Added — M3 CP5 dataset auto-review (off by default)
 
 - Dataset review settings are additive files under

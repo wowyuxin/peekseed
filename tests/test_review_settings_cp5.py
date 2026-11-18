@@ -397,6 +397,108 @@ class AutoReviewTests(unittest.TestCase):
                     else:
                         os.environ[key] = value
 
+    def test_auto_retrigger_after_drafts_is_idempotent(self):
+        """N-8: the AUTO trigger passes a stable trigger-scoped dedupe_key, so
+        re-triggering after the job wrote drafts returns the SAME job with no
+        new provider run; a MANUAL request keeps the computed key (a new
+        intent -> a new job)."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            env = {
+                "PEELFEED_DECISION_BASE": "http://127.0.0.1:9/v1",
+                "PEELFEED_DECISION_MODEL": "fake-decision",
+                "PEELFEED_DECISION_TOKEN": "test-token",
+                "PEELFEED_DECISION_LINK_ID": "env",
+                "PEELFEED_LLM_BASE": "http://127.0.0.1:9/v1",
+                "PEELFEED_LLM_MODEL": "fake-vlm",
+                "PEELFEED_LLM_TOKEN": "test-token",
+                "PEELFEED_LLM_LINK_ID": "env",
+            }
+            previous = {key: os.environ.get(key) for key in env}
+            os.environ.update(env)
+            try:
+                with _peelfeed_cli_env(cli.path):
+                    client = _client()
+                    pdf = make_pdf(root / "manual.pdf")
+                    created = client.post(
+                        "/api/datasets", data={"name": "Docs"},
+                        files=[("files", ("manual.pdf", pdf.read_bytes(),
+                                          "application/pdf"))])
+                    self.assertEqual(created.status_code, 201, created.text)
+                    dataset_id = created.json()["dataset"]["id"]
+                    client.put(
+                        "/api/datasets/%s/review/settings" % dataset_id,
+                        json=_enable_auto())
+                    client.post(
+                        "/api/datasets/%s/review/authorizations"
+                        % dataset_id, json={"scope": {"text": True}})
+                    rows = client.get(
+                        "/api/datasets/%s/sources" % dataset_id).json()
+                    sha = rows["sources"][0]["sha256"]
+                    base = "/api/datasets/%s/sources/%s" % (dataset_id, sha)
+                    extracted = client.post(base + "/extract", json={})
+                    self.assertEqual(extracted.status_code, 200,
+                                     extracted.text)
+                    _wait_call(cli, "adjudicate")
+                    state = cli.state()
+                    first = state["adjudicate_requests"][-1]
+                    self.assertEqual(first["mode"], "auto")
+                    block = next(
+                        row["extraction"] for row in client.get(
+                            "/api/datasets/%s/sources" % dataset_id
+                        ).json()["sources"] if row["sha256"] == sha)
+                    expected_key = "auto:%s:%s:%s" % (
+                        dataset_id, block["peel_id"], block["conversion_id"])
+                    self.assertEqual(first.get("dedupe_key"), expected_key)
+                    first_job = next(
+                        job for job in state["jobs"].values()
+                        if job.get("type") == "adjudicate")
+                    self.assertEqual(state.get("adjudicate_runs"), 1)
+                    # The job "wrote drafts": the plan version advances (the
+                    # computed B2 key would change; the auto key must not).
+                    cli.update(plan={"plan_version": 9, "entries": []})
+                    again = client.post(base + "/extract", json={})
+                    self.assertEqual(again.status_code, 200, again.text)
+                    deadline = time.time() + 10.0
+                    while time.time() < deadline:
+                        state = cli.state()
+                        if len(state.get("adjudicate_requests") or []) >= 2:
+                            break
+                        time.sleep(0.02)
+                    state = cli.state()
+                    self.assertGreaterEqual(
+                        len(state["adjudicate_requests"]), 2,
+                        "the auto trigger did not re-fire")
+                    second = state["adjudicate_requests"][-1]
+                    self.assertEqual(second["mode"], "auto")
+                    self.assertEqual(second.get("dedupe_key"), expected_key)
+                    adjudicate_jobs = [
+                        job for job in state["jobs"].values()
+                        if job.get("type") == "adjudicate"]
+                    self.assertEqual(len(adjudicate_jobs), 1,
+                                     "auto re-trigger created a new job")
+                    self.assertEqual(adjudicate_jobs[0]["job_id"],
+                                     first_job["job_id"])
+                    self.assertEqual(state.get("adjudicate_runs"), 1,
+                                     "auto re-trigger ran the provider again")
+                    # MANUAL keeps the computed key: an explicit manual re-run
+                    # is a new intent and must create a new job.
+                    manual = client.post(base + "/review/adjudicate", json={})
+                    self.assertEqual(manual.status_code, 202, manual.text)
+                    state = cli.state()
+                    third = state["adjudicate_requests"][-1]
+                    self.assertEqual(third["mode"], "manual")
+                    self.assertNotIn("dedupe_key", third)
+                    self.assertNotEqual(manual.json()["job_id"],
+                                        first_job["job_id"])
+                    self.assertEqual(state.get("adjudicate_runs"), 2)
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
     def test_auto_trigger_skipped_without_decision_provider(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")
