@@ -8823,11 +8823,27 @@ function reviewAutoStatusText(auto){
   const job=(auto&&auto.job)||null;
   if(!job) return '尚无自动审阅任务';
   const p=job.progress||{};
+  /* CP5 ⑤: honest attempts/cap display. attempts = cumulative HTTP attempts
+     INCLUDING retries (job-level across resumes, from summary.json when done
+     else summary.partial.json while paused/interrupted); calls = successful
+     calls only. The per-run VLM cap (payload.snapshot.limits.vlm_max_attempts)
+     and resume_count make the documented per-run restart on resume visible
+     (wire §2.7 不自动提高). Old payloads without the additive job fields fall
+     back to the done-state summary, then to progress.calls. */
+  const summary=(auto&&auto.summary)||{};
+  const attempts=job.attempts||summary.attempts||{};
+  const calls=job.calls||summary.calls||(p.calls||{});
+  const cap=job.vlm_max_attempts;
+  const capText=(cap==null)?'—':(Number(cap)<=0?'不限':reviewNum(cap));
   return '任务 '+reviewStr(job.job_id)+' · '+reviewStr(job.status)
     +' · 阶段 '+reviewStr(p.stage||'—')
     +' · '+reviewNum(p.done)+'/'+reviewNum(p.total)
-    +' · 调用 decision='+reviewNum((p.calls||{}).decision)
-    +' vlm='+reviewNum((p.calls||{}).vlm);
+    +' · 调用 decision='+reviewNum(calls.decision)
+    +' vlm='+reviewNum(calls.vlm)+'（仅成功）'
+    +' · 尝试(含重试 HTTP) decision='+reviewNum(attempts.decision)
+    +' vlm='+reviewNum(attempts.vlm)
+    +' · 每运行 VLM 上限 '+capText
+    +' · 续跑次数 '+reviewNum(job.resume_count);
 }
 function paintReviewAuto(){
   const el=$('#reviewAuto'); if(!el) return;

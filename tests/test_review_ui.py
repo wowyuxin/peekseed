@@ -3819,3 +3819,223 @@ class ReviewUiCp5ManualBehaviorTests(unittest.TestCase):
         self.assertIn("授权", result["msgNoAuth"])
         # 3) reviewRetryJob(adjudicate) routes to the same manual action.
         self.assertEqual(result["postsAfterRetry"], 2)
+
+
+# CP5 ⑤ (user-vetoable acceptance addition): the auto panel status line shows
+# cumulative attempts (含重试 HTTP) DISTINCT from successful calls, plus the
+# per-run VLM cap and resume_count — paused (partial summary) and done
+# (cumulative across resumes). Node stub-DOM, no browser/network.
+NODE_CP5_ATTEMPTS_HARNESS = r"""
+/* CP5 ⑤ attempts/cap display behaviour with a stub DOM + canned fetch. */
+const fs = require("fs");
+const vm = require("vm");
+const html = fs.readFileSync(process.argv[2], "utf8");
+const start = html.indexOf("/* ---- review report dialog", 150000);
+const end = html.indexOf("/* ---- workspace dialog", start);
+if (start < 0 || end < 0) throw new Error("review block markers not found");
+const block = html.slice(start, end);
+
+const elements = new Map();
+function element(key) {
+  if (elements.has(key)) return elements.get(key);
+  const value = {
+    id: key, innerHTML: "", textContent: "", hidden: true, disabled: false,
+    value: "", checked: false, onclick: null,
+    classList: { toggle() {}, add() {}, remove() {}, contains() { return false; } },
+    addEventListener() {}, appendChild() {}, focus() {}, blur() {},
+    closest() { return null; }, remove() {},
+    querySelector() { return element(key + ":child"); },
+    querySelectorAll() { return []; }, getAttribute() { return null; },
+    setAttribute() {}, style: {}, dataset: {}, scrollIntoView() {},
+    isConnected: true,
+  };
+  elements.set(key, value);
+  return value;
+}
+const document = {
+  querySelector(selector) { return element(selector); },
+  querySelectorAll() { return []; },
+  addEventListener() {}, getElementById(id) { return element("#" + id); },
+  createElement() { return element("created"); },
+  createTextNode() { return {}; },
+  body: { style: {}, classList: { toggle() {} }, appendChild() {} },
+  documentElement: { style: {}, classList: { toggle() {} } },
+  head: { appendChild() {} },
+};
+const calls = [];
+const settings = {
+  settings: { schema_version: 1, auto_review: { enabled: true },
+              thresholds: { apply: { enabled: true, value: 90 },
+                            keep: { enabled: true, value: 90 } },
+              minimum_validated_cutoff: 50,
+              blind_spotcheck: { enabled: false, count: 3 } },
+  provider: { decision: { available: true }, vlm: { available: true } },
+  authorizations: [], active_authorization: "auth-1",
+  auto_trigger: { enabled: true, ready: true, blockers: [] },
+};
+/* Paused job: partial-summary attempts exposed additively by the API. */
+let auto = {
+  schema_version: 1, peel_id: "peel", plan_version: 3,
+  counts: { apply: 0, keep: 0, escalate: 0, by_code: {}, by_source: {} },
+  groups: [], items: [],
+  job: { job_id: "j-1", status: "paused",
+         progress: { stage: "vlm", done: 1, total: 2,
+                     calls: { decision: 1, vlm: 0 } },
+         result_ref: null,
+         partial_ref: "adjudicate/j-1/summary.partial.json",
+         attempts: { decision: 2, vlm: 2 },
+         calls: { decision: 1, vlm: 0 },
+         vlm_max_attempts: 2, resume_count: 1 },
+  summary: null,
+};
+function response(url) {
+  if (url.indexOf("/review/settings") >= 0) return settings;
+  if (url.indexOf("/review/auto") >= 0) return auto;
+  return {};
+}
+async function fetchStub(url, opts) {
+  calls.push({ url: String(url), method: (opts && opts.method) || "GET" });
+  return { ok: true, status: 200, json: async function () {
+    return response(String(url)); } };
+}
+const sandbox = {
+  console, JSON, Math, Number, String, Object, Array, Date, RegExp, Error,
+  setTimeout: function (fn) { return 0; }, clearTimeout: function () {},
+  setInterval: function () { return 0; }, clearInterval: function () {},
+  fetch: fetchStub, document,
+  window: { location: { search: "", hash: "" }, addEventListener() {},
+            localStorage: { getItem() { return null; }, setItem() {} } },
+  location: { search: "", hash: "" },
+  localStorage: { getItem() { return null; }, setItem() {} },
+  navigator: { clipboard: {} }, URLSearchParams,
+  REVIEW_CTX: { dataset: "docs", sha: "a".repeat(64) },
+};
+sandbox.$ = function (selector) { return element(selector); };
+sandbox.esc = function (value) {
+  return String(value == null ? "" : value).replace(/[&<>"']/g, function (ch) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+             "'": "&#39;" }[ch];
+  });
+};
+sandbox.reviewNum = function (value) { return Number(value || 0).toLocaleString(); };
+sandbox.reviewStr = function (value, fallback) {
+  if (value == null || value === "") return fallback || "";
+  return String(value);
+};
+vm.createContext(sandbox);
+vm.runInContext(block + "\n;globalThis.__attempts = {" +
+  "reviewLoadAuto, reviewAutoStatusText," +
+  "getContext: function () { return REVIEW_CTX; }}" +
+  "\n;reviewLoadJobs = async function () {};" +
+  "reviewLoadBatches = async function () {};", sandbox);
+
+async function tick() { await new Promise(function (r) { setTimeout(r, 5); }); }
+async function main() {
+  const ctx = sandbox.__attempts.getContext();
+  ctx.dataset = "docs"; ctx.sha = "a".repeat(64);
+  /* 1) Paused: attempts (incl retries) != calls, cap + resume_count shown. */
+  await sandbox.__attempts.reviewLoadAuto();
+  await tick();
+  const pausedHtml = document.querySelector("#reviewAuto").innerHTML;
+  const pausedText = sandbox.__attempts.reviewAutoStatusText(auto);
+  /* 2) Done: cumulative attempts across resumes (3 HTTP = 1 call + 2 429s). */
+  auto = Object.assign({}, auto, {
+    job: { job_id: "j-1", status: "done",
+           progress: { stage: "done", done: 1, total: 1 },
+           result_ref: "adjudicate/j-1/summary.json", partial_ref: null,
+           attempts: { decision: 7, vlm: 3 },
+           calls: { decision: 1, vlm: 1 },
+           vlm_max_attempts: 2, resume_count: 2 },
+    summary: { attempts: { decision: 7, vlm: 3 },
+               calls: { decision: 1, vlm: 1 },
+               counts: { manual_pending: 0 } },
+  });
+  const doneText = sandbox.__attempts.reviewAutoStatusText(auto);
+  await sandbox.__attempts.reviewLoadAuto();
+  await tick();
+  const doneHtml = document.querySelector("#reviewAuto").innerHTML;
+  /* 3) Cap semantics: <=0 means unlimited; absent cap renders a dash. */
+  const unlimited = sandbox.__attempts.reviewAutoStatusText(
+    Object.assign({}, auto, { job: Object.assign({}, auto.job,
+      { vlm_max_attempts: 0 }) }));
+  const noCap = sandbox.__attempts.reviewAutoStatusText(
+    Object.assign({}, auto, { job: Object.assign({}, auto.job,
+      { vlm_max_attempts: null }) }));
+  /* 4) Old payload without the additive job fields: done-state summary
+        attempts still render (fallback), never a crash. */
+  const legacy = sandbox.__attempts.reviewAutoStatusText({
+    job: { job_id: "j-0", status: "done", progress: { stage: "done" } },
+    summary: { attempts: { decision: 4, vlm: 5 },
+               calls: { decision: 1, vlm: 1 } },
+  });
+  console.log(JSON.stringify({
+    pausedHtml: pausedHtml, pausedText: pausedText,
+    doneText: doneText, doneHtml: doneHtml,
+    unlimited: unlimited, noCap: noCap, legacy: legacy,
+  }));
+}
+main().catch(function (error) {
+  console.error((error && error.stack) || error);
+  process.exit(1);
+});
+"""
+
+
+@unittest.skipUnless(shutil.which("node"),
+                     "node is needed for the CP5 attempts DOM harness")
+class ReviewUiCp5AttemptsDisplayTests(unittest.TestCase):
+    def _run(self):
+        base = Path(tempfile.mkdtemp(prefix="peekseed-cp5-attempts-"))
+        try:
+            harness = base / "attempts.js"
+            harness.write_text(NODE_CP5_ATTEMPTS_HARNESS, encoding="utf-8")
+            completed = subprocess.run(
+                [shutil.which("node"), str(harness), str(UI_PATH)],
+                capture_output=True, text=True, timeout=120)
+            self.assertEqual(completed.returncode, 0,
+                             completed.stderr or completed.stdout)
+            return json.loads(completed.stdout)
+        finally:
+            shutil.rmtree(str(base), ignore_errors=True)
+
+    def test_status_line_shows_attempts_calls_cap_and_resumes_distinctly(self):
+        result = self._run()
+        paused = result["pausedText"]
+        # Successful calls and retry-inclusive attempts are labelled and
+        # valued DISTINCTLY (2 HTTP attempts vs 0 successful VLM calls).
+        self.assertIn("调用 decision=1 vlm=0（仅成功）", paused)
+        self.assertIn("尝试(含重试 HTTP) decision=2 vlm=2", paused)
+        self.assertIn("每运行 VLM 上限 2", paused)
+        self.assertIn("续跑次数 1", paused)
+        self.assertIn("paused", paused)
+        # The painted panel carries the same honest status line.
+        self.assertIn("尝试(含重试 HTTP) decision=2 vlm=2",
+                      result["pausedHtml"])
+        self.assertIn("每运行 VLM 上限 2", result["pausedHtml"])
+        # Done state: cumulative attempts across resumes (3 = 1 + 2 retries).
+        done = result["doneText"]
+        self.assertIn("调用 decision=1 vlm=1（仅成功）", done)
+        self.assertIn("尝试(含重试 HTTP) decision=7 vlm=3", done)
+        self.assertIn("续跑次数 2", done)
+        self.assertIn("尝试(含重试 HTTP) decision=7 vlm=3",
+                      result["doneHtml"])
+        # Cap semantics: <=0 unlimited, absent dash.
+        self.assertIn("每运行 VLM 上限 不限", result["unlimited"])
+        self.assertIn("每运行 VLM 上限 —", result["noCap"])
+        # Legacy payloads fall back to the done-state summary attempts.
+        self.assertIn("尝试(含重试 HTTP) decision=4 vlm=5", result["legacy"])
+        self.assertIn("调用 decision=1 vlm=1（仅成功）", result["legacy"])
+
+    def test_served_page_ships_the_attempts_display(self):
+        with _served_home():
+            from fastapi.testclient import TestClient
+            from peekseed import app as app_module
+            client = TestClient(app_module.create_app())
+            response = client.get("/")
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("尝试(含重试 HTTP)", response.text)
+            self.assertIn("（仅成功）", response.text)
+            self.assertIn("每运行 VLM 上限", response.text)
+            self.assertIn("续跑次数", response.text)
+            self.assertIn("job.vlm_max_attempts", response.text)
+            self.assertIn("job.resume_count", response.text)

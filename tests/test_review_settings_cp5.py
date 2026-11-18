@@ -226,6 +226,119 @@ class AutoReviewTests(unittest.TestCase):
                 self.assertEqual(payload["job"]["status"], "done")
                 self.assertEqual(len(payload["groups"]), 2)
 
+    def test_auto_exposes_partial_attempts_when_paused(self):
+        """CP5 ⑤: while paused, GET auto exposes the partial summary's
+        cumulative attempts/calls additively (summary stays null for old
+        readers), plus the per-run cap and resume_count — exactly the data
+        the resume decision needs."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, dataset_id, _sha = _extracted_review_source(client, root)
+                _peel, review_dir = self._seed_auto(dataset_id)
+                (review_dir / "adjudicate" / "adj-1" /
+                 "summary.json").unlink()
+                _write_json(review_dir / "adjudicate" / "adj-1" /
+                            "summary.partial.json", {
+                                "status": "paused",
+                                "attempts": {"decision": 2, "vlm": 2},
+                                "calls": {"decision": 1, "vlm": 0},
+                                "counts": {"manual_pending": 2},
+                            })
+                _write_json(review_dir / "jobs" / "adjudicate-adj-1.json", {
+                    "job_id": "adj-1", "type": "adjudicate",
+                    "status": "paused",
+                    "progress": {"stage": "vlm", "done": 1, "total": 2},
+                    "result_ref": None,
+                    "partial_ref": "adjudicate/adj-1/summary.partial.json",
+                    "error": {"code": "paused", "message": "paused"},
+                    "payload": {
+                        "resume_count": 1,
+                        "snapshot": {"limits": {"vlm_max_attempts": 2}},
+                    },
+                })
+                payload = client.get(base + "/review/auto").json()
+                # Additive only: the done-state summary field is unchanged.
+                self.assertIsNone(payload["summary"])
+                job = payload["job"]
+                self.assertEqual(job["status"], "paused")
+                self.assertEqual(job["attempts"], {"decision": 2, "vlm": 2})
+                self.assertEqual(job["calls"], {"decision": 1, "vlm": 0})
+                self.assertEqual(job["vlm_max_attempts"], 2)
+                self.assertEqual(job["resume_count"], 1)
+                self.assertEqual(job["partial_ref"],
+                                 "adjudicate/adj-1/summary.partial.json")
+
+    def test_auto_exposes_partial_attempts_when_interrupted(self):
+        """CP5 ⑤: crash/cancel-interrupted jobs expose the partial attempts
+        too; the conventional partial path works without partial_ref."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, dataset_id, _sha = _extracted_review_source(client, root)
+                _peel, review_dir = self._seed_auto(dataset_id)
+                (review_dir / "adjudicate" / "adj-1" /
+                 "summary.json").unlink()
+                _write_json(review_dir / "adjudicate" / "adj-1" /
+                            "summary.partial.json", {
+                                "status": "interrupted",
+                                "attempts": {"decision": 1, "vlm": 0},
+                                "calls": {"decision": 1, "vlm": 0},
+                            })
+                _write_json(review_dir / "jobs" / "adjudicate-adj-1.json", {
+                    "job_id": "adj-1", "type": "adjudicate",
+                    "status": "interrupted",
+                    "progress": {"stage": "decision", "done": 0, "total": 2},
+                    "result_ref": None, "partial_ref": None,
+                    "error": {"code": "interrupted", "message": "died"},
+                    "payload": {
+                        "resume_count": 0,
+                        "snapshot": {"limits": {"vlm_max_attempts": 2000}},
+                    },
+                })
+                job = client.get(base + "/review/auto").json()["job"]
+                self.assertEqual(job["attempts"], {"decision": 1, "vlm": 0})
+                self.assertEqual(job["calls"], {"decision": 1, "vlm": 0})
+                self.assertEqual(job["vlm_max_attempts"], 2000)
+                self.assertEqual(job["resume_count"], 0)
+
+    def test_auto_exposes_cumulative_attempts_when_done(self):
+        """CP5 ⑤: the done state exposes the cumulative job-level attempts
+        across resumes (attempts include retries; calls are successes only)."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            with _peelfeed_cli_env(cli.path):
+                client = _client()
+                base, dataset_id, _sha = _extracted_review_source(client, root)
+                _peel, review_dir = self._seed_auto(dataset_id)
+                _write_json(review_dir / "adjudicate" / "adj-1" /
+                            "summary.json", {
+                                "status": "done",
+                                "counts": {"manual_pending": 2,
+                                           "auto_drafts": 2},
+                                "attempts": {"decision": 7, "vlm": 3},
+                                "calls": {"decision": 1, "vlm": 1},
+                            })
+                _write_json(review_dir / "jobs" / "adjudicate-adj-1.json", {
+                    "job_id": "adj-1", "type": "adjudicate", "status": "done",
+                    "progress": {"stage": "done", "done": 1, "total": 1},
+                    "result_ref": "adjudicate/adj-1/summary.json",
+                    "payload": {
+                        "resume_count": 2,
+                        "snapshot": {"limits": {"vlm_max_attempts": 2}},
+                    },
+                })
+                payload = client.get(base + "/review/auto").json()
+                self.assertEqual(payload["summary"]["attempts"],
+                                 {"decision": 7, "vlm": 3})
+                job = payload["job"]
+                self.assertEqual(job["attempts"], {"decision": 7, "vlm": 3})
+                self.assertEqual(job["calls"], {"decision": 1, "vlm": 1})
+                self.assertEqual(job["resume_count"], 2)
+                self.assertEqual(job["vlm_max_attempts"], 2)
+
     def test_auto_confirm_creates_batch_and_mirror_then_revert(self):
         with temp_data_root() as root:
             cli = FakePeelfeedCli(root / "fake")

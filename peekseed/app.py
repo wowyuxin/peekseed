@@ -2478,6 +2478,22 @@ def create_app():
                 return payload
         return None
 
+    def _review_partial_summary(review_dir, job):
+        """The partial summary of a non-done adjudicate job (CP5 ⑤).
+
+        Reads the record's ``partial_ref`` (relative to the review dir) when
+        present, else the conventional ``adjudicate/<job_id>/
+        summary.partial.json`` path. Read-only; ``None`` when absent.
+        """
+        ref = str(job.get("partial_ref") or "")
+        if ref:
+            path = Path(review_dir) / ref
+        else:
+            path = (Path(review_dir) / "adjudicate" /
+                    str(job.get("job_id")) / "summary.partial.json")
+        payload = _review_json(path, default=None)
+        return payload if isinstance(payload, dict) else None
+
     def _review_auto_payload(peel_id):
         """The CP5 ``auto`` list derived from plan entries + summary (§6.1).
 
@@ -2554,6 +2570,21 @@ def create_app():
             counts["escalate"] = int(summary_counts.get("manual_pending") or 0)
         job_block = None
         if job is not None:
+            job_payload = job.get("payload") if isinstance(
+                job.get("payload"), dict) else {}
+            snapshot = job_payload.get("snapshot") if isinstance(
+                job_payload.get("snapshot"), dict) else {}
+            limits = snapshot.get("limits") if isinstance(
+                snapshot.get("limits"), dict) else {}
+            # CP5 ⑤ (additive, old readers unaffected): honest attempts/cap
+            # data for the resume UI. ``summary.json`` only exists when done;
+            # while paused/interrupted (or mid-run) the partial summary carries
+            # the cumulative attempts/calls so far — exactly when the user
+            # decides whether to resume. attempts includes every retry HTTP
+            # attempt; calls counts successful calls only (N-1 semantics).
+            counters = summary if isinstance(summary, dict) else \
+                _review_partial_summary(review_dir, job)
+            counters = counters if isinstance(counters, dict) else {}
             job_block = {
                 "job_id": job.get("job_id"),
                 "status": job.get("status"),
@@ -2561,6 +2592,10 @@ def create_app():
                 "error": job.get("error"),
                 "result_ref": job.get("result_ref"),
                 "partial_ref": job.get("partial_ref"),
+                "attempts": counters.get("attempts"),
+                "calls": counters.get("calls"),
+                "resume_count": int(job_payload.get("resume_count") or 0),
+                "vlm_max_attempts": limits.get("vlm_max_attempts"),
             }
         return {
             "schema_version": 1,
