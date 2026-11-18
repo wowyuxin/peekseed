@@ -3513,14 +3513,23 @@ def create_app():
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/jobs/"
               "{job_id}/resume", status_code=202)
     def source_review_job_resume(dataset_id: str, sha: str, job_id: str):
-        """Resume a paused/failed adjudicate job (same job id; B11 rechecked)."""
+        """Resume a paused/failed adjudicate job (same job id; B11 rechecked).
+
+        CP5 F1: the resumed runner continues provider work, so inject the SAME
+        decision/VLM child env the adjudicate call path injects
+        (``_review_provider_env``: keyless-local decision included; an absent
+        provider stays ``None`` and the child env stays stripped — resume
+        never bypasses the allowlisted subprocess env rules).
+        """
         directory = _dataset_dir(dataset_id)
         entry = _source_by_sha(directory, sha)
         peel_id = _peel_id_of(entry)
         _require_review_schema()
+        provider_env = _review_provider_env()
         result = _call_peelfeed(
             "job resume",
-            lambda: peelfeed.client().job_resume(peel_id, job_id))
+            lambda: peelfeed.client().job_resume(
+                peel_id, job_id, provider_env=provider_env))
         return {"job": result}
 
     @app.post("/api/datasets/{dataset_id}/sources/{sha}/review/jobs/"

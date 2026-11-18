@@ -545,6 +545,143 @@ class ReviewJobRoutesTests(unittest.TestCase):
                 self.assertEqual(cancelled.json()["job"]["status"],
                                  "interrupted")
 
+    def _seed_paused_job(self, cli):
+        cli.update(jobs={"adjudicate-1": {
+            "job_id": "adjudicate-1", "type": "adjudicate",
+            "status": "paused", "progress": {}, "result_ref": None,
+        }})
+
+    def _resume_call(self, cli):
+        return next(call for call in cli.calls()
+                    if call["argv"][:2] == ["job", "resume"])
+
+    def test_resume_injects_the_same_provider_env_as_adjudicate(self):
+        """CP5 F1: the app resume route injects the SAME decision/VLM child
+        env the adjudicate call path injects, so the resumed runner can
+        continue provider work (no decision_unavailable/vlm_unavailable)."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            env = {
+                "PEELFEED_DECISION_BASE": "http://127.0.0.1:9/v1",
+                "PEELFEED_DECISION_MODEL": "fake-decision",
+                "PEELFEED_DECISION_TOKEN": "test-token",
+                "PEELFEED_DECISION_LINK_ID": "env",
+                "PEELFEED_LLM_BASE": "http://127.0.0.1:9/v1",
+                "PEELFEED_LLM_MODEL": "fake-vlm",
+                "PEELFEED_LLM_TOKEN": "test-token",
+                "PEELFEED_LLM_LINK_ID": "env",
+            }
+            previous = {key: os.environ.get(key) for key in env}
+            os.environ.update(env)
+            try:
+                with _peelfeed_cli_env(cli.path):
+                    client = _client()
+                    base, dataset_id, _sha = _extracted_review_source(
+                        client, root)
+                    client.post(
+                        "/api/datasets/%s/review/authorizations" % dataset_id,
+                        json={"scope": {"text": True}})
+                    adjudicated = client.post(base + "/review/adjudicate",
+                                              json={})
+                    self.assertEqual(adjudicated.status_code, 202,
+                                     adjudicated.text)
+                    self._seed_paused_job(cli)
+                    resumed = client.post(
+                        base + "/review/jobs/adjudicate-1/resume")
+                    self.assertEqual(resumed.status_code, 202, resumed.text)
+                    calls = cli.calls()
+                    adjudicate_call = next(
+                        call for call in calls
+                        if call["argv"][0] == "adjudicate")
+                    resume_call = self._resume_call(cli)
+                    self.assertEqual(resume_call["decision_env"],
+                                     adjudicate_call["decision_env"])
+                    self.assertEqual(resume_call["llm_env"],
+                                     adjudicate_call["llm_env"])
+                    self.assertEqual(
+                        resume_call["decision_env"]["PEELFEED_DECISION_BASE"],
+                        "http://127.0.0.1:9/v1")
+                    self.assertEqual(
+                        resume_call["decision_env"]["PEELFEED_DECISION_TOKEN"],
+                        "test-token")
+                    self.assertEqual(
+                        resume_call["llm_env"]["PEELFEED_LLM_TOKEN"],
+                        "test-token")
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_resume_keyless_local_decision_and_absent_vlm(self):
+        """CP5 F1: keyless-local decision semantics survive resume (base+model
+        without a token); an absent VLM provider stays stripped."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            env = {
+                "PEELFEED_DECISION_BASE": "http://127.0.0.1:9/v1",
+                "PEELFEED_DECISION_MODEL": "local-decision",
+                "PEELFEED_DECISION_LINK_ID": "env",
+            }
+            cleared = [key for key in os.environ
+                       if key.startswith(("PEELFEED_DECISION_",
+                                          "PEELFEED_LLM_"))]
+            previous = {key: os.environ.get(key)
+                        for key in set(cleared) | set(env)}
+            for key in cleared:
+                os.environ.pop(key, None)
+            os.environ.update(env)
+            try:
+                with _peelfeed_cli_env(cli.path):
+                    client = _client()
+                    base, _dataset_id, _sha = _extracted_review_source(
+                        client, root)
+                    self._seed_paused_job(cli)
+                    resumed = client.post(
+                        base + "/review/jobs/adjudicate-1/resume")
+                    self.assertEqual(resumed.status_code, 202, resumed.text)
+                    resume_call = self._resume_call(cli)
+                    self.assertEqual(resume_call["decision_env"], {
+                        "PEELFEED_DECISION_BASE": "http://127.0.0.1:9/v1",
+                        "PEELFEED_DECISION_MODEL": "local-decision",
+                        "PEELFEED_DECISION_TOKEN": "",
+                        "PEELFEED_DECISION_LINK_ID": "env",
+                    })
+                    self.assertEqual(resume_call["llm_env"], {})
+            finally:
+                for key, value in previous.items():
+                    if value is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = value
+
+    def test_resume_without_providers_stays_stripped_and_succeeds(self):
+        """CP5 F1: with no provider configured the resume env stays stripped
+        (the runner degrades honestly); resume never bypasses the allowlist."""
+        with temp_data_root() as root:
+            cli = FakePeelfeedCli(root / "fake")
+            cleared = [key for key in os.environ
+                       if key.startswith(("PEELFEED_DECISION_",
+                                          "PEELFEED_LLM_"))]
+            previous = {key: os.environ[key] for key in cleared}
+            for key in cleared:
+                os.environ.pop(key, None)
+            try:
+                with _peelfeed_cli_env(cli.path):
+                    client = _client()
+                    base, _dataset_id, _sha = _extracted_review_source(
+                        client, root)
+                    self._seed_paused_job(cli)
+                    resumed = client.post(
+                        base + "/review/jobs/adjudicate-1/resume")
+                    self.assertEqual(resumed.status_code, 202, resumed.text)
+                    resume_call = self._resume_call(cli)
+                    self.assertEqual(resume_call["decision_env"], {})
+                    self.assertEqual(resume_call["llm_env"], {})
+            finally:
+                os.environ.update(previous)
+
 
 if __name__ == "__main__":
     unittest.main()

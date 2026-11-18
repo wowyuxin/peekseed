@@ -160,5 +160,135 @@ class DecisionChildEnvTests(unittest.TestCase):
             self.assertIn("not set", provider["reason"])
 
 
+@contextlib.contextmanager
+def _clean_provider_env():
+    """Remove any ambient decision/VLM provider env for one test."""
+    keys = [key for key in os.environ
+            if key.startswith(("PEELFEED_DECISION_", "PEELFEED_LLM_"))]
+    saved = {key: os.environ[key] for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
+    try:
+        yield
+    finally:
+        os.environ.update(saved)
+
+
+class JobResumeProviderEnvTests(unittest.TestCase):
+    """CP5 F1: ``job resume`` injects the SAME provider env as adjudicate.
+
+    The resumed runner continues provider work, so the resume child must
+    receive the decision/VLM child env exactly like an adjudicate child; with
+    no provider configured the env stays stripped (degraded resume, never a
+    bypass of the allowlisted subprocess env rules).
+    """
+
+    PROVIDER_ENV = {
+        "decision": {"PEELFEED_DECISION_BASE": "http://127.0.0.1:9911",
+                     "PEELFEED_DECISION_MODEL": "jev-1.14.0",
+                     "PEELFEED_DECISION_TOKEN": "decision-secret",
+                     "PEELFEED_DECISION_LINK_ID": "env"},
+        "llm": {"PEELFEED_LLM_BASE": "http://127.0.0.1:9912/v1",
+                "PEELFEED_LLM_MODEL": "fake-vlm",
+                "PEELFEED_LLM_TOKEN": "vlm-secret",
+                "PEELFEED_LLM_LINK_ID": "env"},
+    }
+
+    def _cli(self, root):
+        from tests.fixtures import FakePeelfeedCli
+        cli = FakePeelfeedCli(root / "fake")
+        cli.update(peels={"peel-1": {"peel_id": "peel-1", "state": "ready"}},
+                   jobs={"adjudicate-1": {
+                       "job_id": "adjudicate-1", "type": "adjudicate",
+                       "status": "paused", "progress": {},
+                       "result_ref": None}})
+        return cli
+
+    def _resume_call(self, cli):
+        return next(call for call in cli.calls()
+                    if call["argv"][:2] == ["job", "resume"])
+
+    def test_resume_child_gets_the_injected_provider_env(self):
+        with temp_data_root() as root:
+            from peekseed import peelfeed
+            from tests.test_review_ocr import _peelfeed_cli_env
+            cli = self._cli(root)
+            with _peelfeed_cli_env(cli.path), _clean_provider_env():
+                peelfeed.client().job_resume(
+                    "peel-1", "adjudicate-1",
+                    provider_env=self.PROVIDER_ENV)
+                call = self._resume_call(cli)
+                self.assertEqual(call["decision_env"],
+                                 self.PROVIDER_ENV["decision"])
+                self.assertEqual(call["llm_env"], self.PROVIDER_ENV["llm"])
+
+    def test_resume_env_is_identical_to_the_adjudicate_env(self):
+        with temp_data_root() as root:
+            from peekseed import peelfeed
+            from tests.test_review_ocr import _peelfeed_cli_env
+            cli = self._cli(root)
+            request = {"dataset_id": "ds", "settings": {},
+                       "authorization": {"authorization_id": "auth-1"},
+                       "scope": {"all_unresolved": True}}
+            with _peelfeed_cli_env(cli.path), _clean_provider_env():
+                client = peelfeed.client()
+                client.adjudicate("peel-1", request,
+                                  provider_env=self.PROVIDER_ENV)
+                client.job_resume("peel-1", "adjudicate-1",
+                                  provider_env=self.PROVIDER_ENV)
+                calls = cli.calls()
+                adjudicate_call = next(call for call in calls
+                                       if call["argv"][0] == "adjudicate")
+                resume_call = self._resume_call(cli)
+                self.assertEqual(resume_call["decision_env"],
+                                 adjudicate_call["decision_env"])
+                self.assertEqual(resume_call["llm_env"],
+                                 adjudicate_call["llm_env"])
+
+    def test_keyless_local_decision_env_is_forwarded_verbatim(self):
+        with temp_data_root() as root:
+            from peekseed import peelfeed
+            from tests.test_review_ocr import _peelfeed_cli_env
+            cli = self._cli(root)
+            keyless = {"decision": {
+                "PEELFEED_DECISION_BASE": "http://127.0.0.1:9911",
+                "PEELFEED_DECISION_MODEL": "local-decision",
+                "PEELFEED_DECISION_TOKEN": "",
+                "PEELFEED_DECISION_LINK_ID": "env"}}
+            with _peelfeed_cli_env(cli.path), _clean_provider_env():
+                peelfeed.client().job_resume("peel-1", "adjudicate-1",
+                                             provider_env=keyless)
+                call = self._resume_call(cli)
+                self.assertEqual(call["decision_env"], keyless["decision"])
+                # No VLM provider configured: the LLM env stays stripped.
+                self.assertEqual(call["llm_env"], {})
+
+    def test_resume_without_provider_env_stays_stripped(self):
+        with temp_data_root() as root:
+            from peekseed import peelfeed
+            from tests.test_review_ocr import _peelfeed_cli_env
+            cli = self._cli(root)
+            with _peelfeed_cli_env(cli.path), _clean_provider_env():
+                # Even with provider credentials in the parent env, a resume
+                # without an explicit provider_env never forwards them.
+                added = {
+                    "PEELFEED_DECISION_BASE": "http://127.0.0.1:9911",
+                    "PEELFEED_DECISION_MODEL": "jev-1.14.0",
+                    "PEELFEED_DECISION_TOKEN": "decision-secret",
+                    "PEELFEED_LLM_BASE": "http://127.0.0.1:9912/v1",
+                    "PEELFEED_LLM_MODEL": "fake-vlm",
+                    "PEELFEED_LLM_TOKEN": "vlm-secret",
+                }
+                os.environ.update(added)
+                try:
+                    peelfeed.client().job_resume("peel-1", "adjudicate-1")
+                finally:
+                    for key in added:
+                        os.environ.pop(key, None)
+                call = self._resume_call(cli)
+                self.assertEqual(call["decision_env"], {})
+                self.assertEqual(call["llm_env"], {})
+
+
 if __name__ == "__main__":
     unittest.main()

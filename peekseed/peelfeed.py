@@ -1486,10 +1486,22 @@ class PeelfeedClient(object):
             llm_env=(provider_env or {}).get("llm"),
             decision_env=(provider_env or {}).get("decision"))
 
-    def job_resume(self, peel_id, job_id):
+    def job_resume(self, peel_id, job_id, *, provider_env=None, timeout=None):
+        """``job resume <peel> --job <id>``: requeue + respawn the same job.
+
+        CP5 F1: the resumed runner continues provider work, so the resume
+        child receives the SAME decision/VLM provider env as an adjudicate
+        child (:meth:`adjudicate`) — ``provider_env`` is built by the app's
+        ``_review_provider_env`` (keyless-local decision included; absent
+        providers stay ``None`` and the env stays stripped). Without it the
+        detached runner had no provider config and every resumed run degraded
+        to ``decision_unavailable``/``vlm_unavailable``.
+        """
         return self._run(
             ["job", "resume", str(peel_id), "--job", str(job_id)],
-            timeout=min(SHORT_TIMEOUT, self.timeout))
+            timeout=timeout or min(SHORT_TIMEOUT, self.timeout),
+            llm_env=(provider_env or {}).get("llm"),
+            decision_env=(provider_env or {}).get("decision"))
 
     def job_cancel(self, peel_id, job_id):
         return self._run(
