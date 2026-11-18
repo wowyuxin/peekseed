@@ -8,6 +8,62 @@ version/tag policy.
 
 ## Unreleased
 
+### Fixed — M3 CP5 seam fix round (cp5-retest-after-cp4-fix-v2.md F1/F3/F4/F5)
+
+- F1 (major): app-mediated resume no longer drops the provider env.
+  `PeelfeedClient.job_resume` accepts `provider_env` and forwards
+  `llm_env`/`decision_env` exactly like `adjudicate`; the
+  `POST …/review/jobs/{id}/resume` route builds it with the SAME
+  `_review_provider_env` helper the adjudicate/auto-trigger path uses
+  (keyless-local decision included; absent providers stay `None`). Before,
+  `_environment` stripped the `PEELFEED_DECISION_*`/`PEELFEED_LLM_*`
+  credentials from the resume child, so the detached runner had no provider
+  and every resumed run degraded to `decision_unavailable`/`vlm_unavailable`.
+  The allowlisted subprocess env rules are unchanged.
+- F3 (major): `review-import` identity verification now matches peelfeed
+  `metadata import` EXACTLY (faithful port of
+  `metadata_bundle._current_identity`/`_validate_manifest`): build/conversion/
+  engine-fingerprint/correction bindings/chunk sets come from
+  `corpus/manifest.json` only (`None` for a never-published peel), never from
+  `build_summary.json`; source sha256 is the source-file hash; the
+  uncorrected identity is the full facts+manifest snapshot, compared by full
+  value; `peel_id`/`schema_versions` are required and the frozen schema
+  versions are checked. Before, peekseed rejected (`stale`) bundles peelfeed
+  accepts on unpublished peels. Ported (not CLI-delegated) so `review-import`
+  stays standalone with structured mismatches and peekseed-side staging.
+- F4 (major): `review-import` implements the engine's N-3 append-merge.
+  `auto_confirmations.jsonl`/`unsupported.jsonl` are ALWAYS row-level
+  append-merged (keep ALL local rows byte-prefix intact, natural-key dedupe
+  `ac_id+outcome+event+batch_id+revert_of` /
+  `item_id+reason_code+source+reason`, append bundle-only rows, never shrink,
+  idempotent, missing local ledger recovered byte-identical) — including
+  same-plan-version bundles (`tag_auto_batch` does not bump plan_version).
+  Before, `_merge_tree` byte-overwrote the ledgers (re-test: 4→2 rows).
+  plan/resolutions/corrections semantics unchanged.
+- F5 (minor, O-1 follow-through): the Review auto panel ships a visible
+  manual re-run entry — `运行自动审阅 / Run auto-review` (`#autoAdjudicate`)
+  calling `POST …/sources/{sha}/review/adjudicate`. Enabled only with an
+  active authorization (otherwise disabled with a create-authorization hint;
+  authorization is never bypassed). Works when the auto job is done — the
+  documented exit after settings changes on the same conversion (N-8); a
+  manual request is a new intent and creates a NEW job. The resulting job
+  state is shown; `reviewRetryJob` routes `adjudicate` to the same action.
+
+### Added — M3 CP5 ⑤ honest attempts/cap display (suggested acceptance item, USER-VETOABLE)
+
+- `GET …/review/auto` additively exposes, in the `job` block, `attempts`/
+  `calls` (from `summary.json` when done, else `summary.partial.json` via
+  `partial_ref` or the conventional path — paused/interrupted/mid-run), plus
+  `resume_count` and `vlm_max_attempts` (`payload.snapshot.limits`). Old
+  readers unaffected (`summary` unchanged; new keys only). This closes the
+  data gap where partial attempts were invisible exactly when the user
+  decides whether to resume.
+- The auto panel status line now shows BOTH distinctly: `调用 …（仅成功）`
+  (successful calls) vs `尝试(含重试 HTTP) …` (cumulative attempts including
+  retries, job-level across resumes), the per-run VLM cap (`<=0` = 不限) and
+  `续跑次数`. N-6 raw_score scale, auto-review defaults and threshold/cutoff
+  semantics are unchanged.
+
 ### Fixed — M3 CP4 re-review N-8: auto-trigger dedupe key
 
 - The extraction-completion AUTO trigger now passes a stable trigger-scoped
