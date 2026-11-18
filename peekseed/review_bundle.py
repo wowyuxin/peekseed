@@ -46,6 +46,10 @@ __all__ = ["import_all", "import_one"]
 MANIFEST_NAME = "manifest.json"
 _ALLOWED_PREFIXES = ("review/", "corpus/", "ocr/")
 _LEDGER_FILES = ("plan.json", "resolutions.jsonl", "corrections.jsonl")
+#: Append-only JSONL ledgers (B6): ALWAYS row-level append-merged on import,
+#: regardless of the bundle's plan version — they must never shrink (CP5 F4,
+#: the engine's N-3 fix in peelfeed ``metadata_bundle._merge_tree``).
+_APPEND_LEDGERS = ("auto_confirmations.jsonl", "unsupported.jsonl")
 _MAX_MEMBER = 64 * 1024 * 1024
 
 
@@ -212,6 +216,98 @@ def _safe_members(tar):
     return members
 
 
+def _read_jsonl(path):
+    """Tolerant JSONL read — mirrors peelfeed ``reader.read_jsonl`` (blank and
+    corrupt lines are skipped, never raised)."""
+    path = Path(path)
+    records = []
+    if not path.is_file():
+        return records
+    with path.open(encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                records.append(json.loads(line))
+            except ValueError:
+                continue
+    return records
+
+
+def _append_jsonl(path, records):
+    """Append JSON lines — mirrors peelfeed ``store.append_jsonl`` byte format
+    (``ensure_ascii=False``, insertion order, one trailing newline per row)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [json.dumps(record, ensure_ascii=False, sort_keys=False) + "\n"
+             for record in records]
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write("".join(lines))
+        stream.flush()
+        os.fsync(stream.fileno())
+    return path
+
+
+def _ledger_row_key(name, row):
+    """The idempotency/natural key of one append-only ledger row (N-3).
+
+    Verbatim port of peelfeed ``metadata_bundle._ledger_row_key``:
+    ``auto_confirmations.jsonl`` — one row per (auto_confirmation_id, outcome,
+    event, batch_id, revert_of); ``unsupported.jsonl`` — one row per (item_id,
+    reason_code, source, reason). Rows without the natural identity fall back
+    to the canonical full-row JSON, so nothing is ever silently dropped.
+    """
+    if isinstance(row, dict):
+        if name == "auto_confirmations.jsonl" and row.get(
+                "auto_confirmation_id"):
+            return ("ac", str(row.get("auto_confirmation_id")),
+                    str(row.get("outcome") or ""),
+                    str(row.get("event") or ""),
+                    str(row.get("batch_id") or ""),
+                    str(row.get("revert_of") or ""))
+        if name == "unsupported.jsonl" and row.get("item_id"):
+            return ("unsupported", str(row.get("item_id")),
+                    str(row.get("reason_code") or ""),
+                    str(row.get("source") or ""),
+                    str(row.get("reason") or ""))
+    return ("raw", json.dumps(row, ensure_ascii=False, sort_keys=True))
+
+
+def _merge_append_ledger(source, destination, name):
+    """Row-level append-merge of one append-only JSONL ledger (CP5 F4 / N-3).
+
+    Port of peelfeed ``metadata_bundle._merge_append_ledger``: keeps ALL
+    existing local rows verbatim (the file prefix is never rewritten), appends
+    the bundle rows not already present (natural-key dedupe), and never shrinks
+    the ledger — including same-plan-version bundles (``tag_auto_batch``
+    appends a ``batch_linked`` row without bumping plan_version). Returns
+    ``(copied, skipped)`` file counts: a merge that appends nothing is a skip,
+    so a re-import is idempotent (0 changes). A missing local ledger is
+    recovered byte-identical from the bundle member.
+    """
+    if not destination.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temp = destination.with_suffix(destination.suffix + ".tmp")
+        shutil.copyfile(str(source), str(temp))
+        os.chmod(str(temp), 0o600)
+        temp.replace(destination)
+        return 1, 0
+    local_rows = _read_jsonl(destination)
+    seen = {_ledger_row_key(name, row) for row in local_rows}
+    appended = []
+    for row in _read_jsonl(source):
+        key = _ledger_row_key(name, row)
+        if key in seen:
+            continue
+        seen.add(key)
+        appended.append(row)
+    if not appended:
+        return 0, 1
+    _append_jsonl(destination, appended)
+    return 1, 0
+
+
 def _merge_tree(source, target, *, skip_ledgers=False):
     copied = skipped = 0
     if not source.is_dir():
@@ -220,6 +316,14 @@ def _merge_tree(source, target, *, skip_ledgers=False):
         if not path.is_file():
             continue
         relative = path.relative_to(source)
+        # N-3: the append-only ledgers are ALWAYS row-merged, even when an
+        # older bundle's plan/resolutions/corrections are kept newer.
+        if relative.as_posix() in _APPEND_LEDGERS:
+            count, skipped_count = _merge_append_ledger(
+                path, Path(target) / relative, relative.as_posix())
+            copied += count
+            skipped += skipped_count
+            continue
         if skip_ledgers and relative.as_posix() in _LEDGER_FILES:
             skipped += 1
             continue

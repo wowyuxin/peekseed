@@ -75,7 +75,7 @@ def _uncorrected_identity(manifest):
 
 
 def _bundle(peel, manifest, build, *, path, tamper=None, plan_version=2,
-            extra_member=None, drop=()):
+            extra_member=None, drop=(), ledgers=None):
     # CP5 F3: a peelfeed export manifest reads build_id/engine_fingerprint
     # from corpus/manifest.json (None when unpublished) — NEVER from
     # build_summary.json. ``build`` is kept in the signature so tests can
@@ -108,14 +108,25 @@ def _bundle(peel, manifest, build, *, path, tamper=None, plan_version=2,
         info = tarfile.TarInfo("manifest.json")
         info.size = len(data)
         tar.addfile(info, io.BytesIO(data))
-        for name, body in (
-                ("review/plan.json", json.dumps({"plan_version": plan_version,
-                                                "entries": []})),
-                ("review/items.json", json.dumps({"items": []})),
-                ("review/conversations/conv-1.jsonl",
-                 json.dumps({"turn": 1})),
-                ("corpus/review_facts.json", json.dumps({"facts": True})),
-                ("ocr/figure-1/evidence.json", json.dumps({"labels": []}))):
+        members = [
+            ("review/plan.json", json.dumps({"plan_version": plan_version,
+                                             "entries": []})),
+            # Realistic identity-stable members: a peelfeed export carries the
+            # FULL items/facts payloads, so merging them keeps the current
+            # identity (evidence hashes / facts identity) unchanged.
+            ("review/items.json", json.dumps(
+                {"items": [{"id": "it-1", "evidence": {"hash": "h-1"}}]})),
+            ("review/conversations/conv-1.jsonl", json.dumps({"turn": 1})),
+            ("corpus/review_facts.json", json.dumps(
+                {"schema_version": 1,
+                 "uncorrected_identity": manifest.get("uncorrected_identity")})),
+            ("ocr/figure-1/evidence.json", json.dumps({"labels": []})),
+        ]
+        for name, rows in (ledgers or {}).items():
+            blob = rows if isinstance(rows, bytes) else "".join(
+                json.dumps(row, ensure_ascii=False) + "\n" for row in rows)
+            members.append(("review/" + name, blob))
+        for name, body in members:
             blob = body.encode("utf-8")
             member = tarfile.TarInfo(name)
             member.size = len(blob)
@@ -232,6 +243,273 @@ class ReviewBundleImportTests(unittest.TestCase):
             current = json.loads((peel_dir / "extract" / "review" /
                                   "plan.json").read_text())
             self.assertEqual(current["plan_version"], 2)
+
+
+def _ac_row(ac_id, outcome="confirmed", *, event="", batch_id="",
+            revert_of="", entry_ids=None, created_at="2026-11-18T00:00:00Z"):
+    row = {"auto_confirmation_id": ac_id, "outcome": outcome,
+           "entry_ids": entry_ids or ["e-" + ac_id],
+           "created_at": created_at}
+    if event:
+        row["event"] = event
+    if batch_id:
+        row["batch_id"] = batch_id
+    if revert_of:
+        row["revert_of"] = revert_of
+    return row
+
+
+def _un_row(item_id, reason_code, reason, source="manual"):
+    return {"item_id": item_id, "reason_code": reason_code,
+            "source": source, "reason": reason,
+            "created_at": "2026-11-18T00:00:00Z"}
+
+
+class ReviewBundleAppendMergeTests(unittest.TestCase):
+    """CP5 F4: review-import implements the engine's N-3 append-merge.
+
+    ``auto_confirmations.jsonl`` / ``unsupported.jsonl`` are ALWAYS row-level
+    append-merged (keep ALL local rows byte-prefix intact, natural-key dedupe,
+    append bundle-only rows, never shrink, idempotent) — including
+    same-plan-version bundles (``tag_auto_batch`` does not bump plan_version).
+    Mirrors peelfeed ``tests/test_metadata_bundle_v2.py`` and the CP5 retest
+    adversarial cases; outcomes must match the peelfeed CLI on the same cases
+    (re-verified on real peels by the retest harness self-check).
+    """
+
+    def _setup(self, root, *, local_rows, bundle_rows, plan_version=1,
+               local_un=None, bundle_un=None, extra_local=(),
+               ledgers_extra=None):
+        from peekseed import config
+        paths = config.paths()
+        _dataset, peel, peel_dir, manifest, build = _peel_with_review()
+        review = peel_dir / "extract" / "review"
+        ac_path = review / "auto_confirmations.jsonl"
+        ac_path.write_text("".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in local_rows), encoding="utf-8")
+        un_path = review / "unsupported.jsonl"
+        if local_un is not None:
+            un_path.write_text("".join(
+                json.dumps(row, ensure_ascii=False) + "\n"
+                for row in local_un), encoding="utf-8")
+        for name, body in extra_local:
+            (review / name).write_text(body, encoding="utf-8")
+        ledgers = {"auto_confirmations.jsonl": bundle_rows}
+        if bundle_un is not None:
+            ledgers["unsupported.jsonl"] = bundle_un
+        ledgers.update(ledgers_extra or {})
+        bundle = _bundle(peel, manifest, build,
+                         path=paths.root / "review-bundles" /
+                         peel["peel_id"] / "b1.tar.gz",
+                         plan_version=plan_version, ledgers=ledgers)
+        return paths, peel, peel_dir, manifest, build, bundle, ac_path, un_path
+
+    def _reimport_variant(self, paths, peel, manifest, build, bundle,
+                          ledgers, name="b2.tar.gz", plan_version=1):
+        """A DIFFERENT bundle (new sha) with the same ledger rows: exercises
+        the merge again past the sha-level idempotency shortcut."""
+        variant = _bundle(peel, manifest, build,
+                          path=paths.root / "review-bundles" /
+                          peel["peel_id"] / name,
+                          plan_version=plan_version, ledgers=ledgers,
+                          tamper={"audit_marker": name})
+        from peekseed import review_bundle
+        return review_bundle.import_one(paths, variant)
+
+    def test_older_bundle_never_shrinks_4_to_2(self):
+        """The retest F4 scenario: an older bundle with 2 ledger rows must
+        keep all 4 local rows (and the newer plan/resolutions/corrections)."""
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            local = [_ac_row("ac-1"), _ac_row("ac-1", event="batch_linked",
+                                              batch_id="batch-1"),
+                     _ac_row("ac-2"), _ac_row("ac-2", event="batch_linked",
+                                              batch_id="batch-1")]
+            bundle_rows = local[:2]
+            paths, peel, peel_dir, manifest, build, bundle, ac_path, _un = \
+                self._setup(root, local_rows=local, bundle_rows=bundle_rows,
+                            plan_version=1,
+                            ledgers_extra={
+                                "resolutions.jsonl":
+                                    [{"resolution_id": "r-old"}],
+                                "corrections.jsonl":
+                                    [{"correction_id": "c-old"}]},
+                            extra_local=[
+                                ("resolutions.jsonl",
+                                 json.dumps({"resolution_id": "r-new"})
+                                 + "\n"),
+                                ("corrections.jsonl",
+                                 json.dumps({"correction_id": "c-new"})
+                                 + "\n")])
+            before = ac_path.read_bytes()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertIn("newer_plan_kept", result["warnings"])
+            self.assertEqual(ac_path.read_bytes(), before)
+            rows = [json.loads(line) for line in
+                    ac_path.read_text().splitlines()]
+            self.assertEqual(len(rows), 4)
+            review = peel_dir / "extract" / "review"
+            self.assertEqual(json.loads((review / "plan.json").read_text())
+                             ["plan_version"], 2)
+            self.assertIn("r-new", (review / "resolutions.jsonl").read_text())
+            self.assertIn("c-new", (review / "corrections.jsonl").read_text())
+            # Re-import (new sha, same ledger rows): still 0 ledger changes.
+            again = self._reimport_variant(
+                paths, peel, manifest, build, bundle,
+                {"auto_confirmations.jsonl": bundle_rows})
+            self.assertEqual(again["status"], "imported", again)
+            self.assertEqual(ac_path.read_bytes(), before)
+
+    def test_same_key_different_payload_local_wins(self):
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            local = [_ac_row("ac-1"), _ac_row("ac-2")]
+            forged = _ac_row("ac-1", entry_ids=["e-forged"],
+                             created_at="1999-01-01T00:00:00Z")
+            paths, _peel, _peel_dir, _m, _b, bundle, ac_path, _un = \
+                self._setup(root, local_rows=local, bundle_rows=[forged])
+            before = ac_path.read_bytes()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertEqual(ac_path.read_bytes(), before)
+            rows = [json.loads(line) for line in
+                    ac_path.read_text().splitlines()]
+            self.assertEqual(rows, local)
+
+    def test_interleaved_revert_and_bundle_only_row_appended(self):
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            local = [_ac_row("ac-1"), _ac_row("ac-2"),
+                     _ac_row("ac-2", outcome="reverted", revert_of="ac-2")]
+            row_z = _ac_row("ac-" + "z" * 16, entry_ids=["e-z"])
+            bundle_rows = [local[0], row_z]
+            paths, peel, peel_dir, manifest, build, bundle, ac_path, _un = \
+                self._setup(root, local_rows=local, bundle_rows=bundle_rows)
+            prefix = ac_path.read_bytes()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertTrue(ac_path.read_bytes().startswith(prefix))
+            rows = [json.loads(line) for line in
+                    ac_path.read_text().splitlines()]
+            self.assertEqual(len(rows), 4)
+            self.assertEqual(rows[-1]["auto_confirmation_id"],
+                             "ac-" + "z" * 16)
+            self.assertEqual([row["outcome"] for row in rows],
+                             ["confirmed", "confirmed", "reverted",
+                              "confirmed"])
+            again = self._reimport_variant(
+                paths, peel, manifest, build, bundle,
+                {"auto_confirmations.jsonl": bundle_rows})
+            self.assertEqual(again["status"], "imported", again)
+            self.assertEqual(len([json.loads(line) for line in
+                                  ac_path.read_text().splitlines()]), 4)
+
+    def test_natural_key_includes_event_batch_and_revert(self):
+        """confirmed / batch_linked / reverted rows for the SAME ac id are
+        distinct natural keys: the bundle's additive rows append, the shared
+        confirmed row does not duplicate."""
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            local = [_ac_row("ac-1")]
+            bundle_rows = [_ac_row("ac-1"),
+                           _ac_row("ac-1", event="batch_linked",
+                                   batch_id="batch-9"),
+                           _ac_row("ac-1", outcome="reverted",
+                                   revert_of="ac-1")]
+            paths, _peel, _pd, _m, _b, bundle, ac_path, _un = \
+                self._setup(root, local_rows=local, bundle_rows=bundle_rows)
+            prefix = ac_path.read_bytes()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertTrue(ac_path.read_bytes().startswith(prefix))
+            rows = [json.loads(line) for line in
+                    ac_path.read_text().splitlines()]
+            self.assertEqual([row["outcome"] for row in rows],
+                             ["confirmed", "confirmed", "reverted"])
+            self.assertEqual(rows[1]["event"], "batch_linked")
+            self.assertEqual(rows[1]["batch_id"], "batch-9")
+
+    def test_deleted_local_ledger_recovered_byte_identical(self):
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            bundle_rows = [_ac_row("ac-1"), _ac_row("ac-2")]
+            paths, peel, peel_dir, manifest, build, bundle, ac_path, _un = \
+                self._setup(root, local_rows=[_ac_row("ac-9")],
+                            bundle_rows=bundle_rows)
+            ac_path.unlink()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            expected = "".join(json.dumps(row, ensure_ascii=False) + "\n"
+                               for row in bundle_rows).encode("utf-8")
+            self.assertEqual(ac_path.read_bytes(), expected)
+            again = self._reimport_variant(
+                paths, peel, manifest, build, bundle,
+                {"auto_confirmations.jsonl": bundle_rows})
+            self.assertEqual(again["status"], "imported", again)
+            self.assertEqual(ac_path.read_bytes(), expected)
+
+    def test_same_plan_version_bundle_never_shrinks(self):
+        """tag_auto_batch appends a batch_linked row WITHOUT bumping
+        plan_version: a same-version bundle must not byte-overwrite either."""
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            local = [_ac_row("ac-1"),
+                     _ac_row("ac-1", event="batch_linked",
+                             batch_id="batch-1")]
+            paths, _peel, _pd, _m, _b, bundle, ac_path, _un = \
+                self._setup(root, local_rows=local,
+                            bundle_rows=[local[0]], plan_version=2)
+            before = ac_path.read_bytes()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertNotIn("newer_plan_kept", result["warnings"])
+            self.assertEqual(ac_path.read_bytes(), before)
+            self.assertEqual(len([json.loads(line) for line in
+                                  ac_path.read_text().splitlines()]), 2)
+
+    def test_unsupported_ledger_append_merge(self):
+        with temp_data_root() as root:
+            from peekseed import review_bundle
+            local_un = [_un_row("it-a", "unsupported_evidence", "first"),
+                        _un_row("it-b", "grid_conflict", "second")]
+            bundle_un = [_un_row("it-a", "unsupported_evidence", "first"),
+                         _un_row("it-c", "unsupported_evidence", "third")]
+            paths, peel, peel_dir, manifest, build, bundle, ac_path, un_path = \
+                self._setup(root, local_rows=[_ac_row("ac-1")],
+                            bundle_rows=[_ac_row("ac-1")],
+                            local_un=local_un, bundle_un=bundle_un)
+            prefix = un_path.read_bytes()
+            result = review_bundle.import_one(paths, bundle)
+            self.assertEqual(result["status"], "imported", result)
+            self.assertIn("newer_plan_kept", result["warnings"])
+            self.assertTrue(un_path.read_bytes().startswith(prefix))
+            rows = [json.loads(line) for line in
+                    un_path.read_text().splitlines()]
+            self.assertEqual([row["item_id"] for row in rows],
+                             ["it-a", "it-b", "it-c"])
+            # Same natural key (item_id+reason_code+source+reason), differing
+            # non-key payload: local wins (reason IS part of the key).
+            forged = [dict(local_un[0], created_at="1999-01-01T00:00:00Z")]
+            again = self._reimport_variant(
+                paths, peel, manifest, build, bundle,
+                {"auto_confirmations.jsonl": [_ac_row("ac-1")],
+                 "unsupported.jsonl": forged})
+            self.assertEqual(again["status"], "imported", again)
+            self.assertEqual(un_path.read_bytes(), prefix + (
+                json.dumps(bundle_un[1], ensure_ascii=False) + "\n"
+                ).encode("utf-8"))
+            # Deleted local unsupported ledger: byte-identical recovery.
+            un_path.unlink()
+            third = self._reimport_variant(
+                paths, peel, manifest, build, bundle,
+                {"auto_confirmations.jsonl": [_ac_row("ac-1")],
+                 "unsupported.jsonl": bundle_un}, name="b3.tar.gz")
+            self.assertEqual(third["status"], "imported", third)
+            expected = "".join(json.dumps(row, ensure_ascii=False) + "\n"
+                               for row in bundle_un).encode("utf-8")
+            self.assertEqual(un_path.read_bytes(), expected)
 
 
 class ReviewBundleIdentityParityTests(unittest.TestCase):
